@@ -6,9 +6,9 @@ import subprocess
 
 
 def test_root_address(tmp_path):
-    repo = Path(__file__).resolve().parents[2]
     harness = r'''
 #include <assert.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <libfdt.h>
 /* Compile the actual implementation with host types, without importing
@@ -98,6 +98,97 @@ int main(void)
     return 0;
 }
 '''
+    run(tmp_path, harness)
+
+
+BUS_HARNESS = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <libfdt.h>
+#define TYPES_H
+typedef uint64_t u64;
+#define UTILS_H
+#define printf(...) ((void)0)
+#include "devicetree.c"
+
+/* A /soc bus with one ranges entry and one device on it, at the bus's own cell widths */
+static int device(void *fdt, int cells, const fdt32_t *ranges, int rlen, const fdt32_t *reg,
+                  int len)
+{
+    assert(!fdt_create_empty_tree(fdt, 4096));
+    assert(!fdt_setprop_u32(fdt, 0, "#address-cells", 2));
+    assert(!fdt_setprop_u32(fdt, 0, "#size-cells", 2));
+    int soc = fdt_add_subnode(fdt, 0, "soc");
+    assert(soc >= 0);
+    assert(!fdt_setprop_u32(fdt, soc, "#address-cells", cells));
+    assert(!fdt_setprop_u32(fdt, soc, "#size-cells", cells));
+    assert(!fdt_setprop(fdt, soc, "ranges", ranges, rlen));
+    int dev = fdt_add_subnode(fdt, soc, "dev");
+    assert(dev >= 0);
+    assert(!fdt_setprop(fdt, dev, "reg", reg, len));
+    /* Whatever follows the reg value in the tree must not be read as part of it */
+    assert(!fdt_setprop_u32(fdt, dev, "status", 0xffffffff));
+    return fdt_path_offset(fdt, "/soc/dev");
+}
+
+/* The address of a device on /soc, the way dt_disable_missing_devs() works it out */
+static bool soc_address(void *fdt, int node, u64 *addr)
+{
+    int soc = fdt_path_offset(fdt, "/soc");
+    struct dt_ranges_tbl ranges[DT_MAX_RANGES] = {0};
+
+    dt_parse_ranges(fdt, soc, ranges);
+    if (!dt_reg_address(fdt, soc, node, addr))
+        return false;
+    *addr = dt_translate_address(ranges, *addr);
+    return true;
+}
+
+#define C(x) cpu_to_fdt32(x)
+
+int main(void)
+{
+    unsigned char fdt[4096];
+    u64 addr;
+
+    /* A bus with one address cell: reg holds a 32-bit address, then a 32-bit size */
+    const fdt32_t ranges1[] = {C(0x0), C(0x2), C(0x0), C(0x10000)};
+    const fdt32_t reg1[] = {C(0x100), C(0x10)};
+    int node = device(fdt, 1, ranges1, sizeof(ranges1), reg1, sizeof(reg1));
+    assert(soc_address(fdt, node, &addr) && addr == UINT64_C(0x200000100));
+    assert(dt_get_address(fdt, node) == addr);
+
+    /* A reg shorter than one entry has no address */
+    const fdt32_t ranges2[] = {C(0x0), C(0x0), C(0x2), C(0x0), C(0x0), C(0x10000)};
+    const fdt32_t reg2[] = {C(0x100)};
+    node = device(fdt, 2, ranges2, sizeof(ranges2), reg2, sizeof(reg2));
+    assert(!soc_address(fdt, node, &addr));
+    assert(dt_get_address(fdt, node) == 0);
+
+    /* A window that ends at 2^64 still holds the addresses inside it */
+    const fdt32_t ranges3[] = {C(0xffffffff), C(0xfffff000), C(0x0), C(0x1000), C(0x0), C(0x1000)};
+    const fdt32_t reg3[] = {C(0xffffffff), C(0xfffff800), C(0x0), C(0x10)};
+    node = device(fdt, 2, ranges3, sizeof(ranges3), reg3, sizeof(reg3));
+    assert(soc_address(fdt, node, &addr) && addr == UINT64_C(0x1800));
+    assert(dt_get_address(fdt, node) == addr);
+
+    /* And one just outside a window is left alone */
+    const fdt32_t reg4[] = {C(0x0), C(0x20000), C(0x0), C(0x10)};
+    node = device(fdt, 2, ranges2, sizeof(ranges2), reg4, sizeof(reg4));
+    assert(soc_address(fdt, node, &addr) && addr == UINT64_C(0x20000));
+    assert(dt_get_address(fdt, node) == addr);
+    return 0;
+}
+'''
+
+
+def test_bus_address(tmp_path):
+    run(tmp_path, BUS_HARNESS)
+
+
+def run(tmp_path, harness):
+    repo = Path(__file__).resolve().parents[2]
     cfile = tmp_path / "dt-root.c"
     cfile.write_text(harness)
     libfdt = repo / "src/libfdt"

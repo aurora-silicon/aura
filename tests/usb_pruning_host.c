@@ -21,7 +21,8 @@ static int adt_get_reg(void *a,int *p,const char *s,int r,u64 *v,void *x) { *v=p
 #define DT_MAX_RANGES 1
 struct dt_ranges_tbl { int unused; };
 static void dt_parse_ranges(void *d,int n,struct dt_ranges_tbl *r) {}
-static u64 dt_translate(struct dt_ranges_tbl *r,const fdt64_t *p) { return fdt64_to_cpu(*p); }
+static u64 dt_translate_address(struct dt_ranges_tbl *r,u64 a) { return a; }
+static int dt_reg_address(void *d,int b,int n,u64 *a) { const fdt64_t *p=fdt_getprop(d,n,"reg",NULL); if (!p) return 0; *a=fdt64_to_cpu(*p); return 1; }
 
 /* PRODUCTION ROUTINE */
 

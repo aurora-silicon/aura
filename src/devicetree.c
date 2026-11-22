@@ -46,17 +46,37 @@ void dt_parse_ranges(void *dt, int node, struct dt_ranges_tbl *ranges)
     }
 }
 
-u64 dt_translate(struct dt_ranges_tbl *ranges, const fdt64_t *reg)
+u64 dt_translate_address(struct dt_ranges_tbl *ranges, u64 addr)
 {
-    u64 addr = fdt64_ld(reg);
     for (int idx = 0; idx < DT_MAX_RANGES; ++idx) {
         if (ranges[idx].size == 0)
             break;
-        if (addr >= ranges[idx].start && addr < ranges[idx].start + ranges[idx].size)
-            return ranges[idx].parent - ranges[idx].start + addr;
+        /* An offset into the window, so that a window that ends at 2^64 does not wrap */
+        if (addr >= ranges[idx].start && addr - ranges[idx].start < ranges[idx].size)
+            return ranges[idx].parent + (addr - ranges[idx].start);
     }
 
     return addr;
+}
+
+/*
+ * The first address of node's reg, read at the #address-cells of its parent
+ * bus. False if a width is not one or two cells (the size may also be none),
+ * or there is no reg or it is not a whole number of entries.
+ */
+bool dt_reg_address(void *dt, int bus, int node, u64 *addr)
+{
+    int len;
+    int ac = fdt_address_cells(dt, bus);
+    int sc = fdt_size_cells(dt, bus);
+    const fdt32_t *reg = fdt_getprop(dt, node, "reg", &len);
+    int entry_size = (ac + sc) * sizeof(*reg);
+
+    if (ac < 1 || ac > 2 || sc < 0 || sc > 2 || !reg || len < entry_size || len % entry_size)
+        return false;
+
+    *addr = dt_read_cells(reg, ac);
+    return true;
 }
 
 /*
@@ -74,18 +94,10 @@ u64 dt_get_address(void *dt, int node)
 {
     int bus = fdt_parent_offset(dt, node);
     int len;
+    u64 addr;
 
-    if (bus < 0)
+    if (bus < 0 || !dt_reg_address(dt, bus, node, &addr))
         return 0;
-
-    int ac = fdt_address_cells(dt, bus);
-    int sc = fdt_size_cells(dt, bus);
-    const fdt32_t *reg = fdt_getprop(dt, node, "reg", &len);
-    int entry_size = (ac + sc) * sizeof(*reg);
-    if (ac < 1 || ac > 2 || sc < 0 || sc > 2 || !reg || len < entry_size || len % entry_size)
-        return 0;
-
-    u64 addr = dt_read_cells(reg, ac);
 
     /* The root's children already use the CPU's address space. */
     while (bus > 0) {

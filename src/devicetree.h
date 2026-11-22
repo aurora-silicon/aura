@@ -16,7 +16,9 @@ struct dt_ranges_tbl {
 };
 
 void dt_parse_ranges(void *dt, int node, struct dt_ranges_tbl *ranges);
-u64 dt_translate(struct dt_ranges_tbl *ranges, const fdt64_t *reg);
+u64 dt_translate_address(struct dt_ranges_tbl *ranges, u64 addr);
+/* The first address in @node's reg, at the #address-cells of its parent @bus; false if none */
+bool dt_reg_address(void *dt, int bus, int node, u64 *addr);
 u64 dt_get_address(void *dt, int node);
 
 #endif

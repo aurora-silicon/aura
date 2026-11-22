@@ -103,10 +103,9 @@ static void translate(void *dt)
         int child;
         fdt_for_each_subnode(child, dt, node)
         {
-            int len;
-            const fdt64_t *reg = fdt_getprop(dt, child, "reg", &len);
-            if (reg && len >= (int)sizeof(*reg))
-                sink += dt_translate(ranges, reg);
+            u64 addr;
+            if (dt_reg_address(dt, node, child, &addr))
+                sink += dt_translate_address(ranges, addr);
         }
     }
 }

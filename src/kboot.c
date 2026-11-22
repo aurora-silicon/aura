@@ -10777,11 +10777,10 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
             if (status && !strcmp(status, "disabled"))
                 continue;
 
-            const fdt64_t *reg = fdt_getprop(dt, node, "reg", NULL);
-            if (!reg)
+            u64 addr;
+            if (!dt_reg_address(dt, soc, node, &addr))
                 bail_cleanup("FDT: failed to get reg property of %s\n", name);
-
-            u64 addr = dt_translate(ranges, reg);
+            addr = dt_translate_address(ranges, addr);
 
             int i;
             for (i = 0; i < acnt; i++)
