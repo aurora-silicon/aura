@@ -2212,6 +2212,47 @@ int dt_gpu_t8122_26_calibrate(void *dt)
                               "g15s-fuse-scaled-experimental");
 }
 
+/*
+ * 27.2 start values the kernel takes from the GPU node rather than its own literals, each copied
+ * as it is and only when this Mac's ADT has it (one cell when present; a malformed one fails):
+ * - apple,fast-die0-target: /arm-io/sgx gpu-fast-die0-target (degrees C);
+ * - apple,coredump-copy-buffer: /arm-io/gfx-asc/iop-gfx-nub coredump-copy-buffer (bytes, the
+ *   host's firmware crash-copy buffer).
+ */
+int dt_gpu_t8122_27_machine_values(void *dt)
+{
+    static const struct {
+        const char *path, *adt, *dt, *what;
+    } values[] = {
+        {"/arm-io/sgx", "gpu-fast-die0-target", "apple,fast-die0-target", "fast-die0 target"},
+        {"/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer", "apple,coredump-copy-buffer",
+         "coredump copy buffer"},
+    };
+    bool have[ARRAY_SIZE(values)];
+    u32 val[ARRAY_SIZE(values)];
+    for (size_t i = 0; i < ARRAY_SIZE(values); i++) {
+        int node = adt_path_offset(adt, values[i].path);
+        u32 len = 0;
+        have[i] = node >= 0 && adt_getprop(adt, node, values[i].adt, &len) != NULL;
+        if (have[i] && g15_adt_u32(node, values[i].adt, &val[i]))
+            bail("ADT: GPU: T8122 malformed %s (len %u)\n", values[i].adt, len);
+        int gpu = fdt_path_offset(dt, "gpu");
+        if (gpu < 0 || (have[i] && fdt_setprop_u32(dt, gpu, values[i].dt, val[i])))
+            bail("FDT: GPU: T8122 cannot set %s\n", values[i].dt);
+    }
+    printf("FDT: GPU: T8122 27.2 machine values: %s ", values[0].what);
+    if (have[0])
+        printf("%u C", val[0]);
+    else
+        printf("absent");
+    printf(", %s ", values[1].what);
+    if (have[1])
+        printf("0x%x bytes\n", val[1]);
+    else
+        printf("absent\n");
+    return 0;
+}
+
 /* Whether /chosen has `name` = "1" */
 static bool g15_optin(void *dt, const char *name)
 {
