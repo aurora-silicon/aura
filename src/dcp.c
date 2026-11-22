@@ -83,6 +83,15 @@ bool dcp_left_running(void)
     return dcp_running;
 }
 
+/* Set when the last dcp_init() booted the DCP's RTKit, failed a later step and
+ * quiesced it again. */
+static bool dcp_init_quiesced;
+
+bool dcp_init_left_quiesced(void)
+{
+    return dcp_init_quiesced;
+}
+
 static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
 {
     int node = adt_path_offset(adt, cfg->dp2hdmi_gpio);
@@ -259,6 +268,8 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
 {
     u32 sid;
 
+    dcp_init_quiesced = false;
+
     if (cfg && cfg->dptx_phy[0]) {
         /* J873g reports mBoot-20457.1.29, which is not in the OS firmware
          * table, and the same dptx-port endpoint works on its USB-C route.
@@ -379,6 +390,7 @@ out_afk:
 out_rtkit:
     if (!rtkit_quiesce(dcp->rtkit))
         goto out_running;
+    dcp_init_quiesced = true;
     rtkit_free(dcp->rtkit);
 out_iovad:
     iovad_shutdown(dcp->iovad_dcp, dcp->dart_dcp);
