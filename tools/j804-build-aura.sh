@@ -31,6 +31,13 @@
 #   JOBS               parallel make jobs (default 8).
 #   KEEP_SOURCE=1      keep the exported build trees (src-stage1, src-stage2) afterwards.
 #   GMAKE              GNU make to run (default gmake, else make).
+#   J804_KEEP_BUILD_PATHS=1  do not remap $HOME (below): only to reproduce an image built
+#                      before the remap.
+#
+# Rust panic locations name their source files by absolute path, and for the cargo registry,
+# git checkouts and -Z build-std's rust-src those are under the builder's home. The Rust build
+# runs with --remap-path-prefix=$HOME=/home/builder (CARGO_ENCODED_RUSTFLAGS), so the images
+# carry neither the build host's login nor its folder layout.
 #
 # Checks (the script fails, and writes no manifest, if one does not hold):
 #   - the Mach-O is MH_FILESET (filetype 12), carries stage1-aura.bin byte for byte at file
@@ -84,6 +91,12 @@ case "$OUT/" in "$TOP"/*) die "the output directory must be outside this checkou
 
 if [ "$REV" = HEAD ] && ! git -C "$TOP" diff --quiet HEAD -- 2>/dev/null; then
     echo "j804-build-aura.sh: note: uncommitted changes in $TOP are not built ($SHORT is)" >&2
+fi
+
+if [ "${J804_KEEP_BUILD_PATHS:-0}" != 1 ]; then
+    [ -n "${HOME:-}" ] && [ "$HOME" != / ] || die "HOME is not set: needed to remap Rust source paths"
+    CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$HOME=/home/builder"
+    export CARGO_ENCODED_RUSTFLAGS
 fi
 
 build() { # build <stage> <make variables...>
