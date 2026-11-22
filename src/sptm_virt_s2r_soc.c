@@ -79,10 +79,10 @@ static int s2r_by_phandle(const void *adt, int parent, u32 phandle, bool grandch
 
 static void s2r_add_link(struct s2r_soc *out, const void *adt, int node)
 {
-    if (out->n_link >= S2R_LINK_NODES)
+    const char *name = adt_get_name(adt, node);
+    if (!name || out->n_link >= S2R_LINK_NODES)
         return;
     char *p = out->link_paths[out->n_link++];
-    const char *name = adt_get_name(adt, node);
     size_t n = strlen(name);
     if (n > sizeof(out->link_paths[0]) - sizeof("/arm-io/"))
         n = sizeof(out->link_paths[0]) - sizeof("/arm-io/");

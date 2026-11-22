@@ -2,7 +2,7 @@
 // Host harness for the production Rust ADT parser.
 #![allow(non_camel_case_types)]
 
-use std::ffi::{c_void, CString};
+use std::ffi::{c_void, CStr, CString};
 
 type c_size_t = usize;
 
@@ -26,6 +26,87 @@ fn property(blob: &mut Vec<u8>, name: &str, value: &[u8]) {
     blob.extend_from_slice(value);
     while blob.len() % 4 != 0 {
         blob.push(0);
+    }
+}
+
+/// A node header and its properties; its children, if any, follow in the blob.
+fn node(blob: &mut Vec<u8>, props: &[(&str, &[u8])], children: u32) -> i32 {
+    let offset = blob.len() as i32;
+    blob.extend_from_slice(&(props.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&children.to_le_bytes());
+    for (name, value) in props {
+        property(blob, name, value);
+    }
+    offset
+}
+
+/// Point the parser at `blob`, of which the ADT is the first `size` bytes.
+/// The blob is leaked: the parser hands out 'static references into it.
+fn install(blob: Vec<u8>, size: usize) -> *const c_void {
+    assert!(size <= blob.len());
+    let words: &'static mut [u32] =
+        Box::leak(vec![0u32; blob.len().div_ceil(4)].into_boxed_slice());
+    // SAFETY: the u32 slice is leaked and holds at least blob.len() bytes.
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), blob.len()) };
+    bytes.copy_from_slice(&blob);
+    unsafe {
+        adt = bytes.as_ptr().cast();
+        ADT_SIZE = size as u32;
+        adt
+    }
+}
+
+/// The C entry points return their error value for an offset that is not a
+/// node or property, or a node they cannot read, instead of panicking (which
+/// reboots aura), so that the ADT_FOREACH_* loops can stop on it.
+fn c_api_errors_instead_of_panics() {
+    let mut blob = Vec::new();
+    // The root's second property claims more bytes than the image has.
+    node(&mut blob, &[("name", b"device-tree\0"), ("x", b"1234")], 2);
+    let size = blob.len();
+    blob[size - 8..size - 4].copy_from_slice(&64u32.to_le_bytes());
+    let adt_ptr = install(blob, size);
+    let name = CString::new("name").unwrap();
+    let compat = CString::new("apple,x").unwrap();
+    unsafe {
+        for bad in [-1, -4, 2, size as i32, i32::MAX] {
+            assert!(parser::adt_get_child_count(adt_ptr, bad) < 0, "{bad}");
+            assert!(parser::adt_get_property_count(adt_ptr, bad) < 0, "{bad}");
+            assert!(parser::adt_first_property_offset(adt_ptr, bad) < 0, "{bad}");
+            assert!(parser::adt_next_property_offset(adt_ptr, bad) < 0, "{bad}");
+            assert!(parser::adt_get_name(adt_ptr, bad).is_null(), "{bad}");
+            assert!(
+                parser::adt_getprop(adt_ptr, bad, name.as_ptr(), std::ptr::null_mut()).is_null()
+            );
+            assert!(parser::adt_get_property(adt_ptr, bad, name.as_ptr()).is_null());
+            assert!(!parser::adt_is_compatible(adt_ptr, bad, compat.as_ptr()));
+            assert!(!parser::adt_is_compatible_at(
+                adt_ptr,
+                bad,
+                compat.as_ptr(),
+                0
+            ));
+            assert!(parser::adt_subnode_offset(adt_ptr, bad, name.as_ptr()) < 0);
+        }
+        let first = parser::adt_first_property_offset(adt_ptr, 0);
+        assert_eq!(first, 8);
+        // The broken second property is not handed out as an offset.
+        assert!(parser::adt_next_property_offset(adt_ptr, first) < 0);
+        // A lookup that has to pass it cannot read the compatible list.
+        assert!(!parser::adt_is_compatible(adt_ptr, 0, compat.as_ptr()));
+        // The children the header claims are not there.
+        assert!(parser::adt_first_child_offset(adt_ptr, 0) < 0);
+    }
+
+    // A node without a name has no name, rather than halting aura.
+    let mut blob = Vec::new();
+    node(&mut blob, &[("compatible", b"apple,x\0")], 0);
+    let len = blob.len();
+    let adt_ptr = install(blob, len);
+    unsafe {
+        assert!(parser::adt_get_name(adt_ptr, 0).is_null());
+        assert!(parser::adt_is_compatible(adt_ptr, 0, compat.as_ptr()));
     }
 }
 
@@ -219,4 +300,5 @@ fn main() {
         assert_eq!((addr, size), (0xa5a5, 0x5a5a));
     }
     register_paths();
+    c_api_errors_instead_of_panics();
 }

@@ -62,17 +62,22 @@ int adt_get_reg(const void *adt, int *path, const char *prop, int idx, u64 *addr
 bool adt_is_compatible(const void *adt, int nodeoffset, const char *compat);
 bool adt_is_compatible_at(const void *adt, int nodeoffset, const char *compat, size_t index);
 
+/*
+ * The loops stop early at a node or property the reader rejects (a negative offset), so the body
+ * only ever sees offsets the reader validated.
+ */
 #define ADT_FOREACH_CHILD(adt, node)                                                               \
-    for (int _child_count = adt_get_child_count(adt, node); _child_count; _child_count = 0)        \
-        for (node = adt_first_child_offset(adt, node); _child_count--;                             \
+    for (int _child_count = adt_get_child_count(adt, node); _child_count > 0; _child_count = 0)    \
+        for (node = adt_first_child_offset(adt, node); _child_count-- > 0 && node >= 0;            \
              node = adt_next_sibling_offset(adt, node))
 
 #define ADT_FOREACH_PROPERTY(adt, node, prop)                                                      \
     for (int _prop_count = adt_get_property_count(adt, node),                                      \
              _poff = adt_first_property_offset(adt, node);                                         \
-         _prop_count; _prop_count = 0)                                                             \
-        for (const struct adt_property *prop = ADT_PROP(adt, _poff); _prop_count--;                \
-             prop = ADT_PROP(adt, _poff = adt_next_property_offset(adt, _poff)))
+         _prop_count > 0 && _poff >= 0; _prop_count = 0)                                           \
+        for (const struct adt_property *prop = ADT_PROP(adt, _poff); _prop_count-- > 0 && prop;    \
+             prop = (_poff = adt_next_property_offset(adt, _poff)) < 0 ? NULL                      \
+                                                                       : ADT_PROP(adt, _poff))
 
 /* Common ADT properties */
 struct adt_segment_ranges {

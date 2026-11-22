@@ -756,78 +756,95 @@ unsafe extern "C" {
     unsafe fn adt_get_size() -> c_uint;
 }
 
+/// The node at an offset the C API hands in.
+///
+/// Offsets come from C callers and may be error codes or point anywhere, so the
+/// pointer is formed with wrapping arithmetic and checked by ADTNode::from_ptr().
+fn node_at(offset: c_int) -> Result<&'static ADTNode, AdtError> {
+    let offset = usize::try_from(offset).map_err(|_| AdtError::BadOffset)?;
+    ADTNode::from_ptr(unsafe { adt }.wrapping_byte_add(offset) as *const ADTNode)
+}
+
+/// The property at an offset the C API hands in; see node_at().
+fn property_at(offset: c_int) -> Result<&'static ADTProperty, AdtError> {
+    let offset = usize::try_from(offset).map_err(|_| AdtError::BadOffset)?;
+    ADTProperty::from_ptr((unsafe { adt } as usize).wrapping_add(offset))
+}
+
+/// The C API offset of something inside the ADT.
+fn offset_of(ptr: *const u8) -> c_int {
+    (ptr as usize).wrapping_sub(unsafe { adt } as usize) as c_int
+}
+
+fn offset_or_error(res: Result<*const u8, AdtError>) -> c_int {
+    match res {
+        Ok(ptr) => offset_of(ptr),
+        Err(e) => e as c_int,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn adt_check_header(_dt: *const c_void) -> c_int {
-    unsafe {
-        match ADTNode::from_ptr(adt as *const ADTNode) {
-            Ok(_) => 0,
-            Err(e) => e as c_int,
-        }
+    match ADTNode::root() {
+        Ok(_) => 0,
+        Err(e) => e as c_int,
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn adt_first_property_offset(_dt: *const c_void, offset: c_int) -> c_int {
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-
-    let p: *const u8 = ADTNode::from_ptr(ptr)
-        .unwrap()
-        .first_property()
-        .unwrap()
-        .as_ptr();
-
-    unsafe { p.sub(adt as usize) as c_int }
+    offset_or_error(
+        node_at(offset)
+            .and_then(|n| n.first_property())
+            .map(|p| p.as_ptr()),
+    )
 }
 
-// This function has load-bearing UB on the C side... The sound Rust equivalent
-// breaks this. Recreate the UB here rather than call the new Rust function.
+/// The property after the one at `offset`. Past a node's last property this
+/// reads whatever follows (a child node header) as a property, and returns an
+/// error if that does not look like one; ADT_FOREACH_PROPERTY calls it there but
+/// does not use what it returns.
 #[no_mangle]
 pub unsafe extern "C" fn adt_next_property_offset(_dt: *const c_void, offset: c_int) -> c_int {
-    let ptr: usize = unsafe { adt.add(offset as usize) as usize };
-    let p = ADTProperty::from_ptr(ptr).unwrap();
-    unsafe {
-        p.as_ptr()
-            .add(size_of::<[c_char; 32]>())
-            .add(size_of::<u32>())
-            .add((p.size as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1))
-            .sub(adt as usize) as c_int
-    }
+    offset_or_error(
+        property_at(offset)
+            .and_then(|p| p.next_property())
+            .map(|p| p.as_ptr()),
+    )
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn adt_first_child_offset(_dt: *const c_void, offset: c_int) -> c_int {
-    if offset < 0 {
-        return AdtError::BadOffset as c_int;
-    }
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    match ADTNode::from_ptr(ptr).and_then(|n| n.first_child()) {
-        Ok(child) => unsafe { child.as_ptr().sub(adt as usize) as c_int },
-        Err(e) => e as c_int,
-    }
+    offset_or_error(
+        node_at(offset)
+            .and_then(|n| n.first_child())
+            .map(|c| c.as_ptr()),
+    )
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn adt_next_sibling_offset(_dt: *const c_void, offset: c_int) -> c_int {
-    if offset < 0 {
-        return AdtError::BadOffset as c_int;
-    }
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    match ADTNode::from_ptr(ptr).and_then(|n| n.next_sibling()) {
-        Ok(sibling) => unsafe { sibling.as_ptr().sub(adt as usize) as c_int },
+    offset_or_error(
+        node_at(offset)
+            .and_then(|n| n.next_sibling())
+            .map(|s| s.as_ptr()),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn adt_get_child_count(_dt: *const c_void, offset: c_int) -> c_int {
+    match node_at(offset) {
+        Ok(n) => n.child_count as c_int,
         Err(e) => e as c_int,
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn adt_get_child_count(_dt: *const c_void, offset: c_int) -> c_int {
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr).unwrap().child_count as c_int
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn adt_get_property_count(_dt: *const c_void, offset: c_int) -> c_int {
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr).unwrap().property_count as c_int
+    match node_at(offset) {
+        Ok(n) => n.property_count as c_int,
+        Err(e) => e as c_int,
+    }
 }
 
 #[no_mangle]
@@ -835,8 +852,7 @@ pub unsafe extern "C" fn adt_get_property_by_offset(
     _dt: *const c_void,
     offset: c_int,
 ) -> *const c_void {
-    let ptr: usize = unsafe { adt.add(offset as usize) as usize };
-    match ADTProperty::from_ptr(ptr) {
+    match property_at(offset) {
         Ok(p) => p as *const ADTProperty as *const c_void,
         Err(_) => core::ptr::null(),
     }
@@ -849,10 +865,8 @@ pub unsafe extern "C" fn adt_get_property(
     name: *const c_char,
 ) -> *const c_void {
     let strname: &str = unsafe { CStr::from_ptr(name).to_str().unwrap() };
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    let n = ADTNode::from_ptr(ptr).unwrap();
 
-    match n.named_prop(strname) {
+    match node_at(offset).and_then(|n| n.named_prop(strname)) {
         Ok(p) => p.as_ptr() as *const c_void,
         Err(_) => core::ptr::null(),
     }
@@ -866,9 +880,8 @@ pub unsafe extern "C" fn adt_getprop(
     lenp: *mut c_uint,
 ) -> *const c_void {
     let strname: &str = unsafe { CStr::from_ptr(name).to_str().unwrap() };
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
 
-    let p = match ADTNode::from_ptr(ptr).unwrap().named_prop(strname) {
+    let p = match node_at(offset).and_then(|n| n.named_prop(strname)) {
         Ok(prop) => prop,
         Err(_) => return core::ptr::null(),
     };
@@ -887,8 +900,7 @@ pub unsafe extern "C" fn adt_getprop_by_offset(
     namep: *mut *const c_char,
     lenp: *mut c_uint,
 ) -> *const c_void {
-    let ptr: usize = unsafe { adt.add(offset as usize) as usize };
-    let p = match ADTProperty::from_ptr(ptr) {
+    let p = match property_at(offset) {
         Ok(prop) => prop,
         Err(_) => return core::ptr::null(),
     };
@@ -914,19 +926,12 @@ pub unsafe extern "C" fn adt_setprop(
 ) -> c_int {
     let buf: &[u8];
     let strname: &str;
-    let ptr: *const ADTNode;
     unsafe {
         buf = core::slice::from_raw_parts(val as *const u8, len as usize);
         strname = CStr::from_ptr(name).to_str().unwrap();
-        ptr = adt.add(offset as usize) as *const ADTNode;
     };
 
-    let n = match ADTNode::from_ptr(ptr) {
-        Ok(node) => node,
-        Err(e) => return e as c_int,
-    };
-
-    let p = match n.named_prop_mut(strname) {
+    let p = match node_at(offset).and_then(|n| n.named_prop_mut(strname)) {
         Ok(prop) => prop,
         Err(e) => return e as c_int,
     };
@@ -944,19 +949,15 @@ pub unsafe extern "C" fn adt_subnode_offset(
     name: *const c_char,
 ) -> c_int {
     let strname: &str = unsafe { CStr::from_ptr(name).to_str().unwrap() };
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
 
-    let n = match ADTNode::from_ptr(ptr) {
-        Ok(node) => node,
-        Err(e) => return e as c_int,
-    };
-
-    match n.subnode_by_name(strname) {
-        Ok(s) => unsafe { s.as_ptr().sub(adt as usize) as c_int },
-        Err(e) => e as c_int,
-    }
+    offset_or_error(
+        node_at(offset)
+            .and_then(|n| n.subnode_by_name(strname))
+            .map(|s| s.as_ptr()),
+    )
 }
 
+/// A node that cannot be read, or whose compatible list cannot, is not compatible.
 #[no_mangle]
 pub unsafe extern "C" fn adt_is_compatible(
     _dt: *const c_void,
@@ -964,11 +965,9 @@ pub unsafe extern "C" fn adt_is_compatible(
     compat: *const c_char,
 ) -> bool {
     let strcompat: &str = unsafe { CStr::from_ptr(compat).to_str().unwrap() };
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr)
-        .unwrap()
-        .is_compatible(strcompat)
-        .unwrap()
+    node_at(offset)
+        .and_then(|n| n.is_compatible(strcompat))
+        .unwrap_or(false)
 }
 
 #[no_mangle]
@@ -979,15 +978,17 @@ pub unsafe extern "C" fn adt_is_compatible_at(
     index: usize,
 ) -> bool {
     let strcompat: &str = unsafe { CStr::from_ptr(compat).to_str().unwrap() };
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
     // A node without that many compatible entries is simply not compatible.
-    ADTNode::from_ptr(ptr).unwrap().compatible(index) == Some(strcompat)
+    node_at(offset).ok().and_then(|n| n.compatible(index)) == Some(strcompat)
 }
 
+/// NULL for a node that cannot be read or has no valid "name", as libfdt's fdt_get_name().
 #[no_mangle]
 pub unsafe extern "C" fn adt_get_name(_dt: *const c_void, offset: c_int) -> *const c_char {
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr).unwrap().name().unwrap().as_ptr() as *const c_char
+    match node_at(offset).and_then(|n| n.name()) {
+        Ok(name) => name.as_ptr() as *const c_char,
+        Err(_) => core::ptr::null(),
+    }
 }
 
 #[no_mangle]
@@ -998,18 +999,9 @@ pub unsafe extern "C" fn adt_getprop_copy(
     out: *mut c_void,
     len: c_size_t,
 ) -> c_int {
-    if offset < 0 {
-        return AdtError::BadOffset as c_int;
-    }
     let strname: &str = unsafe { CStr::from_ptr(name).to_str().unwrap() };
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
 
-    let n = match ADTNode::from_ptr(ptr) {
-        Ok(node) => node,
-        Err(e) => return e as c_int,
-    };
-
-    let p = match n.named_prop(strname) {
+    let p = match node_at(offset).and_then(|n| n.named_prop(strname)) {
         Ok(prop) => prop,
         Err(e) => return e as c_int,
     };

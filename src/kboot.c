@@ -10722,7 +10722,7 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
     ADT_FOREACH_CHILD(adt, node)
     {
         const char *name = adt_get_name(adt, node);
-        if (strncmp(name, adt_prefix, adt_prefix_len))
+        if (!name || strncmp(name, adt_prefix, adt_prefix_len))
             continue;
 
         if (name[adt_prefix_len] && (name[adt_prefix_len] < '0' || name[adt_prefix_len] > '9'))
@@ -11213,7 +11213,7 @@ static int dt_set_t8132_lifecycle(void)
     ADT_FOREACH_CHILD(adt, bus)
     {
         const char *name = adt_get_name(adt, bus);
-        if (strncmp(name, "nub-spmi", 8) && strncmp(name, "spmi", 4))
+        if (!name || (strncmp(name, "nub-spmi", 8) && strncmp(name, "spmi", 4)))
             continue;
 
         int dev = bus;
