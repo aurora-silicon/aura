@@ -233,12 +233,24 @@ pr)
 		head=$ARG
 	fi
 	load_canonical
-	out=$(scan_commit "$head" | awk -F'\t' '$1 != "missing"')
+	scan=$(scan_commit "$head")
+	out=$(printf '%s\n' "$scan" | awk -F'\t' 'NF && $1 != "missing"')
 	if [ -n "$out" ]; then
 		log "Assistant instruction files that are not Aurora policy copies:"
 		log "$out"
 		log "Remove them. Aurora's policy lives in $CANON_PATH on $DEFAULT_BRANCH."
 		exit 1
+	fi
+	# A head that carries the policy file but not its copies deletes the
+	# copies from $DEFAULT_BRANCH when it is merged.
+	if git cat-file -e "$head:$CANON_PATH" 2>/dev/null; then
+		out=$(printf '%s\n' "$scan" | awk -F'\t' '$1 == "missing" { print $2 }')
+		if [ -n "$out" ]; then
+			log "This head deletes Aurora policy copies:"
+			log "$out"
+			log "Restore them from $DEFAULT_BRANCH, e.g. git checkout origin/$DEFAULT_BRANCH -- ${COPIES[*]}"
+			exit 1
+		fi
 	fi
 	log "PR head is clean"
 	;;

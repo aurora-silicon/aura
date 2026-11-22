@@ -41,7 +41,9 @@ check "healed foreign branch merges into main cleanly" 'merges foreign'
 check "pr check passes on a stale snapshot" 'policy pr stale'
 git checkout -q -b bad stale; echo junk > GEMINI.md; git commit -qam junk; git checkout -q main
 check "pr check rejects a foreign copy" '! policy pr bad'
-git branch -q -D bad
+git checkout -q -b gone stale; git rm -q AGENTS.md; git commit -qm gone; git checkout -q main
+check "pr check rejects a deleted copy" '! policy pr gone'
+git branch -q -D bad gone
 before=$(git for-each-ref --format='%(objectname)' refs/heads/ | sort | sha1sum)
 policy sweep
 check "second sweep changes nothing" '[ "$(git for-each-ref --format="%(objectname)" refs/heads/ | sort | sha1sum)" = "$before" ]'
