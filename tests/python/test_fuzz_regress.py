@@ -81,3 +81,20 @@ def test_dt_fuzz_regress(adt_lib, tmp_path):
                     src / "kboot_audio.c", *libfdt],
                    incs=["-I", str(FUZZ / "host")])
     replay(binary, sorted(seeds.iterdir()) + sorted((FUZZ / "regress/dt").glob("*")))
+
+
+def test_pmgr_fuzz_regress(adt_lib, tmp_path):
+    seeds = tmp_path / "seeds"
+    subprocess.run([sys.executable, "-I", str(FUZZ / "gen_seeds.py"), "pmgr", str(seeds)],
+                   check=True)
+    # pmgr.c includes ../build/build_cfg.h, which only a firmware build generates
+    src = tmp_path / "src"
+    src.mkdir()
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build/build_cfg.h").write_text("")
+    for name in ("pmgr.c", "sptm_virt_s2r_soc.c"):
+        shutil.copy(ROOT / "src" / name, src / name)
+    binary = build(adt_lib, "pmgr-replay",
+                   [FUZZ / "pmgr_fuzz.c", src / "pmgr.c", src / "sptm_virt_s2r_soc.c"],
+                   incs=["-I", str(FUZZ / "host")])
+    replay(binary, sorted(seeds.iterdir()) + sorted((FUZZ / "regress/pmgr").glob("*")))

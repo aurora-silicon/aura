@@ -4,6 +4,7 @@
 
     gen_seeds.py adt <dir>     seed ADTs for adt_fuzz.c
     gen_seeds.py dt <dir>      seed ADT + device tree pairs for dt_fuzz.c
+    gen_seeds.py pmgr <dir>    seed ADTs with power manager tables for pmgr_fuzz.c
 
 Every value is made up. The ADTs only follow the layout aura's reader walks (a node header of
 property and child counts, 36-byte property headers padded to 4 bytes, children after the
@@ -264,8 +265,79 @@ def dt_seeds():
     yield "minimal", dt_pair(Node("device-tree"), FNode("", {}))
 
 
+def pmgr_device(dev_id, name, parents=(0, 0), psreg=0, offset=0, flags=0, u8id=False, group=None):
+    """One /arm-io/pmgr "devices" entry (struct pmgr_device in src/pmgr.c, 48 bytes)"""
+    if u8id:
+        ids = struct.pack("<BHB", flags, 0, dev_id) + bytes(parents) + b"\0\0"
+        id2 = 0
+    else:
+        ids = struct.pack("<BHB", flags, 0, 0) + struct.pack("<HH", *parents)
+        id2 = dev_id
+    go = 0 if group is None else (group[1] & 0xFFFFFF) | (group[0] << 24)
+    out = ids + b"\0\0" + bytes([offset, psreg]) + b"\0" * 4 + struct.pack("<I", go) + b"\0" * 6
+    out += struct.pack("<H", id2) + b"\0" * 4 + name.encode().ljust(16, b"\0")
+    assert len(out) == 48
+    return out
+
+
+def pmgr_adt(u8id=False, groups=False, dies=1, cycle=False):
+    names = ["SOC_DPE", "SIO_BUSIF", "SIO", "UART0", "AIC", "DISP_CPU", "USB2HOST0", "ATC0_USB",
+             "DART_USB0", "ANS2", "SPMI0", "VIRT"]
+    parents = {2: (1, 0), 3: (2, 0), 4: (1, 0), 5: (1, 0), 7: (6, 1), 8: (7, 0), 9: (1, 4),
+               10: (0, 0), 11: (3, 0), 12: (0, 0)}
+    if cycle:
+        parents[1] = (3, 0)
+    devices = b""
+    for i, n in enumerate(names, 1):
+        devices += pmgr_device(i, n, parents.get(i, (0, 0)), psreg=i % 3, offset=i,
+                               flags=0x10 if n == "VIRT" else 0, u8id=u8id,
+                               group=(i % 3, 8 * i) if groups else None)
+    pmgr_props = {"compatible": cstr("pmgr1,t8103"), "#address-cells": u32(2), "#size-cells": u32(2),
+                  "reg": u64(0x3B700000, 0x14000, 0x3B000000, 0x8000, 0x3B800000, 0x4000),
+                  "devices": devices, "cpu-features": u32(1)}
+    pmgr_props["ps-groups" if groups else "ps-regs"] = u32(0, 0x0, 0, 1, 0x100, 0, 2, 0x0, 0)
+    if dies > 1:
+        pmgr_props["die-stride"] = u64(0x2000000000)
+    arm_io_props = dict(cells(2, 2), compatible=cstr("arm-io,t8103"),
+                        ranges=u64(0x0, 0x200000000, 0x100000000))
+    if dies > 1:
+        arm_io_props["die-count"] = u32(dies)
+    gated = [
+        dev("uart0", ["uart-1,samsung"], u64(0x35200000, 0x4000), {"clock-gates": u32(4)}),
+        dev("aic", ["aic,1"], u64(0x3B100000, 0x8000), {"clock-gates": u32(5)}),
+        dev("usb-drd0", ["usb-drd,t8103"], u64(0x382280000, 0x100000),
+            {"clock-gates": u32(7, 8), "power-gates": u32(7)}),
+        dev("dart-usb0", ["dart,t8020"], u64(0x382f00000, 0x4000), {"clock-gates": u32(9)}),
+        dev("ans", ["iop,ascwrap-v4"], u64(0x27bc00000, 0x4000), {"clock-gates": u32(10, 99)}),
+        dev("nub-spmi0", ["spmi,gen0"], u64(0x23d0d9300, 0x100), {"clock-gates": u32(11)}),
+        dev("disp0", ["disp0,t8103"], u64(0x231c00000, 0x4000), {"clock-gates": u32(6)}),
+        dev("mcc", ["mcc,t8103"], u64(0x200000000, 0x1000, 0x200040000, 0x1000),
+            {"amcc-reg-idx": u32(1), "dcs-count-per-amcc": u32(4)}),
+        Node("pmgr", pmgr_props),
+    ]
+    cpus = Node("cpus", cells(1, 0), [
+        Node("cpu%d" % i, {"cpu-id": u32(i), "reg": u32(i), "state": cstr("running"),
+                           "cpu-impl-reg": u64(0x210050000 + 0x100000 * i, 0x1000),
+                           "acc-impl-reg": u64(0x211050000 + 0x100000 * i, 0x1000),
+                           "cpm-impl-reg": u64(0x212050000 + 0x100000 * i, 0x1000)})
+        for i in range(2)])
+    root = Node("device-tree", dict(cells(2, 2), compatible=cstr("J000AP", "AppleARM")),
+                [Node("arm-io", arm_io_props, gated), cpus])
+    return root
+
+
+def pmgr_seeds():
+    regs = bytes([0xF0, 0x0F, 0x8F, 0x00, 0xFF, 0x4F, 0x04, 0x84] * 2)
+    yield "pmgr", b"\x00" + regs + pmgr_adt().encode()
+    yield "pmgr-u8", b"\x02" + regs + pmgr_adt(u8id=True).encode()
+    yield "pmgr-groups", b"\x04" + regs + pmgr_adt(groups=True).encode()
+    yield "pmgr-2die", b"\x08" + regs + pmgr_adt(dies=2).encode()
+    yield "pmgr-stuck", b"\x01" + regs + pmgr_adt().encode()
+    yield "pmgr-cycle", b"\x00" + regs + pmgr_adt(cycle=True).encode()
+
+
 def main():
-    if len(sys.argv) != 3 or sys.argv[1] not in ("adt", "dt"):
+    if len(sys.argv) != 3 or sys.argv[1] not in ("adt", "dt", "pmgr"):
         raise SystemExit(__doc__)
     out = Path(sys.argv[2])
     out.mkdir(parents=True, exist_ok=True)
@@ -273,7 +345,7 @@ def main():
         for name, node in seeds():
             (out / ("%s.adt" % name)).write_bytes(node.encode())
     else:
-        for name, blob in dt_seeds():
+        for name, blob in dt_seeds() if sys.argv[1] == "dt" else pmgr_seeds():
             (out / ("%s.bin" % name)).write_bytes(blob)
 
 

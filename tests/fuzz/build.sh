@@ -48,4 +48,11 @@ $CC $cflags $incs tests/fuzz/adt_fuzz.c "$out/libadt_fuzz.a" -lpthread -ldl -lm 
 # shellcheck disable=SC2086
 $CC $cflags -I"$root/tests/fuzz/host" $incs tests/fuzz/dt_fuzz.c "$out/src_copy.c" "$out/devicetree.c" \
     "$out/kboot_audio.c" $libfdt "$out/libadt_fuzz.a" -lpthread -ldl -lm -o "$out/dt-fuzz"
-echo "built $out/adt-fuzz $out/dt-fuzz"
+# pmgr.c includes ../build/build_cfg.h, which only a firmware build generates
+mkdir -p "$out/src" "$out/build"
+: >"$out/build/build_cfg.h"
+cp src/pmgr.c src/sptm_virt_s2r_soc.c "$out/src/"
+# shellcheck disable=SC2086
+$CC $cflags -I"$root/tests/fuzz/host" $incs tests/fuzz/pmgr_fuzz.c "$out/src/pmgr.c" \
+    "$out/src/sptm_virt_s2r_soc.c" "$out/libadt_fuzz.a" -lpthread -ldl -lm -o "$out/pmgr-fuzz"
+echo "built $out/adt-fuzz $out/dt-fuzz $out/pmgr-fuzz"
