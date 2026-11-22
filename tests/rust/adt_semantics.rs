@@ -555,11 +555,57 @@ fn registers() {
     assert_eq!(reg("/arm-io/bad-cells/leaf", "reg", 0), Err(BAD_NCELLS));
 }
 
+fn edge_cases() {
+    // An out-of-range compatible index, or a node without compatible, is
+    // "not compatible" rather than a panic.
+    assert!(!compat_at(path("/arm-io"), "arm-io", 2));
+    assert!(!compat_at(path("/cpus"), "cpus", 0));
+
+    // A reg index whose byte offset does not fit in 32 bits is refused instead
+    // of wrapping the bounds check onto another entry.
+    assert_eq!(
+        reg("/arm-io/dart-disp0", "reg", 0x4000_0000),
+        Err(BAD_VALUE)
+    );
+    assert_eq!(
+        reg("/arm-io/dart-disp0", "reg", 0x3fff_ffff),
+        Err(BAD_VALUE)
+    );
+    assert_eq!(reg("/arm-io/dart-disp0", "reg", i32::MAX), Err(BAD_VALUE));
+
+    install(&node(
+        "device-tree",
+        vec![],
+        vec![
+            node("abcdefg@9", vec![], vec![]),
+            node("dcp@0", vec![], vec![]),
+            node("dcpext", vec![], vec![]),
+            node("last", vec![], vec![node("kid", vec![], vec![])]),
+        ],
+    ));
+    // A unit address in the query must match the node's whole name.
+    assert_eq!(path("/zzzzz@1"), NOT_FOUND);
+    assert_eq!(path("/dcp@1"), NOT_FOUND);
+    assert_eq!(name_of(path("/dcp@0")), "dcp@0");
+    // A query without a unit address matches a node name that has one, but
+    // never a longer name.
+    assert_eq!(name_of(path("/dcp")), "dcp@0");
+    assert_eq!(name_of(path("/dcpext")), "dcpext");
+    assert_eq!(path("/dcpex"), NOT_FOUND);
+    // A miss under the last node of the ADT is NotFound, not a walk past the
+    // end of the image.
+    assert_eq!(path("/missing"), NOT_FOUND);
+    assert_eq!(path("/last/missing"), NOT_FOUND);
+    assert_eq!(name_of(path("/last/kid")), "kid");
+    install(&tree());
+}
+
 fn main() {
     install(&tree());
     walk_tree();
     lookup_paths();
     properties();
     registers();
+    edge_cases();
     println!("adt_semantics: ok");
 }
