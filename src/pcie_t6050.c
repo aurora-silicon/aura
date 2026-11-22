@@ -549,6 +549,11 @@ static int stage_d(const struct port_regs *pp)
         TRY(rmw("shadow select", rp + DBI_SHADOW_SEL, 3 << 24, shadows[i].sel));
         TRY(apply_tunables(pp->bridge, shadows[i].prop, rp, PCI_CFG_SIZE, NO_CHECK));
     }
+    /*
+     * Of the equalization controls only the Gen3 bit is set here; the 16 and 32 GT/s rates get what
+     * their shadow tunables carry. Links up to 16 GT/s have been seen to train with equalization
+     * complete (the J775D's RTL8127A); a 32 GT/s endpoint would be the first run at a higher rate.
+     */
     TRY(rmw("Gen3 EQ", rp + DBI_GEN3_EQ, 0, BIT(0)));
     int speed = target_link_speed(pp, read32(rp + cap + PCI_EXP_LNKCAP2));
     TRY(speed);
@@ -905,6 +910,7 @@ static void t6050_max_link_speed(void *dt, int port, u32 speed)
 
     if (rp == -FDT_ERR_NOTFOUND || !speed)
         return;
+    /* The pci-bus-common binding allows 1-4: revisit this if it grows a 32 GT/s value */
     speed = min(speed, 4u);
     /* A hint: without it Linux trains the port at 8 GT/s, so a failed write never stops the boot */
     if (rp < 0 || fdt_setprop_u32(dt, rp, "max-link-speed", speed))
