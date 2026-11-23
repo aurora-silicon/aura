@@ -47,9 +47,14 @@ def build(adt_lib, target, sources, incs=()):
     return binary
 
 
+# Each input takes milliseconds; a replay that is still running after this long is a hang
+REPLAY_TIMEOUT_S = 300
+
+
 def replay(binary, inputs):
     assert inputs
     out = subprocess.run([str(binary), *map(str, inputs)], capture_output=True, text=True,
+                         timeout=REPLAY_TIMEOUT_S,
                          env={"ASAN_OPTIONS": "detect_leaks=0", "UBSAN_OPTIONS": "print_stacktrace=1"})
     assert out.returncode == 0, out.stdout[-4000:] + out.stderr[-4000:]
     assert out.stdout.count("ok ") == len(inputs)
