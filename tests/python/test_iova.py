@@ -78,11 +78,12 @@ _Noreturn void panic(const char *fmt, ...)
     abort();
 }
 
-static unsigned l2_frees;
+static unsigned l2_frees, l2_max = -1u;
 void dart_free_l2(dart_dev_t *dart, u64 iova)
 {
     (void)dart;
     assert(iova % SZ_32M == 0);
+    assert(l2_frees < l2_max); /* a walk that never reaches the limit */
     l2_frees++;
 }
 
@@ -401,6 +402,55 @@ static void test_reserve_wrap_and_straddle(void)
     iovad_shutdown(d, NULL);
 }
 
+static void test_alloc_zero_and_wrapping_size(void)
+{
+    iova_domain_t *d = iovad_init(0, 4 * PG);
+    /* nothing to hand out, and the domain is left alone */
+    assert(iova_alloc(d, 0) == 0);
+    /* sizes that round up past SIZE_MAX must not become 0 */
+    assert(iova_alloc(d, (size_t)-1) == 0);
+    assert(iova_alloc(d, (size_t)-PG + 1) == 0);
+    assert(iova_alloc(d, (size_t)-PG) == 0); /* page aligned, but far too large */
+    check_list(d);
+    assert(blocks(d) == 1 && d->free_list->iova == PG && d->free_list->sz == 3 * PG);
+    /* the first real allocation still gets the first page, once */
+    assert(iova_alloc(d, PG) == PG);
+    assert(iova_alloc(d, PG) == 2 * PG);
+    iovad_shutdown(d, NULL);
+}
+
+static void test_reserve_zero_size_unaligned(void)
+{
+    iova_domain_t *d = iovad_init(0, 16 * PG);
+    /* a zero-size range holds no page, whatever its address */
+    assert(iova_reserve(d, 8 * PG + 1, 0));
+    assert(iova_reserve(d, 1, 0));
+    assert(iova_reserve(d, (u64)-1, 0));
+    check_list(d);
+    assert(blocks(d) == 1 && d->free_list->iova == PG && d->free_list->sz == 15 * PG);
+    iovad_shutdown(d, NULL);
+}
+
+static void test_shutdown_at_top_of_address_space(void)
+{
+    /* The last two L2 tables below 2^64: stepping an address past the limit wraps to 0. */
+    u64 base = 0 - 2 * (u64)SZ_32M;
+    iova_domain_t *d = iovad_init(base, 0 - (u64)PG);
+    assert(d);
+    assert(iova_alloc(d, PG) == base);
+    l2_frees = 0;
+    l2_max = 2;
+    iovad_shutdown(d, (dart_dev_t *)1);
+    assert(l2_frees == 2);
+    l2_max = -1u;
+
+    /* a limit inside an L2 table still frees that table */
+    d = iovad_init(2 * (u64)SZ_32M, 3 * (u64)SZ_32M + PG);
+    l2_frees = 0;
+    iovad_shutdown(d, (dart_dev_t *)1);
+    assert(l2_frees == 2);
+}
+
 int main(void)
 {
     test_init();
@@ -412,6 +462,9 @@ int main(void)
     test_free_outside_domain_panics();
     test_zero_size();
     test_reserve_wrap_and_straddle();
+    test_alloc_zero_and_wrapping_size();
+    test_reserve_zero_size_unaligned();
+    test_shutdown_at_top_of_address_space();
     puts("iova: ok");
     return 0;
 }
