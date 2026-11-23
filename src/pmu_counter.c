@@ -144,7 +144,10 @@ void pmu_take_failed_boots_var(const char *val)
     passed_failed = count;
 }
 
-/* Only a count handed on by an earlier stage: this stage's own read follows its clear. */
+/*
+ * Only a count handed on by an earlier stage: a stage that got none can't tell a first failure
+ * from a count an older Stage 1 cleared at start. Its own read only raises the count.
+ */
 bool pmu_failed_boots_passed(u8 *count)
 {
     if (!passed_valid)

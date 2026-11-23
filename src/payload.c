@@ -463,6 +463,9 @@ bool payload_logo(void **custom_128, void **custom_256)
  * (about 1 start in 7 failed, 2026-11-21). iBoot counts each such reset as a failed boot, and no
  * aura stage clears the count until the chain reaches an OS or the proxy (pmu_chain_leave()), so
  * a failure that persists ends in the proxy after this many reboots.
+ *
+ * Temporary: once a Stage 2 starts ANS from off reliably (or takes the running ANS over), this
+ * reboot goes away.
  */
 #define PAYLOAD_NVME_START_REBOOTS 2
 

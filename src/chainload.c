@@ -397,7 +397,7 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
         }
     }
 
-    /* The failed-boot count this stage cleared, for a later stage's reboot decision. */
+    /* The failed-boot count this stage read and left in place, for a later stage's decision. */
     const char *failed_var = pmu_failed_boots_var();
     if (failed_var) {
         bool present = false;
