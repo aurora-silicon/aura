@@ -122,6 +122,27 @@ add. In an aura image it searches only what follows the image (from the load
 header's footprint, where `_payload_start` is), since aura's own code holds
 the line's format string.
 
+## Updating a Stage 1 that checks signatures
+
+Sign Stage 2 again with the `secboot_sign.py` that ships with the new Stage 1
+before, or together with, enrolling that Stage 1:
+
+1. Update aura and its tools, and sign the installed Stage 2 with them
+   (`secboot_sign.py sign-image`, or `aurora-secboot stage2 sign`).
+   `secboot_sign.py verify --pub K` from the new tools must say `verified`.
+2. Boot once. The Stage 1 still enrolled, whatever its age, verifies the
+   newly signed Stage 2: it ignores the form.
+3. Only then build, fill and enrol the new Stage 1.
+
+The other order does not boot under enforce. A new Stage 1 reports a Stage 2
+that an older signer wrote as `bad-format`; an enforcing one refuses it,
+leaves the message on the panel and reboots every 10 s until the owner holds
+the power button and starts another system or recoveryOS, where the earlier
+Stage 1 can be enrolled again or Stage 2 signed. An audit Stage 1 boots it and
+records `bad-format`, so check the record after the update and before turning
+enforce on. Tools that enrol a Stage 1 (the installer, `aurora-secboot stage1
+build`) have to keep this order.
+
 ## The record
 
 Every stage measures (SHA-256) what it hands over: the selected DTB, the
@@ -145,3 +166,14 @@ that builds the OS device tree writes `/chosen/aurora,boot-security`:
 U-Boot (`EFI_AURORA_MEASURE`) adds an entry for every EFI image it loads.
 The record is only as good as the first stage that enforces: a stage nobody
 verified can write anything here.
+
+## What a stage that does not enforce trusts
+
+- The ESP. A Stage 1 that does not enforce starts whatever Stage 2 the ESP
+  holds, so anyone who can write the ESP already chooses the code that runs.
+- The `aura-proxy` request for the same reason. It is an unauthenticated file
+  at the ESP root or a boot argument, and it gives a USB host the proxy for 15
+  seconds. That is no more than an ESP or NVRAM writer has anyway under such a
+  Stage 1, and it is why the request counts as asked for by the owner. A stage
+  that enforces, one started by an enforcing stage, and the `secure` flavour
+  ignore it.
