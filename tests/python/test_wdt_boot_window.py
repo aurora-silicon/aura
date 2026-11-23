@@ -7,7 +7,7 @@ Ways it can fail, and the check for each:
 2. Stage 2 (ESP_STAGE2) arms it too: U-Boot and GRUB menus may wait for a person indefinitely.
 3. A host that attaches gets reset under it: the first synced window or proxy request disarms it.
 4. A host attach disarms something else: a trial watchdog or one a host armed (P_WDT_ARM) stays.
-5. Arming on a layout it cannot drive: wdt_arm()'s version 2 checks refuse, nothing is written.
+5. Arming on a layout it cannot drive: wdt_arm()'s ADT checks refuse, nothing is written.
 6. A bounded host window outlives the watchdog: both windows must be shorter than the period.
 """
 import re
@@ -19,54 +19,87 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def harness(main_body):
     source = (ROOT / 'src/wdt.c').read_text()
-    function = source[source.index('static int wdt_arm('):]
+    body = source[source.index('#define WDT_COUNT'):]
+    # Replace wdt_disable with a counting wrapper by renaming the real one.
+    body = body.replace('void wdt_disable(void)', 'static void real_wdt_disable(void)')
     return r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 typedef uint32_t u32;
 typedef uint64_t u64;
+#define BIT(x) (1u << (x))
 #define T8140 0x8140
 #define T6040 0x6040
-#define WDT_COUNT 0x10
-#define WDT_ALARM 0x14
-#define WDT_CTL 0x1c
 #define WDT_TRIAL_SECONDS 178
 #define WDT_BOOT_SECONDS 178
 #define ADT_GETPROP(a,n,k,v) (*(v)=adt_version,0)
 #define sysop(x) ((void)0)
-static u32 chip_id = 0x8112, adt_version = 2, regs[8], secondary_value;
-static u64 primary = 0x1000, primary_size = 0x4000, secondary_size = 4;
-static u64 wdt_base;
+static u32 chip_id = 0x8112, adt_version = 2, regs[12], secondary_value, reconfig_value;
+static u64 primary = 0x1000, primary_size = 0x4000, secondary_size = 4, reconfig_size = 4;
+static bool has_simple_reconfig;
 static unsigned writes, disables;
-static void *adt;
+static int adt_dummy;
+static void *adt = &adt_dummy;
+static void real_wdt_disable(void);
 static void wdt_disable(void)
 {
     disables++;
-    regs[WDT_CTL/4] = 0;
-    secondary_value = 0;
+    real_wdt_disable();
 }
 static int adt_path_offset_trace(void *a, const char *p, int *trace)
 { (void)a; (void)p; (void)trace; return 1; }
+static const void *adt_getprop(void *a, int node, const char *key, u32 *len)
+{
+    (void)a; (void)node; (void)len;
+    if (!strcmp(key, "simple-reconfig-wdog-support"))
+        return has_simple_reconfig ? (const void *)1 : NULL;
+    return NULL;
+}
 static int adt_get_reg(void *a, int *p, const char *key, int i, u64 *base, u64 *size)
 {
     (void)a; (void)p; (void)key;
-    *base = i == 0 ? primary : 0x2000;
-    *size = i == 0 ? primary_size : secondary_size;
-    return 0;
+    if (i == 0) {
+        *base = primary;
+        if (size) *size = primary_size;
+        return 0;
+    }
+    if (i == 2) {
+        *base = 0x2000;
+        if (size) *size = secondary_size;
+        return 0;
+    }
+    if (i == 3) {
+        *base = 0x3000;
+        if (size) *size = reconfig_size;
+        return 0;
+    }
+    return -1;
 }
 static u32 read32(u64 addr)
 {
     if (addr == 0x2000) return secondary_value;
-    return regs[(addr-primary)/4];
+    if (addr == 0x3000) return reconfig_value;
+    return regs[(addr - primary) / 4];
 }
 static void write32(u64 addr, u32 value)
 {
-    regs[(addr-primary)/4] = value;
+    if (addr == 0x2000) {
+        secondary_value = value;
+        writes++;
+        return;
+    }
+    if (addr == 0x3000) {
+        reconfig_value = value;
+        writes++;
+        return;
+    }
+    regs[(addr - primary) / 4] = value;
     writes++;
 }
-''' + function + '\nint main(void)\n{\n' + main_body + '\n    return 0;\n}\n'
+''' + body + '\nint main(void)\n{\n' + main_body + '\n    return 0;\n}\n'
 
 
 def run(tmp_path, body):
@@ -96,6 +129,19 @@ def test_boot_watchdog_arms_on_any_v2_chip_and_a_host_disarms_it(tmp_path):
 ''')
 
 
+def test_boot_watchdog_arms_wd2_on_v3_simple_reconfig_and_host_disarms_it(tmp_path):
+    run(tmp_path, r'''
+    adt_version = 3;
+    has_simple_reconfig = true;
+    assert(wdt_arm_boot() == 0);
+    assert(regs[WDT_WD2_BARK/4] == 4272000000U && regs[WDT_WD2_CTL/4] == 1);
+    assert((reconfig_value & 0x30u) == 0x10u);
+    disables = 0;
+    wdt_host_attached();
+    assert(disables == 1 && regs[WDT_WD2_CTL/4] == 0);
+''')
+
+
 def test_trial_watchdog_is_not_disarmed_by_a_host(tmp_path):
     run(tmp_path, r'''
     assert(wdt_arm_boot() == 0);
@@ -109,6 +155,7 @@ def test_trial_watchdog_is_not_disarmed_by_a_host(tmp_path):
 def test_boot_watchdog_refuses_layouts_it_cannot_drive(tmp_path):
     run(tmp_path, r'''
     adt_version = 3;
+    has_simple_reconfig = false;
     writes = disables = 0;
     assert(wdt_arm_boot() == -1 && writes == 0);
     wdt_host_attached();
