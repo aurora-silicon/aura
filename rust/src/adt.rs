@@ -546,9 +546,12 @@ impl ADTNode {
         let mut c = self.first_child()?;
 
         for idx in 0..self.child_count {
-            let prop = c.named_prop("name")?;
-            if node_names_equal(prop.str()?, name) {
-                return Ok(c);
+            // A child without a readable name cannot match; skip it as the C walkers do
+            // (adt_get_name() is NULL for it), so that later siblings stay reachable.
+            if let Ok(child_name) = c.name() {
+                if node_names_equal(child_name, name) {
+                    return Ok(c);
+                }
             }
             // Do not step past the last child: for the last node in the ADT
             // there is nothing after it, and a miss must stay NotFound.

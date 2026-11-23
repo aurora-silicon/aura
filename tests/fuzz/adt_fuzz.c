@@ -135,6 +135,8 @@ static void touch_node(int node)
     sink += adt_subnode_offset(adt, node, "missing");
 }
 
+static bool names_match(const char *name, const char *query);
+
 static void walk(int node, int depth, char *path, size_t plen)
 {
     check(node >= 0 && (u32)node < adt_size);
@@ -169,6 +171,17 @@ static void walk(int node, int depth, char *path, size_t plen)
     int child = node;
     ADT_FOREACH_CHILD(adt, child)
     {
+        /*
+         * A named child is found by its own name: the first match wins, so this may be an
+         * earlier sibling of the same name, but there must be one (nameless ones in between
+         * must not hide it).
+         */
+        const char *cname = adt_get_name(adt, child);
+        if (cname) {
+            int found = adt_subnode_offset(adt, node, cname);
+            check(found >= 0);
+            check(names_match(adt_get_name(adt, found), cname));
+        }
         walk(child, depth + 1, path, plen);
     }
     path[plen] = 0;

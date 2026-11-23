@@ -135,6 +135,11 @@ def edge_cases():
     yield "dup-names", Node("device-tree", cells(1, 1), [
         Node("a", {"reg": u32(0, 4)}), Node("a@1", {"reg": u32(4, 4)}),
         Node("a", {"reg": u32(8, 4)}, [Node("b")])])
+    # A child whose name is empty, before a named sibling: lookups must step over it
+    nameless = Node("")
+    nameless.props[0] = ("name", b"")
+    yield "nameless-child", Node("device-tree", cells(1, 1), [
+        Node("a", {"reg": u32(0, 4)}), nameless, Node("b", {"reg": u32(4, 4)})])
     yield "big-prop", Node("device-tree", {"blob": bytes(range(256)) * 16})
     yield "odd-sizes", Node("device-tree", {"one": b"\x01", "three": b"abc", "five": b"hello",
                                             "empty": b"", "nonul": b"abcd"})
