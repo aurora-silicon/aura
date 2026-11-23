@@ -8528,6 +8528,13 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine);
 /*
  * Firmware 27 DCPs are given their firmware clocks by the OS: the one rule by which dcp's are
  * published (dt_set_dcp_fw27_clocks()) and the external processors' handoff is chosen.
+ *
+ * This is a release test because no ADT property separates the two interfaces: on the 26.5.1
+ * J713 and 26.6.2 J773 ADTs the external processors already run dcp's uuid and share its __TEXT
+ * (same address and size), as on 27.2, yet they take the firmware-ready path there. Any firmware
+ * 27 boot takes this path and publishes each processor with its own uuid, firmware-version and
+ * memory; the kernel decides which releases it drives, and such a boot never gets the 26.6.2
+ * ready marker.
  */
 static bool dt_dcp_fw_clocks(void)
 {

@@ -3956,7 +3956,7 @@ static int dcpext_page_kept(void *dt, u64 page, const char *what, const char *no
         u64 a, sz;
         if (fdt_get_mem_rsv(dt, i, &a, &sz) || !dcp6_overlaps(page, SZ_16K, a, sz))
             continue;
-        if (sz < SZ_16K || page < a || page - a > sz - SZ_16K)
+        if (sz < SZ_16K || a + sz < a || page < a || page - a > sz - SZ_16K)
             bail("%s: %s 0x%lx straddles /memreserve/ 0x%lx+0x%lx\n", what, noun, page, a, sz);
         kept = 1;
     }
@@ -3974,7 +3974,7 @@ static int dcpext_page_kept(void *dt, u64 page, const char *what, const char *no
             u64 a = fdt64_ld(&reg[k]), sz = fdt64_ld(&reg[k + 1]);
             if (!dcp6_overlaps(page, SZ_16K, a, sz))
                 continue;
-            if (sz < SZ_16K || page < a || page - a > sz - SZ_16K ||
+            if (sz < SZ_16K || a + sz < a || page < a || page - a > sz - SZ_16K ||
                 !fdt_getprop(dt, node, "no-map", NULL))
                 bail("%s: %s 0x%lx overlaps /reserved-memory/%s\n", what, noun, page,
                      fdt_get_name(dt, node, NULL));
@@ -4420,11 +4420,12 @@ static int dcpext_keep_darts(void *dt, int child, int node, u64 *darts)
 /*
  * Keep the 16K pages around [base, base + size) from the OS: each one in the RAM the OS gets that
  * no reservation holds yet is reserved no-map as /reserved-memory/<prefix>@<address>, consecutive
- * ones as one node unless `per_page`. A page a reservation holds in part is logged and left.
- * Returns how many pages were reserved, -1 (logged) if a node cannot be added.
+ * ones as one node unless `per_page`. A page a reservation holds in part (or a wrapping
+ * reservation) is logged, left and counted in *missed. Returns how many pages were reserved, -1
+ * (logged) if a node cannot be added.
  */
 static int dcpext_keep_range(void *dt, u64 base, u64 size, const char *what, const char *noun,
-                             const char *prefix, bool per_page)
+                             const char *prefix, bool per_page, int *missed)
 {
     u64 ram_min = kboot_ram_base(), ram_max = kboot_ram_base() + kboot_ram_size();
     u64 start = base & ~(u64)(SZ_16K - 1), end = ALIGN_UP(base + size, SZ_16K), run = 0,
@@ -4432,8 +4433,11 @@ static int dcpext_keep_range(void *dt, u64 base, u64 size, const char *what, con
     int pages = 0;
 
     for (u64 page = start; page <= end; page += SZ_16K) {
-        bool need = page < end && page + SZ_16K > ram_min && page < ram_max &&
-                    dcpext_page_kept(dt, page, what, noun) == 0;
+        bool in_ram = page < end && page + SZ_16K > ram_min && page < ram_max;
+        int kept = in_ram ? dcpext_page_kept(dt, page, what, noun) : 1;
+        if (kept < 0)
+            (*missed)++;
+        bool need = in_ram && kept == 0;
         if (need && run_end == page && !per_page) {
             run_end += SZ_16K;
             continue;
@@ -4481,8 +4485,8 @@ static int dcpext_keep_segments(void *dt, const char *name, const char *what, in
             (*missed)++;
             continue;
         }
-        int got =
-            dcpext_keep_range(dt, r.phys, r.size, what, "firmware page", "dcpext-firmware", false);
+        int got = dcpext_keep_range(dt, r.phys, r.size, what, "firmware page", "dcpext-firmware",
+                                    false, missed);
         if (got < 0)
             return -1;
         *pages += got;
@@ -4536,7 +4540,7 @@ static void dcpext_keep(void *dt, int child, int node)
     int ret = dcpext_keep_segments(tree, name, what, &fw, &missed);
     for (int i = 0; !ret && i < t->n; i++) {
         int got = dcpext_keep_range(tree, t->page[i], SZ_16K, what, "DART table page",
-                                    "dcpext-tables", true);
+                                    "dcpext-tables", true, &missed);
         if (got < 0)
             ret = -1;
         else
