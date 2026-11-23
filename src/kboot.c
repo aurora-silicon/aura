@@ -5351,15 +5351,15 @@ static int dt_set_ave_dapf(void)
 }
 
 /*
- * The M4, M4 Pro, M5 Pro and A18 Pro Neural Engines run firmware that iBoot preloads into
- * DRAM below the OS: /arm-io/ane0 (M4 Pro, M5 Pro) or /arm-io/ane (M4, A18 Pro) is
- * pre-loaded, with exactly a __TEXT and a __DATA segment range. Reserve both segments no-map and
+ * Neural Engines run firmware that iBoot preloads into DRAM below the OS: /arm-io/ane0
+ * or /arm-io/ane is pre-loaded, with exactly a __TEXT and a __DATA segment range.
+ * Reserve both segments no-map and
  * give them to the ANE node as its "firmware-text" and "firmware-data" memory regions, with the
  * device addresses the firmware runs them at (their remap addresses) as apple,firmware-iovas. A DT
  * that describes the two regions as placeholders gets them filled in place, renamed to their
  * physical addresses and enabled; a DT without them gets them added. The node's status is left as
  * the DT has it, except that a node whose preload cannot be handed over is
- * disabled.
+ * disabled. For the block with a legacy disk-loaded path, this handoff is optional.
  *
  * When aura runs on bare metal (EL2, booted from iBoot, not a guest of a
  * hypervisor that may have run another OS first) and the hand-off succeeds,
@@ -5406,7 +5406,7 @@ static int dt_ane_fill_region(int resv, uint32_t phandle, const char *kind, u64 
  * The node is looked up again by its compatible after each edit, never by its path: "/soc" can
  * resolve to a sibling soc@ node (libfdt matches a name without a unit address to the first one).
  */
-static int dt_set_ane_node(int node, const char *compat)
+static int dt_set_ane_node(int node, const char *compat, bool optional)
 {
     static const char names_expected[] = "__TEXT;__DATA";
     static const char *const kinds[2] = {"text", "data"};
@@ -5421,13 +5421,13 @@ static int dt_set_ane_node(int node, const char *compat)
         anode = adt_path_offset(adt, "/arm-io/ane");
     if (anode < 0) {
         reason = "ADT node absent";
-        goto disable;
+        goto unavailable;
     }
 
     u32 preloaded;
     if (ADT_GETPROP(adt, anode, "pre-loaded", &preloaded) != sizeof(preloaded) || preloaded != 1) {
         reason = "firmware not preloaded";
-        goto disable;
+        goto unavailable;
     }
 
     u32 seg_len, names_len;
@@ -5437,13 +5437,13 @@ static int dt_set_ane_node(int node, const char *compat)
         names_len > sizeof(names_expected) ||
         memcmp(names, names_expected, sizeof(names_expected) - 1) ||
         (names_len == sizeof(names_expected) && names[names_len - 1]))
-        goto disable;
+        goto unavailable;
 
     int chosen = adt_path_offset(adt, "/chosen");
     u64 dram_base;
     if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
         dram_base > cur_boot_args.phys_base)
-        goto disable;
+        goto unavailable;
 
     u64 span[2];
     for (int i = 0; i < 2; i++) {
@@ -5452,18 +5452,18 @@ static int dt_set_ane_node(int node, const char *compat)
             (seg[i].remap & (SZ_16K - 1)) || seg[i].phys < dram_base ||
             seg[i].phys > cur_boot_args.phys_base ||
             span[i] > cur_boot_args.phys_base - seg[i].phys || seg[i].remap > UINT64_MAX - span[i])
-            goto disable;
+            goto unavailable;
     }
     if ((seg[0].phys < seg[1].phys + span[1] && seg[1].phys < seg[0].phys + span[0]) ||
         (seg[0].remap < seg[1].remap + span[1] && seg[1].remap < seg[0].remap + span[0]))
-        goto disable;
+        goto unavailable;
 
     int resv = fdt_path_offset(dt, "/reserved-memory");
     const fdt32_t *ac = resv < 0 ? NULL : fdt_getprop(dt, resv, "#address-cells", NULL);
     const fdt32_t *sc = resv < 0 ? NULL : fdt_getprop(dt, resv, "#size-cells", NULL);
     if (!ac || !sc || fdt32_ld(ac) != 2 || fdt32_ld(sc) != 2) {
         reason = "no 64-bit /reserved-memory";
-        goto disable;
+        goto unavailable;
     }
 
     reason = "firmware reservation failed";
@@ -5474,13 +5474,13 @@ static int dt_set_ane_node(int node, const char *compat)
     if (regions) {
         /* Placeholders from the DT: fill them where they are. */
         if (len != sizeof(phandles))
-            goto disable;
+            goto unavailable;
         phandles[0] = fdt32_ld(&regions[0]);
         phandles[1] = fdt32_ld(&regions[1]);
         for (int i = 0; i < 2; i++) {
             resv = fdt_path_offset(dt, "/reserved-memory");
             if (dt_ane_fill_region(resv, phandles[i], kinds[i], seg[i].phys, span[i]))
-                goto disable;
+                goto unavailable;
         }
     } else {
         for (int i = 0; i < 2; i++) {
@@ -5488,10 +5488,10 @@ static int dt_set_ane_node(int node, const char *compat)
             snprintf(name, sizeof(name), "ane-firmware-%s@%lx", kinds[i], seg[i].phys);
             int mem = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, seg[i].phys, span[i]);
             if (mem < 0)
-                goto disable;
+                goto unavailable;
             phandles[i] = fdt_get_phandle(dt, mem);
             if (!phandles[i])
-                goto disable;
+                goto unavailable;
         }
     }
 
@@ -5500,28 +5500,44 @@ static int dt_set_ane_node(int node, const char *compat)
     fdt64_t iovas[2] = {cpu_to_fdt64(seg[0].remap), cpu_to_fdt64(seg[1].remap)};
     node = fdt_node_offset_by_compatible(dt, -1, compat);
     if (node < 0 || fdt_setprop(dt, node, "memory-region", region_cells, sizeof(region_cells)))
-        goto disable;
+        goto unavailable;
     node = fdt_node_offset_by_compatible(dt, -1, compat);
     if (node < 0 ||
         fdt_setprop(dt, node, "memory-region-names", region_names, sizeof(region_names)))
-        goto disable;
+        goto unavailable;
     node = fdt_node_offset_by_compatible(dt, -1, compat);
     if (node < 0 || fdt_setprop(dt, node, "apple,firmware-iovas", iovas, sizeof(iovas)))
-        goto disable;
-
-    printf("FDT: %s: ANE firmware TEXT 0x%lx DATA 0x%lx reserved\n", path, seg[0].phys,
-           seg[1].phys);
+        goto unavailable;
 
     if (in_el2()) {
         static const char marker[] = "raw-no-xnu-ane-untouched-v1";
         int chosen_dt = fdt_path_offset(dt, "/chosen");
         if (chosen_dt < 0 ||
-            fdt_setprop(dt, chosen_dt, "apple,ane-cold-boot", marker, sizeof(marker)))
+            fdt_setprop(dt, chosen_dt, "apple,ane-cold-boot", marker, sizeof(marker))) {
+            if (optional) {
+                reason = "cold-boot marker publication failed";
+                goto unavailable;
+            }
             printf("FDT: ANE cold-boot marker not set\n");
+        }
     }
+
+    if (optional) {
+        node = fdt_node_offset_by_compatible(dt, -1, compat);
+        if (node < 0 || fdt_setprop_empty(dt, node, "apple,firmware-preloaded")) {
+            reason = "preload marker publication failed";
+            goto unavailable;
+        }
+    }
+    printf("FDT: %s: ANE firmware TEXT 0x%lx DATA 0x%lx reserved\n", path, seg[0].phys,
+           seg[1].phys);
     return 0;
 
-disable:
+unavailable:
+    if (optional) {
+        printf("FDT: optional ANE handoff skipped: %s\n", reason);
+        return -1;
+    }
     printf("FDT: ANE disabled: %s\n", reason);
     node = fdt_node_offset_by_compatible(dt, -1, compat);
     int ret = node < 0 ? node : fdt_setprop_string(dt, node, "status", "disabled");
@@ -5532,13 +5548,37 @@ disable:
     return 0;
 }
 
+/* Keep the legacy device and its reservations intact if the handoff fails. */
+static void dt_ane_optional_handoff(int node, const char *compat)
+{
+    void *original = dt;
+    size_t capacity = fdt_totalsize(original);
+    void *scratch = malloc(capacity);
+    if (!scratch) {
+        printf("FDT: optional ANE handoff skipped: no FDT scratch space\n");
+        return;
+    }
+    memcpy(scratch, original, capacity);
+    dt = scratch;
+    int ret = dt_set_ane_node(node, compat, true);
+    dt = original;
+    if (!ret)
+        memcpy(original, scratch, capacity);
+    free(scratch);
+}
+
 static int dt_set_ane_firmware(void)
 {
     for (size_t i = 0; i < ARRAY_SIZE(ane_compatibles); i++) {
         int node = fdt_node_offset_by_compatible(dt, -1, ane_compatibles[i]);
         if (node >= 0)
-            return dt_set_ane_node(node, ane_compatibles[i]);
+            return dt_set_ane_node(node, ane_compatibles[i], false);
     }
+
+    const char *legacy_compat = "apple,t8112-ane";
+    int node = fdt_node_offset_by_compatible(dt, -1, legacy_compat);
+    if (node >= 0)
+        dt_ane_optional_handoff(node, legacy_compat);
     return 0;
 }
 
