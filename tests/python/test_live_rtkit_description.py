@@ -19,11 +19,15 @@ The session reaches dt_publish_live_rtkit() through display.c's display_live_rtk
 copied unchanged with the record layout of display.h and rtkit.h. In an installed Stage 1 ->
 Stage 2 chain the stage that handed the DCP on is not the one that boots the kernel: Stage 1's
 display_live_rtkit_record() makes the record chainload.c passes on in /chosen
-(test_chainload_run_base.py checks where it lands) and Stage 2 publishes from it. Checked: the
-tree Stage 2 produces from the record is the one the handing stage itself produces; the same
-buffer checks stop its boot; a record that is missing, of another size or version, or malformed
-stops the boot without describing anything; and a session the handing stage could not describe
-leaves the tree alone in both stages.
+(test_chainload_run_base.py checks where it lands and that the receiver must advertise
+CHAINLOAD_HDR_F_LIVE_RTKIT) and Stage 2 publishes from it. Checked: the tree Stage 2 produces from
+the record is the one the handing stage itself produces; the same buffer checks stop its boot; a
+record that is missing, of another size or version, names another DCP, has unknown buffer flags,
+a used slot past n_buffers or an address range that wraps, or is otherwise malformed, stops the
+boot without describing anything. A session the handing stage could not describe (a crashed IOP
+or an incomplete endpoint map) fails closed: that stage makes no record and stops its own Linux
+boot, and a record without a session, as the first version of this code passed one on, stops the
+chained stage's boot.
 """
 from pathlib import Path
 import os
@@ -42,9 +46,9 @@ FUNCTIONS = (
 )
 
 DISPLAY_FUNCTIONS = (
-    "void display_live_rtkit_record(struct display_live_rtkit_record *rec)",
+    "int display_live_rtkit_record(struct display_live_rtkit_record *rec)",
     "static int display_parse_live_rtkit_record(const void *prop, u32 len,",
-    "int display_live_rtkit_state(const struct rtkit_live_state **st, const char **alias)",
+    "const struct rtkit_live_state *display_live_rtkit_state(const char **alias)",
 )
 
 HARNESS = r'''
@@ -101,12 +105,15 @@ static int dt_reserve_live_rtkit_buffer(const char *path, const char *alias,
 @FUNCTIONS@
 
 /* Stage 1 hands the DCP on and records it; the stage under test only inherits the record. */
-static void chain(const char *how)
+static int chain(const char *how)
 {
     struct display_live_rtkit_record rec;
     handed_on = true;
     described = strcmp(how, "chain-undescribed");
-    display_live_rtkit_record(&rec);
+    if (display_live_rtkit_record(&rec) < 0) {
+        printf("sender: no record\n");
+        return -1;
+    }
     handed_on = false;
     inherited = true;
     /* Nothing of Stage 1 but the record survives the chainload */
@@ -122,17 +129,34 @@ static void chain(const char *how)
         rec.version++;
     else if (!strcmp(how, "chain-size"))
         rec.size -= 4;
-    else if (!strcmp(how, "chain-flags"))
-        rec.flags |= 2;
     else if (!strcmp(how, "chain-reserved"))
-        rec.reserved = 1;
-    else if (!strcmp(how, "chain-alias"))
+        rec.reserved[0] = 1;
+    else if (!strcmp(how, "chain-reserved1"))
+        rec.reserved[1] = 2;
+    else if (!strcmp(how, "chain-unterminated"))
         memset(rec.alias, 'd', sizeof(rec.alias));
     else if (!strcmp(how, "chain-noalias"))
         rec.alias[0] = 0;
+    else if (!strcmp(how, "chain-otheralias"))
+        strcpy(rec.alias, "dcp");
     else if (!strcmp(how, "chain-buffers"))
         rec.rtkit.n_buffers = RTKIT_LIVE_MAX_BUFFERS + 1;
+    else if (!strcmp(how, "chain-bufflags"))
+        rec.rtkit.buffers[0].flags |= 2;
+    else if (!strcmp(how, "chain-unused"))
+        rec.rtkit.buffers[rec.rtkit.n_buffers].ep = 5;
+    else if (!strcmp(how, "chain-iova"))
+        rec.rtkit.buffers[0].iova = UINT64_MAX - 0xfff;
+    else if (!strcmp(how, "chain-phys"))
+        rec.rtkit.buffers[0].phys = UINT64_MAX - 0xfff;
+    else if (!strcmp(how, "chain-nosession")) {
+        /* What the first version passed on for a session it could not describe */
+        memset(&rec, 0, sizeof(rec));
+        rec.version = DISPLAY_LIVE_RTKIT_VERSION;
+        rec.size = sizeof(rec);
+    }
     memcpy(chosen_prop, &rec, sizeof(rec));
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -151,8 +175,8 @@ int main(int argc, char **argv)
         handed_on = true;
     else if (!strcmp(argv[6], "local-undescribed"))
         handed_on = true, described = false;
-    else if (strcmp(argv[6], "none"))
-        chain(argv[6]);
+    else if (chain(argv[6]) < 0)
+        return 4;
     int ret = dt_publish_live_rtkit(strtoull(argv[3], NULL, 0), strtoull(argv[4], NULL, 0));
     if (fdt_check_full(dt, fdt_totalsize(dt)))
         return 3;
@@ -243,7 +267,7 @@ def harness(tmp_path_factory):
     display_c = (SOURCE / "src/display.c").read_text()
     layout = (_between(rtkit_h, "#define RTKIT_LIVE_MAX_BUFFERS", "bool rtkit_get_live_state(") +
               _between(display_h, "#define DISPLAY_LIVE_RTKIT_ADT_PROP",
-                       "void display_live_rtkit_record(") +
+                       "int display_live_rtkit_record(") +
               _between(display_c, "_Static_assert(sizeof(struct display_live_rtkit_record)",
                        "/*\n * The record of the DCP this stage handed on running"))
     code.write_text(HARNESS.replace("@LAYOUT@", layout)
@@ -324,12 +348,6 @@ def test_unaligned_owned_buffer_fails_the_boot(harness):
     assert _fdt_cells(out, "/soc/dcp@271c00000", "memory-region") is None
 
 
-def test_no_handed_on_dcp_leaves_the_tree_alone(harness):
-    run, out = _publish(harness, "none", "none")
-    assert run.returncode == 0, run.stdout
-    assert _undescribed(out)
-
-
 def test_chained_stage_publishes_the_record_like_the_handing_stage(harness):
     local, local_out = _publish(harness, "local", "local")
     chain, chain_out = _publish(harness, "chain", "chain")
@@ -353,21 +371,28 @@ def test_chained_stage_applies_the_buffer_checks(harness):
     assert _undescribed(out)
 
 
-@pytest.mark.parametrize("how", ["missing", "short", "long", "version", "size", "flags",
-                                 "reserved", "alias", "noalias", "buffers"])
+@pytest.mark.parametrize("how", ["missing", "short", "long", "version", "size", "reserved",
+                                 "reserved1", "unterminated", "noalias", "otheralias", "buffers",
+                                 "bufflags", "unused", "iova", "phys", "nosession"])
 def test_chained_stage_without_a_usable_record_fails_the_boot(harness, how):
     run, out = _publish(harness, "chain-" + how, "chain-" + how)
     assert run.returncode == 1, run.stdout
-    assert "no usable record of the DCP an earlier stage handed on" in run.stdout
+    assert "the running DCP's session cannot be described" in run.stdout
     assert _undescribed(out)
 
 
-@pytest.mark.parametrize("mode", ["local-undescribed", "chain-undescribed"])
-def test_undescribed_session_is_passed_on_as_such(harness, mode):
+def test_undescribed_local_session_fails_the_boot(harness):
     # rtkit_get_live_state() had nothing to describe (no complete endpoint map, or a crash)
-    run, out = _publish(harness, mode, mode)
-    assert run.returncode == 0, run.stdout
+    run, out = _publish(harness, "local-undescribed", "local-undescribed")
+    assert run.returncode == 1, run.stdout
+    assert "the running DCP's session cannot be described" in run.stdout
     assert _undescribed(out)
+
+
+def test_undescribed_session_makes_no_record(harness):
+    # The handing stage has no record to pass on: chainload.c then refuses to chainload
+    run, _ = _publish(harness, "chain-undescribed", "chain-undescribed")
+    assert run.returncode == 4 and "sender: no record" in run.stdout, run.stdout
 
 
 def test_both_owners_publish_after_the_display_handoff():

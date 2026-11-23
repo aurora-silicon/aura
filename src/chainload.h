@@ -15,7 +15,8 @@
 #define CHAINLOAD_HDR_MAGIC         0x44414f4c41525541 /* "AURALOAD" */
 #define CHAINLOAD_HDR_VERSION       1
 #define CHAINLOAD_HDR_F_RUN_BASE    1
-#define CHAINLOAD_HDR_F_LIVE_DCP    2 /* consumes the live DCP entries in the ADT */
+#define CHAINLOAD_HDR_F_LIVE_DCP    2 /* consumes the live DCP marker in the ADT */
+#define CHAINLOAD_HDR_F_LIVE_RTKIT  4 /* consumes its RTKit record (DISPLAY_LIVE_RTKIT_ADT_PROP) */
 #define CHAINLOAD_HDR_FOOTPRINT_OFF 0x10
 #define CHAINLOAD_HDR_RUN_BASE_OFF  0x18
 #define CHAINLOAD_HDR_SIZE          0x20

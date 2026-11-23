@@ -1263,73 +1263,81 @@ _Static_assert(offsetof(struct display_live_rtkit_record, rtkit) == 24 &&
                "live RTKit record layout");
 
 /*
- * The record of the DCP this stage handed on running, for the next aura stage. A session this
- * stage cannot describe (rtkit_get_live_state()) is passed on as such, without the session flag.
+ * The record of the DCP this stage handed on running, for the next aura stage. Returns -1 if this
+ * stage cannot describe the session (rtkit_get_live_state() found the IOP crashed or the endpoint
+ * map incomplete): the caller then must not hand that DCP on to anyone.
  */
-void display_live_rtkit_record(struct display_live_rtkit_record *rec)
+int display_live_rtkit_record(struct display_live_rtkit_record *rec)
 {
     const struct rtkit_live_state *st = dcp_live_rtkit_state();
     const display_config_t *conf = st ? display_get_config() : NULL;
 
     memset(rec, 0, sizeof(*rec));
+    if (!conf)
+        return -1;
     rec->version = DISPLAY_LIVE_RTKIT_VERSION;
     rec->size = sizeof(*rec);
-    if (!conf)
-        return;
-    rec->flags = DISPLAY_LIVE_RTKIT_F_SESSION;
     memcpy(rec->alias, conf->dcp_alias, sizeof(rec->alias));
     rec->rtkit = *st;
+    return 0;
 }
 
-/* Check the record an earlier stage passed on. Its buffers are checked when they are reserved. */
+/*
+ * Check the record an earlier stage passed on: it must name this stage's DCP and hold a session
+ * that is whole. Owned buffers are checked against the reserved range when they are reserved.
+ */
 static int display_parse_live_rtkit_record(const void *prop, u32 len,
                                            struct display_live_rtkit_record *rec)
 {
-    if (!prop || len != sizeof(*rec))
+    static const struct rtkit_live_buffer unused;
+    const display_config_t *conf = display_get_config();
+
+    if (!prop || len != sizeof(*rec) || !conf)
         return -1;
     memcpy(rec, prop, sizeof(*rec));
     if (rec->version != DISPLAY_LIVE_RTKIT_VERSION || rec->size != sizeof(*rec) ||
-        (rec->flags & ~DISPLAY_LIVE_RTKIT_F_SESSION) || rec->reserved)
-        return -1;
-    if (!(rec->flags & DISPLAY_LIVE_RTKIT_F_SESSION))
-        return 0;
-    if (!rec->alias[0] || rec->alias[sizeof(rec->alias) - 1] ||
+        rec->reserved[0] || rec->reserved[1] || rec->alias[sizeof(rec->alias) - 1] ||
+        memcmp(rec->alias, conf->dcp_alias, sizeof(rec->alias)) ||
         rec->rtkit.n_buffers > RTKIT_LIVE_MAX_BUFFERS)
         return -1;
+    for (u32 i = 0; i < RTKIT_LIVE_MAX_BUFFERS; i++) {
+        const struct rtkit_live_buffer *b = &rec->rtkit.buffers[i];
+        if (i >= rec->rtkit.n_buffers) {
+            if (memcmp(b, &unused, sizeof(*b)))
+                return -1;
+        } else if ((b->flags & ~RTKIT_LIVE_BUFFER_OWNED) || b->iova > UINT64_MAX - b->size ||
+                   b->phys > UINT64_MAX - b->size) {
+            return -1;
+        }
+    }
     return 0;
 }
 
 /*
  * The RTKit session of the DCP handed on running, and that DCP's DT alias: this stage's own if it
- * handed the DCP on, else the one in the record of the stage that did. *st is NULL if that stage
- * could not describe the session. Returns -1 if an earlier stage handed a DCP on and its record
- * is missing or not one this stage understands.
+ * handed the DCP on, else the one in the record of the stage that did. NULL if no DCP was handed
+ * on running, or if one was and its session cannot be described: this stage could not read it,
+ * or the earlier stage's record is missing, names another DCP or is not one this stage
+ * understands.
  */
-int display_live_rtkit_state(const struct rtkit_live_state **st, const char **alias)
+const struct rtkit_live_state *display_live_rtkit_state(const char **alias)
 {
-    static struct display_live_rtkit_record inherited;
+    static struct display_live_rtkit_record rec;
 
-    *st = NULL;
     if (dcp_handed_on_live()) {
-        const display_config_t *conf = display_get_config();
-        if (conf && (*st = dcp_live_rtkit_state()))
-            *alias = conf->dcp_alias;
-        return 0;
+        if (display_live_rtkit_record(&rec) < 0)
+            return NULL;
+    } else {
+        u32 len = 0;
+        int chosen = adt_path_offset(adt, "/chosen");
+        const void *prop =
+            chosen < 0 ? NULL : adt_getprop(adt, chosen, DISPLAY_LIVE_RTKIT_ADT_PROP, &len);
+        if (!display_inherited_live_heap(NULL) ||
+            display_parse_live_rtkit_record(prop, len, &rec) < 0)
+            return NULL;
     }
-    if (!display_inherited_live_heap(NULL))
-        return 0;
-
-    u32 len = 0;
-    int chosen = adt_path_offset(adt, "/chosen");
-    const void *prop =
-        chosen < 0 ? NULL : adt_getprop(adt, chosen, DISPLAY_LIVE_RTKIT_ADT_PROP, &len);
-    if (display_parse_live_rtkit_record(prop, len, &inherited) < 0)
-        return -1;
-    if (inherited.flags & DISPLAY_LIVE_RTKIT_F_SESSION) {
-        *st = &inherited.rtkit;
-        *alias = inherited.alias;
-    }
-    return 0;
+    *alias = rec.alias;
+    return &rec.rtkit;
 }
 
 int display_shutdown(dcp_shutdown_mode mode)
