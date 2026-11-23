@@ -161,9 +161,35 @@ SPEAKER_ID_SCENARIOS = {
                                        ""),
 }
 
+# The HDMI converter's HPD pin (ADT function-hdmi_hpd on dp2hdmi-gpio0), read by the display code
+HPD_PIN = 0x31
+
+
+def dp2hdmi(hpd):
+    return [Node("dp2hdmi-gpio0", {} if hpd is None else {"function-hdmi_hpd": hpd})]
+
+
+HPD_SCENARIOS = {
+    # name: function-hdmi_hpd (None: absent); the pin itself is modelled by run-kboot-audio.sh
+    "hpd-high": strap(HPD_PIN),
+    "hpd-low": strap(HPD_PIN),
+    "hpd-inverted-low-pad": strap(HPD_PIN, 0x0),
+    "hpd-inverted-high-pad": strap(HPD_PIN, 0x0),
+    "hpd-output-pin": strap(HPD_PIN),
+    "hpd-peripheral-pin": strap(HPD_PIN),
+    "hpd-input-stage-off": strap(HPD_PIN),
+    "hpd-absent": None,
+    "hpd-not-gpio": strap(HPD_PIN, fourcc=b"pKW4"),
+    "hpd-bad-phandle": strap(HPD_PIN, phandle=0x99),
+    "hpd-pin-out-of-range": strap(GPIO_NPINS),
+}
+
 
 def scenario(name):
     """(ADT, DTS) for one scenario"""
+    if name in HPD_SCENARIOS:
+        return (adt(speaker_group([strap(0x34), strap(0x35)]), dp2hdmi(HPD_SCENARIOS[name])),
+                dts(THREE))
     if name in SPEAKER_ID_SCENARIOS:
         straps, valid, find, extra, chosen = SPEAKER_ID_SCENARIOS[name]
         return adt(speaker_group(straps, valid, find), extra), dts(THREE, chosen=chosen)
@@ -221,7 +247,7 @@ def scenario(name):
 
 
 SCENARIOS = ["group", "no-dcblocker", "six-amps", "short-speaker-config", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
-             "dangling-phandle", "no-amps"] + list(SPEAKER_ID_SCENARIOS)
+             "dangling-phandle", "no-amps"] + list(SPEAKER_ID_SCENARIOS) + list(HPD_SCENARIOS)
 
 
 def from_ioreg(path):

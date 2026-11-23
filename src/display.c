@@ -606,8 +606,20 @@ int display_configure(const char *config)
         ret = dcp_connect_dptx(dcp);
         if (ret < 0)
             return ret;
-        if (dcp_dptx_needs_ap_hpd(dcp) && dcp_dptx_hpd(dcp->dptx_ep, 0, true))
-            printf("display: telling the dptx-port about HPD failed\n");
+        if (dcp_dptx_needs_ap_hpd(dcp)) {
+            /* The sink drives HPD. When the pin says nothing is attached (it reads low although
+             * the connector's 5 V was on before this stage), the firmware will not find a
+             * display however long it is asked, so tell it the truth and skip the status wait.
+             * A pin that cannot tell yet keeps the old report (HPD asserted) and the wait. */
+            int level = dcp_hdmi_hpd_level(dcp);
+
+            if (dcp_dptx_hpd(dcp->dptx_ep, 0, level != 0))
+                printf("display: telling the dptx-port about HPD failed\n");
+            if (level == 0) {
+                printf("display: HPD not asserted, no display attached\n");
+                return 0;
+            }
+        }
     }
 
     if (!display_is_external) {
