@@ -191,3 +191,28 @@ def test_a_caller_from_before_the_form_still_signs_an_image(tmp_path):
     out.write_bytes(data + rec + struct.pack("<Q", len(data)) + tool.FOOTER)
     r = run("verify", "--pub", PUB, out)
     assert r.returncode == 0 and "image trailer: verified" in r.stdout, r.stdout
+
+
+def test_make_record_writes_no_record_without_a_form(tmp_path):
+    """The fourth argument was the flags word, 0 by default, before it named the form."""
+    import importlib.util
+    import struct
+    import pytest
+    spec = importlib.util.spec_from_file_location("secboot_sign", ROOT / "tools/secboot_sign.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    seed, data = KEY.read_bytes(), b"a stage 2" * 100
+    # No form, or one no stage checks for: refused instead of signing a record nothing verifies.
+    for args, kwargs in (((0,), {}), ((), {"form": 0}), ((), {"flags": 0}), ((3,), {}),
+                         ((tool.FORM_IMAGE | 0x10,), {})):
+        with pytest.raises(ValueError, match="form"):
+            tool.make_record(seed, data, 2, *args, **kwargs)
+    # The old keyword still names the same argument.
+    for kwargs, form in (({"flags": tool.FORM_IMAGE}, "image trailer"), ({"form": tool.FORM_IMAGE}, "image trailer")):
+        rec, _ = tool.make_record(seed, data, 2, **kwargs)
+        out = tmp_path / "s2.bin"
+        out.write_bytes(data + rec + struct.pack("<Q", len(data)) + tool.FOOTER)
+        r = run("verify", "--pub", PUB, out)
+        assert r.returncode == 0 and f"{form}: verified" in r.stdout, r.stdout
+    with pytest.raises(TypeError):
+        tool.make_record(seed, data, 2, form=tool.FORM_IMAGE, flags=tool.FORM_IMAGE)

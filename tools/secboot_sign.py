@@ -148,9 +148,20 @@ def key_id(pub):
     return hashlib.sha256(pub).digest()[:8]
 
 
-def make_record(seed, covered, secver, form=FORM_IMAGE):
+_UNSET = object()
+
+
+def make_record(seed, covered, secver, form=_UNSET, flags=_UNSET):
     # form defaults to the image trailer for callers from before the form (aurora-secboot
-    # stage2 sign imports this to sign a Stage 2 image).
+    # stage2 sign imports this to sign a Stage 2 image). Its place was the flags word then, 0 by
+    # default and "flags" by name: the name still works, and a value that names no form is an
+    # error here, because no stage verifies such a record.
+    if form is not _UNSET and flags is not _UNSET:
+        raise TypeError("make_record() takes form or its old name flags, not both")
+    if form is _UNSET:
+        form = FORM_IMAGE if flags is _UNSET else flags
+    if form not in (FORM_PAYLOADS, FORM_IMAGE):
+        raise ValueError(f"a record needs a form, FORM_PAYLOADS or FORM_IMAGE, not {form!r}")
     pub = pubkey(seed)
     flags = form
     header = BODY_MAGIC + struct.pack("<IIIIQ", 1, 1, secver, flags, len(covered)) + key_id(pub)
