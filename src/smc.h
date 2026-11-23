@@ -9,6 +9,10 @@
 
 typedef struct smc_dev smc_dev_t;
 
+/* SMC GPIO key command: the output latch (as a read-write query), or a level to drive it to */
+#define SMC_GPIO_CMD_OUTPUT 0x01000000
+
+int smc_rw_u32(smc_dev_t *smc, u32 key, u32 wvalue, u32 *value);
 int smc_write_u32(smc_dev_t *smc, u32 key, u32 value);
 int smc_write_u64(smc_dev_t *smc, u32 key, u64 value);
 

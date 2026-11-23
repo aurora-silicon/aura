@@ -3,6 +3,7 @@
 #include "../config.h"
 
 #include "adt.h"
+#include "adt_gpio.h"
 #include "afk.h"
 #include "dcp.h"
 #include "firmware.h"
@@ -92,6 +93,35 @@ bool dcp_init_left_quiesced(void)
     return dcp_init_quiesced;
 }
 
+/*
+ * The level of the converter's HPD pin (ADT function-hdmi_hpd): 1 when a sink asserts it, 0 when
+ * it does not, -1 when that cannot be told. The pin belongs to its controller's owner (it is an
+ * interrupt input there), so it is only read, never reconfigured.
+ *
+ * A sink raises HPD only after it sees the connector's +5 V, and a slow one (a TV in standby, a
+ * monitor waking its scaler) takes a while to. So a low pin means "no sink" only when the 5 V
+ * was already on before this stage switched it on; when this stage has just turned it on, or its
+ * state could not be read, the level says nothing yet.
+ */
+int dcp_hdmi_hpd_level(dcp_dev_t *dcp)
+{
+    u32 cfg;
+
+    if (!dcp->hpd_pin.reg)
+        return -1;
+
+    int level = adt_gpio_pin_sample(&dcp->hpd_pin, &cfg);
+    if (level < 0) {
+        printf("dcp: HPD pin is not a readable input (0x%08x), level unknown\n", cfg);
+        return -1;
+    }
+    printf("dcp: HPD pin 0x%08x: %s, HDMI 5 V %s\n", cfg, level ? "asserted" : "not asserted",
+           dcp->hdmi_5v_was_on ? "on before this stage" : "switched on by this stage");
+    if (!level && !dcp->hdmi_5v_was_on)
+        return -1;
+    return level;
+}
+
 static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
 {
     int node = adt_path_offset(adt, cfg->dp2hdmi_gpio);
@@ -99,7 +129,13 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         printf("dcp: failed to find dp2hdmi-gpio node '%s'\n", cfg->dp2hdmi_gpio);
         return -1;
     }
-    dcp->hpd_on_ap = adt_getprop(adt, node, "function-hdmi_hpd", NULL) != NULL;
+    int hpd = adt_gpio_function_pin(adt, node, "function-hdmi_hpd", &dcp->hpd_pin);
+    dcp->hpd_on_ap = hpd <= 0;
+    if (hpd)
+        dcp->hpd_pin.reg = 0;
+    if (hpd < 0)
+        printf("dcp: function-hdmi_hpd is not an AP gpio pin, its level stays unread\n");
+    dcp->hdmi_5v_was_on = false;
     struct adt_function_smc_gpio dp2hdmi_pwr, hdmi_pwr;
     u32 pw8_size;
     const struct adt_function_smc_pw8 *pw8_dp2hdmi =
@@ -139,6 +175,15 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         if (dcp->dp2hdmi_pwr_gpio && dcp->hdmi_pwr_gpio) {
             smc_dev_t *smc = smc_init();
             if (smc) {
+                /* Whether the connector's 5 V was already on decides what the HPD pin means: its
+                 * SMC gpio's output latch, queried without changing it */
+                u32 was;
+                int r = smc_rw_u32(smc, dcp->hdmi_pwr_gpio, SMC_GPIO_CMD_OUTPUT, &was);
+                dcp->hdmi_5v_was_on = !r && (was & 1);
+                if (r)
+                    printf("dcp: HDMI 5 V state unknown (%d)\n", r);
+                else
+                    printf("dcp: HDMI 5 V before this stage: 0x%x\n", was);
                 smc_write_u32(smc, dcp->dp2hdmi_pwr_gpio, 0x800001);
                 smc_write_u32(smc, dcp->hdmi_pwr_gpio, 0x800001);
                 smc_shutdown(smc);
