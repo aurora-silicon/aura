@@ -1,27 +1,34 @@
 # SPDX-License-Identifier: MIT
-"""Run kboot_gpu.c's T6041 GPU fill on real FDTs with a modelled ADT and SGX.
+"""Run kboot_gpu.c's T6041 GPU fill on real FDTs with a modelled ADT, efuse page and SGX.
 
-The accepted cases use the operating points, CS/AFR tables, AON PTD rows, active MCC mask and
-regions of one J616C (32-core M4 Max) ADT on 26.6.2 (two gfx-asc segments: __TEXT and __DATA) and
-on 27.2 / 26B123 (three gfx-asc segments: __TEXT, __DATA and a contiguous __DATA_SHARED_RO tail
-merged into gpu-fw-data), plus a 40-core (8-MCC) topology check.
+The accepted cases use the operating points, CS/AFR tables, AON PTD rows, active MCC mask, regions
+and live efuse page (0x508374c10..0x508374c28) of one J616C (32-core M4 Max) on 26.6.2 (two
+gfx-asc segments: __TEXT and __DATA) and on 27.2 / 26B123 (three gfx-asc segments: __TEXT, __DATA
+and a contiguous __DATA_SHARED_RO tail merged into gpu-fw-data), plus a 40-core (8-MCC) topology
+check matching the measured 40-core T6041 leakage reference.
 
-Failure model for 3-segment 27.2 framing and v1 handoff recorded before implementation:
+Failure model for 3-segment 27.2 framing and v2 calibration handoff recorded before implementation:
 - segment-ranges counts other than 2 or 3 must be refused.
 - A 3-segment gfx-asc must match /arm-io/sgx gfx-data-shared-ro-{base,size} on physical base,
   identity remap and non-zero 16 KiB-aligned size, sit immediately after gfx-data with no gap
   or wrap, and have zero (or absent) gfx-data-shared-rw-{base,size}.
 - Extending gpu-fw-data by gfx-data-shared-ro-size must still satisfy 42-bit OAS bounds and
   pairwise non-overlap against every other UAT and firmware reservation (including gpu-fw-text).
+- Efuse reads (0x508374c10, 0xc14, 0xc1c, 0xc20, 0xc24, 0xc28) happen before SGX is powered;
+  any fault, unprogrammed zero, or saturated all-ones field refuses before SGX is enabled and
+  deletes any stale apple,t6041-handoff-version property.
 - SGX power is enabled only around the SGX register reads and restored before returning; every
-  ADT/DT refusal happens before SGX is powered.
-- Handoff v1 emits only verified ADT and SGX properties (active-mcc-bit-vector, aon-table,
-  perf-map-a/b, perf-relative-b, perf-base-pstate, 40-bit core-mask, t6041-handoff-version = 1)
-  and never emits unverified efuse-derived leakage/power properties.
+  ADT/DT/efuse refusal happens before SGX is powered.
+- Non-monotonic power ladders or computed power ceilings above 250,000 mW are refused after
+  restoring SGX power.
+- Handoff v2 emits all verified ADT, efuse, and SGX calibration properties (active-mcc-bit-vector,
+  aon-table, core/sram/cs/afr-leak-coef, perf-map-a/b, perf-relative-a/b, perf-base-pstate,
+  max-power-mw, 40-bit core-mask, t6041-handoff-version = 2) matching linux calibration.rs.
 - Every refusal leaves the GPU node and all six reserved-memory nodes disabled.
 """
 
 from pathlib import Path
+import re
 import subprocess
 
 from host_compiler import host_cc
@@ -36,6 +43,7 @@ def function(source, signature):
 
 HARNESS = r'''
 #include <assert.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -51,6 +59,7 @@ _Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define SZ_16K 0x4000
 #define MASK(x) ((1UL << (x)) - 1)
+#define min(a, b) (((a) < (b)) ? (a) : (b))
 #define sysop(op) ((void)0)
 enum { GUARD_OFF = 0, GUARD_MARK = 2, GUARD_SILENT = 0x100 };
 static int exc_guard, exc_count;
@@ -71,11 +80,14 @@ static int firmware_set_fdt(void *tree, int node, const char *prop,
 
 /* SGX power: the fill must power it only around the register reads and restore it after. */
 struct pmgr_saved_modes { int count; };
-static bool sgx_on;
-static int enables, restores;
+static bool sgx_on, sgx_power_fail;
+static int enables, restores, enable_attempts;
 static int pmgr_adt_power_enable_traced_saved(const char *path, struct pmgr_saved_modes *saved)
 {
     assert(!strcmp(path, "/arm-io/sgx"));
+    enable_attempts++;
+    if (sgx_power_fail)
+        return -1;
     enables++;
     sgx_on = true;
     saved->count = 1;
@@ -91,6 +103,7 @@ static void pmgr_restore_modes(struct pmgr_saved_modes *saved)
 
 ADT = r'''
 #define SGX_BASE 0x288000000UL
+#define EFUSE    0x508374000UL
 static struct perf_state states[64];
 static struct {
     u64 dies, count;
@@ -103,9 +116,11 @@ static u64 region[6][2], shared_ro[2], shared_rw[2];
 static u32 raw_count, raw_tables, raw_max_state, active_mcc;
 static u32 base_pstate, base_length;
 static u32 ptd_table[18], ptd_len;
+static u32 ef_c10, ef_c14, ef_c1c, ef_c20, ef_c24, ef_c28;
 static u32 sgx_masks[3], map_a[16], map_b[16];
 static bool missing_sgx, missing_asc, missing_aon, missing_mcc;
-static bool have_base_pstate, has_shared_ro, has_shared_rw, bad_shared_rw_len, sgx_fault;
+static bool have_base_pstate, has_shared_ro, has_shared_rw, bad_shared_rw_len;
+static bool efuse_fault, sgx_fault;
 static const char *const region_names[5] = {
     "gfx-handoff", "gfx-shared-l2-region", "gfx-shared-region", "gpu-region", "gfx-data",
 };
@@ -197,6 +212,20 @@ static int adt_copy(const char *name, void *out, size_t size)
 
 static u32 read32(u64 addr)
 {
+    if (addr >= EFUSE && addr < EFUSE + 0x1000) {
+        if (efuse_fault)
+            exc_count++;
+        switch (addr - EFUSE) {
+        case 0xc10: return ef_c10;
+        case 0xc14: return ef_c14;
+        case 0xc1c: return ef_c1c;
+        case 0xc20: return ef_c20;
+        case 0xc24: return ef_c24;
+        case 0xc28: return ef_c28;
+        }
+        exc_count++;
+        return 0;
+    }
     if (!sgx_on || sgx_fault) {
         exc_count++;
         return 0;
@@ -239,7 +268,23 @@ static const u32 j616c_aon_want[15] = {
 };
 static const u32 good_a[16] = {0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 15};
 static const u32 good_b[16] = {0, 1, 2, 3, 4, 6, 7, 9, 11, 13, 15};
+static const u32 want_rel_a[16] = {0, 10, 18, 25, 31, 40, 51, 62, 69, 78, 100};
 static const u32 want_rel_b[16] = {0, 0, 22, 36, 47, 57, 68, 78, 84, 91, 100};
+/* Public 40-core T6041 (J575C) OPP voltages (t6041-j575c.dts) and relative-A (hw/t6041.rs). */
+static const u32 j575c_mv[4][16] = {
+    {125, 600, 665, 705, 725, 770, 770, 810, 810, 860, 860, 900, 900, 940, 940, 1020},
+    {125, 600, 665, 705, 725, 770, 770, 810, 810, 860, 860, 895, 895, 925, 925, 1020},
+    {125, 600, 660, 700, 715, 770, 770, 805, 805, 860, 860, 900, 900, 940, 940, 1020},
+    {125, 600, 660, 705, 730, 780, 780, 810, 810, 860, 860, 900, 900, 940, 940, 1020},
+};
+static const u32 j575c_aux_uv[8] = {585000, 585000, 635000, 685000,
+                                    720000, 770000, 855000, 885000};
+static const u32 j575c_rel_a[16] = {0, 10, 18, 25, 31, 40, 50, 62, 70, 78, 100};
+/* Live J616C efuse words (0x508374c10, c14, c1c, c20, c24, c28) -> binary32 leakages. */
+static const u32 j616c_core_leak_want[4] = {0x4509b800, 0x45137800, 0x4506e800, 0x45005800};
+static const u32 j616c_sram_leak_want = 0x43f30000;
+static const u32 j616c_cs_leak_want = 0x440d4000;
+static const u32 j616c_afr_leak_want = 0x43e64000;
 static const char *const region_paths[6] = {
     "/reserved-memory/uat-handoff", "/reserved-memory/uat-l2-pagetables",
     "/reserved-memory/uat-pagetables", "/reserved-memory/uat-ttbs",
@@ -318,14 +363,18 @@ static void world_with(const char *compatible, int gpu_opps, int gpu_cells, int 
     ptd_table[0] = 0x73305452; ptd_table[1] = 0x00f20001; ptd_table[2] = 0x00001601;
     memcpy(&ptd_table[3], j616c_aon_want, sizeof(j616c_aon_want));
     ptd_len = 18 * sizeof(u32);
+    /* Live J616C efuse capture (0x508374c10, c14, c1c, c20, c24, c28). */
+    ef_c10 = 0xc3120b78; ef_c14 = 0x002ac0b3; ef_c1c = 0x58046800;
+    ef_c20 = 0xa11505fc; ef_c24 = 0x602880e0; ef_c28 = 0x00001322;
     sgx_masks[0] = 0xfdbf6fdb; sgx_masks[1] = 0xf6; sgx_masks[2] = 0;
     memcpy(map_a, good_a, sizeof(map_a));
     memcpy(map_b, good_b, sizeof(map_b));
     missing_sgx = missing_asc = missing_aon = missing_mcc = false;
-    has_shared_ro = has_shared_rw = bad_shared_rw_len = sgx_fault = false;
+    has_shared_ro = has_shared_rw = bad_shared_rw_len = efuse_fault = sgx_fault = false;
+    sgx_power_fail = false;
     shared_ro[0] = shared_ro[1] = shared_rw[0] = shared_rw[1] = 0;
     sgx_on = false;
-    enables = restores = exc_count = 0;
+    enables = restores = enable_attempts = exc_count = 0;
 }
 
 static void world(void) { world_with("apple,agx-t6041", 16, 4, 8); }
@@ -378,6 +427,12 @@ static void expect_refused(const char *what, int expected_enables)
     int gpu = fdt_path_offset(dt, "gpu");
     assert(!fdt_getprop(dt, gpu, "apple,firmware-version", NULL));
     assert(!fdt_getprop(dt, gpu, "apple,t6041-handoff-version", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,max-power-mw", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,core-leak-coef", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,sram-leak-coef", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,cs-leak-coef", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,afr-leak-coef", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,perf-relative-a", NULL));
     printf("PASS refused: %s\n", what);
 }
 
@@ -396,7 +451,7 @@ static void expect_untouched(const char *what, const char *gpu_status)
 
 int main(void)
 {
-    /* The accepted case publishes verified ADT/SGX handoff v1 and restores SGX power. */
+    /* The accepted case publishes verified ADT/efuse/SGX handoff v2 and restores SGX power. */
     world();
     assert(dt_set_gpu_t6041(dt) == 0);
     assert(!strcmp(status("gpu"), "okay"));
@@ -429,12 +484,22 @@ int main(void)
         n++;
     }
     assert(n == 8);
+    n = 0;
+    fdt_for_each_subnode(opp, dt, fdt_path_offset(dt, "/afr-opp"))
+    {
+        const fdt32_t *uv = fdt_getprop(dt, opp, "opp-microvolt", &len);
+        const fdt64_t *hz = fdt_getprop(dt, opp, "opp-hz", NULL);
+        assert(uv && len == 4 && fdt32_ld(uv) == j616c_aux_uv[n] &&
+               fdt64_ld(hz) == j616c_aux_mhz[n] * 1000000ULL);
+        n++;
+    }
+    assert(n == 8);
     int gpu = fdt_path_offset(dt, "gpu");
     const fdt32_t *version = fdt_getprop(dt, gpu, "apple,firmware-version", &len);
     assert(version && len == 12 && fdt32_ld(&version[0]) == 26 && fdt32_ld(&version[1]) == 6 &&
            fdt32_ld(&version[2]) == 2);
     const fdt32_t *hver = fdt_getprop(dt, gpu, "apple,t6041-handoff-version", &len);
-    assert(hver && len == 4 && fdt32_ld(hver) == 1);
+    assert(hver && len == 4 && fdt32_ld(hver) == 2);
     const fdt32_t *mcc = fdt_getprop(dt, gpu, "apple,active-mcc-bit-vector", &len);
     assert(mcc && len == 4 && fdt32_ld(mcc) == 0x3f);
     const fdt64_t *cmask = fdt_getprop(dt, gpu, "apple,core-mask", &len);
@@ -449,34 +514,77 @@ int main(void)
     assert(ma && len == 16 * 4);
     const fdt32_t *mb = fdt_getprop(dt, gpu, "apple,perf-map-b", &len);
     assert(mb && len == 16 * 4);
+    const fdt32_t *ra = fdt_getprop(dt, gpu, "apple,perf-relative-a", &len);
+    assert(ra && len == 16 * 4);
     const fdt32_t *rb = fdt_getprop(dt, gpu, "apple,perf-relative-b", &len);
     assert(rb && len == 16 * 4);
     for (int i = 0; i < 16; i++) {
         assert(fdt32_ld(&ma[i]) == good_a[i]);
         assert(fdt32_ld(&mb[i]) == good_b[i]);
+        assert(fdt32_ld(&ra[i]) == want_rel_a[i]);
         assert(fdt32_ld(&rb[i]) == want_rel_b[i]);
     }
-    /* Efuse-dependent v2 properties must NOT be emitted until live efuse offsets are verified. */
-    assert(!fdt_getprop(dt, gpu, "apple,core-leak-coef", NULL));
-    assert(!fdt_getprop(dt, gpu, "apple,sram-leak-coef", NULL));
-    assert(!fdt_getprop(dt, gpu, "apple,cs-leak-coef", NULL));
-    assert(!fdt_getprop(dt, gpu, "apple,afr-leak-coef", NULL));
-    assert(!fdt_getprop(dt, gpu, "apple,max-power-mw", NULL));
-    assert(!fdt_getprop(dt, gpu, "apple,perf-relative-a", NULL));
-    puts("PASS accepted: J616C v1 handoff, tables and regions");
+    const fdt32_t *cleak = fdt_getprop(dt, gpu, "apple,core-leak-coef", &len);
+    assert(cleak && len == 4 * 4);
+    const fdt32_t *sleak = fdt_getprop(dt, gpu, "apple,sram-leak-coef", &len);
+    assert(sleak && len == 4 * 4);
+    for (int c = 0; c < 4; c++) {
+        assert(fdt32_ld(&cleak[c]) == j616c_core_leak_want[c]);
+        assert(fdt32_ld(&sleak[c]) == j616c_sram_leak_want);
+    }
+    const fdt32_t *csleak = fdt_getprop(dt, gpu, "apple,cs-leak-coef", &len);
+    assert(csleak && len == 4 && fdt32_ld(csleak) == j616c_cs_leak_want);
+    const fdt32_t *afrleak = fdt_getprop(dt, gpu, "apple,afr-leak-coef", &len);
+    assert(afrleak && len == 4 && fdt32_ld(afrleak) == j616c_afr_leak_want);
+    const fdt32_t *mw = fdt_getprop(dt, gpu, "apple,max-power-mw", &len);
+    assert(mw && len == 4 && fdt32_ld(mw) == 113169);
+    puts("PASS accepted: J616C v2 handoff, leakage, power, tables and regions");
 
-    /* 40-core (8-MCC) topology also accepted cleanly. */
+    /* 40-core (8-MCC) J575C OPPs + measured 40-core T6041 leakage reference (hw/t6041.rs). */
     world();
+    for (int t = 0; t < 4; t++)
+        for (int i = 0; i < 16; i++)
+            states[t * 16 + i] = (struct perf_state){j616c_mhz[i] * 1000000u, j575c_mv[t][i]};
+    for (int i = 0; i < 8; i++) {
+        cs.states[i] = (struct aux_perf_state){j575c_aux_uv[i], j616c_aux_mhz[i] * 1000000UL};
+        afr.states[i] = cs.states[i];
+    }
     active_mcc = 0xff;
     sgx_masks[0] = 0xffffffff; sgx_masks[1] = 0xff; sgx_masks[2] = 0;
     have_base_pstate = true; base_pstate = 1;
+    u64 ref40 = (1331ULL << 1) | (1317ULL << 15) | (1304ULL << 29) | (1286ULL << 43);
+    ef_c10 = (u32)ref40; ef_c14 = (u32)(ref40 >> 32);
+    ef_c1c = 527U << 9; ef_c20 = 151U << 24; ef_c24 = 0; ef_c28 = 297U << 4;
     assert(dt_set_gpu_t6041(dt) == 0 && !strcmp(status("gpu"), "okay"));
     gpu = fdt_path_offset(dt, "gpu");
+    hver = fdt_getprop(dt, gpu, "apple,t6041-handoff-version", &len);
+    assert(hver && len == 4 && fdt32_ld(hver) == 2);
     cmask = fdt_getprop(dt, gpu, "apple,core-mask", &len);
     assert(cmask && len == 8 && fdt64_ld(cmask) == 0xffffffffffULL);
     mcc = fdt_getprop(dt, gpu, "apple,active-mcc-bit-vector", &len);
     assert(mcc && len == 4 && fdt32_ld(mcc) == 0xff);
-    puts("PASS accepted: 40-core 8-MCC T6041 topology");
+    cleak = fdt_getprop(dt, gpu, "apple,core-leak-coef", &len);
+    assert(cleak && len == 16 && fdt32_ld(&cleak[0]) == 0x44f9c000 &&
+           fdt32_ld(&cleak[1]) == 0x44f72000 && fdt32_ld(&cleak[2]) == 0x44f4b000 &&
+           fdt32_ld(&cleak[3]) == 0x44f15000);
+    sleak = fdt_getprop(dt, gpu, "apple,sram-leak-coef", &len);
+    assert(sleak && len == 16 && fdt32_ld(&sleak[0]) == 0x43e40000 &&
+           fdt32_ld(&sleak[3]) == 0x43e40000);
+    csleak = fdt_getprop(dt, gpu, "apple,cs-leak-coef", &len);
+    assert(csleak && len == 4 && fdt32_ld(csleak) == 0x44040000);
+    afrleak = fdt_getprop(dt, gpu, "apple,afr-leak-coef", &len);
+    assert(afrleak && len == 4 && fdt32_ld(afrleak) == 0x43df8000);
+    ra = fdt_getprop(dt, gpu, "apple,perf-relative-a", &len);
+    assert(ra && len == 16 * 4);
+    rb = fdt_getprop(dt, gpu, "apple,perf-relative-b", &len);
+    assert(rb && len == 16 * 4);
+    for (int i = 0; i < 16; i++) {
+        assert(fdt32_ld(&ra[i]) == j575c_rel_a[i]);
+        assert(fdt32_ld(&rb[i]) == want_rel_b[i]);
+    }
+    mw = fdt_getprop(dt, gpu, "apple,max-power-mw", &len);
+    assert(mw && len == 4 && fdt32_ld(mw) == 129702);
+    puts("PASS accepted: 40-core 8-MCC J575C T6041 power, relative-A and leakage parity");
 
     world_with("apple,agx-t6040", 16, 2, 8);
     expect_untouched("T6040 GPU node", "okay");
@@ -571,7 +679,36 @@ int main(void)
         assert(!strcmp(status(region_paths[i]), "disabled"));
     puts("PASS refused: missing reserved-memory node");
 
-    /* SGX read / mask / perf-map refusal checks (must power off SGX cleanly). */
+    /* Efuse refusal checks (must fail closed BEFORE powering SGX and strip stale version). */
+    world(); efuse_fault = true;
+    expect_refused("efuse read faults", 0);
+    world();
+    assert(!fdt_setprop_u32(dt, fdt_path_offset(dt, "gpu"), "apple,t6041-handoff-version", 1));
+    efuse_fault = true;
+    expect_refused("efuse fault deletes stale handoff version", 0);
+    world(); ef_c10 &= ~(0x3fffU << 1);
+    expect_refused("cluster 0 core efuse is zero", 0);
+    world(); ef_c10 |= 7U << 29; ef_c14 |= 0x7ffU;
+    expect_refused("cluster 2 cross-word core efuse is saturated", 0);
+    world(); ef_c14 &= ~(0x3fffU << 11);
+    expect_refused("cluster 3 core efuse is zero", 0);
+    world(); ef_c20 &= ~(0xffU << 24); ef_c24 &= ~3U;
+    expect_refused("cross-word SRAM efuse is zero", 0);
+    world(); ef_c20 |= 0xffU << 24; ef_c24 |= 3U;
+    expect_refused("cross-word SRAM efuse is saturated", 0);
+    world(); ef_c1c &= ~(0x1fffU << 9);
+    expect_refused("CS efuse is zero", 0);
+    world(); ef_c1c |= 0x1fffU << 9;
+    expect_refused("CS efuse is saturated", 0);
+    world(); ef_c28 &= ~(0xfffU << 4);
+    expect_refused("AFR efuse is zero", 0);
+    world(); ef_c28 |= 0xfffU << 4;
+    expect_refused("AFR efuse is saturated", 0);
+
+    /* SGX read / mask / perf-map / power-ladder refusal checks (must power off SGX cleanly). */
+    world(); sgx_power_fail = true;
+    expect_refused("SGX power enable fails", 0);
+    assert(enable_attempts == 1);
     world(); sgx_fault = true;
     expect_refused("SGX read faults", 1);
     world(); sgx_masks[2] = 1;
@@ -588,6 +725,16 @@ int main(void)
     expect_refused("A map does not climb", 1);
     world(); states[6].freq = states[16 + 6].freq = states[32 + 6].freq = states[48 + 6].freq = states[4].freq;
     expect_refused("ADT frequency does not climb along A map", 1);
+    world(); states[6].volt = states[16 + 6].volt = states[32 + 6].volt = states[48 + 6].volt = 500;
+    expect_refused("power falls along A map", 1);
+    world();
+    /* Extreme legal voltage + max non-saturated leakage pushes power over the 250 W T6041 cap. */
+    for (int t = 0; t < 4; t++)
+        states[t * 16 + 15].volt = 1300;
+    cs.states[7].volt = 1300000;
+    u64 max_raw = (0x3ffeULL << 1) | (0x3ffeULL << 15) | (0x3ffeULL << 29) | (0x3ffeULL << 43);
+    ef_c10 = (u32)max_raw; ef_c14 = (u32)(max_raw >> 32); ef_c1c = 0x1ffeU << 9;
+    expect_refused("computed max power exceeds 250 W T6041 ceiling", 1);
 
     /* 27.2 (26B123) 3-segment framing: __DATA + contiguous __DATA_SHARED_RO in gpu-fw-data. */
     world_27_2();
@@ -606,7 +753,9 @@ int main(void)
     assert(version && len == 12 && fdt32_ld(&version[0]) == 27 && fdt32_ld(&version[1]) == 2 &&
            fdt32_ld(&version[2]) == 0);
     hver = fdt_getprop(dt, fdt_path_offset(dt, "gpu"), "apple,t6041-handoff-version", &len);
-    assert(hver && len == 4 && fdt32_ld(hver) == 1);
+    assert(hver && len == 4 && fdt32_ld(hver) == 2);
+    mw = fdt_getprop(dt, fdt_path_offset(dt, "gpu"), "apple,max-power-mw", &len);
+    assert(mw && len == 4 && fdt32_ld(mw) == 113169);
     puts("PASS accepted: J616C 27.2 3-segment regions");
 
     world_27_2(); segments_len = sizeof(segments[0]);
@@ -645,30 +794,21 @@ int main(void)
 def test_t6041_gpu_fill(tmp_path):
     source = (ROOT / "src/kboot_gpu.c").read_text()
     defs = source[source.index("#define MAX_PSTATES"):source.index("int32_t rust_gpu_initdata_size(")]
-    t6040 = source[source.index("/*\n * T6040 (M4 Pro)."):]
-    macros = "\n".join(
-        line for line in t6040.splitlines()
-        if line.startswith(("#define T6040_OPPS", "#define T6040_CORES", "#define T6040_MAP_STATES"))
-    ) + "\n"
-    regions = t6040[t6040.index("static const struct {\n    const char *name;"):]
-    regions = regions[:regions.index("};\n") + 3]
+    t6040_start = source.index("/*\n * T6040 (M4 Pro).")
+    t6040_helpers = source[t6040_start:source.index("static int dt_set_gpu_t6040(", t6040_start)]
+    t6040_helpers, replaced = re.subn(r'#define T6040_ROUND\(x\) __asm__\(""\s*:\s*"\+w"\(x\)\)',
+                                      '#define T6040_ROUND(x) __asm__("" : "+m"(x))', t6040_helpers)
+    assert replaced == 1
     header = (ROOT / "src/kboot.h").read_text()
     fw = header[header.index("struct gpu_fw_layout {"):]
-    fw = fw[:fw.index("};\n") + 3] + function(source, "int gpu_fw_layout(")
-    t6041_macros = "\n".join(
-        line for line in source.splitlines()
-        if line.startswith(("#define T6041_CLUSTERS ", "#define T6041_AON_ROWS "))
-    ) + "\n"
-    t6041 = (t6041_macros + function(source, "static int t6041_aon_table(") +
-             function(source, "static int dt_set_gpu_t6041("))
+    fw = fw[:fw.index("};\n") + 3]
+    t6041_start = source.index("/*\n * T6041 (M4 Max).")
+    t6041 = source[t6041_start:source.index("/*\n * T6050 G17S", t6041_start)]
     bail = '#define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)\n'
-    code = (HARNESS + bail + defs + ADT + macros +
+    code = (HARNESS + bail + defs + ADT +
             function(source, "static int dt_set_resvmem(") +
             function(source, "static int fdt_set_aux_opp(") +
-            function(source, "static int t6040_read32(") +
-            function(source, "static int t6040_perf_map(") +
-            function(source, "static int t6040_set_u32s(") +
-            function(source, "static int t6040_opp_table(") + regions + fw + t6041 + MAIN)
+            fw + t6040_helpers + t6041 + MAIN)
     cfile = tmp_path / "t6041-gpu-fill.c"
     cfile.write_text(code)
     libfdt = ROOT / "src/libfdt"
@@ -679,7 +819,7 @@ def test_t6041_gpu_fill(tmp_path):
     binary = tmp_path / "t6041-gpu-fill"
     subprocess.run([*host_cc(), "-D_GNU_SOURCE", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                     "-Wno-unused-function", "-Wno-unused-parameter", "-I", str(libfdt),
-                    str(cfile), *sources, "-o", str(binary)], check=True)
+                    str(cfile), *sources, "-lm", "-o", str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 59, result.stdout
+    assert result.stdout.count("PASS") == 73, result.stdout
