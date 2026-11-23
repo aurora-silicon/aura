@@ -9779,15 +9779,6 @@ static int dt_reserve_t8132_aop_windows(const char *path)
 }
 
 /*
- * J713 and J604: iBoot leaves the AOP halted, its DART's DAPF empty, its
- * external code (__ETEXT) in DRAM at a fixed address and its log (__OS_LOG) at
- * a new one every boot. When the OS asks for the AOP's handoff, program the
- * DAPF, then reserve both segments at the IOVAs the firmware uses (their remap
- * addresses: EC0p for __ETEXT, the physical address for __OS_LOG) and the
- * DAPF windows. Without all of it the firmware cannot run, so on any failure
- * the AOP is disabled.
- */
-/*
  * Take an AOP node out of the OS's tree after its handoff failed. That failure is often a full
  * DT, where growing status to "disabled" fails too: overwrite "okay" in place with "fail" (same
  * length, no new space; Linux treats anything but "okay" as unavailable) and only grow the
@@ -9805,6 +9796,15 @@ static int dt_disable_aop(const char *path)
     return fdt_setprop_string(dt, node, "status", "disabled") ? -1 : 0;
 }
 
+/*
+ * J713 and J604: iBoot leaves the AOP halted, its DART's DAPF empty, its
+ * external code (__ETEXT) in DRAM at a fixed address and its log (__OS_LOG) at
+ * a new one every boot. When the OS asks for the AOP's handoff, program the
+ * DAPF, then reserve both segments at the IOVAs the firmware uses (their remap
+ * addresses: EC0p for __ETEXT, the physical address for __OS_LOG) and the
+ * DAPF windows. Without all of it the firmware cannot run, so on any failure
+ * the AOP is disabled.
+ */
 static int dt_set_t8132_aop(const char *path)
 {
     const char *why;
@@ -9931,6 +9931,28 @@ static int dt_find_aop(char *path, size_t size)
 }
 
 /*
+ * The AOP's DRAM firmware segments could not be reserved (or only some of them), so they are
+ * free RAM to the OS. An AOP iBoot left halted is only started by the OS, from those segments:
+ * take it out of the OS's tree. An AOP that is already running (or whose CPU cannot be read)
+ * executes from those pages now, and disabling its node would not stop it: refuse the handoff.
+ */
+static int dt_aop_segments_unreserved(const char *path)
+{
+    asc_dev_t *asc = asc_init("/arm-io/aop");
+    if (!asc)
+        bail("FDT: %s: AOP firmware segments not reserved and its CPU state is unknown\n", path);
+    bool running = asc_cpu_running(asc);
+    asc_free(asc);
+    if (running)
+        bail("FDT: %s: AOP firmware segments not reserved while the AOP runs from them\n", path);
+
+    printf("FDT: %s: AOP firmware segments not reserved, disabling the halted AOP\n", path);
+    if (dt_disable_aop(path))
+        bail("FDT: %s: cannot disable the AOP\n", path);
+    return 0;
+}
+
+/*
  * The AOP's accelerometer and gyroscope services wait for their calibration, which the ADT
  * carries on every AOP. iBoot starts the AOP firmware and leaves the part that does not run
  * from the AOP's own SRAM in DRAM, where the ADT lists its segments: the external code
@@ -9975,17 +9997,8 @@ static int dt_set_aop_firmware(void)
         return 0;
     }
 
-    /*
-     * The OS starts the AOP from these segments through its DART. Unreserved (or only some of
-     * them), they are free RAM to the OS, and the AOP would run code from pages it reuses:
-     * disable the AOP instead, as on T8132.
-     */
-    if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true)) {
-        printf("FDT: %s: reserving the AOP firmware segments failed, disabling the AOP\n", path);
-        if (dt_disable_aop(path))
-            bail("FDT: %s: cannot disable the AOP\n", path);
-        return 0;
-    }
+    if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true))
+        return dt_aop_segments_unreserved(path);
     printf("FDT: %s: AOP firmware segments reserved\n", path);
 
     return 0;
