@@ -34,6 +34,35 @@ def load_header():
     return defines + "\n" + struct[:struct.index("};") + 2] + "\n"
 
 
+def _between(text, start, end):
+    start = text.index(start)
+    return text[start:text.index(end, start)]
+
+
+def live_rtkit_record():
+    """The record layout, its property names and its maker, from rtkit.h, display.h and display.c,
+    and chainload.c's size of the entries it adds to the ADT copy."""
+    rtkit_h = (REPO / "src/rtkit.h").read_text()
+    display_h = (REPO / "src/display.h").read_text()
+    display_c = (REPO / "src/display.c").read_text()
+    chainload_c = (REPO / "src/chainload.c").read_text()
+    live_prop = next(line for line in display_h.splitlines()
+                     if line.startswith("#define DISPLAY_LIVE_ADT_PROP "))
+    return "\n".join((
+        _between(rtkit_h, "#define RTKIT_LIVE_MAX_BUFFERS", "bool rtkit_get_live_state("),
+        live_prop,
+        _between(display_h, "#define DISPLAY_LIVE_RTKIT_ADT_PROP", "int display_live_rtkit_record("),
+        _between(display_c, "_Static_assert(sizeof(struct display_live_rtkit_record)",
+                 "/*\n * The record of the DCP this stage handed on running"),
+        _between(chainload_c, "/* DISPLAY_LIVE_ADT_PROP and DISPLAY_LIVE_RTKIT_ADT_PROP",
+                 "/* A copied tree has"),
+        "typedef struct { const char dcp_alias[8]; } display_config_t;",
+        "static const display_config_t *display_get_config(void);",
+        "static const struct rtkit_live_state *dcp_live_rtkit_state(void);",
+        function(display_c, "display_live_rtkit_record"),
+    )) + "\n"
+
+
 def test_chainload_header_rejects_footprint_outside_file(tmp_path):
     source = (REPO / "src/chainload.c").read_text()
     harness = r'''
@@ -94,8 +123,7 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define T8112 0x8112
 #define T8122 0x8122
 #define T8140 0x8140
-#define DISPLAY_LIVE_ADT_PROP "aurora,dcp-retained-heap"
-#define LIVE_DCP_ADT_ENTRY_SIZE (sizeof(struct adt_property) + sizeof(u64))
+#define BIT(x) (1UL << (x))
 #define T6000 0x6000
 #define T6020 0x6020
 #define T6030 0x6030
@@ -147,6 +175,18 @@ static struct {
 
 struct adt_property { char name[32]; u32 size; u8 value[]; };
 struct adt_node_hdr { u32 property_count, child_count; };
+''' + live_rtkit_record() + r'''
+/* The DCP this stage handed on running; described unless rtkit_get_live_state() failed */
+static bool described;
+static const display_config_t display_config = {"dcpext"};
+static const struct rtkit_live_state live_session = {
+    2, {0x17, 0, 0, 0, 0, 0, 0, 0x80000000}, 2,
+    {{1, 0, 0x802424000, 0x9e5010000, 0x10000}, {2, 1, 0x810004000, 0x80696c000, 0x4000}}};
+static const display_config_t *display_get_config(void) { return &display_config; }
+static const struct rtkit_live_state *dcp_live_rtkit_state(void)
+{
+    return handed_on && described ? &live_session : NULL;
+}
 static int display_prepare_live_handoff(void) { return 0; }
 static bool display_handed_on_live(void) { return handed_on; }
 static bool display_needs_live_receiver(void) { return handed_on || inherited_dcp; }
@@ -278,6 +318,7 @@ static void setup(int chip, u64 heap_used)
     force_alloc = alloc_fail = allocs = frees = last_alloc = 0;
     setprop_ret = 0;
     handed_on = inherited_dcp = false;
+    described = true;
     memset(adt_buf, 0, sizeof(adt_buf));
     message[0] = 0;
     sepfw_src = ram + SEPFW_OFF;
@@ -721,9 +762,21 @@ static void carries_live_display_in_chosen(void)
     };
     memcpy(image + CHAINLOAD_HDR_OFFSET, &hdr, sizeof(hdr));
     assert(chainload_image(image, sizeof(image), NULL, 0) == -1);
-    assert(!next_stage.entry);
+    assert(!next_stage.entry && strstr(message, "cannot inherit the running DCP"));
+    /* A receiver built before the RTKit record would boot the kernel without describing it */
     hdr.flags |= CHAINLOAD_HDR_F_LIVE_DCP;
     memcpy(image + CHAINLOAD_HDR_OFFSET, &hdr, sizeof(hdr));
+    message[0] = 0;
+    assert(chainload_image(image, sizeof(image), NULL, 0) == -1);
+    assert(!next_stage.entry && strstr(message, "cannot inherit the running DCP"));
+    hdr.flags |= CHAINLOAD_HDR_F_LIVE_RTKIT;
+    memcpy(image + CHAINLOAD_HDR_OFFSET, &hdr, sizeof(hdr));
+    /* A session this stage cannot describe is handed on to no one */
+    described = false;
+    assert(chainload_image(image, sizeof(image), NULL, 0) == -1);
+    assert(!next_stage.entry && strstr(message, "cannot describe the running DCP's RTKit session"));
+    assert(allocs == 0);
+    described = true;
     assert(chainload_image(image, sizeof(image), NULL, 0) == 0);
     struct boot_args *ba = (void *)staged_view(next_stage.args[0]);
     u64 dst = (u64)ba->devtree - ba->virt_base + ba->phys_base;
@@ -733,17 +786,43 @@ static void carries_live_display_in_chosen(void)
     struct adt_node_hdr *next = (void *)staged_view(dst);
     struct adt_property *prop = (void *)(next + 1);
     u64 retained;
-    assert(next->property_count == 2 && node->property_count == 1);
+    assert(next->property_count == 3 && node->property_count == 1);
     assert(!strcmp(prop->name, DISPLAY_LIVE_ADT_PROP) && prop->size == sizeof(retained));
     memcpy(&retained, prop->value, sizeof(retained));
     assert(retained == cur_boot_args.top_of_kernel_data);
-    assert(!memcmp(prop->value + sizeof(retained), name, sizeof(*name) + 8));
+    /* The RTKit record follows as a property of its own, then the tree's first property. */
+    struct display_live_rtkit_record rec;
+    prop = (void *)(prop->value + sizeof(retained));
+    assert(!strcmp(prop->name, DISPLAY_LIVE_RTKIT_ADT_PROP) && prop->size == sizeof(rec));
+    memcpy(&rec, prop->value, sizeof(rec));
+    assert(rec.version == DISPLAY_LIVE_RTKIT_VERSION && rec.size == sizeof(rec));
+    assert(!rec.reserved[0] && !rec.reserved[1] && !strcmp(rec.alias, "dcpext"));
+    assert(!memcmp(&rec.rtkit, &live_session, sizeof(live_session)));
+    assert(!memcmp(prop->value + sizeof(rec), name, sizeof(*name) + 8));
+    assert((u8 *)prop->value + sizeof(rec) == (u8 *)next + sizeof(*next) + LIVE_DCP_ADT_ENTRY_SIZE);
     const u8 *copied = (const u8 *)next + LIVE_DCP_ADT_ENTRY_SIZE;
     u64 tree_range[2];
     memcpy(tree_range, copied + TEST_DEVTREE_OFF, sizeof(tree_range));
     assert(tree_range[0] == dst && tree_range[1] == SZ_16K);
     assert(!memcmp(adt_buf + TEST_DEVTREE_OFF, original_tree_range, sizeof(tree_range)));
     assert(!memcmp(adt_buf + TEST_SEPFW_OFF, sepfw, sizeof(sepfw)));
+}
+
+/* A stage that inherited a running DCP passes its tree on as is: the next one needs both bits */
+static void inherited_dcp_needs_a_record_receiver(void)
+{
+    setup(T8112, HEAP_USED);
+    inherited_dcp = true;
+    retained_heap_base = cur_boot_args.top_of_kernel_data - SZ_16K;
+    u8 image[SZ_16K] = {0};
+    struct chainload_header hdr = {CHAINLOAD_HDR_MAGIC, CHAINLOAD_HDR_VERSION,
+                                   CHAINLOAD_HDR_F_RUN_BASE | CHAINLOAD_HDR_F_LIVE_DCP, SZ_16K, 0};
+    memcpy(image + CHAINLOAD_HDR_OFFSET, &hdr, sizeof(hdr));
+    assert(chainload_image(image, sizeof(image), NULL, 0) == -1);
+    assert(!next_stage.entry && strstr(message, "cannot inherit the running DCP"));
+    hdr.flags |= CHAINLOAD_HDR_F_LIVE_RTKIT;
+    memcpy(image + CHAINLOAD_HDR_OFFSET, &hdr, sizeof(hdr));
+    assert(chainload_image(image, sizeof(image), NULL, 0) == 0 && next_stage.entry);
 }
 
 int main(void)
@@ -769,6 +848,7 @@ int main(void)
     t6000_stage1_before_larger_stage2(0x3b0000, 0x808000, 0x430000, false); /* m1n1 v2.0.0 size */
     t6000_stage1_before_larger_stage2(0x430000, 0x808000, 0x430000, false); /* aura 1.0.0b1 */
     carries_live_display_in_chosen();
+    inherited_dcp_needs_a_record_receiver();
     composed_image_is_placed();
     puts("chainload run base matrix PASS");
     return 0;

@@ -797,6 +797,105 @@ static int dt_reserve_retained_span(u64 start, u64 end)
     return 0;
 }
 
+/*
+ * A DCP handed on running (display_shutdown()) keeps its RTKit session: the next owner must not
+ * repeat HELLO/EPMAP, which a running IOP does not answer. Describe that session on the DCP's own
+ * node so the kernel can adopt it, with the RTKit handoff properties other handed-over
+ * co-processors use (apple,rtkit-handoff + apple,rtkit-buffers) plus what a DCP needs on top:
+ *   apple,rtkit-handoff   "dcp-live-v1"
+ *   apple,rtkit-buffers   <ep dva_hi dva_lo size is_mapped> per system buffer: the DART input
+ *                         address, the size, and 1 if the firmware supplied the address (0 if
+ *                         this loader allocated it)
+ *   apple,rtkit-version   <n>        RTKit protocol version the session runs
+ *   apple,rtkit-epmap     <8 cells>  endpoint map the IOP announced; cell i holds endpoints
+ *                                    32 * i to 32 * i + 31 (application endpoints included; all
+ *                                    are stopped at handoff)
+ * Each loader-allocated buffer also gets a no-map reserved-memory region with iommu-addresses
+ * (dt_reserve_live_rtkit_buffer()), so its IOVA stays mapped when the kernel rebuilds the
+ * display DART from those regions. The DCP is already running and DMAs into these buffers, so
+ * this is fail-hard: a loader-allocated buffer outside the reserved range [@lo, @hi), or any
+ * failure to describe it, stops the Linux boot instead of handing over unmapped live DMA.
+ * Called after dt_set_display(), whose handoff paths treat a DCP node that already has a
+ * memory-region as described elsewhere.
+ * The session is the one this stage handed on or, in a Stage 1 -> Stage 2 chain, the one the
+ * earlier stage recorded in the private ADT (display_live_rtkit_state()); both are published
+ * here. Its buffers then lie in that stage's heap, which this stage keeps reserved too. Only
+ * called when a DCP was handed on running, so a session that cannot be described (this stage
+ * could not read it; the earlier stage's record is missing, names another DCP or is not
+ * understood) stops the boot the same way.
+ */
+static int dt_reserve_live_rtkit_buffer(const char *path, const char *alias,
+                                        const struct rtkit_live_buffer *b);
+
+static int dt_publish_live_rtkit(u64 lo, u64 hi)
+{
+    const char *alias = NULL;
+    const struct rtkit_live_state *st = display_live_rtkit_state(&alias);
+    if (!st) {
+        printf("FDT: live RTKit: the running DCP's session cannot be described\n");
+        return -1;
+    }
+
+    /* A copy: setting properties moves the rest of the tree, the alias string included. */
+    char path[128];
+    const char *apath = fdt_get_alias(dt, alias);
+    if (!apath || strlen(apath) >= sizeof(path) || fdt_path_offset(dt, apath) < 0) {
+        printf("FDT: live RTKit: no node for alias %s\n", alias);
+        return -1;
+    }
+    strcpy(path, apath);
+
+    fdt32_t bufs[RTKIT_LIVE_MAX_BUFFERS * 5];
+    for (u32 i = 0; i < st->n_buffers; i++) {
+        const struct rtkit_live_buffer *b = &st->buffers[i];
+        bool owned = b->flags & RTKIT_LIVE_BUFFER_OWNED;
+        if (!b->size || b->size > UINT32_MAX) {
+            printf("FDT: live RTKit: %s buffer ep %u size 0x%lx\n", alias, b->ep, b->size);
+            return -1;
+        }
+        if (owned && (b->phys < lo || b->size > hi - lo || b->phys - lo > hi - lo - b->size)) {
+            printf("FDT: live RTKit: %s buffer ep %u [0x%lx+0x%lx) outside [0x%lx, 0x%lx)\n", alias,
+                   b->ep, b->phys, b->size, lo, hi);
+            return -1;
+        }
+        /* Its region is no-map: whole pages only, or the kernel unmaps its neighbours too */
+        if (owned && ((b->phys | b->size) & (SZ_16K - 1))) {
+            printf("FDT: live RTKit: %s buffer ep %u [0x%lx+0x%lx) not 16K aligned\n", alias, b->ep,
+                   b->phys, b->size);
+            return -1;
+        }
+        fdt32_t *c = &bufs[i * 5];
+        c[0] = cpu_to_fdt32(b->ep);
+        c[1] = cpu_to_fdt32(b->iova >> 32);
+        c[2] = cpu_to_fdt32(b->iova);
+        c[3] = cpu_to_fdt32(b->size);
+        c[4] = cpu_to_fdt32(!owned);
+    }
+    /* The names below must not contain a path separator */
+    if (strchr(alias, '/'))
+        alias = "dcp";
+    for (u32 i = 0; i < st->n_buffers; i++)
+        if ((st->buffers[i].flags & RTKIT_LIVE_BUFFER_OWNED) &&
+            dt_reserve_live_rtkit_buffer(path, alias, &st->buffers[i]))
+            return -1;
+
+    fdt32_t epmap[8];
+    for (int i = 0; i < 8; i++)
+        epmap[i] = cpu_to_fdt32(st->epmap[i]);
+
+    /* The reservations above moved the tree: find the node again for every write */
+    if (fdt_setprop_u32(dt, fdt_path_offset(dt, path), "apple,rtkit-version", st->version) ||
+        fdt_setprop(dt, fdt_path_offset(dt, path), "apple,rtkit-epmap", epmap, sizeof(epmap)) ||
+        fdt_setprop(dt, fdt_path_offset(dt, path), "apple,rtkit-buffers", bufs,
+                    st->n_buffers * 5 * sizeof(fdt32_t)) ||
+        fdt_setprop_string(dt, fdt_path_offset(dt, path), "apple,rtkit-handoff", "dcp-live-v1"))
+        return -1;
+
+    printf("FDT: %s: live RTKit session v%u, %u system buffer(s), epmap %08x %08x\n", alias,
+           st->version, st->n_buffers, st->epmap[0], st->epmap[1]);
+    return 0;
+}
+
 /* Windows A to C. One inside the firmware RO range (T8140) is reserved with that range. */
 static int dt_reserve_ctxr_low_windows(void)
 {
@@ -4036,6 +4135,42 @@ static int dt_device_add_mem_region(const char *alias, uint32_t phandle, const c
         bail("FDT: failed to append to 'memory-region-names' property\n");
 
     return 0;
+}
+
+/*
+ * Keep a loader-owned live buffer mapped for the kernel: a reserved-memory region for its pages
+ * whose iommu-addresses give the IOVA the IOP uses, referenced from the DCP's memory-region. The
+ * kernel rebuilds a display DART's translations from these regions when it takes the stream over,
+ * so a buffer without one is no longer mapped once it does.
+ */
+static int dt_reserve_live_rtkit_buffer(const char *path, const char *alias,
+                                        const struct rtkit_live_buffer *b)
+{
+    char node_name[64], region_name[32];
+    int dev = fdt_path_offset(dt, path);
+    uint32_t dev_phandle = dev < 0 ? 0 : fdt_get_phandle(dt, dev);
+
+    /* iommu-addresses names the device by phandle; give it one if the DT did not */
+    if (dev >= 0 && !dev_phandle &&
+        (fdt_generate_phandle(dt, &dev_phandle) ||
+         fdt_setprop_u32(dt, dev, "phandle", dev_phandle)))
+        dev_phandle = 0;
+    if (!dev_phandle)
+        bail("FDT: live RTKit: no phandle for %s\n", path);
+    snprintf(node_name, sizeof(node_name), "%s-rtkit-ep%u@%lx", alias, b->ep, b->phys);
+    snprintf(region_name, sizeof(region_name), "rtkit-ep%u", b->ep);
+
+    /*
+     * no-map: the kernel maps these pages write-combined for the DCP, so they must not also sit
+     * in its cacheable linear map.
+     */
+    int mem = dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, b->phys, b->size);
+    if (mem < 0)
+        return mem;
+    uint32_t mem_phandle = fdt_get_phandle(dt, mem);
+    if (dt_device_set_reserved_mem(mem, node_name, dev_phandle, b->iova, b->size))
+        return -1;
+    return dt_device_add_mem_region(path, mem_phandle, region_name);
 }
 
 static int dt_set_dcp_firmware(const char *alias)
@@ -12552,6 +12687,8 @@ int kboot_prepare_dt(void *fdt)
 
     bool local_dcp = display_handed_on_live();
     u64 display_heap_end = heapblock_high_water();
+    /* The range kept for a live DCP's buffers, see dt_publish_live_rtkit() */
+    u64 live_rtkit_lo = 0, live_rtkit_hi = 0;
 
     /* Before the tree and anything kboot reserves are allocated */
     kboot_decide_hibernate_layout();
@@ -12646,9 +12783,13 @@ int kboot_prepare_dt(void *fdt)
             if (heap_end > ram_end || dt_reserve_retained_span(heap_start, heap_end))
                 bail("FDT: couldn't reserve retained heap\n");
             image_end = heap_start;
+            live_rtkit_hi = heap_end;
             printf("FDT: retained heap [0x%lx, 0x%lx)\n", heap_start, heap_end);
         }
     }
+    /* The loader-allocated buffers of a DCP handed on running must lie in what is kept. */
+    live_rtkit_lo = image_start;
+    live_rtkit_hi = max(live_rtkit_hi, image_end);
     if (dt_reserve_retained_span(image_start, image_end))
         bail("FDT: couldn't add reservation for aura and inherited high-water\n");
 
@@ -12801,6 +12942,9 @@ int kboot_prepare_dt(void *fdt)
                 return -1;
         }
     }
+    /* After dt_set_display(): see dt_publish_live_rtkit() */
+    if ((local_dcp || inherited_dcp) && dt_publish_live_rtkit(live_rtkit_lo, live_rtkit_hi))
+        bail("FDT: couldn't describe the live DCP RTKit session\n");
     /*
      * The first core of a cluster has a power-gate slot here, and iBoot leaves the boot core's
      * clear, so that core and its cluster never power off. macOS sets it at every boot. T6040

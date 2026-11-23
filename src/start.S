@@ -92,7 +92,7 @@ _start:
 .Lload_header:
     .ascii "AURALOAD"
     .long CHAINLOAD_HDR_VERSION
-    .long CHAINLOAD_HDR_F_RUN_BASE | CHAINLOAD_HDR_F_LIVE_DCP
+    .long CHAINLOAD_HDR_F_RUN_BASE | CHAINLOAD_HDR_F_LIVE_DCP | CHAINLOAD_HDR_F_LIVE_RTKIT
     .quad _image_footprint
 .Lrun_base:
     .quad 0
