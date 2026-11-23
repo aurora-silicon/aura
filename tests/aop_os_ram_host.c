@@ -143,7 +143,7 @@ static int build_tree(void *buf, size_t cap, const char *aop_status, bool pack_t
     assert(!fdt_begin_node(buf, "reserved-memory"));
     assert(!fdt_property_u32(buf, "#address-cells", 2));
     assert(!fdt_property_u32(buf, "#size-cells", 2));
-    assert(!fdt_property(buf, "ranges", NULL, 0));
+    assert(!fdt_property(buf, "ranges", "", 0));
     assert(!fdt_end_node(buf));
 
     assert(!fdt_begin_node(buf, "soc"));
