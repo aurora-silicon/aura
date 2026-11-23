@@ -52,6 +52,9 @@ static jmp_buf refused;
 static _Noreturn void panic(const char *format, ...) { longjmp(refused, 1); }
 /* The T8152 handoff has its own path and is not modelled here. */
 static int kboot_boot_t8152(void *kernel) { return -1; }
+static bool dt_retained_live_dcp;
+static int display_prepare_live_handoff(void) { return 0; }
+static bool display_needs_live_receiver(void) { return false; }
 static int mcc_enable_cache(void) { hardware_calls++; return 0; }
 static void tunables_apply_static(void) {}
 static void clk_init(void) { if (mode == 2) spin_table[1].target = 0x1234; }

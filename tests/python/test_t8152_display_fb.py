@@ -277,11 +277,14 @@ static int display_shutdown(dcp_shutdown_mode mode)
 }
 static int dcp_connect_dptx(dcp_dev_t *d) { (void)d; return 0; }
 static int dcp_dptx_hpd(void *ep, u32 port, bool hpd) { (void)ep; (void)port; assert(hpd); hpd_pokes++; return 0; }
+/* The J873g ADT gives dp2hdmi-gpio0 function-hdmi_hpd and its dptx-port speaks AFKv2. */
+static bool dcp_dptx_needs_ap_hpd(dcp_dev_t *d) { (void)d; return chip_id == T8152; }
 static int dcp_work(dcp_dev_t *d) { (void)d; return 0; }
 static void mdelay(unsigned ms) { (void)ms; }
 static u64 get_ticks(void) { return 0; }
 static u64 ticks_to_msecs(u64 t) { return t; }
 static void mmu_map_framebuffer(u64 a, u64 s) { (void)a; (void)s; }
+static bool display_inherited_live_heap(u64 *start) { (void)start; return false; }
 static int adt_path_offset(void *a, const char *p) { (void)a; (void)p; return -1; }
 static int adt_setprop(void *a, int n, const char *p, void *v, size_t s) { (void)a; (void)n; (void)p; (void)v; (void)s; assert(0); return -1; }
 static bool adt_is_compatible(void *a, int n, const char *c) { (void)a; assert(!n && !strcmp(c, "J873gAP")); return is_j873g; }

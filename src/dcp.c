@@ -99,6 +99,7 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         printf("dcp: failed to find dp2hdmi-gpio node '%s'\n", cfg->dp2hdmi_gpio);
         return -1;
     }
+    dcp->hpd_on_ap = adt_getprop(adt, node, "function-hdmi_hpd", NULL) != NULL;
     struct adt_function_smc_gpio dp2hdmi_pwr, hdmi_pwr;
     u32 pw8_size;
     const struct adt_function_smc_pw8 *pw8_dp2hdmi =
@@ -166,6 +167,18 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         return -1;
     }
 
+    /*
+     * The firmware announces which message format its dptx-port service speaks. The AFKv2
+     * format is the same on every firmware that has it. The older format's layouts were only
+     * checked against the 13.5 firmware, so other firmware with that format is not driven.
+     */
+    if (!dcp_dptx_is_afkv2(dcp->dptx_ep) && os_firmware.version != V13_5) {
+        printf("dcp: dptx-port uses the pre-AFKv2 format, checked on 13.5 firmware only\n");
+        dcp_dptx_shutdown(dcp->dptx_ep);
+        dcp_dpav_shutdown(dcp->dpav_ep);
+        return -1;
+    }
+
 #ifdef RTKIT_SYSLOG
     // start system endpoint when extended logging is requested
     dcp->system_ep = dcp_system_init(dcp);
@@ -180,6 +193,16 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
 #endif
 
     return 0;
+}
+
+/*
+ * Whether the firmware has to be told about HPD. When the converter's HPD reaches an AP gpio
+ * (function-hdmi_hpd on its dp2hdmi-gpio node) instead of the phy, a dptx-port service that speaks
+ * AFKv2 brings the port up only once the AP reports HPD. The older format never needed it.
+ */
+bool dcp_dptx_needs_ap_hpd(dcp_dev_t *dcp)
+{
+    return dcp->hpd_on_ap && dcp_dptx_is_afkv2(dcp->dptx_ep);
 }
 
 int dcp_connect_dptx(dcp_dev_t *dcp)
@@ -271,14 +294,6 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
     dcp_init_quiesced = false;
 
     if (cfg && cfg->dptx_phy[0]) {
-        /* J873g reports mBoot-20457.1.29, which is not in the OS firmware
-         * table, and the same dptx-port endpoint works on its USB-C route.
-         * Keep the V13_5 restriction for the machines it was written for. */
-        if (os_firmware.version != V13_5 && chip_id != T8152) {
-            printf("dcp: dtpx-port is only supported with V13_5 OS firmware.\n");
-            return NULL;
-        }
-
         strncpy(dcp_pmgr_dev, cfg->pmgr_dev, sizeof(dcp_pmgr_dev));
         dcp_die = cfg->die;
         pmgr_adt_power_enable(cfg->dcp);
@@ -433,6 +448,26 @@ int dcp_handoff(dcp_dev_t *dcp)
     else
         dcp->afk = NULL;
     return ret;
+}
+
+static bool dcp_handed_on;
+
+/*
+ * Hand a running DCP on to the next stage: its endpoints stopped (dcp_handoff()), RTKit, its
+ * buffers and DART mappings and the scanout left running. It counts as running from here on, so
+ * it is not started again and the next stage keeps its memory (kboot reserves the heap).
+ */
+int dcp_hand_on(dcp_dev_t *dcp)
+{
+    int ret = dcp_handoff(dcp);
+    dcp_running = true;
+    dcp_handed_on = !ret;
+    return ret;
+}
+
+bool dcp_handed_on_live(void)
+{
+    return dcp_handed_on;
 }
 
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep)

@@ -683,8 +683,11 @@ dart_dev_t *dart_init_adt_display(const char *path, int instance, int device)
     u32 tcr = read32(DART_TCR(dart));
     bool enabled, translating;
     if (dart->type == DART_T8110) {
-        u32 mode = DART_T8110_TCR_TRANSLATE_ENABLE | DART_T8110_TCR_BYPASS_DART |
-                   DART_T8110_TCR_BYPASS_DAPF | DART_T8110_TCR_REMAP_EN;
+        /* Bypassing only the DAPF filter stage leaves translation through the tables on, as the
+         * rest of this file reads TCR: iBoot locks dart-dispext0 that way (TCR 0x5) on firmware 27.
+         */
+        u32 mode =
+            DART_T8110_TCR_TRANSLATE_ENABLE | DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_REMAP_EN;
         enabled = read32(dart->regs + DART_T8110_ENABLE_STREAMS + 4 * (dart->device >> 5)) &
                   BIT(dart->device & 31);
         translating = (tcr & mode) == DART_T8110_TCR_TRANSLATE_ENABLE;

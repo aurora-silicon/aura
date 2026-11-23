@@ -39,15 +39,19 @@ typedef struct dcp_dev {
     u32 die;
     u32 dp2hdmi_pwr_gpio;
     u32 hdmi_pwr_gpio;
+    bool hpd_on_ap; /* the converter's HPD reaches an AP gpio (ADT function-hdmi_hpd) */
 } dcp_dev_t;
 
 int dcp_connect_dptx(dcp_dev_t *dcp);
+bool dcp_dptx_needs_ap_hpd(dcp_dev_t *dcp);
 int dcp_work(dcp_dev_t *dcp);
 
 dcp_dev_t *dcp_init(const display_config_t *config);
 
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep);
 int dcp_handoff(dcp_dev_t *dcp);
+int dcp_hand_on(dcp_dev_t *dcp);
+bool dcp_handed_on_live(void);
 bool dcp_left_running(void);
 u32 t8152_psd_state(u32 service);
 bool dcp_init_left_quiesced(void);

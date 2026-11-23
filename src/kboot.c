@@ -68,6 +68,7 @@
 static void *dt = NULL;
 static int dt_bufsize = 0;
 static bool dt_ready;
+static bool dt_retained_live_dcp;
 static void *initrd_start = NULL;
 static size_t initrd_size = 0;
 static char *chosen_params[MAX_CHOSEN_PARAMS][2];
@@ -757,6 +758,41 @@ static int dt_reserve_outside_exec_window(u64 start, u64 size)
         u64 above = max(start, window_end);
         if (fdt_add_mem_rsv(dt, above, end - above))
             return -1;
+    }
+    return 0;
+}
+
+/*
+ * U-Boot may discard an entire memreserve entry that partially overlaps an earlier one.
+ * Add only uncovered intervals, including when the DT buffer or an individual DART table
+ * occupies part of the retained heap.
+ */
+static int dt_reserve_retained_span(u64 start, u64 end)
+{
+    int count = fdt_num_mem_rsv(dt);
+    if (count < 0)
+        return -1;
+
+    while (start < end) {
+        u64 covered_end = start, gap_end = end;
+        for (int i = 0; i < count; i++) {
+            u64 base, size;
+            if (fdt_get_mem_rsv(dt, i, &base, &size) || size > UINT64_MAX - base)
+                return -1;
+            if (!size)
+                continue;
+            if (base <= start)
+                covered_end = max(covered_end, base + size);
+            else
+                gap_end = min(gap_end, base);
+        }
+        if (covered_end > start) {
+            start = covered_end;
+            continue;
+        }
+        if (dt_reserve_outside_exec_window(start, gap_end - start))
+            return -1;
+        start = gap_end;
     }
     return 0;
 }
@@ -12505,9 +12541,17 @@ int kboot_prepare_dt(void *fdt)
     }
 
     dt_ready = false;
+    dt_retained_live_dcp = false;
 
     if (!ctxr_exec_os_may_start())
         return -1;
+
+    /* Finalize display ownership before measuring the heap that the DCP can still use. */
+    if (display_prepare_live_handoff() < 0)
+        bail("FDT: display handoff failed\n");
+
+    bool local_dcp = display_handed_on_live();
+    u64 display_heap_end = heapblock_high_water();
 
     /* Before the tree and anything kboot reserves are allocated */
     kboot_decide_hibernate_layout();
@@ -12547,8 +12591,18 @@ int kboot_prepare_dt(void *fdt)
     if (dart_reserve_legacy_tables(dt, cur_boot_args.phys_base, cur_boot_args.mem_size))
         bail("FDT: couldn't reserve inherited display translation tables\n");
 
-    u64 image_end = (u64)_end;
-    if (display_dart_tables_inherited()) {
+    u64 image_start = (u64)_base, image_end = (u64)_end;
+    u64 inherited_dcp_heap;
+    bool inherited_dcp = display_inherited_live_heap(&inherited_dcp_heap);
+    if (inherited_dcp) {
+        u64 top = cur_boot_args.top_of_kernel_data;
+        if (inherited_dcp_heap < cur_boot_args.phys_base || inherited_dcp_heap >= top)
+            bail("FDT: invalid inherited display heap\n");
+        image_start = min(image_start, ALIGN_DOWN(inherited_dcp_heap, SZ_16K));
+        if (image_start < cur_boot_args.phys_base)
+            bail("FDT: inherited display heap overlaps the start of RAM\n");
+    }
+    if (inherited_dcp || display_dart_tables_inherited()) {
         /* chainload_image carries the previous stage's live heap in this
          * high-water mark. Tables that stage published into a locked display
          * DART's inherited roots have no local record here, so keep the
@@ -12570,32 +12624,32 @@ int kboot_prepare_dt(void *fdt)
      * or powered off: they must stay out of Linux's allocator (J616C: ANS syslog lines in
      * page-cache pages at the SART-allowed heap addresses).
      */
-    if (nvme_post_m4()) {
+    /* A DCP handed on running keeps its RTKit buffers in this stage's heap too. */
+    if (nvme_post_m4() || local_dcp) {
         u64 ram_end, inherited = cur_boot_args.top_of_kernel_data;
-        u64 high_water = heapblock_high_water();
+        u64 high_water = nvme_post_m4() ? heapblock_high_water() : display_heap_end;
 
         if (!cur_boot_args.mem_size ||
             cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size)
             bail("FDT: invalid inherited RAM extent\n");
         ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;
-        image_end = max(image_end, inherited);
         if ((u64)_base < cur_boot_args.phys_base || image_end < (u64)_base || image_end > ram_end ||
-            high_water > ram_end)
+            inherited > ram_end || high_water > ram_end)
             bail("FDT: invalid retained memory extent\n");
 
         u64 heap_top = max(inherited, high_water);
         if (heap_top > (u64)_end) {
             if (heap_top > UINT64_MAX - (SZ_16K - 1))
                 bail("FDT: retained heap extent overflows\n");
-            u64 heap_start = ALIGN_DOWN((u64)_end, SZ_16K);
+            u64 heap_start = ALIGN_DOWN(image_end, SZ_16K);
             u64 heap_end = ALIGN_UP(heap_top, SZ_16K);
-            if (heap_end > ram_end ||
-                dt_reserve_outside_exec_window(heap_start, heap_end - heap_start))
+            if (heap_end > ram_end || dt_reserve_retained_span(heap_start, heap_end))
                 bail("FDT: couldn't reserve retained heap\n");
+            image_end = heap_start;
             printf("FDT: retained heap [0x%lx, 0x%lx)\n", heap_start, heap_end);
         }
     }
-    if (dt_reserve_outside_exec_window((u64)_base, image_end - (u64)_base))
+    if (dt_reserve_retained_span(image_start, image_end))
         bail("FDT: couldn't add reservation for aura and inherited high-water\n");
 
     /*
@@ -12878,6 +12932,7 @@ int kboot_prepare_dt(void *fdt)
         kboot_withdraw_hibernate_layout("the heap came within 8 MiB of the fixed end"))
         return -1;
 
+    dt_retained_live_dcp = local_dcp || inherited_dcp;
     printf("FDT prepared at %p\n", dt);
 
     return 0;
@@ -13007,6 +13062,13 @@ int kboot_boot(void *kernel)
         next_stage.entry = NULL;
         bail("kboot: refusing handoff while secondary callbacks are pending\n");
     }
+    /* The proxy can configure a display between preparing and booting the tree. */
+    if (display_prepare_live_handoff() < 0 ||
+        (display_needs_live_receiver() && !dt_retained_live_dcp)) {
+        next_stage.entry = NULL;
+        bail("kboot: display handoff changed; prepare the device tree again\n");
+    }
+
     int ret = mcc_enable_cache();
     if (ret && chip_id == T8140) {
         printf("kboot: refusing T8140 handoff after MCC cache failure\n");

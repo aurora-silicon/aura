@@ -793,6 +793,42 @@ static void t6000_locked_dcp(void)
     dart_shutdown(dart);
     assert(!live_objects && !heap_frees && legacy_l2_count == 1);
 }
+/* ---- T8110-format display DART: locked by firmware with only the DAPF stage bypassed ---- */
+static void t8110_view(u32 tcr)
+{
+    /* As dart-dispext0 on an M2 desktop with the 27.2 firmware: PROTECT set, TCR 0x5. */
+    reset(false, 0, 0, false);
+    chip_id = T8112;
+    nodes[DART_NODE].compat = "dart,t8110";
+    *reg(REGS + DART_T8110_PROTECT) = DART_T8110_PROTECT_TTBR_TCR;
+    *reg(REGS + DART_T8110_ENABLE_STREAMS) = BIT(SID);
+    *reg(REGS + DART_T8110_TCR_OFF + 4 * SID) = tcr;
+    *reg(REGS + DART_T8110_TTBR_OFF + 4 * SID) =
+        DART_T8110_TTBR_VALID | FIELD_PREP(DART_T8110_TTBR_ADDR, PAGE(ROOT) >> DART_T8110_TTBR_SHIFT);
+}
+static void t8110_dapf_bypass_translates(void)
+{
+    t8110_view(DART_T8110_TCR_TRANSLATE_ENABLE | DART_T8110_TCR_BYPASS_DAPF);
+    dart_dev_t *dart = dart_init_adt_display(DCP_PATH, 0, SID);
+    assert(dart && dart->type == DART_T8110 && dart->locked && dart->l1[0] == at(ROOT));
+    assert(!protected_writes() && !heap_used);
+    dart_shutdown(dart);
+    assert(!live_objects);
+}
+static void t8110_untranslated_refused(void)
+{
+    static const u32 tcrs[] = {
+        0,
+        DART_T8110_TCR_TRANSLATE_ENABLE | DART_T8110_TCR_BYPASS_DART,
+        DART_T8110_TCR_TRANSLATE_ENABLE | DART_T8110_TCR_REMAP_EN,
+        DART_T8110_TCR_TRANSLATE_ENABLE | DART_T8110_TCR_BYPASS_DAPF | DART_T8110_TCR_BYPASS_DART,
+    };
+    for (unsigned int i = 0; i < ARRAY_SIZE(tcrs); i++) {
+        t8110_view(tcrs[i]);
+        assert(!dart_init_adt_display(DCP_PATH, 0, SID));
+        assert(!heap_used && !live_objects);
+    }
+}
 static void t6000_device_range(void)
 {
     /* A T6000-format DART has 32 streams: an out-of-range stream gets no handle,
@@ -875,6 +911,8 @@ static const struct { const char *name; void (*run)(void); } cases[] = {
     {"t6000-locked-dcp", t6000_locked_dcp},
     {"t6000-locked-refusals", t6000_locked_refusals},
     {"t6000-device-range", t6000_device_range},
+    {"t8110-dapf-bypass-translates", t8110_dapf_bypass_translates},
+    {"t8110-untranslated-refused", t8110_untranslated_refused},
     {"generic-locked-immutable", generic_locked_immutable},
     {"fdt-locked-immutable", fdt_locked_immutable},
     {"map-selected-root", map_selected_root},
@@ -935,7 +973,7 @@ CASES = (
     "admit-locked-translating", "refuse-device-range", "refuse-disabled-stream",
     "refuse-untranslated-stream", "stock-unlocked-view", "other-chip-same-rule",
     "gen3-unchanged", "disp-path-same-rule", "t6000-locked-dcp", "t6000-locked-refusals",
-    "t6000-device-range",
+    "t6000-device-range", "t8110-dapf-bypass-translates", "t8110-untranslated-refused",
     "generic-locked-immutable", "fdt-locked-immutable",
     "map-selected-root", "unmap-selected-root", "unmap-absent-allocates-nothing",
     "map-absent-root-refused", "map-new-l2-in-present-root", "map-conflict-rolls-back",
