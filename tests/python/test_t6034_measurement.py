@@ -120,7 +120,9 @@ int main(void)
     code = fixture + 'int main(void)' + main.replace('apple,j514m', board)
     run_c(tmp_path, 't6034-measurement', code)
     boot = (ROOT / 'src/kboot.c').read_text()
-    assert 'if (!(chip_id == T6034 && chosen_lost) && dt_set_gpu(dt))' in boot
+    # A lost line reaches dt_set_gpu_t6034() too, which disables the GPU without the opt-in.
+    assert '    if (dt_set_gpu(dt))\n        return -1;' in boot
+    assert 'chosen_lost) && dt_set_gpu' not in boot
 
 @pytest.mark.parametrize("board", ["apple,j514m", "apple,j516m"])
 def test_normal_t6034_selector_keeps_owner_optouts_before_any_probe(tmp_path, board):

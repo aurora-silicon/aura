@@ -12981,8 +12981,12 @@ int kboot_prepare_dt(void *fdt)
     if (chip_id == T6040 || chip_id == T6041)
         set32(0x50282c040, BIT(31));
 
-    /* A lost owner opt-out must also suppress the T6034 measurement. */
-    if (!(chip_id == T6034 && chosen_lost) && dt_set_gpu(dt))
+    /*
+     * A config line lost before the defaults run also covers the T6034: dt_set_m3_defaults()
+     * dropped its graphics lines, so dt_set_gpu_t6034() finds no opt-in and disables the GPU
+     * node before any measurement.
+     */
+    if (dt_set_gpu(dt))
         return -1;
     if (dt_set_multitouch())
         return -1;

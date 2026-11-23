@@ -47,7 +47,9 @@ FAMILY = {"j613": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
           "j504": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
           "j514s": ("asahi,t6030-",),
           "j516s": ("asahi,t6030-",),
-          "j516c": ("asahi,t6031-",)}
+          "j516c": ("asahi,t6031-",),
+          "j514m": ("asahi,t6034-",),
+          "j516m": ("asahi,t6034-",)}
 M3_LINES = ("asahi,t8122-", "asahi,t6030-", "asahi,t6031-", "asahi,t6034-")
 MAX_GPU = "asahi,t6031-gpu"
 MAX_DCP = "asahi,t6031-dcp"
@@ -219,7 +221,7 @@ static int kboot_prepare_dt(void *fdt)
         assert(!dt_set_gpu_t8122_select(dt));
     if (chip_id == T6031)                     /* dt_set_gpu()'s switch on the chip */
         assert(!dt_set_gpu_t6031(dt));
-    if (chip_id == T6034 && !chosen_lost)
+    if (chip_id == T6034)                     /* also after a lost line, as dt_set_gpu() runs */
         assert(!dt_set_gpu_t6034(dt));
     int prop;
     fdt_for_each_property_offset(prop, dt, node) {
@@ -480,6 +482,8 @@ def graphics_off(r, board="j613"):
         assert r.select == "reservation-only", r.stdout
     if board == "j516c":                      # no image read, no identity probe, GPU node disabled
         assert r.select == "t6031-disabled" and not r.probes, r.stdout
+    if board in ("j514m", "j516m"):           # no measurement, GPU node disabled
+        assert r.select == "t6034-disabled" and not r.probes, r.stdout
 
 
 def booted(r):
@@ -671,6 +675,16 @@ def test_a_lost_line_drops_the_owners_max_lines_and_keeps_the_rest(tools, build)
     b = boot(tools, build, config, board="j516c")
     graphics_off(b, board="j516c")
     assert b.chosen["asahi,m3-defaults"] == "0" and b.chosen["test,filler"] == "1"
+
+
+@pytest.mark.parametrize("board", ["j514m", "j516m"])
+@pytest.mark.parametrize("build", STAGE2)
+def test_a_lost_line_disables_the_t6034_gpu_and_boots(tools, build, board):
+    """The owner's own GPU line is dropped too, and the GPU node is disabled before any measurement"""
+    config = (b"chosen.asahi,t6034-gpu=1\nchosen.asahi,t6034-dcp=1\n" +
+              fill(build, keep=2) + b"chosen.asahi,t6034-gpu=0\n")
+    graphics_off(boot(tools, build, config, board=board), board=board)
+    graphics_off(boot(tools, build, b"chosen.asahi,t6034-gpu=1\n" + LOST, board=board), board=board)
 
 
 @pytest.mark.parametrize("build", STAGE2)
