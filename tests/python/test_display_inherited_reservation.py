@@ -20,15 +20,18 @@ SOURCE = Path(os.environ.get("DART_DISPLAY_SOURCE", Path(__file__).resolve().par
 
 def test_inherited_reservation(tmp_path):
     text = (SOURCE / "src/kboot.c").read_text()
-    start = text.index("    u64 image_end = (u64)_end;", text.index("int kboot_prepare_dt("))
+    start = text.index("    u64 image_start = (u64)_base, image_end = (u64)_end;", text.index("int kboot_prepare_dt("))
     # Followed by the post-M4 retained-heap block.
-    end = text.index("    if (nvme_post_m4())", start)
+    end = text.index("    if (nvme_post_m4()", start)
     block = text[start:end]
     call = re.search(
-        r"    if \(dt_reserve_outside_exec_window\(\(u64\)_base, image_end - \(u64\)_base\)\)\n"
+        r"    if \(dt_reserve_retained_span\(image_start, image_end\)\)\n"
         r"        bail\([^\n]+\);", text[end:]
     )
     assert call, "missing real aura image reservation"
+    reserve_start = text.index("static int dt_reserve_retained_span(")
+    reserve_end = text.index("\n}", reserve_start) + 2
+    reserve = text[reserve_start:reserve_end]
     code = tmp_path / "inherited.c"
     code.write_text(r'''
 #include <assert.h>
@@ -40,11 +43,20 @@ def test_inherited_reservation(tmp_path):
 typedef uint64_t u64;
 #define T8103 0x8103
 #define T8112 0x8112
+#define SZ_16K 0x4000UL
+#define ALIGN_DOWN(n, a) ((n) & ~((a) - 1))
+#define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 static struct { u64 phys_base, mem_size, top_of_kernel_data; } cur_boot_args;
 static unsigned chip_id;
 static bool tables_inherited;
+static u64 dcp_heap_base;
+static bool display_inherited_live_heap(u64 *start)
+{
+    *start = dcp_heap_base;
+    return dcp_heap_base != 0;
+}
 static bool display_dart_tables_inherited(void) { (void)chip_id; return tables_inherited; }
 static u64 image_base, image_end_address;
 #define _base ((void *)(uintptr_t)image_base)
@@ -53,6 +65,7 @@ static unsigned char tree[4096], before[4096];
 static void *dt = tree;
 /* Without a window this is the plain call (test_ctxr_exec_window.py). */
 #define dt_reserve_outside_exec_window(start, size) fdt_add_mem_rsv(dt, start, size)
+''' + reserve + r'''
 static int reserve(void)
 {
 ''' + block + call.group(0) + r'''
@@ -65,6 +78,7 @@ static void reset(void)
     memcpy(before, tree, sizeof(tree));
     chip_id = T8103;
     tables_inherited = true;
+    dcp_heap_base = 0;
     cur_boot_args.phys_base = 0x800000000UL;
     cur_boot_args.mem_size = 0x20000000;
     image_base = cur_boot_args.phys_base + 0x100000;
@@ -126,7 +140,30 @@ int main(void)
     range(image_end_address);
     reset(); tables_inherited = false; cur_boot_args.mem_size = 0;
     range(image_end_address);
-    puts("PASS inherited reservation 14 cases");
+    /* A moved stage still reserves the earlier live heap, even without a locked DART. */
+    reset();
+    tables_inherited = false;
+    dcp_heap_base = image_base - SZ_16K;
+    assert(!reserve() && fdt_num_mem_rsv(tree) == 1);
+    assert(!fdt_get_mem_rsv(tree, 0, &address, &size));
+    assert(address == dcp_heap_base && address + size == cur_boot_args.top_of_kernel_data);
+    reset();
+    dcp_heap_base = cur_boot_args.top_of_kernel_data;
+    refused();
+    /* Earlier reservations such as the FDT buffer and a locked-DART L2 must not
+     * cause U-Boot to discard the rest of the live display heap. */
+    reset();
+    u64 split = image_base + 2 * SZ_16K;
+    assert(!fdt_add_mem_rsv(tree, split, SZ_16K));
+    assert(!fdt_add_mem_rsv(tree, split + 3 * SZ_16K, SZ_16K));
+    assert(!reserve() && fdt_num_mem_rsv(tree) == 5);
+    assert(!fdt_get_mem_rsv(tree, 2, &address, &size));
+    assert(address == image_base && size == 2 * SZ_16K);
+    assert(!fdt_get_mem_rsv(tree, 3, &address, &size));
+    assert(address == split + SZ_16K && size == 2 * SZ_16K);
+    assert(!fdt_get_mem_rsv(tree, 4, &address, &size));
+    assert(address == split + 4 * SZ_16K && address + size == cur_boot_args.top_of_kernel_data);
+    puts("PASS inherited reservation 17 cases");
     return 0;
 }
 ''')
@@ -144,4 +181,4 @@ int main(void)
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS inherited reservation 14 cases" in result.stdout
+    assert "PASS inherited reservation 17 cases" in result.stdout

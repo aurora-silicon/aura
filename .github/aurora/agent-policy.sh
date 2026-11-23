@@ -16,6 +16,14 @@
 # This script works only with paths, modes and object ids. It never reads
 # the contents of an assistant instruction file and never checks one out.
 #
+# Only policy branches are ever committed to. On any other branch (feature
+# and pull request branches, mirrors) push mode reports what it finds and
+# changes nothing: a commit there would move a pull request head under its
+# author and reviewers, and it would carry no human sign-off. The pull
+# request check below gates what such a branch may merge, and the merge
+# result takes the copies from the default branch unless the branch itself
+# changed them. sweep visits the policy branches only.
+#
 # In pr mode the check runs on the merge result when GitHub has one
 # (refs/pull/N/merge), else on the head. There the policy file must exist
 # and every copy must exist and equal the policy file on the default
@@ -156,6 +164,10 @@ heal() {
 	fi
 	for line in "${viol[@]+"${viol[@]}"}"; do log "$b: violation ${line}"; done
 	for p in "${missing[@]+"${missing[@]}"}"; do log "$b: restore copy $p"; done
+	if [ "$policy" = 0 ]; then
+		log "$b: not a policy branch, report only (the pull request check gates the merge)"
+		return 0
+	fi
 	[ "$DRY_RUN" = 1 ] && { log "$b: dry run, no commit"; return 0; }
 
 	idx=$(mktemp)
@@ -225,15 +237,19 @@ push)
 	heal "$ARG" || rc=1
 	;;
 sweep)
+	# Policy branches only; every other branch is left to its owner and
+	# to the pull request check.
+	branches=$(list_branches)
 	if [ "$LOCAL" != 1 ]; then
-		git fetch -q --no-tags --prune --depth=1 --filter=blob:none "$REMOTE" \
-			"+refs/heads/*:$NS/*"
+		for b in $POLICY_BRANCHES; do
+			printf '%s\n' "$branches" | grep -qxF -- "$b" && fetch_heads "$b"
+		done
 	fi
 	load_canonical
-	while IFS= read -r b; do
-		[ -z "$b" ] && continue
+	for b in $POLICY_BRANCHES; do
+		printf '%s\n' "$branches" | grep -qxF -- "$b" || { log "$b: no such branch"; continue; }
 		heal "$b" || rc=1
-	done < <(list_branches)
+	done
 	;;
 pr)
 	[ -n "$ARG" ] || { log "pr needs a ref"; exit 2; }

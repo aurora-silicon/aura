@@ -28,6 +28,7 @@
 
 #include "kboot_audio.h"
 #include "adt.h"
+#include "adt_gpio.h"
 #include "string.h"
 #include "types.h"
 #include "utils.h"
@@ -284,55 +285,6 @@ int kboot_audio_amp_config(void *dt, const void *adt)
 #define SPEAKER_ID_STRAPS  2
 #define SPEAKER_ID_INVALID 0xffff
 #define MAX_VALID_SPEAKERS 32
-#define GPIO_FOURCC        0x4750494f /* 'GPIO' */
-#define GPIO_CTRL_POLARITY GENMASK(15, 8)
-
-/* Apple GPIO pin register (one u32 per pin) */
-#define GPIO_PIN_DATA     BIT(0)
-#define GPIO_PIN_MODE     GENMASK(3, 1)
-#define GPIO_PIN_MODE_IN  7 /* input, interrupt off */
-#define GPIO_PIN_PERIPH   GENMASK(6, 5)
-#define GPIO_PIN_INPUT_EN BIT(9)
-
-struct adt_function_gpio {
-    u32 phandle;
-    u32 fourcc;
-    u32 pin;
-    u32 control;
-} PACKED;
-
-/* The base of the /arm-io GPIO controller whose AAPL,phandle is @phandle, and its pin count */
-static int adt_gpio_by_phandle(const void *adt, u32 phandle, u64 *base, u32 *npins)
-{
-    int arm_io = adt_path_offset(adt, "/arm-io");
-    int node = arm_io;
-
-    if (arm_io < 0)
-        return -1;
-
-    ADT_FOREACH_CHILD(adt, node)
-    {
-        u32 ph;
-        u32 len;
-        const char *compat;
-        char path[64];
-        int trace[8];
-
-        if (ADT_GETPROP(adt, node, "AAPL,phandle", &ph) != sizeof(ph) || ph != phandle)
-            continue;
-        compat = adt_getprop(adt, node, "compatible", &len);
-        if (!compat || len < 5 || memcmp(compat, "gpio,", 5))
-            return -1;
-        if (ADT_GETPROP(adt, node, "#gpio-pins", npins) != sizeof(*npins))
-            return -1;
-        snprintf(path, sizeof(path), "/arm-io/%s", adt_get_name(adt, node));
-        if (adt_path_offset_trace(adt, path, trace) < 0 ||
-            adt_get_reg(adt, trace, "reg", 0, base, NULL))
-            return -1;
-        return 0;
-    }
-    return -1;
-}
 
 /* Sample strap @idx of @node into *@level. Returns -1 when the strap does not resolve. */
 static int read_speaker_id_strap(const void *adt, int node, int idx, u32 *level)
@@ -344,7 +296,7 @@ static int read_speaker_id_strap(const void *adt, int node, int idx, u32 *level)
     u32 npins, cfg, in, val;
 
     snprintf(prop, sizeof(prop), "function-speaker-id%d", idx);
-    if (ADT_GETPROP(adt, node, prop, &fn) != sizeof(fn) || fn.fourcc != GPIO_FOURCC) {
+    if (ADT_GETPROP(adt, node, prop, &fn) != sizeof(fn) || fn.fourcc != ADT_GPIO_FOURCC) {
         printf("kboot: audio: %s: no GPIO %s\n", name, prop);
         return -1;
     }
@@ -357,13 +309,13 @@ static int read_speaker_id_strap(const void *adt, int node, int idx, u32 *level)
     /* A plain GPIO input with its pull as it is, sampled once */
     reg = base + 4 * fn.pin;
     cfg = read32(reg);
-    in = (cfg & ~(GPIO_PIN_MODE | GPIO_PIN_PERIPH)) | FIELD_PREP(GPIO_PIN_MODE, GPIO_PIN_MODE_IN) |
-         GPIO_PIN_INPUT_EN;
+    in = (cfg & ~(ADT_GPIO_PIN_MODE | ADT_GPIO_PIN_PERIPH)) |
+         FIELD_PREP(ADT_GPIO_PIN_MODE, ADT_GPIO_PIN_MODE_IN) | ADT_GPIO_PIN_INPUT_EN;
     if (in != cfg)
         write32(reg, in);
     val = read32(reg);
 
-    *level = !!(val & GPIO_PIN_DATA) ^ !FIELD_GET(GPIO_CTRL_POLARITY, fn.control);
+    *level = !!(val & ADT_GPIO_PIN_DATA) ^ !FIELD_GET(ADT_GPIO_CTRL_POLARITY, fn.control);
     printf("kboot: audio: %s: %s = %u (pin %u: 0x%08x -> 0x%08x)\n", name, prop, *level, fn.pin,
            cfg, val);
     return 0;

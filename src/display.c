@@ -418,13 +418,24 @@ static void display_stop_failed_dcp(void)
         display_dcp_state = !stopped;
 }
 
+bool display_inherited_live_heap(u64 *start)
+{
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 base;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, DISPLAY_LIVE_ADT_PROP, &base) != sizeof(base))
+        return false;
+    if (start)
+        *start = base;
+    return true;
+}
+
 int display_start_dcp(void)
 {
     if (iboot)
         return 0;
 
-    if (dcp_left_running()) {
-        printf("display: a DCP did not stop; not starting it again\n");
+    if (dcp_left_running() || display_inherited_live_heap(NULL)) {
+        printf("display: a DCP is still running; not starting it again\n");
         return -1;
     }
 
@@ -595,11 +606,20 @@ int display_configure(const char *config)
         ret = dcp_connect_dptx(dcp);
         if (ret < 0)
             return ret;
-        /* The T8152 DCP only brings the port up once HPD is asserted. On the
-         * J873g HDMI path the sink's HPD reaches the AP gpio, so tell the
-         * firmware. */
-        if (chip_id == T8152)
-            dcp_dptx_hpd(dcp->dptx_ep, 0, true);
+        if (dcp_dptx_needs_ap_hpd(dcp)) {
+            /* The sink drives HPD. When the pin says nothing is attached (it reads low although
+             * the connector's 5 V was on before this stage), the firmware will not find a
+             * display however long it is asked, so tell it the truth and skip the status wait.
+             * A pin that cannot tell yet keeps the old report (HPD asserted) and the wait. */
+            int level = dcp_hdmi_hpd_level(dcp);
+
+            if (dcp_dptx_hpd(dcp->dptx_ep, 0, level != 0))
+                printf("display: telling the dptx-port about HPD failed\n");
+            if (level == 0) {
+                printf("display: HPD not asserted, no display attached\n");
+                return 0;
+            }
+        }
     }
 
     if (!display_is_external) {
@@ -1126,6 +1146,12 @@ int display_init(void)
     else
         printf("display: Display is internal\n");
 
+    if (display_inherited_live_heap(NULL)) {
+        printf("display: preserving live display from the previous stage (%ldx%ld)\n",
+               cur_boot_args.video.width, cur_boot_args.video.height);
+        return 0;
+    }
+
     if (chip_id == T8140 || chip_id == T8132 ||
         (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP")) ||
         /* J575c: iBoot leaves the internal DCP running with no panel and a dummy framebuffer;
@@ -1208,6 +1234,39 @@ static int display_handoff_t8152(void)
     return ret;
 }
 
+/*
+ * Once a dptx-port that speaks AFKv2 has been connected, its DCP acknowledges no power request:
+ * on the M2 Mac mini with the 27.2 firmware neither AP QUIESCED or IDLE nor IOP SLEEP is answered,
+ * even after the display is released and powered off. It cannot be slept or quiesced, so it is
+ * handed on running, as the T8152 and T8132 displays are, with the display left lit: the next
+ * stage keeps showing the framebuffer.
+ */
+static bool display_dptx_hands_on(void)
+{
+    return display_is_dptx && dcp && dcp_dptx_is_afkv2(dcp->dptx_ep);
+}
+
+bool display_needs_live_receiver(void)
+{
+    return dcp_handed_on_live() || display_inherited_live_heap(NULL) ||
+           (iboot && display_dptx_hands_on() && !display_hands_on_live());
+}
+
+/* Stop the endpoints before callers lay out the next image or measure its reservations. */
+int display_prepare_live_handoff(void)
+{
+    if (!iboot || !display_dptx_hands_on())
+        return 0;
+
+    return display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+}
+
+/* Whether a DCP was handed on running; its buffers stay in this stage's heap. */
+bool display_handed_on_live(void)
+{
+    return dcp_handed_on_live();
+}
+
 int display_shutdown(dcp_shutdown_mode mode)
 {
     if (chip_id == T8152 && mode == DCP_HANDOFF)
@@ -1226,6 +1285,11 @@ int display_shutdown(dcp_shutdown_mode mode)
         /* An endpoint that does not stop stays registered, so dcp_shutdown()
          * retries it with the rest and reports the DCP as still running. */
         dcp_ib_shutdown(iboot);
+        if (display_dptx_hands_on()) {
+            printf("display: handing the DCP on running (its dptx-port speaks AFKv2)\n");
+            iboot = NULL;
+            return dcp_hand_on(dcp) < 0 ? -1 : 0;
+        }
         switch (mode) {
             case DCP_QUIESCED:
                 printf("display: Quiescing DCP (unconditional)\n");
@@ -1246,6 +1310,7 @@ int display_shutdown(dcp_shutdown_mode mode)
         iboot = NULL;
     }
 
-    /* A DCP that did not stop at any point may still use its buffers. */
-    return dcp_left_running() ? -1 : 0;
+    /* A DCP that did not stop at any point may still use its buffers; one handed on running
+     * keeps them on purpose. */
+    return dcp_left_running() && !dcp_handed_on_live() ? -1 : 0;
 }

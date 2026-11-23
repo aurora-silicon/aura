@@ -12,15 +12,20 @@
  *
  * Then runs kboot_audio_speaker_id() and prints "speaker-id <value>" (/chosen/asahi,speaker-id,
  * "-" when absent) and, for every modelled GPIO pin, "gpio <address> <register>" with the
- * register as the code left it. The pins come from KBOOT_AUDIO_GPIO, a comma-separated list of
- * <address>:<register>:<pad level>. A pin's data bit reads as its pad level only while the pin
- * is an input with its input stage on; any other address is a test failure.
+ * register as the code left it.
+ *
+ * When the ADT has /arm-io/dp2hdmi-gpio0, its function-hdmi_hpd is resolved and sampled the way
+ * the display code reads it (src/adt_gpio.c) and "hpd <level>" is printed before the pins: 1, 0,
+ * -1 (not a readable input), "absent" or "unresolved". The pins come from KBOOT_AUDIO_GPIO, a
+ * comma-separated list of <address>:<register>:<pad level>. A pin's data bit reads as its pad level
+ * only while the pin is an input with its input stage on; any other address is a test failure.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "adt.h"
+#include "adt_gpio.h"
 #include "kboot_audio.h"
 #include "types.h"
 
@@ -191,6 +196,19 @@ int main(int argc, char **argv)
         printf("speaker-id bad-length-%d\n", len);
     else
         printf("speaker-id %u\n", fdt32_to_cpu(*id));
+    int hdmi = adt_path_offset(adt, "/arm-io/dp2hdmi-gpio0");
+    if (hdmi >= 0) {
+        struct adt_gpio_pin hpd;
+        u32 cfg;
+        int r = adt_gpio_function_pin(adt, hdmi, "function-hdmi_hpd", &hpd);
+
+        if (r > 0)
+            printf("hpd absent\n");
+        else if (r < 0)
+            printf("hpd unresolved\n");
+        else
+            printf("hpd %d\n", adt_gpio_pin_sample(&hpd, &cfg));
+    }
     for (int i = 0; i < npins; i++)
         printf("gpio 0x%llx 0x%08x\n", (unsigned long long)pins[i].addr, pins[i].reg);
     return 0;
