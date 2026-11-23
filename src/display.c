@@ -11,6 +11,7 @@
 #include "firmware.h"
 #include "memory.h"
 #include "soc.h"
+#include "sptm_virt.h"
 #include "string.h"
 #include "utils.h"
 #include "xnuboot.h"
@@ -1111,6 +1112,18 @@ static bool display_internal_panel_absent(int node, int product)
 
 int display_init(void)
 {
+    u64 carveout_base, carveout_limit;
+
+    /*
+     * Under the virtualized SPTM the guest's XNU owns the display, from the state iBoot left it
+     * in. A session started here would hand the DCP on running, its DART mapping buffers from
+     * aura's heap, which lies in the carve-out SPTM is told it must not manage.
+     */
+    if (sptm_virt_heap_window(&carveout_base, &carveout_limit)) {
+        printf("display: SPTM-virt guest owns the display, leaving it as iBoot left it\n");
+        return 0;
+    }
+
     if (chip_id == T8152) {
         display_is_external = true;
         return display_init_t8152();
