@@ -155,12 +155,31 @@ struct live_maps {
     bool ram;
 };
 
+/*
+ * Each run adds a /memreserve/ entry, a node and two property appends (about 120
+ * bytes), and a fragmented stream has no bound on its runs. Refuse the stream
+ * while enough room is left to withdraw a refused session and for the rest of
+ * kboot's edits: the J704 has 209,123 bytes left after its whole handoff.
+ */
+#define T8142_DISPLAY_FDT_FLOOR (64 * 1024)
+
+static bool fdt_room_left(void *dt)
+{
+    int used = fdt_off_dt_strings(dt) + fdt_size_dt_strings(dt);
+    return (int)fdt_totalsize(dt) - used >= T8142_DISPLAY_FDT_FLOOR;
+}
+
 /* An IOVA-only node reserves the alias; the memreserve keeps its RAM CPU mapped. */
 static int flush_mapping(struct live_maps *m)
 {
     if (!m->size)
         return 0;
     void *dt = m->dt;
+    if (!fdt_room_left(dt)) {
+        printf("FDT: display SID%u: below %d bytes of FDT space; refused\n", m->stream.sid,
+               T8142_DISPLAY_FDT_FLOOR);
+        return -1;
+    }
     m->runs++;
     if (m->ram && fdt_add_mem_rsv(dt, m->phys, m->size))
         return -1;
