@@ -76,6 +76,7 @@ static char stage1_esp_chosen[96];
 #endif
 
 static void *load_one_payload(void *start, size_t size);
+static void payload_scan_stopped(void);
 
 bool stage1_chained;
 #ifdef DEBUGUSB_PROXY
@@ -161,11 +162,13 @@ static void *load_fdt(void *p, size_t size)
     /*
      * The tree comes from the payload. libfdt's read and open functions only probe the magic and
      * version and leave the block offsets and sizes to fdt_check_header(); where the payload
-     * gives the tree's size, the header must agree with it too. A tree that fails ends the
-     * payload: nothing says where whatever follows it starts.
+     * gives the tree's size, the header must agree with it too. An inline tree that fails ends
+     * the scan: nothing says where whatever follows it starts.
      */
     if (fdt_check_header(p) || (size && size != fdt_totalsize(p))) {
         printf("Ignoring an invalid devicetree at %p\n", p);
+        if (!size)
+            payload_scan_stopped();
         return NULL;
     }
 
@@ -245,11 +248,12 @@ static bool enable_tso = false;
 /*
  * A config line that cannot be kept or read: a chosen. line past the end of chosen[]; a line of a
  * variable m1n1 knows that has no newline or a name or value too long (the scan stops there), or
- * that a line without '=' took into its name; or a stop at unknown data after the kernel or a
- * config line, before config that may follow. A chainloading stage 1 that lost one says so with
- * CONFIG_LOST_VAR. The value the config set before the lost line still stands, an owner's
- * chosen.<switch>=1 against a lost =0 perhaps, so on the Macs with M3 graphics defaults kboot
- * then hands no graphics over (kboot_set_config_lost()). Everything else boots as before.
+ * that a line without '=' took into its name; or a stop at unknown data or an invalid inline
+ * devicetree after the kernel or a config line, before config that may follow. A chainloading
+ * stage 1 that lost one says so with CONFIG_LOST_VAR. The value the config set before the lost
+ * line still stands, an owner's chosen.<switch>=1 against a lost =0 perhaps, so on the Macs with
+ * M3 graphics defaults kboot then hands no graphics over (kboot_set_config_lost()). Everything
+ * else boots as before.
  */
 static bool config_lost = false;
 static bool config_seen = false;
@@ -404,12 +408,18 @@ static void *load_one_payload(void *start, size_t size)
     } else if (check_var(&p)) {
         return p;
     } else {
-        /* After the kernel or a config line, more config may follow (update-m1n1 puts it last) */
-        if (kernel || config_seen)
-            config_lost = true;
+        payload_scan_stopped();
         printf("Unknown payload at %p (magic: %02x%02x%02x%02x)\n", p, p[0], p[1], p[2], p[3]);
         return NULL;
     }
+}
+
+/* The scan ends at data it cannot step over, an unknown payload or an invalid inline devicetree */
+static void payload_scan_stopped(void)
+{
+    /* After the kernel or a config line, more config may follow (update-m1n1 puts it last) */
+    if (kernel || config_seen)
+        config_lost = true;
 }
 
 void do_enable_tso(void)

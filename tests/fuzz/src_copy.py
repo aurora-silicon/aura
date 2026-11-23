@@ -69,6 +69,9 @@ static enum fw_version firmware_os_components(void)
 static char expect_compatible[256] = "apple,j000";
 static void *fdt;
 static int fdt_rank;
+static void payload_scan_stopped(void)
+{
+}
 '''
 
 EPILOGUE = r'''
