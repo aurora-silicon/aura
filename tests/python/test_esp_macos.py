@@ -94,16 +94,28 @@ def compare(sptm, txm, xnu, tc, adt, exclave, love, *, video=VIDEO, ans_drop=(),
     b = esp_macos.build(sptm, txm, xnu, tc, adt, exclave=exclave, love=love, keep_video=bool(video),
                         ans_drop=ans_drop, chosen=chosen)
     hide, _phys = esp_macos.hide_nodes(adt, xnu)
-    cl4, ce, cv, exic, extc = exclave
+    drops = list(ans_drop)
+    if exclave is not None:
+        cl4, ce, cv, exic, extc = exclave
+        cl4_regions, cl4_len = cl4.regions, len(cl4.payload)
+    else:
+        cl4_regions, ce, cv, exic, extc, cl4_len = None, 0, 0, b"", b"", 0
+        ex_hide, ex_drop = esp_macos.no_exclave_adt(adt)
+        for p in ex_hide:
+            if p not in hide:
+                hide.append(p)
+        for item in ex_drop:
+            if item not in drops:
+                drops.append(item)
     py = plan_mod.plan_boot(
         sptm, txm, xnu, adt, dram_base=DRAM, phys_base=PHYS, mem_size=MEM, mem_size_actual=ACTUAL,
         cmdline=esp_macos.runner().DEFAULT_BOOTARGS, blob_base=PHYS, trustcache=tc,
-        iboot_copies=copies_from(adt), hide_nodes=hide, diag_record=False, drop_props=ans_drop,
-        xnu_serial="/arm-io/uart0", os_long_version=love, video=video, cl4_regions=cl4.regions,
+        iboot_copies=copies_from(adt), hide_nodes=hide, diag_record=False, drop_props=drops,
+        xnu_serial="/arm-io/uart0", os_long_version=love, video=video, cl4_regions=cl4_regions,
         cl4_entry=ce, cl4_virt=cv, exclave_integrity=exic, exclave_trustcache=extc,
         chosen_props=chosen)
     lens = {"sptm": len(sptm), "txm": len(txm), "xnu": len(xnu), "tc": len(tc),
-            "cl4": len(cl4.payload), "exic": len(exic), "extc": len(extc)}
+            "cl4": cl4_len, "exic": len(exic), "extc": len(extc)}
     regions, loads, c_adt, c_ba, info = c_plan(b, adt, lens, tc, copies_from(adt), video)
     assert regions == [(n, pa, s) for n, (pa, s) in py.regions.items()], (regions, py.regions)
     for k in ("adt_pa", "sptm_pa", "sptm_entry_pa", "txm_pa", "boot_args_pa", "blob_end", "virt_base"):
@@ -169,6 +181,162 @@ def _real():
     imgs = [(fw / n).read_bytes() for n in ("sptm.macho", "txm.macho", "kernelcache.macho")]
     return (imgs, Path(tcp).read_bytes(), [Path(a).read_bytes() for a in adts.split(":")], ex,
             esp_macos.os_long_version(fw / "BuildIdentity.plist"))
+
+
+def _minimal_manifest(*extra_lines):
+    sha = "0" * 64
+    lines = [
+        "aura-macos-esp 2",
+        "build 26A428",
+        f"file sptm sptm.bin 0x4000 {sha}",
+        f"file txm txm.bin 0x4000 {sha}",
+        f"file tc trustcache.bin 0x4000 {sha}",
+        f"file xnu kernelcache 0x4000 {sha}",
+        "image sptm 0xfffffff000000000 0xfffffff000004000 0xfffffff000000000",
+        "seg sptm __TEXT 0xfffffff000000000 0x4000 0x0 0x4000",
+        "image txm 0xfffffff000000000 0xfffffff000004000 0xfffffff000000000",
+        "seg txm __TEXT 0xfffffff000000000 0x4000 0x0 0x4000",
+        "image xnu 0xfffffff007004000 0xfffffff007008000 0xfffffff007004000",
+        "seg xnu __TEXT 0xfffffff007004000 0x4000 0x0 0x4000",
+        *extra_lines,
+        "end",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _parse_manifest_rc(manifest_text):
+    d = Path(tempfile.mkdtemp())
+    (d / "manifest").write_text(manifest_text)
+    (d / "adt").write_bytes(b"\x00" * 16)
+    (d / "params").write_text(f"dram_base {DRAM:x}\nphys_base {PHYS:x}\n")
+    r = subprocess.run([host(), "plan", d / "manifest", d / "adt", d / "params", d],
+                       capture_output=True, text=True,
+                       env=dict(os.environ, ASAN_OPTIONS="detect_leaks=0"))
+    return r.returncode, r.stdout + r.stderr
+
+
+def test_chosen_manifest_parse_validation():
+    # Valid chosen lines pass manifest parsing (they fail later on the dummy 16-byte ADT).
+    rc, out = _parse_manifest_rc(_minimal_manifest(
+        "chosen boot-uuid 31323300",
+        "chosen asmb/lp-spih " + "ab" * 48,
+    ))
+    assert rc != 0 and "ERR manifest:" not in out, out
+
+    bad_cases = [
+        (["chosen /boot-uuid 00"], "bad chosen line"),
+        (["chosen asmb/ 00"], "bad chosen line"),
+        (["chosen a/b/c 00"], "bad chosen line"),
+        (["chosen " + "a" * 32 + " 00"], "bad chosen line"),
+        (["chosen boot-uuid 0"], "bad chosen line"),
+        (["chosen boot-uuid zz"], "bad chosen line"),
+        (["chosen boot-uuid " + "aa" * 193], "bad chosen line"),
+        (["chosen boot-uuid 00", "chosen boot-uuid 01"], "duplicate chosen line"),
+        (["chosen asmb/lp-spih 00", "chosen asmb/lp-spih 01"], "duplicate chosen line"),
+        ([f"chosen p{i} 00" for i in range(9)], "too many chosen lines"),
+    ]
+    for lines, want in bad_cases:
+        rc, out = _parse_manifest_rc(_minimal_manifest(*lines))
+        assert rc != 0 and want in out, (lines, out)
+
+
+def test_root_props_validation():
+    d = Path(tempfile.mkdtemp())
+    good = d / "good.txt"
+    good.write_text("\n".join([
+        "# comment",
+        "boot-uuid = 11111111-2222-3333-4444-555555555555",
+        "apfs-preboot-uuid = AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+        "boot-objects-path = /0123456789abcdef",
+        "root-snapshot-name = com.apple.os.update-TEST",
+        "boot-manifest-hash = " + "ab" * 48,
+        "asmb/lp-spih = " + "cd" * 48,
+        "ignored-extra = foo",
+    ]) + "\n")
+    props = esp_macos.root_props(good)
+    assert props["boot-uuid"] == b"11111111-2222-3333-4444-555555555555\0"
+    assert props["boot-manifest-hash"] == bytes.fromhex("ab" * 48)
+    assert props["asmb/lp-spih"] == bytes.fromhex("cd" * 48)
+    assert "ignored-extra" not in props
+
+    bad_hash = d / "bad_hash.txt"
+    bad_hash.write_text(good.read_text().replace("ab" * 48, "ab" * 47))
+    try:
+        esp_macos.root_props(bad_hash)
+        raise AssertionError("expected BundleError on short SHA-384")
+    except esp_macos.BundleError:
+        pass
+
+    missing = d / "missing.txt"
+    missing.write_text("boot-uuid = 11111111-2222-3333-4444-555555555555\n")
+    try:
+        esp_macos.root_props(missing)
+        raise AssertionError("expected BundleError on missing required root props")
+    except esp_macos.BundleError:
+        pass
+
+
+def test_no_exclave_adt_discovery():
+    def node(name, props=(), kids=()):
+        n = plan_mod.RawNode()
+        n.props = [["name", name.encode() + b"\0", 0], *props]
+        n.kids = list(kids)
+        return n
+
+    tree = node("device-tree", kids=[
+        node("arm-io", kids=[
+            node("uart0"),
+            node("hib-exclave-watchdog"),
+            node("aop-exclave-mailbox"),
+            node("exdisplaypipe"),
+            node("exdisplaypipe-s-proxy"),
+            node("isp-exclave-s-proxy"),
+            node("dcp", kids=[node("iop-dcp-nub", props=[["routes", b"\x01\x02\x03\x04", 0]])]),
+            node("aop", kids=[node("iop-aop-nub")]),
+        ]),
+    ])
+    adt = plan_mod.adt_build(tree)
+    hide, drop = plan_mod.no_exclave_adt(adt)
+    assert hide == [
+        "/arm-io/aop-exclave-mailbox",
+        "/arm-io/exdisplaypipe",
+        "/arm-io/exdisplaypipe-s-proxy",
+        "/arm-io/isp-exclave-s-proxy",
+    ], hide
+    assert drop == [("/arm-io/dcp/iop-dcp-nub", "routes")], drop
+    assert esp_macos.no_exclave_adt is plan_mod.no_exclave_adt
+
+
+def test_make_bundle_no_exclave_cli():
+    d = Path(tempfile.mkdtemp())
+    stage2 = d / "aura.bin"
+    stage2.write_bytes(b"X" * 32 + b"STACKBOT")
+    (d / "build_cfg.h").write_text(
+        "#define CHAINLOADING 1\n#define ESP_STAGE2 1\n"
+        "#define SPTM_VIRT 1\n#define SPTM_VIRT_ESP 1\n"
+    )
+    dummy = d / "dummy"
+    dummy.write_bytes(b"")
+    base = [
+        sys.executable, str(REPO / "tools/esp-macos/make_bundle.py"),
+        "--stage2", str(stage2), "--esp-partuuid", "11111111-2222-3333-4444-555555555555",
+        "--sptm", str(dummy), "--txm", str(dummy), "--xnu", str(dummy),
+        "--trustcache", str(dummy), "--adt", str(dummy), "--out", str(d / "out"),
+    ]
+    # Omitting --exclave-* without --no-exclave fails closed.
+    r = subprocess.run(base, capture_output=True, text=True)
+    assert r.returncode != 0 and "--no-exclave" in r.stderr, r.stderr
+    # Combining --no-exclave with --exclave-* fails closed.
+    r = subprocess.run(base + ["--no-exclave", "--exclave-bundle", str(dummy)],
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "cannot be combined" in r.stderr, r.stderr
+    # --no-exclave without --build-identity passes CLI validation (fails later on empty dummy sptm).
+    r = subprocess.run(base + ["--no-exclave"], capture_output=True, text=True)
+    assert r.returncode != 0 and "--build-identity" not in r.stderr and "--no-exclave" not in r.stderr, r.stderr
+    # --help advertises --no-exclave (probed by tools/macos-hv-install).
+    r = subprocess.run([sys.executable, str(REPO / "tools/esp-macos/make_bundle.py"), "--help"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and "--no-exclave" in r.stdout, r.stdout
 
 
 def test_real_plan_matches_python():

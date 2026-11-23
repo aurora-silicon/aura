@@ -81,6 +81,9 @@ def hide_nodes(adt, xnu, *, debug_port=DEBUG_PORT, keep_errh=False, hide_dockcha
     return list(hide), list(phys[:2])
 
 
+no_exclave_adt = plan_mod.no_exclave_adt
+
+
 def os_long_version(build_identity):
     return plistlib.load(open(build_identity, "rb"))["Ap,OSLongVersion"]
 
@@ -199,10 +202,19 @@ def build(sptm, txm, xnu, trustcache, adt, *, exclave=None, love=None, bootargs=
     lines.append(f"ctrr-stash 0x{sp['ctrr_stash_off']:x}")
 
     hide, phys = hide_nodes(adt, xnu)
+    drops = list(ans_drop)
+    if cl4 is None:
+        ex_hide, ex_drop = no_exclave_adt(adt)
+        for p in ex_hide:
+            if p not in hide:
+                hide.append(p)
+        for item in ex_drop:
+            if item not in drops:
+                drops.append(item)
     for p in hide:
         lines.append(f"hide {p}")
     lines.append("link-phys " + " ".join(f"0x{ph:x}" for ph in phys))
-    for path, prop in ans_drop:
+    for path, prop in drops:
         lines.append(f"drop {path} {prop}")
     lines.append("serial /arm-io/uart0")
     r = runner()

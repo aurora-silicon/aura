@@ -329,6 +329,29 @@ def adt_drop_props(root, drop_props, notes):
         notes.append(f"drop: {path}/{name} {'removed' if len(node.props) < before else 'absent'}")
 
 
+def no_exclave_adt(adt):
+    """Nodes to hide and RTBuddy routes properties to drop when booting without cL4, read from the
+    ADT itself so every SoC gets its own nodes without a chip table."""
+    root, _ = adt_parse(adt)
+    try:
+        arm_io = adt_find(root, "arm-io")
+    except KeyError:
+        return [], []
+    hide, drop = [], []
+    for child in arm_io.kids:
+        name = child.name()
+        lname = name.lower()
+        if (("exclave" in lname and lname != "hib-exclave-watchdog")
+                or lname.startswith("exdisplaypipe")):
+            hide.append(f"/arm-io/{name}")
+        for grand in child.kids:
+            gname = grand.name()
+            if gname.startswith("iop-") and gname.endswith("-nub"):
+                if any(pr[0] == "routes" for pr in grand.props):
+                    drop.append((f"/arm-io/{name}/{gname}", "routes"))
+    return hide, drop
+
+
 # The /chosen properties that name the root to boot (relative paths; children must exist). TXM
 # reads the previous stage's cryptex digest from asmb/lp-spih.
 CHOSEN_PROPS = ("boot-uuid", "apfs-preboot-uuid", "boot-objects-path", "root-snapshot-name",

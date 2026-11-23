@@ -42,12 +42,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--stage2", type=pathlib.Path, required=True, help="the aura.bin to install")
     ap.add_argument("--build-cfg", help="that image's build_cfg.h (default: next to it)")
-    for f in ("sptm", "txm", "trustcache", "adt", "build-identity"):
+    for f in ("sptm", "txm", "trustcache", "adt"):
         ap.add_argument(f"--{f}", type=pathlib.Path, required=True)
+    ap.add_argument("--build-identity", type=pathlib.Path,
+                    help="BuildIdentity.plist (required with exclaves; optional with --no-exclave)")
     ap.add_argument("--xnu", type=pathlib.Path, required=True, help="decompressed kernelcache")
-    ap.add_argument("--exclave-bundle", type=pathlib.Path, required=True)
-    ap.add_argument("--exclave-integrity", type=pathlib.Path, required=True)
-    ap.add_argument("--exclave-trustcache", type=pathlib.Path, required=True)
+    ap.add_argument("--no-exclave", action="store_true",
+                    help="build a bundle without cL4/ExclaveOS and hide exclave ADT nodes")
+    ap.add_argument("--exclave-bundle", type=pathlib.Path)
+    ap.add_argument("--exclave-integrity", type=pathlib.Path)
+    ap.add_argument("--exclave-trustcache", type=pathlib.Path)
     ap.add_argument("--out", type=pathlib.Path, required=True, help="staging directory")
     ap.add_argument("--esp-partuuid", required=True)
     ap.add_argument("--bootargs", help="XNU boot-args (default: run_guest_sptm.py's)")
@@ -76,11 +80,22 @@ def main():
     if not stage2.endswith(b"STACKBOT") or b"AURORA-S1-CFG01\0" in stage2:
         raise SystemExit(f"{a.stage2}: expected a bare ESP_STAGE2=1 aura image")
 
+    ex_args = (a.exclave_bundle, a.exclave_integrity, a.exclave_trustcache)
+    if a.no_exclave:
+        if any(ex_args):
+            raise SystemExit("--no-exclave cannot be combined with --exclave-*")
+    else:
+        if not all(ex_args):
+            raise SystemExit("pass all three --exclave-* options, or --no-exclave")
+        if not a.build_identity:
+            raise SystemExit("--build-identity is required with exclaves, or pass --no-exclave")
+
     try:
-        ex = esp_macos.exclaves(a.exclave_bundle, a.exclave_integrity, a.exclave_trustcache)
+        ex = None if a.no_exclave else esp_macos.exclaves(*ex_args)
+        love = esp_macos.os_long_version(a.build_identity) if a.build_identity else None
         b = esp_macos.build(
             a.sptm.read_bytes(), a.txm.read_bytes(), a.xnu.read_bytes(), a.trustcache.read_bytes(),
-            a.adt.read_bytes(), exclave=ex, love=esp_macos.os_long_version(a.build_identity),
+            a.adt.read_bytes(), exclave=ex, love=love,
             bootargs=a.bootargs, flags=tuple(a.flag) if a.flag else esp_macos.DEFAULT_FLAGS,
             s2r=dict(a.s2r) if a.s2r else None,
             ans_drop=[("/arm-io/ans/iop-ans-nub", p) for p in a.ans_drop],
