@@ -306,8 +306,9 @@ static int preserve_streams(void *dt, const char *alias, struct display_stream *
             goto out;
         }
         ret = -1;
+        /* Up to 2049 entries per stream: the same floor as for the mappings. */
         for (size_t j = 0; j < count; j++)
-            if (fdt_add_mem_rsv(dt, tables[j], SZ_16K)) {
+            if (!fdt_room_left(dt) || fdt_add_mem_rsv(dt, tables[j], SZ_16K)) {
                 printf("FDT: %s SID%u: cannot reserve page tables\n", alias, m.stream.sid);
                 goto out;
             }
