@@ -1255,16 +1255,81 @@ bool display_handed_on_live(void)
     return dcp_handed_on_live();
 }
 
-/* The RTKit session of the DCP this stage handed on running, and that DCP's DT alias. */
-const struct rtkit_live_state *display_live_rtkit_state(const char **alias)
+_Static_assert(sizeof(struct display_live_rtkit_record) == DISPLAY_LIVE_RTKIT_RECORD_SIZE,
+               "live RTKit record size");
+_Static_assert(offsetof(struct display_live_rtkit_record, rtkit) == 24 &&
+                   offsetof(struct rtkit_live_state, buffers) == 40 &&
+                   sizeof(struct rtkit_live_buffer) == 32 && RTKIT_LIVE_MAX_BUFFERS == 4,
+               "live RTKit record layout");
+
+/*
+ * The record of the DCP this stage handed on running, for the next aura stage. A session this
+ * stage cannot describe (rtkit_get_live_state()) is passed on as such, without the session flag.
+ */
+void display_live_rtkit_record(struct display_live_rtkit_record *rec)
 {
     const struct rtkit_live_state *st = dcp_live_rtkit_state();
     const display_config_t *conf = st ? display_get_config() : NULL;
 
+    memset(rec, 0, sizeof(*rec));
+    rec->version = DISPLAY_LIVE_RTKIT_VERSION;
+    rec->size = sizeof(*rec);
     if (!conf)
-        return NULL;
-    *alias = conf->dcp_alias;
-    return st;
+        return;
+    rec->flags = DISPLAY_LIVE_RTKIT_F_SESSION;
+    memcpy(rec->alias, conf->dcp_alias, sizeof(rec->alias));
+    rec->rtkit = *st;
+}
+
+/* Check the record an earlier stage passed on. Its buffers are checked when they are reserved. */
+static int display_parse_live_rtkit_record(const void *prop, u32 len,
+                                           struct display_live_rtkit_record *rec)
+{
+    if (!prop || len != sizeof(*rec))
+        return -1;
+    memcpy(rec, prop, sizeof(*rec));
+    if (rec->version != DISPLAY_LIVE_RTKIT_VERSION || rec->size != sizeof(*rec) ||
+        (rec->flags & ~DISPLAY_LIVE_RTKIT_F_SESSION) || rec->reserved)
+        return -1;
+    if (!(rec->flags & DISPLAY_LIVE_RTKIT_F_SESSION))
+        return 0;
+    if (!rec->alias[0] || rec->alias[sizeof(rec->alias) - 1] ||
+        rec->rtkit.n_buffers > RTKIT_LIVE_MAX_BUFFERS)
+        return -1;
+    return 0;
+}
+
+/*
+ * The RTKit session of the DCP handed on running, and that DCP's DT alias: this stage's own if it
+ * handed the DCP on, else the one in the record of the stage that did. *st is NULL if that stage
+ * could not describe the session. Returns -1 if an earlier stage handed a DCP on and its record
+ * is missing or not one this stage understands.
+ */
+int display_live_rtkit_state(const struct rtkit_live_state **st, const char **alias)
+{
+    static struct display_live_rtkit_record inherited;
+
+    *st = NULL;
+    if (dcp_handed_on_live()) {
+        const display_config_t *conf = display_get_config();
+        if (conf && (*st = dcp_live_rtkit_state()))
+            *alias = conf->dcp_alias;
+        return 0;
+    }
+    if (!display_inherited_live_heap(NULL))
+        return 0;
+
+    u32 len = 0;
+    int chosen = adt_path_offset(adt, "/chosen");
+    const void *prop =
+        chosen < 0 ? NULL : adt_getprop(adt, chosen, DISPLAY_LIVE_RTKIT_ADT_PROP, &len);
+    if (display_parse_live_rtkit_record(prop, len, &inherited) < 0)
+        return -1;
+    if (inherited.flags & DISPLAY_LIVE_RTKIT_F_SESSION) {
+        *st = &inherited.rtkit;
+        *alias = inherited.alias;
+    }
+    return 0;
 }
 
 int display_shutdown(dcp_shutdown_mode mode)

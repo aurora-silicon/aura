@@ -812,6 +812,10 @@ static int dt_reserve_retained_span(u64 start, u64 end)
  * failure to describe it, stops the Linux boot instead of handing over unmapped live DMA.
  * Called after dt_set_display(), whose handoff paths treat a DCP node that already has a
  * memory-region as described elsewhere.
+ * The session is the one this stage handed on or, in a Stage 1 -> Stage 2 chain, the one the
+ * earlier stage recorded in the private ADT (display_live_rtkit_state()); both are published
+ * here. Its buffers then lie in that stage's heap, which this stage keeps reserved too. An
+ * earlier stage's record that is missing or not understood stops the boot the same way.
  */
 static int dt_reserve_live_rtkit_buffer(const char *path, const char *alias,
                                         const struct rtkit_live_buffer *b);
@@ -819,7 +823,11 @@ static int dt_reserve_live_rtkit_buffer(const char *path, const char *alias,
 static int dt_publish_live_rtkit(u64 lo, u64 hi)
 {
     const char *alias = NULL;
-    const struct rtkit_live_state *st = display_live_rtkit_state(&alias);
+    const struct rtkit_live_state *st;
+    if (display_live_rtkit_state(&st, &alias)) {
+        printf("FDT: live RTKit: no usable record of the DCP an earlier stage handed on\n");
+        return -1;
+    }
     if (!st)
         return 0;
 
@@ -12879,7 +12887,7 @@ int kboot_prepare_dt(void *fdt)
         }
     }
     /* After dt_set_display(): see dt_publish_live_rtkit() */
-    if (local_dcp && dt_publish_live_rtkit(live_rtkit_lo, live_rtkit_hi))
+    if ((local_dcp || inherited_dcp) && dt_publish_live_rtkit(live_rtkit_lo, live_rtkit_hi))
         bail("FDT: couldn't describe the live DCP RTKit session\n");
     /*
      * The first core of a cluster has a power-gate slot here, and iBoot leaves the boot core's

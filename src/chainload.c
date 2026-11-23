@@ -53,9 +53,12 @@ static u64 chainload_run_footprint(const void *image, size_t size, u32 *flags)
     return hdr.footprint;
 }
 
-#define LIVE_DCP_ADT_ENTRY_SIZE (sizeof(struct adt_property) + sizeof(u64))
+/* DISPLAY_LIVE_ADT_PROP and DISPLAY_LIVE_RTKIT_ADT_PROP, in this order */
+#define LIVE_DCP_ADT_ENTRY_SIZE                                                                    \
+    (2 * sizeof(struct adt_property) + sizeof(u64) + DISPLAY_LIVE_RTKIT_RECORD_SIZE)
+_Static_assert(!(DISPLAY_LIVE_RTKIT_RECORD_SIZE & 3), "ADT property values are padded to 4 bytes");
 
-/* A copied tree has one new property before its memory-map child. */
+/* A copied tree has the new properties before its memory-map child. */
 static int chainload_set_adt_range(void *copy, int node, const char *name, u64 range[2])
 {
     if (!copy)
@@ -308,9 +311,16 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
         memcpy(prop->name, DISPLAY_LIVE_ADT_PROP, sizeof(DISPLAY_LIVE_ADT_PROP));
         prop->size = sizeof(inherited_top);
         memcpy(prop->value, &inherited_top, sizeof(inherited_top));
-        memcpy(prop->value + sizeof(inherited_top), (u8 *)adt + prop_offset,
+        /* The RTKit session only this stage negotiated, for the stage that boots the kernel */
+        struct display_live_rtkit_record rec;
+        display_live_rtkit_record(&rec);
+        prop = (void *)(prop->value + sizeof(inherited_top));
+        memcpy(prop->name, DISPLAY_LIVE_RTKIT_ADT_PROP, sizeof(DISPLAY_LIVE_RTKIT_ADT_PROP));
+        prop->size = sizeof(rec);
+        memcpy(prop->value, &rec, sizeof(rec));
+        memcpy(prop->value + sizeof(rec), (u8 *)adt + prop_offset,
                cur_boot_args.devtree_size - prop_offset);
-        node->property_count++;
+        node->property_count += 2;
         new_boot_args->devtree =
             (void *)(next_adt_pa - cur_boot_args.phys_base + cur_boot_args.virt_base);
         new_boot_args->devtree_size = adt_size;

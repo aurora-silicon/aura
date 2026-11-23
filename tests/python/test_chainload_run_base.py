@@ -95,7 +95,11 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define T8122 0x8122
 #define T8140 0x8140
 #define DISPLAY_LIVE_ADT_PROP "aurora,dcp-retained-heap"
-#define LIVE_DCP_ADT_ENTRY_SIZE (sizeof(struct adt_property) + sizeof(u64))
+#define DISPLAY_LIVE_RTKIT_ADT_PROP "aurora,dcp-live-rtkit"
+#define DISPLAY_LIVE_RTKIT_RECORD_SIZE 192
+struct display_live_rtkit_record { u8 bytes[DISPLAY_LIVE_RTKIT_RECORD_SIZE]; };
+#define LIVE_DCP_ADT_ENTRY_SIZE \
+    (2 * sizeof(struct adt_property) + sizeof(u64) + DISPLAY_LIVE_RTKIT_RECORD_SIZE)
 #define T6000 0x6000
 #define T6020 0x6020
 #define T6030 0x6030
@@ -150,6 +154,12 @@ struct adt_node_hdr { u32 property_count, child_count; };
 static int display_prepare_live_handoff(void) { return 0; }
 static bool display_handed_on_live(void) { return handed_on; }
 static bool display_needs_live_receiver(void) { return handed_on || inherited_dcp; }
+/* The record is display.c's (test_live_rtkit_description.py); here only its place matters. */
+static void display_live_rtkit_record(struct display_live_rtkit_record *rec)
+{
+    for (size_t i = 0; i < sizeof(rec->bytes); i++)
+        rec->bytes[i] = 0xa0 ^ i;
+}
 static bool display_inherited_live_heap(u64 *start)
 {
     if (inherited_dcp)
@@ -733,11 +743,19 @@ static void carries_live_display_in_chosen(void)
     struct adt_node_hdr *next = (void *)staged_view(dst);
     struct adt_property *prop = (void *)(next + 1);
     u64 retained;
-    assert(next->property_count == 2 && node->property_count == 1);
+    assert(next->property_count == 3 && node->property_count == 1);
     assert(!strcmp(prop->name, DISPLAY_LIVE_ADT_PROP) && prop->size == sizeof(retained));
     memcpy(&retained, prop->value, sizeof(retained));
     assert(retained == cur_boot_args.top_of_kernel_data);
-    assert(!memcmp(prop->value + sizeof(retained), name, sizeof(*name) + 8));
+    /* The RTKit record follows as a property of its own, then the tree's first property. */
+    struct display_live_rtkit_record rec, want;
+    prop = (void *)(prop->value + sizeof(retained));
+    display_live_rtkit_record(&want);
+    assert(!strcmp(prop->name, DISPLAY_LIVE_RTKIT_ADT_PROP) && prop->size == sizeof(rec));
+    memcpy(&rec, prop->value, sizeof(rec));
+    assert(!memcmp(&rec, &want, sizeof(rec)));
+    assert(!memcmp(prop->value + sizeof(rec), name, sizeof(*name) + 8));
+    assert((u8 *)prop->value + sizeof(rec) == (u8 *)next + sizeof(*next) + LIVE_DCP_ADT_ENTRY_SIZE);
     const u8 *copied = (const u8 *)next + LIVE_DCP_ADT_ENTRY_SIZE;
     u64 tree_range[2];
     memcpy(tree_range, copied + TEST_DEVTREE_OFF, sizeof(tree_range));
