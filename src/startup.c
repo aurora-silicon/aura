@@ -66,6 +66,33 @@ void apply_rela(uint64_t base, struct rela_entry *rela_start, struct rela_entry 
     }
 }
 
+/*
+ * The relative relocations packed as RELR (-z pack-relative-relocs, Makefile): an even entry is
+ * the offset of a word to relocate, an odd entry a bitmap of the 63 words after the last one
+ * relocated (bit n + 1 for word n). Unlike a RELA entry, the word already holds its link-time
+ * value, so it is relocated by adding base: this runs once per image, from start.S at _start
+ * after any copy of the image, before the copy is used. CPU resets enter at cpu_reset and do
+ * not come here again.
+ */
+void apply_relr(uint64_t base, const uint64_t *relr_start, const uint64_t *relr_end)
+{
+    u64 *where = NULL;
+
+    for (const uint64_t *e = relr_start; e < relr_end; e++) {
+        if (!(*e & 1)) {
+            where = (u64 *)(base + *e);
+            *where++ += base;
+        } else {
+            u64 *p = where;
+
+            for (uint64_t bits = *e >> 1; bits; bits >>= 1, p++)
+                if (bits & 1)
+                    *p += base;
+            where += 63;
+        }
+    }
+}
+
 extern uint32_t _v_sp0_sync[], _v_sp0_irq[], _v_sp0_fiq[], _v_sp0_serr[];
 #ifdef SPTM_VIRT
 extern uint32_t _v_lower_sync[]; /* nv2_asm.S */

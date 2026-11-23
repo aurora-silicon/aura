@@ -64,7 +64,10 @@ class Run:
                     if addr not in pages:
                         self.uc.mem_map(addr, 4096); pages.add(addr)
                 self.uc.mem_write(s['p_vaddr'], s.data())
-        for relocation in binary.elf.get_section_by_name('.rela.dyn').iter_relocations():
+        # The image runs at its link address (0), so a RELR-packed word already holds its value;
+        # only .rela.dyn words (zero in the file, --no-apply-dynamic-relocs) need their addend.
+        rela = binary.elf.get_section_by_name('.rela.dyn')
+        for relocation in rela.iter_relocations() if rela else ():
             if relocation['r_info_type'] == 0:
                 continue
             assert relocation['r_info_type'] == 1027

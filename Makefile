@@ -191,6 +191,18 @@ LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
 	-z nocopyreloc --gc-sections -pie
 
+# Pack the relative relocations as RELR (.relr.dyn, applied by apply_relr() in startup.c): 8 bytes
+# per run of up to 63 words instead of 24 bytes per word in .rela.dyn, which sits in the file part
+# below _file_limit (aura-raw.ld). Only if the linker can (LLD 15 and later, a GNU ld with AArch64
+# DT_RELR support); with an older one every relocation stays in .rela.dyn for apply_rela(). The
+# probe links a one-symbol object with --fatal-warnings, as some linkers only warn about a -z
+# value they do not know.
+LD_RELR := $(shell t=$$(mktemp -d) && \
+	printf '.globl _start\n_start:\n' | $(AS) -c -x assembler - -o $$t/p.o 2>/dev/null && \
+	$(LD) -EL -maarch64elf -pie -z pack-relative-relocs --fatal-warnings -o $$t/p $$t/p.o \
+	>/dev/null 2>&1 && echo -z pack-relative-relocs; rm -rf $$t)
+LDFLAGS += $(LD_RELR)
+
 MINILZLIB_OBJECTS := $(patsubst %,minilzlib/%, \
 	dictbuf.o inputbuf.o lzma2dec.o lzmadec.o rangedec.o xzstream.o)
 
