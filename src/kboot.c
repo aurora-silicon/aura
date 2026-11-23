@@ -9281,9 +9281,23 @@ static int dt_set_pmp(void)
     ADT_GETPROP(adt, pmp_iop_anode, "dram-capacity", &dram_capacity);
 
     /* Check the whole alias handoff before writing any PMP data. */
+    size_t total = fdt_totalsize(dt);
+    size_t strings_offset = fdt_off_dt_strings(dt);
+    size_t strings_size = fdt_size_dt_strings(dt);
+    if (strings_offset > total || strings_size > total - strings_offset)
+        bail("FDT: invalid strings block while checking the PMP handoff\n");
+
     size_t need = pmp_alias_space(pmp_iop_anode);
-    size_t free_space = fdt_totalsize(dt) - fdt_off_dt_strings(dt) - fdt_size_dt_strings(dt);
+    size_t free_space = total - strings_offset - strings_size;
     if (need > free_space) {
+        int status_len;
+        const char *status = fdt_getprop(dt, pmp_node, "status", &status_len);
+
+        /* An absent status also enables the node. */
+        if ((!status || status_len != sizeof("disabled") ||
+             memcmp(status, "disabled", sizeof("disabled"))) &&
+            fdt_setprop_string(dt, pmp_node, "status", "disabled"))
+            bail("FDT: cannot disable pmp after handoff shortfall\n");
         printf("FDT: pmp left disabled: handoff needs up to %zu bytes, %zu free\n", need,
                free_space);
         return 0;
@@ -9326,7 +9340,8 @@ static int dt_set_pmp(void)
     }
 
     pmp_node = fdt_path_offset(dt, "pmp");
-    fdt_setprop_string(dt, pmp_node, "status", "okay");
+    if (fdt_setprop_string(dt, pmp_node, "status", "okay"))
+        bail("FDT: failed to enable pmp after handoff\n");
     return 0;
 }
 
