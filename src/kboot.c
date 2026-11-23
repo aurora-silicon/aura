@@ -123,22 +123,25 @@ void kboot_loaded_file_part(u64 *base, u64 *size)
         goto err;                                                                                  \
     } while (0)
 
-void get_notchless_fb(u64 *fb_base, u64 *fb_height)
+static bool adt_panel_has_notch(int product)
+{
+    u32 val;
+
+    return product >= 0 && ADT_GETPROP(adt, product, "partially-occluded-display", &val) >= 0 &&
+           val;
+}
+
+static void get_notchless_fb(u64 *fb_base, u64 *fb_height, int product, bool panel_has_notch)
 {
     *fb_base = cur_boot_args.video.base;
     *fb_height = cur_boot_args.video.height;
 
-    int node = adt_path_offset(adt, "/product");
-
-    if (node < 0) {
+    if (product < 0) {
         printf("FDT: /product node not found\n");
         return;
     }
 
-    u32 val;
-
-    if ((ADT_GETPROP(adt, node, "partially-occluded-display", &val) < 0 || !val) &&
-        (chip_id != T8015 || (board_id != 0x6 && board_id != 0xe))) {
+    if (!panel_has_notch && (chip_id != T8015 || (board_id != 0x6 && board_id != 0xe))) {
         printf("FDT: No notch detected\n");
         return;
     }
@@ -155,28 +158,22 @@ void get_notchless_fb(u64 *fb_base, u64 *fb_height)
 
     u64 offset = cur_boot_args.video.height - new_height;
 
-    printf("display: Hiding notch, %lux%lu -> %lux%lu (+%lu, 16:%lu)\n", cur_boot_args.video.width,
-           cur_boot_args.video.height, cur_boot_args.video.width, new_height, offset, hfrac);
+    printf("display: Notch-free geometry, %lux%lu -> %lux%lu (+%lu, 16:%lu)\n",
+           cur_boot_args.video.width, cur_boot_args.video.height, cur_boot_args.video.width,
+           new_height, offset, hfrac);
 
     *fb_base += cur_boot_args.video.stride * offset;
     *fb_height = new_height;
 }
 
-/*
- * chosen.asahi,show-notch=1 (aura config): the OS drives the full panel, notch rows
- * included (appledrm.show_notch=1). Keep iBoot's full framebuffer then, so
- * the boot framebuffer covers the same rows as the display driver later does and early
- * users (fbcon, Plymouth) do not shift by the notch height at the handoff.
- */
-static bool kboot_show_notch(void)
+/* Keep the boot framebuffer and the OS scanout at the same panel height. */
+static bool kboot_show_notch(bool panel_has_notch)
 {
-    for (int i = 0; i < MAX_CHOSEN_PARAMS; i++) {
-        if (!chosen_params[i][0])
-            break;
+    for (int i = 0; i < MAX_CHOSEN_PARAMS && chosen_params[i][0]; i++)
         if (!strcmp(chosen_params[i][0], "asahi,show-notch"))
             return chosen_params[i][1] && !strcmp(chosen_params[i][1], "1");
-    }
-    return false;
+
+    return panel_has_notch;
 }
 
 static int dt_set_rng_seed_sep(int node)
@@ -301,9 +298,13 @@ static int dt_set_fb(void)
     }
 
     u64 fb_base, fb_height;
-    get_notchless_fb(&fb_base, &fb_height);
+    int product = adt_path_offset(adt, "/product");
+    bool panel_has_notch = adt_panel_has_notch(product);
+    get_notchless_fb(&fb_base, &fb_height, product, panel_has_notch);
     u64 notch_height = cur_boot_args.video.height - fb_height;
-    if (notch_height && kboot_show_notch()) {
+    bool show_notch = notch_height && kboot_show_notch(panel_has_notch);
+
+    if (show_notch) {
         printf("display: keeping the notch rows (chosen.asahi,show-notch=1), %lux%lu\n",
                cur_boot_args.video.width, cur_boot_args.video.height);
         fb_base = cur_boot_args.video.base;
@@ -356,6 +357,10 @@ static int dt_set_fb(void)
 
     // We do not need to reserve the framebuffer, as it will be excluded from the usable RAM
     // range already.
+
+    if (show_notch &&
+        fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "asahi,show-notch", "1"))
+        bail("FDT: couldn't set chosen.asahi,show-notch property\n");
 
     // save notch height in the dcp node if present (also when the notch rows are kept,
     // so that a display driver hiding the notch still can)
@@ -3604,6 +3609,56 @@ static int adt_acio_rc_regnum(void)
     return 2;
 }
 
+/* The size of node's reg entry named name, at its bus's #address-cells and #size-cells. */
+static int dt_get_named_reg_size(int node, const char *name, u64 *size)
+{
+    int index = fdt_stringlist_search(dt, node, "reg-names", name);
+    int bus = fdt_parent_offset(dt, node);
+    int len;
+
+    if (index < 0 || bus < 0)
+        return -1;
+
+    int ac = fdt_address_cells(dt, bus);
+    int sc = fdt_size_cells(dt, bus);
+    const fdt32_t *reg = fdt_getprop(dt, node, "reg", &len);
+    if (ac < 1 || ac > 2 || sc < 1 || sc > 2 || !reg ||
+        len < (int)((index + 1) * (ac + sc) * sizeof(*reg)))
+        return -1;
+
+    reg += index * (ac + sc) + ac;
+    *size = sc == 2 ? ((u64)fdt32_ld(reg) << 32) | fdt32_ld(reg + 1) : fdt32_ld(reg);
+    return 0;
+}
+
+/*
+ * The router's AP firmware window takes its own table. The kernel applies it
+ * only to a router whose reg names that window ("router-ap-fw"), so it is
+ * copied only to such a router, and each row must fall inside that window.
+ * A tree that still carries the table keeps it.
+ */
+static void dt_copy_router_ap_fw_tunable(int adt_node, const char *fdt_alias)
+{
+    const char *fdt_path = fdt_get_alias(dt, fdt_alias);
+    int fdt_node = fdt_path ? fdt_path_offset(dt, fdt_path) : -1;
+    struct adt_tunable_info tunable = {
+        .adt_name = "pcie_router_ap_fw",
+        .fdt_name = "apple,tunable-router-ap-fw",
+    };
+    u64 size;
+
+    if (fdt_node < 0 || fdt_getprop(dt, fdt_node, tunable.fdt_name, NULL) ||
+        dt_get_named_reg_size(fdt_node, "router-ap-fw", &size))
+        return;
+
+    tunable.reg_size = size;
+    if (dt_append_acio_tunable(adt_node, fdt_node, &tunable)) {
+        /* The converter can have appended valid rows before rejecting one. */
+        fdt_delprop(dt, fdt_node, tunable.fdt_name);
+        printf("kboot: %s: router AP firmware tunable not copied\n", fdt_alias);
+    }
+}
+
 static int dt_set_acio_tunables(void)
 {
     char adt_path[32];
@@ -3631,6 +3686,7 @@ static int dt_set_acio_tunables(void)
             snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-acio", i);
         dt_copy_acio_tunables(adt_path, fdt_alias, usb4_rc_tunables,
                               sizeof(usb4_rc_tunables) / sizeof(*usb4_rc_tunables));
+        dt_copy_router_ap_fw_tunable(adt_node, fdt_alias);
 
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_pcie_adapter", i);
         if (!fdt_get_alias(dt, fdt_alias))

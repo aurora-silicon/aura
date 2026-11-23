@@ -7,6 +7,7 @@ name: aurora-agent-policy
 on:
   push:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
@@ -37,14 +38,37 @@ jobs:
           sparse-checkout: .github/aurora
           sparse-checkout-cone-mode: false
 
+      # Forks run this workflow too; only this repository heals branches.
       - name: Heal the pushed branch
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.repository_owner == 'aurora-silicon'
         run: bash .github/aurora/agent-policy.sh push "${GITHUB_REF_NAME}"
 
       - name: Sweep every branch
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.repository_owner == 'aurora-silicon'
         run: bash .github/aurora/agent-policy.sh sweep
 
-      - name: Check the pull request head
+      - name: Check the pull request
         if: github.event_name == 'pull_request'
-        run: bash .github/aurora/agent-policy.sh pr "refs/pull/${{ github.event.pull_request.number }}/head"
+        env:
+          POLICY_CHANGE_OK: ${{ contains(github.event.pull_request.labels.*.name, 'agent-policy-change') && '1' || '0' }}
+        run: >-
+          bash .github/aurora/agent-policy.sh pr
+          "refs/pull/${{ github.event.pull_request.number }}/merge"
+          "refs/pull/${{ github.event.pull_request.number }}/head"
+
+  selftest:
+    # The pull request's own copy of the script, on a scratch repository.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          sparse-checkout: .github/aurora
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Run agent-policy-test.sh
+        run: bash .github/aurora/agent-policy-test.sh

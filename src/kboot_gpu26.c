@@ -46,9 +46,10 @@
  *   description has three VAs and flags: apple,m3-handoff-version 2, which a
  *   version-1 kernel refuses before it maps anything.
  * On OS firmware 27.2 the handoff is published (reservations, links, segment
- * description, firmware-compat) with the GPU node disabled: no kernel has a
- * 27.2 G15G firmware interface yet, so there is nothing to enable. That still
- * keeps the loaded firmware and the UAT tables out of the kernel's memory.
+ * description, firmware-compat) and the GPU is handed to Linux when this Mac
+ * describes everything its start needs (see t8122_gpu_publish_27()); else the
+ * GPU node stays disabled, which still keeps the loaded firmware and the UAT
+ * tables out of the kernel's memory.
  */
 #define T8122_GPU_REGIONS  6
 #define T8122_GPU_UAT      4
@@ -410,12 +411,82 @@ static void t8122_gpu_log(const struct t8122_gpu_fw *fw, const char *state)
                fw->vas[1], state);
 }
 
+/* The node a single-phandle property of the GPU node points at, or -1 */
+static int t8122_gpu_phandle_node(void *dt, const char *prop)
+{
+    int gpu = t8122_gpu_node(dt), len = 0;
+    const fdt32_t *ref = gpu < 0 ? NULL : fdt_getprop(dt, gpu, prop, &len);
+    if (!ref || len != sizeof(*ref))
+        return -1;
+    int node = fdt_node_offset_by_phandle(dt, fdt32_ld(ref));
+    return node < 0 ? -1 : node;
+}
+
 /*
- * OS firmware 27.2: the reservations, links and segment description are in place. Publish the
- * firmware version and leave the GPU node disabled; the mailbox is not enabled. The 25G83 profile
- * switches do not apply. Only with chosen.asahi,t8122-gpu-power-diag=1 the bounded powered
- * identity probe (the SGX ID and core-mask reads the kernel's T8122 admission checks) runs, with
- * the SGX power voted off again before Linux starts; without it nothing powers the GPU.
+ * Hand the GPU to Linux on 27.2, on the copy t8122_gpu_publish_27() passes: everything is
+ * checked in the DT and both start values are read from the ADT first (nothing is powered for a
+ * refusal), then the 26.6.2 path's calibration runs (OPPs and SRAM voltages from
+ * this Mac's ADT, the bounded powered identity, every power vote released), and only then are
+ * the mailbox and the GPU node enabled. Any failure discards the copy.
+ */
+static int t8122_gpu_enable_27(void *dt, void *arg)
+{
+    UNUSED(arg);
+    /* The firmware's own mailbox: an AGX ASC mailbox, as the 25G83 path takes. */
+    int mailbox = t8122_gpu_phandle_node(dt, "mboxes");
+    if (mailbox < 0 || (fdt_node_check_compatible(dt, mailbox, "apple,asc-mailbox-v4") &&
+                        fdt_node_check_compatible(dt, mailbox, "apple,t8122-agx-asc-mailbox")))
+        bail("FDT: GPU: T8122 27.2: GPU mailbox is not an AGX ASC mailbox\n");
+    if (t8122_gpu_phandle_node(dt, "power-domains") < 0)
+        bail("FDT: GPU: T8122 27.2: GPU node has no single power domain\n");
+
+    /* Both start values from this Mac's ADT, read before anything is powered. */
+    u32 values[T8122_27_VALUES];
+    if (dt_gpu_t8122_27_machine_values_read(values))
+        return -1;
+
+    if (dt_gpu_t8122_26_calibrate(dt))
+        bail("FDT: GPU: T8122 27.2: calibration from this Mac's ADT failed\n");
+    for (size_t i = 0; i < T8122_27_VALUES; i++) {
+        int gpu = t8122_gpu_node(dt);
+        if (gpu < 0 || fdt_setprop_u32(dt, gpu, t8122_27_values[i].dt, values[i]))
+            bail("FDT: GPU: T8122 27.2: cannot set %s\n", t8122_27_values[i].dt);
+    }
+    printf("FDT: GPU: T8122 27.2 machine values: fast-die0 target %u C, coredump copy buffer "
+           "0x%x bytes\n",
+           values[0], values[1]);
+
+    mailbox = t8122_gpu_phandle_node(dt, "mboxes");
+    if (mailbox < 0 || fdt_setprop_string(dt, mailbox, "status", "okay"))
+        bail("FDT: GPU: T8122 27.2: cannot enable the GPU mailbox\n");
+    /*
+     * The 27.2 start takes no PMP link or vote (GPU power through its power domain), so the GPU
+     * node gets no apple,pmp. Linux's pmgr must not arm hardware auto power-gating of GFX under a
+     * running firmware.
+     */
+    int domain = t8122_gpu_phandle_node(dt, "power-domains");
+    if (domain < 0 || fdt_setprop_empty(dt, domain, "apple,no-auto-pm"))
+        bail("FDT: GPU: T8122 27.2: cannot mark the GPU power domain apple,no-auto-pm\n");
+    int gpu = t8122_gpu_node(dt);
+    if (gpu < 0 || fdt_setprop_string(dt, gpu, "status", "okay"))
+        bail("FDT: GPU: T8122 27.2: cannot enable the GPU\n");
+    return 0;
+}
+
+/*
+ * OS firmware 27.2: the reservations, links and segment description are in place; publish the
+ * firmware version. The 25G83 profile switches do not apply. The GPU is handed to Linux when
+ * this Mac describes everything its start needs: the GPU's mailbox is an AGX ASC mailbox, the GPU
+ * has a single power domain, and the 26.6.2 path's calibration (OPPs and SRAM
+ * voltages from this Mac's ADT, the bounded powered identity the kernel's admission checks, every
+ * power vote released before Linux starts) succeeds under the M3 Air's chosen.asahi,t8122-gpu
+ * switch, and this Mac's ADT has both 27.2 start values. Then the GPU node gets them
+ * (dt_gpu_t8122_27_machine_values_read()), the mailbox is enabled, the GPU's power domain gets
+ * apple,no-auto-pm (the 27.2 start takes no PMP link), and the GPU node is enabled; the kernel
+ * admits and starts the loaded firmware. Any failure leaves the GPU node and the mailbox disabled,
+ * as before; then only with chosen.asahi,t8122-gpu-power-diag=1 the bounded powered identity probe
+ * runs, with the SGX power voted off again before Linux starts; without it nothing more powers
+ * the GPU.
  */
 static int t8122_gpu_publish_27(void *dt, const struct t8122_gpu_fw *fw)
 {
@@ -426,10 +497,14 @@ static int t8122_gpu_publish_27(void *dt, const struct t8122_gpu_fw *fw)
     gpu = t8122_gpu_node(dt);
     if (gpu < 0 || fdt_setprop_string(dt, gpu, "status", "disabled"))
         bail("FDT: GPU: T8122 cannot set GPU status\n");
+    if (!t8122_fdt_transaction(dt, t8122_gpu_enable_27, NULL)) {
+        t8122_gpu_log(fw, "enabled (27.2 firmware, calibrated from this Mac's ADT)");
+        return 0;
+    }
     gpu = t8122_gpu_node(dt);
     if (gpu >= 0)
         t8122_read_powered_identity(dt, gpu);
-    t8122_gpu_log(fw, "left disabled (no 27.2 G15G firmware interface in the kernel yet)");
+    t8122_gpu_log(fw, "left disabled (27.2 firmware: the GPU start is not fully described)");
     return 0;
 }
 

@@ -87,6 +87,12 @@ endif
 
 # Required for no_std + alloc for now
 export RUSTC_BOOTSTRAP=1
+# aura's Rust codegen comes from rust/Cargo.toml: opt-level "z" for aura's own crate and the
+# signature code, so Stage 1 stays below the DCP log buffer (aura-raw.ld). A packager's
+# RUSTFLAGS would override those profiles for this bare-metal image: rpmbuild's %build exports
+# -Copt-level=3 -Cforce-frame-pointers=yes -Cdebuginfo=2, which grows Stage 1 by ~16 KiB and
+# no longer links. Keep the environment's flags out of cargo.
+unexport RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
 RUST_LIB := librust.a
 ifeq ($(BUILDSTD),1)
 CARGO_FLAGS := -Z build-std=alloc,core

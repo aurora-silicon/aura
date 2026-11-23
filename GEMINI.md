@@ -16,8 +16,8 @@ merge. To change the policy, edit .github/aurora/AGENTS.md.
 
 ## Pre-PR checklist
 
-Synced from [aurora-silicon/agent-guidelines](https://github.com/aurora-silicon/agent-guidelines/blob/8c0f9c227cd7/pre-pr-checklist.md)
-at 8c0f9c227cd7. Change it there, then sync the copy here; do not edit this section
+Synced from [aurora-silicon/agent-guidelines](https://github.com/aurora-silicon/agent-guidelines/blob/f7edafb3ce3b/pre-pr-checklist.md)
+at f7edafb3ce3b. Change it there, then sync the copy here; do not edit this section
 on its own. These are the checks Aurora's review agents apply.
 
 Each item is a hard rule unless it says "default". If your change fails one, fix the change, or say in the PR why it can't be done yet and keep the PR a draft.
@@ -47,7 +47,7 @@ Each item is a hard rule unless it says "default". If your change fails one, fix
 ### 4. Clean-room and attribution (hard)
 
 - No Apple code, strings, firmware, disassembly output or Apple tuning values in public code, PRs, issues or channels. Our own traces and measurements are fine.
-- Commits carry human identity only, with a human `Signed-off-by`. No agent co-author or sign-off and no `Assisted-by` in commits. When an agent helped, the PR body's last line is `Assisted-by: LLM (<Vendor>:<Model>)`.
+- Commits carry human identity only, with a human `Signed-off-by`. No agent co-author or sign-off and no `Assisted-by` in commits. When an agent helped, disclose it at the end of the PR body with a plain `Assisted-by:` line naming the model or tool (exact wording, vendor prefix, and punctuation are flexible; do not nitpick format).
 - Carry other people's commits unchanged. No force pushes to shared branches.
 
 ### 5. Evidence (default, high bar)
@@ -57,7 +57,9 @@ Each item is a hard rule unless it says "default". If your change fails one, fix
 
 ### 6. Naming (hard)
 
-- The Vulkan driver is **Borealis** (Aurora Silicon's Vulkan driver, in Mesa). Never call our work Honeykrisp or "hk". The code prefix is `brl_`; the rename is tracked in [aurora-silicon/mesa#591](https://github.com/aurora-silicon/mesa/issues/591). Use Aurora paths and names, not Asahi or m1n1.
+- The Vulkan driver is **Borealis** (Aurora Silicon's Vulkan driver, in Mesa). Never call our work Honeykrisp or "hk" in prose: PR and issue text, commit messages, docs, reports and user-facing names.
+- Code keeps the identifiers it has today. Until the rename in [aurora-silicon/mesa#591](https://github.com/aurora-silicon/mesa/pull/591) is merged, Borealis lives in `src/asahi/vulkan/` with `hk_`/`HK_` symbols; after it lands, new code uses its `brl_` prefix.
+- Names shared with upstream or fixed by an interface stay as they are: the Gallium `asahi` driver, `src/asahi/`, the DRM UAPI (`asahi_drm.h`, `DRM_ASAHI_*`) and Asahi or m1n1 names in upstream code. New paths and names of our own use Aurora, not Asahi or m1n1.
 
 ## Testing and collaboration
 
