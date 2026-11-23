@@ -55,7 +55,10 @@ transport_error:
  * CMD1, and then boots its application firmware. So first see CMD1 lose Gaid
  * (or the transport drop while the controller is in reset), then wait for
  * MODE to read APP/APP1. A MODE read before CMD1 lost Gaid could still be
- * the old firmware and does not count. Transport errors during the reset are
+ * the old firmware and does not count. CMD1 may clear before the controller
+ * goes down, so APP/APP1 counts only once the reset was seen in the
+ * transport (a failed read) or in MODE (anything but APP/APP1), or once
+ * TPS6598X_RESET_SETTLE_MS have passed without either. Transport errors during the reset are
  * expected: wake the transport again (SPMI) and keep polling until the
  * deadline. Returns 0, or TPS6598X_COMMAND_TIMEOUT with the last MODE in
  * *mode (0 if it never read).
@@ -67,6 +70,8 @@ int tps6598x_reset_wait_execute(const struct tps6598x_command_ops *ops, void *ct
 
     u64 start = ops->now_ms(ctx);
     bool reset_seen = false;
+    /* The controller was seen down or booting: an APP/APP1 after that is the new firmware's. */
+    bool went_down = false;
     *mode = 0;
     for (;;) {
         u8 bytes[4];
@@ -85,12 +90,17 @@ int tps6598x_reset_wait_execute(const struct tps6598x_command_ops *ops, void *ct
         if (reset_seen && transport_ok) {
             if (ops->read(ctx, TPS_REG_MODE, bytes, sizeof(bytes)) == sizeof(bytes)) {
                 *mode = TPS6598X_TAG(bytes[0], bytes[1], bytes[2], bytes[3]);
-                if (*mode == TPS6598X_MODE_APP || *mode == TPS6598X_MODE_APP1)
+                bool app = *mode == TPS6598X_MODE_APP || *mode == TPS6598X_MODE_APP1;
+                if (app && (went_down || ops->now_ms(ctx) - start >= TPS6598X_RESET_SETTLE_MS))
                     return 0;
+                if (!app)
+                    went_down = true;
             } else {
                 transport_ok = false;
             }
         }
+        if (!transport_ok)
+            went_down = true;
         if (ops->now_ms(ctx) - start >= TPS6598X_RESET_READY_MS)
             return TPS6598X_COMMAND_TIMEOUT;
         if (!transport_ok && ops->wake)

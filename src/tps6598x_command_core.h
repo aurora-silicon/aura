@@ -23,6 +23,12 @@ typedef uint64_t u64;
  */
 #define TPS6598X_RESET_READY_MS 2000
 #define TPS6598X_RESET_POLL_US  10000
+/*
+ * TI's reset de-assertion to ready time. A MODE of APP/APP1 that the wait never
+ * saw leave (no transport drop, no boot mode) only counts this long after Gaid:
+ * it could still be the old firmware's, read before the controller went down.
+ */
+#define TPS6598X_RESET_SETTLE_MS 1000
 
 /* MODE register values, four ASCII characters read as a little-endian word. */
 #define TPS6598X_TAG(a, b, c, d) ((u32)(a) | ((u32)(b) << 8) | ((u32)(c) << 16) | ((u32)(d) << 24))

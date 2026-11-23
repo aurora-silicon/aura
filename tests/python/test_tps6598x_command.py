@@ -88,11 +88,37 @@ def test_reset_wait_ignores_old_firmware_and_rides_out_the_reset(tmp_path):
 
 def test_reset_wait_accepts_app1(tmp_path):
     lib = command_lib(tmp_path)
+    hpm = ResettingHpm(stale=0, down=2, modes=[b"APP1"])
+    mode = ctypes.c_uint32()
+    assert lib.tps6598x_reset_wait_execute(ctypes.byref(hpm.ops), None,
+                                           ctypes.byref(mode)) == 0
+    assert mode.value == int.from_bytes(b"APP1", "little")
+    assert hpm.clock == 2 * 10
+
+
+def test_reset_wait_does_not_take_app_before_the_controller_goes_down(tmp_path):
+    """CMD1 cleared while the old firmware still answers MODE with APP: that
+    APP must not count at 0 ms. Ready once the controller was seen down."""
+    lib = command_lib(tmp_path)
+    hpm = ResettingHpm(stale=0, down=0, modes=[b"APP ", b"APP ", b"BOOT", b"APP "])
+    mode = ctypes.c_uint32()
+    assert lib.tps6598x_reset_wait_execute(ctypes.byref(hpm.ops), None,
+                                           ctypes.byref(mode)) == 0
+    assert mode.value == int.from_bytes(b"APP ", "little")
+    # Two stale APP polls, the BOOT poll, then the new firmware's APP.
+    assert hpm.clock == 3 * 10
+
+
+def test_reset_wait_takes_an_unobserved_reset_only_after_the_settle_time(tmp_path):
+    """The reset fell between two polls: MODE never left APP. Accept it no
+    sooner than TI's 1000 ms reset-to-ready time, the old fixed wait."""
+    lib = command_lib(tmp_path)
     hpm = ResettingHpm(stale=0, down=0, modes=[b"APP1"])
     mode = ctypes.c_uint32()
     assert lib.tps6598x_reset_wait_execute(ctypes.byref(hpm.ops), None,
                                            ctypes.byref(mode)) == 0
-    assert hpm.clock == 0
+    assert mode.value == int.from_bytes(b"APP1", "little")
+    assert hpm.clock == 1000
 
 
 def test_reset_wait_fails_when_firmware_never_returns(tmp_path):
