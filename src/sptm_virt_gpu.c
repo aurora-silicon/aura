@@ -52,7 +52,8 @@ static struct {
 static int gpu_nranges;
 static u64 gpu_sgx; /* sgx reg 0: offsets print relative to it */
 
-static u64 gpu_seen[GPU_SEEN_MAX];
+/* On the heap with the ring: as .bss its 16 KiB pushed the stacks past the next 64 KiB step. */
+static u64 *gpu_seen;
 static u32 gpu_nseen;
 static u64 gpu_first_t, gpu_stop_t;
 static volatile u32 gpu_printed;
@@ -73,6 +74,8 @@ static const char *gpu_range_name(u64 addr, u64 *off)
 /* The first read of an address (a small open table, full = never first again). */
 static bool gpu_first_read(u64 addr)
 {
+    if (!gpu_seen)
+        return false;
     u32 h = (u32)((addr >> 2) * 2654435761u) & (GPU_SEEN_MAX - 1);
     for (u32 i = 0; i < GPU_SEEN_MAX; i++) {
         u64 *s = &gpu_seen[(h + i) & (GPU_SEEN_MAX - 1)];
@@ -256,6 +259,9 @@ void sptm_virt_gpu_setup(void)
         return;
     }
     memset(sptm_virt_gpu_ring, 0, GPU_RING_BYTES);
+    gpu_seen = calloc(GPU_SEEN_MAX, sizeof(*gpu_seen));
+    if (!gpu_seen)
+        printf("SPTM-virt[gpu]: no memory for the first-read table; reads do not print\n");
     sptm_virt_bss_canary = 0xa5a5c0ffee5a5a5aUL; /* read back while the guest runs */
     dc_cvac_range((void *)&sptm_virt_bss_canary, sizeof(sptm_virt_bss_canary));
     sptm_virt_gpu_nrec = GPU_RING_BYTES / sizeof(struct gpu_rec);
