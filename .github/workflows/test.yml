@@ -69,6 +69,10 @@ jobs:
       - name: Test PMP boot data fixups
         run: sh tests/run-pmp-boot-data.sh
 
+      - name: Test keeping an FDT node off with no free space
+        run: sh tests/run-fdt-disable.sh
+
+
       - name: Run pytest with clang
         if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'llvm'
         env:
