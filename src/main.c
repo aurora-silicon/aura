@@ -493,6 +493,8 @@ next_stage:
     printf("Preparing to run next stage at %p...\n", next_stage.entry);
 
     if (!nvme_shutdown()) {
+        /* Shown on the panel, like the other proxy stops */
+        fb_set_active(true);
         printf("NVMe handoff failed; returning to proxy\n");
         if (!secboot_host_proxy_allowed())
             flush_and_reboot();
@@ -513,6 +515,7 @@ next_stage:
             printf("USB: retained DMA not fully reserved; booting on\n");
         /* Its firmware may still use memory the next stage will reuse. */
         if (display_shutdown(DCP_SLEEP_IF_EXTERNAL) < 0) {
+            fb_set_active(true);
             printf("Display handoff failed; returning to proxy\n");
             if (!secboot_host_proxy_allowed())
                 flush_and_reboot();

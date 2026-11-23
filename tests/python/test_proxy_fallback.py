@@ -15,6 +15,8 @@ Ways it can fail, and the check for each:
 5. The window outlives the trial watchdog, which would then reset the Mac with no log line.
 6. A stage that is not a trial waits or reboots (it must stop in the proxy as before), or a trial
    with a host in the window reboots under it.
+7. A handoff failure leaves the panel dark (FB_SILENT_MODE), or a CDC transition still scheduled
+   runs from the window's usb_cdc_poll() after USB was shut down for the handoff.
 """
 import re
 import subprocess
@@ -59,7 +61,10 @@ def test_every_host_less_proxy_stop_falls_back():
     assert call < usb
     # A host that attached in the window keeps its carrier: USB is not brought up under it.
     assert re.search(r"if \(!host_attached && ", run_actions[call:usb])
+    # The handoff stops light the panel before their first line, as run_actions() does.
     for why in ("NVMe handoff failed", "Display handoff failed"):
+        line = handoff.index(f'printf("{why}; returning to proxy')
+        assert "fb_set_active(true);" in handoff[handoff.rindex("{", 0, line):line], why
         assert f'proxy_fallback("{why}");' in handoff
     # The last proxy entry of run_actions() and both handoff ones, and no other host-less one.
     assert len(re.findall(r"\buartproxy_run\(NULL\);", handoff)) == 2
@@ -251,3 +256,12 @@ def test_trial_without_a_host_reboots_after_the_window(tmp_path):
 
 def test_trial_with_a_host_keeps_the_proxy(tmp_path):
     assert _fallback(tmp_path, True, True) == {"ret": "1", "waited": "15000", "reboots": "0"}
+
+
+def test_cdc_cleanup_cancels_a_scheduled_transition():
+    cdc = (ROOT / "src/usb_cdc.c").read_text()
+    cleanup = _body(cdc, "void usb_cdc_cleanup(void)")
+    assert "if (cdc.state == USB_CDC_SCHEDULED)\n        cdc.state = USB_CDC_IDLE;" in cleanup
+    # usb_cdc_poll() only runs a transition that is still scheduled.
+    poll = _body(cdc, "void usb_cdc_poll(void)")
+    assert poll.count("usb_cdc_state_due(&cdc,") == 2
