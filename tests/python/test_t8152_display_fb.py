@@ -71,6 +71,7 @@ def unit():
         block(disp, disp.index("struct display_options {")) + ";\n",
         function(disp, "int display_parse_mode("),
         function(disp, "static int display_swap("),
+        function(disp, "static int display_service_dcp("),
         function(disp, "int display_configure("),
         function(disp, "static void display_swap_state("),
         function(disp, "int display_configure_second("),
@@ -284,9 +285,11 @@ static int dcp_hdmi_hpd_level(dcp_dev_t *d) { (void)d; return hpd_pin; }
 static int dcp_dptx_hpd(void *ep, u32 port, bool hpd) { (void)ep; (void)port; hpd_reported = hpd; hpd_pokes++; return 0; }
 /* The J873g ADT gives dp2hdmi-gpio0 function-hdmi_hpd and its dptx-port speaks AFKv2. */
 static bool dcp_dptx_needs_ap_hpd(dcp_dev_t *d) { (void)d; return chip_id == T8152; }
-static int dcp_work(dcp_dev_t *d) { (void)d; return 0; }
+static u64 current_tick;
+static int dcp_work(dcp_dev_t *d) { (void)d; current_tick += 1000; return 0; }
+static u64 timeout_calculate(u32 usec) { return current_tick + usec; }
 static void mdelay(unsigned ms) { (void)ms; }
-static u64 get_ticks(void) { return 0; }
+static u64 get_ticks(void) { return current_tick; }
 static u64 ticks_to_msecs(u64 t) { return t; }
 static void mmu_map_framebuffer(u64 a, u64 s) { (void)a; (void)s; }
 static bool display_inherited_live_heap(u64 *start) { (void)start; return false; }

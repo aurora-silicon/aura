@@ -65,6 +65,7 @@ def unit():
         function(disp, "static void display_choose_color_mode("),
         function(disp, "static bool display_t6030_hands_off("),
         function(disp, "int display_parse_mode("),
+        function(disp, "static int display_service_dcp("),
         function(disp, "int display_configure("),
     ))
     return PREFIX + types + structures + TRANSPORT + commands + display + CASES
@@ -104,6 +105,7 @@ typedef struct dcp_iboot_if dcp_iboot_if_t;
 TRANSPORT = r'''
 /* Host AFKEPV1 transport. Setters reply with setter_bytes; GET_HPD follows hpd_script. */
 static int setter_bytes, hpd_empty, hpd_script[32], hpd_calls, setter_calls, timing_requested;
+static unsigned work_since_query, work_at_second_query;
 /* Direct command cases: any operation replies with direct_bytes and header length
  * direct_len, and the transport returns direct_error. */
 static bool direct;
@@ -133,6 +135,9 @@ static int afk_epic_command(afk_epic_ep_t *epic, int channel, int type, void *tx
     }
     if (op == 3) {
         int state = hpd_script[hpd_calls < 32 ? hpd_calls : 31];
+        if (hpd_calls == 1)
+            work_at_second_query = work_since_query;
+        work_since_query = 0;
         hpd_calls++;
         if (state < 0)
             return -5;
@@ -172,9 +177,11 @@ static int dcp_connect_dptx(dcp_dev_t *d) { (void)d; assert(!"no DPTX on the int
 static int dcp_dptx_hpd(void *dptx, u32 port, bool hpd) { (void)dptx; (void)port; (void)hpd; assert(!"no DPTX on the internal panel"); return -1; }
 static bool dcp_dptx_needs_ap_hpd(dcp_dev_t *d) { (void)d; assert(!"no DPTX on the internal panel"); return false; }
 static int dcp_hdmi_hpd_level(dcp_dev_t *d) { (void)d; assert(!"no DPTX on the internal panel"); return -1; }
-static int dcp_work(dcp_dev_t *d) { (void)d; return 0; }
+static u64 current_tick;
+static int dcp_work(dcp_dev_t *d) { (void)d; work_since_query++; current_tick += 1000; return 0; }
+static u64 timeout_calculate(u32 usec) { return current_tick + usec; }
 static void mdelay(unsigned ms) { (void)ms; delays++; }
-static u64 get_ticks(void) { return 0; }
+static u64 get_ticks(void) { return current_tick; }
 static u64 ticks_to_msecs(u64 t) { return t; }
 /* Framebuffer remap leaves follow the timing query, which every case fails. */
 static uintptr_t display_map_fb(uintptr_t iova, u64 pa, u64 size) { (void)iova; (void)pa; (void)size; assert(0); return 0; }
@@ -206,6 +213,8 @@ static void setup(int setter_reply, int first, int rest)
     setter_bytes = setter_reply;
     hpd_empty = 0;
     hpd_calls = setter_calls = timing_requested = 0;
+    work_since_query = work_at_second_query = 0;
+    current_tick = 0;
     delays = 0;
     hpd_script[0] = first;
     for (int i = 1; i < 32; i++)
@@ -230,6 +239,11 @@ int main(int argc, char **argv)
         setup(8, -1, 1);
         ret = display_configure(NULL);
         assert(hpd_calls == 2 && timing_requested == 1 && ret == -1);
+    } else if (!strcmp(c, "service-between-status-queries")) {
+        setup(8, 0, 1);
+        ret = display_configure(NULL);
+        assert(hpd_calls == 2 && timing_requested == 1 && ret == -1);
+        assert(work_at_second_query > 1);
     } else if (!strcmp(c, "persistent-status-error")) {
         /* Every status query fails: no modeset, as before. */
         setup(8, -1, -1);
@@ -302,6 +316,7 @@ int main(int argc, char **argv)
 '''
 
 CASES_LIST = ("observed-empty-setter-replies", "transient-status-error", "persistent-status-error",
+              "service-between-status-queries",
               "not-connected", "malformed-setter-reply", "empty-status-reply", "control",
               "direct-empty-power-observed", "direct-empty-mode-surface-contract",
               "direct-empty-nonsetters-refused", "direct-transport-error-propagated",
