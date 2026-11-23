@@ -576,18 +576,19 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
         for (int phy = 0; phy < state->num_phys; phy++) {
             u64 ctrl = state->phy_base[phy] + APCIE_PHY_CTRL;
             set32(ctrl, state->pcie_regs->phy_ctrl_reset);
+            /*
+             * No boot has shown yet that both acknowledges always fall within 50 ms. Until one
+             * has, a late one is logged and the power-off goes on, as before: stopping here would
+             * end every such boot's handoff in the proxy.
+             */
             clear32(ctrl, APCIE_PHY_CTRL_CLK1REQ);
-            if (poll32(ctrl, APCIE_PHY_CTRL_CLK1ACK, 0, 50000)) {
-                printf("pcie: Timeout dropping PHY %d CLK1 (0x%x); not powering ANS off\n", phy,
+            if (poll32(ctrl, APCIE_PHY_CTRL_CLK1ACK, 0, 50000))
+                printf("pcie: Timeout dropping PHY %d CLK1 (0x%x); powering ANS off anyway\n", phy,
                        read32(ctrl));
-                return -1;
-            }
             clear32(ctrl, APCIE_PHY_CTRL_CLK0REQ);
-            if (poll32(ctrl, APCIE_PHY_CTRL_CLK0ACK, 0, 50000)) {
-                printf("pcie: Timeout dropping PHY %d CLK0 (0x%x); not powering ANS off\n", phy,
+            if (poll32(ctrl, APCIE_PHY_CTRL_CLK0ACK, 0, 50000))
+                printf("pcie: Timeout dropping PHY %d CLK0 (0x%x); powering ANS off anyway\n", phy,
                        read32(ctrl));
-                return -1;
-            }
             /* PHY control keeps its value through the power cycle: take the PHY down whole. */
             clear32(ctrl, pcie_phy_up(state));
             clear32(state->phy_base[phy] + 4, 0x10);
