@@ -72,6 +72,8 @@ jobs:
       - name: Test keeping an FDT node off with no free space
         run: sh tests/run-fdt-disable.sh
 
+      - name: Test locked-DART AOP OS-RAM reservation and failure handling
+        run: sh tests/run-aop-os-ram.sh
 
       - name: Run pytest with clang
         if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'llvm'

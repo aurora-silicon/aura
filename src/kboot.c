@@ -17,6 +17,7 @@
 #include "display.h"
 #include "dockchannel_uart.h"
 #include "exception.h"
+#include "fdt_disable.h"
 #include "firmware.h"
 #include "heapblock.h"
 #include "iodev.h"
@@ -10082,6 +10083,172 @@ static int dt_find_aop(char *path, size_t size)
 }
 
 /*
+ * Reserve [paddr, paddr + size) as a no-map RAM-only node under /reserved-memory without calling
+ * bail() on error, so the caller can decide whether a failure disables a halted coprocessor or
+ * stops the boot. Returns 1 when an existing no-map reservation already covers the range (leaving
+ * it untouched), 0 when a new node was added, or -1 on a conflicting/overlapping reservation or an
+ * FDT error (removing any half-built node with fdt_nop_node()).
+ */
+static int dt_try_reserve_ram_mem(const char *node_name, const char *compat, u64 paddr, u64 size)
+{
+    int resv_node = fdt_path_offset(dt, "/reserved-memory");
+    if (resv_node < 0 || !size || paddr > UINT64_MAX - size)
+        return -1;
+
+    u64 end = paddr + size;
+    bool covered = false;
+    int sub;
+    fdt_for_each_subnode(sub, dt, resv_node)
+    {
+        const char *sname = fdt_get_name(dt, sub, NULL);
+        bool same_name = sname && !strcmp(sname, node_name);
+        int rlen = 0;
+        const fdt64_t *reg = fdt_getprop(dt, sub, "reg", &rlen);
+
+        if (!reg || rlen != 16) {
+            if (same_name) {
+                printf("FDT: /reserved-memory/%s already exists without a valid reg\n", node_name);
+                return -1;
+            }
+            continue;
+        }
+        u64 base = fdt64_ld(&reg[0]), count = fdt64_ld(&reg[1]);
+        if (!count || base > UINT64_MAX - count) {
+            if (same_name) {
+                printf("FDT: /reserved-memory/%s has an invalid reg\n", node_name);
+                return -1;
+            }
+            continue;
+        }
+        u64 send = base + count;
+        if (paddr >= send || end <= base) {
+            if (same_name) {
+                printf("FDT: /reserved-memory/%s already exists for [0x%lx, +0x%lx)\n", node_name,
+                       base, count);
+                return -1;
+            }
+            continue;
+        }
+        if (fdt_getprop(dt, sub, "no-map", NULL) && paddr >= base && end <= send) {
+            covered = true;
+            continue;
+        }
+        printf("FDT: [0x%lx, +0x%lx) conflicts with /reserved-memory/%s [0x%lx, +0x%lx)\n", paddr,
+               size, sname ? sname : "?", base, count);
+        return -1;
+    }
+    if (covered)
+        return 1;
+
+    int node = fdt_add_subnode(dt, resv_node, node_name);
+    if (node < 0)
+        return -1;
+
+    uint32_t phandle;
+    u64 reg[2] = {cpu_to_fdt64(paddr), cpu_to_fdt64(size)};
+    if (fdt_generate_phandle(dt, &phandle) || fdt_setprop_u32(dt, node, "phandle", phandle) ||
+        fdt_setprop(dt, node, "reg", reg, sizeof(reg)) ||
+        fdt_setprop_string(dt, node, "compatible", compat) ||
+        fdt_setprop_empty(dt, node, "no-map")) {
+        fdt_nop_node(dt, node);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Reserve, RAM only, every firmware segment of the ADT AOP @anode that lies in the OS's memory.
+ * On a locked DART the OS keeps the firmware's own mappings, so the segments get no IOVA, but the
+ * pages under them must not be reused while the AOP uses them (its log, which iBoot places in the
+ * OS's memory at a new address every boot, and which the locked tables do not map at handoff, so
+ * the ADT's phys field is its only description). The nodes are named as the segment reservation
+ * names them. Segments are rounded out to 16K pages; a segment list longer than 64 entries, a
+ * wrapping address/size, a segment in the OS's memory outside the ADT's DRAM, a conflicting
+ * /reserved-memory node, or a full tree fails the reservation.
+ */
+static int dt_reserve_aop_os_ram(int anode, const char *path)
+{
+    u64 lo = kboot_ram_base(), ram_size = kboot_ram_size(), dram, dram_size;
+    int chosen = adt_path_offset(adt, "/chosen");
+    u32 len = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, anode, "segment-ranges", &len);
+
+    if (!seg || !len)
+        return 0;
+    if (!ram_size || lo > UINT64_MAX - ram_size || len % sizeof(*seg) || len / sizeof(*seg) > 64 ||
+        chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size ||
+        dram > UINT64_MAX - dram_size) {
+        printf("FDT: %s: the ADT's segment list or DRAM bounds are not usable\n", path);
+        return -1;
+    }
+    u64 hi = lo + ram_size, dram_end = dram + dram_size;
+
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        struct adt_segment_ranges r;
+        memcpy(&r, &seg[i], sizeof(r));
+        if (!r.size)
+            continue;
+        if (r.phys > UINT64_MAX - (u64)r.size) {
+            printf("FDT: %s: firmware segment [0x%lx, +0x%x) wraps\n", path, r.phys, r.size);
+            return -1;
+        }
+        u64 raw_end = r.phys + (u64)r.size;
+        if (raw_end > UINT64_MAX - (SZ_16K - 1)) {
+            printf("FDT: %s: firmware segment [0x%lx, +0x%x) wraps on 16K rounding\n", path, r.phys,
+                   r.size);
+            return -1;
+        }
+        u64 start = ALIGN_DOWN(r.phys, SZ_16K);
+        u64 end = ALIGN_UP(raw_end, SZ_16K);
+        u64 size = end - start;
+        if (start >= hi || end <= lo)
+            continue;
+        if (start < dram || end > dram_end) {
+            printf("FDT: %s: firmware segment [0x%lx, +0x%lx) is outside DRAM\n", path, start,
+                   size);
+            return -1;
+        }
+
+        char name[64];
+        snprintf(name, sizeof(name), "asc-firmware@%lx", start);
+        int ret = dt_try_reserve_ram_mem(name, "apple,asc-mem", start, size);
+        if (ret < 0)
+            return -1;
+        if (ret > 0)
+            printf("FDT: %s: firmware segment [0x%lx, +0x%lx) is already reserved no-map\n", path,
+                   start, size);
+        else
+            printf("FDT: %s: firmware segment [0x%lx, +0x%lx) is in the OS's memory: reserved, RAM "
+                   "only\n",
+                   path, start, size);
+    }
+    return 0;
+}
+
+static int dt_aop_locked_dart_handoff(int anode, const char *path)
+{
+    printf("FDT: %s: preserving firmware mappings in locked DART\n", path);
+    if (!dt_reserve_aop_os_ram(anode, path))
+        return 0;
+
+    asc_dev_t *asc = asc_init("/arm-io/aop");
+    bool running = !asc || asc_cpu_running(asc);
+    if (asc)
+        asc_free(asc);
+    if (running)
+        bail("FDT: %s: the AOP is running and its firmware RAM cannot be reserved\n", path);
+
+    char found_path[64];
+    int node = dt_find_aop(found_path, sizeof(found_path));
+    /* fdt_disable_node() needs no space: this cannot fail on the node just found */
+    if (node < 0 || fdt_disable_node(dt, node))
+        bail("FDT: %s: cannot keep the AOP off\n", path);
+    printf("FDT: %s: its firmware RAM could not be reserved: AOP kept off\n", path);
+    return 0;
+}
+
+/*
  * The AOP's accelerometer and gyroscope services wait for their calibration, which the ADT
  * carries on every AOP. iBoot starts the AOP firmware and leaves the part that does not run
  * from the AOP's own SRAM in DRAM, where the ADT lists its segments: the external code
@@ -10118,13 +10285,17 @@ static int dt_set_aop_firmware(void)
         return 0;
     }
 
-    /* Linux keeps the firmware roots when this DART's TTBR/TCR lock is set. */
+    /*
+     * Linux keeps the firmware roots when this DART's TTBR/TCR lock is set. The RAM under any
+     * segment in the OS's memory is still reserved; without that the firmware would write into
+     * pages the OS reuses. If the reservation fails, a halted AOP is kept off, which needs no
+     * space (fdt_disable_node()): the OS then never starts it, and its firmware never writes
+     * those pages. A running AOP writes them whatever the tree says, so then no boot is safe.
+     */
     u64 dart_base, dart_size;
     if (!dt_device_dart_mmio(node, anode, &dart_base, &dart_size) &&
-        dart_t8110_is_locked(dart_base, dart_size)) {
-        printf("FDT: %s: preserving firmware mappings in locked DART\n", path);
-        return 0;
-    }
+        dart_t8110_is_locked(dart_base, dart_size))
+        return dt_aop_locked_dart_handoff(anode, path);
 
     if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true))
         printf("FDT: %s: reserving the AOP firmware segments failed\n", path);
