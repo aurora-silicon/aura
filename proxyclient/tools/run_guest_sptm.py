@@ -47,6 +47,8 @@ Environment (all optional; 1 enables a switch):
   AURA_XNU_BT              sample XNU backtraces every few seconds per core
   AURA_GPU_TRACE           hook the GPU (sgx reg 0) and PMP registers, record every access
   AURA_GPU_STOP_SECS=<n>   park in the proxy n s after the first GPU access (read the ring)
+  AURA_GPU_STOP_BOOT_SECS=<n>  park n s after guest entry (GPU trace or not)
+  AURA_GPU_STOP_REBOOT     reboot via watchdog on a stop park instead of entering the proxy
   AURA_GPU_STOP_MSG=<v>    park right after the guest writes v to the GPU (a mailbox message)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
@@ -149,6 +151,7 @@ KNOWN_ENV = {
     "AURA_TAIL_IDLE",
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_STOP_BOOT_SECS",
+    "AURA_GPU_STOP_REBOOT",
     "AURA_GPU_STOP_MSG",
     "AURA_GPU_PRINT_MAX",
     "AURA_SAMPLE_HZ",
@@ -729,6 +732,8 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
         p.write32(sym["sptm_virt_gpu_stop_secs"], env_int("AURA_GPU_STOP_SECS"))
     if os.environ.get("AURA_GPU_STOP_BOOT_SECS"):
         p.write32(sym["sptm_virt_gpu_stop_boot_secs"], env_int("AURA_GPU_STOP_BOOT_SECS"))
+    if env_on("AURA_GPU_STOP_REBOOT"):
+        p.write32(sym["sptm_virt_gpu_stop_reboot"], 1)
     if os.environ.get("AURA_GPU_STOP_MSG"):
         p.write64(sym["sptm_virt_gpu_stop_msg"], env_int("AURA_GPU_STOP_MSG"))
     if os.environ.get("AURA_GPU_PRINT_MAX"):
@@ -799,7 +804,9 @@ def tail_console(iface, secs, idle):
             print(f"--- tail: console silent for {idle:g}s ---", flush=True)
             break
         try:
-            chunk = dev.read(4096)
+            # Read only what is already buffered (or wait for 1 byte): pyserial's read(4096)
+            # loops until full or timeout and discards buffered bytes if the link resets mid-read.
+            chunk = dev.read(max(1, min(4096, dev.in_waiting)))
         except (serial.serialutil.SerialException, OSError) as e:
             print(f"--- tail: read error ({e}); reopening ---", flush=True)
             try:
