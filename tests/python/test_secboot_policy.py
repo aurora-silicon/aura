@@ -429,6 +429,56 @@ def test_a_stage_started_by_an_enforcing_stage_refuses_an_unverified_next_stage(
             assert results(out) == "unsigned 0\ngood 0\nbad 0\n", (defines, policy, out)
 
 
+HAND_ON = LOAD + r"""
+static void report(const char *name, int ret, size_t used)
+{
+    /* The line this stage added for the next one, if any: its stage and policy fields. */
+    char *line = var_cnt > used ? strchr(vars[used], '=') + 1 : "-";
+    char *end = strchr(line, ';');
+    end = end ? strchr(end + 1, ';') : NULL;
+    printf("%s %d %.*s\n", name, ret, end ? (int)(end - line) : 1, line);
+}
+int main(int argc, char **argv)
+{
+    earlier_stage(argv[1]);
+    verify_verdict = 0;
+    report("room", load(true, 3, 4, "chosen.owner=1"), 3);
+    /* The list is shared with the owner's chosen lines and the loader's own. */
+    report("full", load(true, 4, 4, "chosen.owner=1"), 4);
+    /* The next stage reads measure-0 to measure-9. */
+    report("ten", load(true, 10, 24, "chosen.aurora,measure-0=x"), 10);
+    return 0;
+}
+"""
+
+
+def test_an_enforcing_stage_hands_over_only_with_its_policy(tmp_path):
+    (tmp_path / "own.pub").write_bytes(bytes(range(32)))
+    cases = [
+        # An enforcing Stage 1: the next stage enforces because of this line, so no line, no
+        # hand-over.
+        (["CHAINLOADING", "SECBOOT_ENFORCE"], "none",
+         "room 0 stage1;enforce\nfull -1 -\nten -1 -\n"),
+        # A stage that does not enforce goes on without the line, as before.
+        (["CHAINLOADING", "SECBOOT_AUDIT"], "none", "room 0 stage1;audit\nfull 0 -\nten 0 -\n"),
+        (["CHAINLOADING"], "none", "room 0 stage1;off\nfull 0 -\nten 0 -\n"),
+        (["CHAINLOADING", "ESP_STAGE2", "SECBOOT_AUDIT"], "audit",
+         "room 0 stage2;audit\nfull 0 -\nten 0 -\n"),
+        # A stage started by an enforcing one passes that policy on with what it verified.
+        (["CHAINLOADING", "ESP_STAGE2", "SECBOOT_AUDIT"], "enforce",
+         "room 0 stage2;enforce\nfull -1 -\nten -1 -\n"),
+    ]
+    for defines, earlier, want in cases:
+        name = "-".join(defines)
+        binary = tmp_path / name / name
+        if not binary.exists():
+            build(tmp_path, name, defines, HAND_ON, key=tmp_path / "own.pub")
+        out = subprocess.run([str(binary), earlier], capture_output=True, text=True).stdout
+        got = "".join(l + "\n" for l in out.splitlines()
+                      if l.split()[0] in ("room", "full", "ten"))
+        assert got == want, (defines, earlier, out)
+
+
 def test_the_payload_scan_hands_chosen_lines_to_secboot():
     payload = (ROOT / "src/payload.c").read_text()
     branch = payload[payload.index('if (IS_VAR("chosen.")) {'):]

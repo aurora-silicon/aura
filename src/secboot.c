@@ -470,13 +470,20 @@ int secboot_check_chainload(void *image, size_t *size, char **vars, size_t *var_
             n++;
     if (*var_cnt >= var_capacity || n > 9) {
         printf("secboot: no room to pass the measurement on\n");
+        /* The next stage takes the policy from this line: without it, it would not enforce. */
+        if (refuses_unverified()) {
+            printf("secboot: refusing next stage\n");
+            return -1;
+        }
         return 0;
     }
     char h[65], k[17];
     hex(h, m->sha256, 32);
     hex(k, m->key_id, 8);
+    /* The policy this image was checked under, which an earlier stage may have set. */
     snprintf(var, sizeof(var), "chosen.aurora,measure-%d=%s;%s;%s;%s;%s;%u;%s", n, stage_name,
-             policy_name(), "next-stage", verdict_name(m->verdict), k, m->security_version, h);
+             refuses_unverified() ? "enforce" : policy_name(), "next-stage",
+             verdict_name(m->verdict), k, m->security_version, h);
     vars[(*var_cnt)++] = var;
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
     /* Which Stage 1 flavour started the chain; the next stage copies it into the record. */

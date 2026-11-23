@@ -49,7 +49,9 @@ void secboot_note_chosen(const char *line);
 
 /*
  * Check the trailer signature of an image this stage chainloads. Returns 0 to go on, with *size
- * cut to the covered bytes when a trailer is present. Adds the measurement var for the next stage.
+ * cut to the covered bytes when a trailer is present. Adds the measurement var for the next stage;
+ * a stage that enforces refuses the image when the var list has no room for it, because the next
+ * stage takes the policy from that var.
  */
 int secboot_check_chainload(void *image, size_t *size, char **vars, size_t *var_cnt,
                             size_t var_capacity);

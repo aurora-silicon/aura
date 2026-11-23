@@ -82,6 +82,13 @@ does not check its own payloads under that policy (the earlier stage's image
 trailer covered them) and records its own policy as built. A forged line can
 only make a stage stricter.
 
+The line shares a fixed list with the owner's `chosen.*` lines and the
+loader's own (`nvme.sart`, the trial, the Stage 1 log). A stage that enforces
+and finds no room for the line refuses the next stage, since handing over
+without it would drop the policy: keep the configuration a few `chosen.*`
+lines under the limit of 16 on an enforcing chain. A stage that does not
+enforce goes on without the line, as before.
+
 ## Signature forms
 
 Both are made and checked with `tools/secboot_sign.py`.
