@@ -41,7 +41,7 @@ volatile u64 sptm_virt_bss_canary;
 u64 sptm_virt_flags;
 u32 sptm_virt_cpu_entries[MAX_CPUS];
 
-static u64 sptm_entry_pa, sptm_handoff_pa;
+static u64 sptm_entry_pa, sptm_handoff_pa, sptm_va_offset;
 static bool sptm_images_loaded;
 static u64 sptm_reset_pa;
 static u32 sptm_cpu_resets[MAX_CPUS];
@@ -366,12 +366,22 @@ __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
     }
     if (sptm_virt_check_handoff(&l, handoff) < 0)
         return -1;
+    const volatile struct sptm_virt_boot_args *ba = (const void *)handoff;
     sptm_entry_pa = sptm_entry;
     sptm_handoff_pa = handoff;
+    sptm_va_offset = ba->virt_base - ba->phys_base;
     sptm_images_loaded = true;
     printf("SPTM-virt: images recorded, entry 0x%lx handoff 0x%lx; ready to enter\n", sptm_entry,
            handoff);
     return 0;
+}
+
+/* SPTM's static image map offset (VA - PA), derived from the handoff boot_args. */
+u64 sptm_virt_image_va_offset(void)
+{
+    if (sptm_va_offset)
+        return sptm_va_offset;
+    return 0xfffffe0000000000UL - ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
 }
 
 #ifdef AURACTL

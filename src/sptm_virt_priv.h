@@ -18,6 +18,7 @@ extern volatile u64 sptm_virt_bss_canary;
 extern u64 sptm_virt_flags;
 extern u32 sptm_virt_cpu_entries[MAX_CPUS];
 int sptm_virt_layout(struct sptm_virt_layout *out);
+u64 sptm_virt_image_va_offset(void);
 void sptm_virt_cpu_enters_xnu(int cpu);
 extern u32 sptm_virt_wfi_watch;
 

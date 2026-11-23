@@ -16,6 +16,7 @@
 #include "exception.h"
 #include "gxf.h"
 #include "heapblock.h"
+#include "iodev.h"
 #include "malloc.h"
 #include "memory.h"
 #include "nv2.h"
@@ -29,10 +30,10 @@
 /* A GEXIT from physical GL1 to SPTM's normal world, which GL1 cannot reach: EC 0x3f, ISS 0x22. */
 #define ESR_ISS_GEXIT_UP 0x22
 
-/* SPTM's static map of its own image (VA = PA + base) and its physmap of DRAM (25G83). */
-#define SPTM_IMAGE_VA_OFFSET 0xfffffd0000000000UL
-#define SPTM_PHYSMAP_VA      0xfffffe1000000000UL
-#define SPTM_PHYSMAP_VA_END  0xfffffe2000000000UL
+/* SPTM's physmap of DRAM (25G83); its static image map offset comes from
+ * sptm_virt_image_va_offset(). */
+#define SPTM_PHYSMAP_VA     0xfffffe1000000000UL
+#define SPTM_PHYSMAP_VA_END 0xfffffe2000000000UL
 
 /* ---- fault-tolerant reads ------------------------------------------------------------------ */
 
@@ -87,12 +88,13 @@ static bool sptm_virt_is_ram(u64 pa)
 /* A word of SPTM's memory by SPTM virtual address (its image map or its physmap). */
 static bool sptm_virt_guest_rd64(u64 va, u64 *out)
 {
+    u64 img_off = sptm_virt_image_va_offset();
     u64 pa;
 
     if (va >= SPTM_PHYSMAP_VA && va < SPTM_PHYSMAP_VA_END)
         pa = va - SPTM_PHYSMAP_VA + ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
-    else if (va >= SPTM_IMAGE_VA_OFFSET)
-        pa = va - SPTM_IMAGE_VA_OFFSET;
+    else if (va >= img_off)
+        pa = va - img_off;
     else
         return false;
     if (!sptm_virt_is_ram(pa))
@@ -785,9 +787,11 @@ static bool sptm_virt_guarded_gexit(u64 *regs)
 static void sptm_virt_park_report(u64 *regs, u64 pc);
 static void sptm_virt_park_strings(u64 *regs)
 {
+    u64 img_off = sptm_virt_image_va_offset();
+
     for (int r = 0; r < 30; r++) {
-        u64 p = regs[r] - SPTM_IMAGE_VA_OFFSET, probe;
-        if (regs[r] < SPTM_IMAGE_VA_OFFSET || !sptm_virt_is_ram(p) || !sptm_virt_peek64(p, &probe))
+        u64 p = regs[r] - img_off, probe;
+        if (regs[r] < img_off || !sptm_virt_is_ram(p) || !sptm_virt_peek64(p & ~7UL, &probe))
             continue;
         dc_civac_range((void *)p, 0x100);
         sysop("dsb sy");
@@ -867,8 +871,11 @@ static void sptm_virt_park_report(u64 *regs, u64 pc)
         printf("SPTM-virt[park]: x%-2d-x%-2d: 0x%016lx 0x%016lx 0x%016lx 0x%016lx\n", r,
                r + 3 < 30 ? r + 3 : 30, regs[r], r + 1 < 31 ? regs[r + 1] : 0,
                r + 2 < 31 ? regs[r + 2] : 0, r + 3 < 31 ? regs[r + 3] : 0);
-    sptm_virt_park_diag();
+    iodev_console_flush();
     sptm_virt_park_strings(regs);
+    iodev_console_flush();
+    sptm_virt_park_diag();
+    iodev_console_flush();
 }
 
 /* A synchronous exception into aura's GL2 from SPTM (or cL4) at GL1. */
