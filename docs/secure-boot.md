@@ -15,8 +15,9 @@ Both are build options; a default build only writes the record.
   nothing about who signed an image. A `SECBOOT=enforce` or `secure` build
   refuses to build with it unless `SECBOOT_TEST_KEY=1` is given (test builds).
   Whatever key a stage trusts, a good signature by the test key is recorded as
-  `test-key`, not `verified`: the stage runs it, and the chain is not called
-  verified.
+  `test-key`, not `verified`, and the chain is not called verified. A stage
+  that does not enforce runs it. A stage that enforces, by its build or by its
+  key block, refuses it unless it is a `SECBOOT_TEST_KEY=1` test build.
 - `SECBOOT_MIN_SECURITY_VERSION` (a `-D` define): the lowest security version
   a signature may carry. Signatures below it are refused as rollbacks.
 - `SECBOOT_FLAVOUR=dev|secure` (default `dev`): `dev` keeps the USB host
@@ -47,6 +48,8 @@ A Stage 1 built with `SECBOOT=audit` or `enforce` also carries an
 security version, filled before `kmutil` enrols the image, so the
 LocalPolicy's `coih` covers them like the rest of Stage 1:
 `secboot_sign.py fill-keys --pub aurora.pub [--pub owner.pub] --min-secver N [--enforce] in out`.
+`fill-keys --enforce` refuses the published test key unless `--test-key` is
+given; that is for a Stage 1 built with `SECBOOT_TEST_KEY=1`.
 A record is checked with the key whose id it names. An unfilled block leaves
 the built-in key in charge; a damaged one (bad CRC, unknown flags) is reported
 and ignored.

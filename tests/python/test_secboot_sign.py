@@ -61,11 +61,29 @@ def test_fill_keys(tmp_path):
     assert struct.unpack_from("<I", d, 4 + 160)[0] == zlib.crc32(body)
     assert run("fill-keys", "--pub", PUB, out, tmp_path / "x").returncode == 0  # refill is fine
     enf = tmp_path / "s1-enforce.bin"
-    assert run("fill-keys", "--pub", PUB, "--enforce", src, enf).returncode == 0
+    # Anyone can sign with the published test key: enforce with it only when asked for a test.
+    r = run("fill-keys", "--pub", PUB, "--enforce", src, enf)
+    assert r.returncode != 0 and "test key" in r.stderr and not enf.exists()
+    assert run("fill-keys", "--pub", PUB, "--enforce", "--test-key", src, enf).returncode == 0
     body = enf.read_bytes()[4 + 16:4 + 16 + 144]
     assert struct.unpack_from("<IIII", body) == (1, 1, 0, 1)
+    own = tmp_path / "own.pub"
+    own.write_bytes(bytes(range(32)))
+    assert run("fill-keys", "--pub", own, "--enforce", src, tmp_path / "own.bin").returncode == 0
+    r = run("fill-keys", "--pub", own, "--pub", PUB, "--enforce", src, tmp_path / "mixed.bin")
+    assert r.returncode != 0 and "test key" in r.stderr
     src.write_bytes(b"no block here")
     assert run("fill-keys", "--pub", PUB, src, tmp_path / "y").returncode != 0
+
+
+def test_the_tool_knows_the_published_test_key():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("secboot_sign", ROOT / "tools/secboot_sign.py")
+    secboot_sign = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(secboot_sign)
+    assert secboot_sign.TEST_KEY_ID == secboot_sign.key_id(PUB.read_bytes())
+    assert secboot_sign.pubkey(KEY.read_bytes()) == PUB.read_bytes()
 
 
 def aura_stage2(footprint=0x20000):

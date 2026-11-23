@@ -11,9 +11,11 @@
   secboot_sign.py sign-image --key K [--secver V] <in> <out>
         append an aura_sig record and the AURSIGT1 footer that cover the whole image, for the
         stage that chainloads it
-  secboot_sign.py fill-keys --pub P [--pub P2 ...] [--min-secver V] [--enforce] <stage1-in> <stage1-out>
+  secboot_sign.py fill-keys --pub P [--pub P2 ...] [--min-secver V] [--enforce [--test-key]] <stage1-in> <stage1-out>
         fill the AURORA-S1-KEY01 block of a Stage 1 image (up to 4 keys) before kmutil enrols it;
-        --enforce makes an audit build refuse what it cannot verify (the floor applies either way)
+        --enforce makes an audit build refuse what it cannot verify (the floor applies either way).
+        --enforce with the published test key needs --test-key, and a Stage 1 built with
+        SECBOOT_TEST_KEY=1: any other enforcing stage refuses what that key signed
   secboot_sign.py verify --pub P <file> [--head-len N]
         check either form and print the verdict, the key id and the SHA-256
 
@@ -138,6 +140,8 @@ RECORD_SIZE = 0x1000  # keeps whatever follows the record 4K-aligned
 FORM_MASK = 0xF
 FORM_PAYLOADS = 1
 FORM_IMAGE = 2
+# key_id() of data/secboot/test-ed25519.pub, whose private half is published with it.
+TEST_KEY_ID = bytes.fromhex("6ef2bae2eee577cb")
 
 
 def key_id(pub):
@@ -224,6 +228,7 @@ def main():
     f.add_argument("--pub", action="append", required=True)
     f.add_argument("--min-secver", type=int, default=0)
     f.add_argument("--enforce", action="store_true")
+    f.add_argument("--test-key", action="store_true")
     f.add_argument("inp")
     f.add_argument("out")
     v = sub.add_parser("verify")
@@ -278,6 +283,8 @@ def main():
         keys = [open(k, "rb").read() for k in a.pub]
         if not 1 <= len(keys) <= 4 or any(len(k) != 32 for k in keys):
             sys.exit("want 1..4 raw 32-byte Ed25519 public keys")
+        if a.enforce and not a.test_key and any(key_id(k) == TEST_KEY_ID for k in keys):
+            sys.exit("refusing --enforce with the published test key: anyone can sign with it (--test-key fills it anyway, for a SECBOOT_TEST_KEY=1 test build)")
         off = img.index(magic) + 16
         if struct.unpack_from("<I", img, off)[0] != 1:
             sys.exit("unsupported key block version")

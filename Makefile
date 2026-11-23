@@ -133,6 +133,13 @@ SECBOOT_TEST_PUBKEY := data/secboot/test-ed25519.pub
 SECBOOT_PUBKEY ?= $(SECBOOT_TEST_PUBKEY)
 # Anyone can sign with the test key (its private half is in data/secboot), so a build that
 # enforces or is the secure flavour refuses it unless SECBOOT_TEST_KEY=1 says this is a test build.
+# A stage that enforces (by its build, or by its key block at run time) runs what the test key
+# signed only in such a test build.
+ifeq ($(SECBOOT_TEST_KEY),1)
+ifneq ($(filter audit enforce,$(SECBOOT)),)
+CFG += SECBOOT_ALLOW_TEST_KEY
+endif
+endif
 ifneq ($(filter enforce,$(SECBOOT))$(filter secure,$(SECBOOT_FLAVOUR)),)
 ifneq ($(SECBOOT_TEST_KEY),1)
 ifeq ($(shell cmp -s $(SECBOOT_PUBKEY) $(SECBOOT_TEST_PUBKEY) && echo same),same)

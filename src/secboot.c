@@ -279,9 +279,12 @@ static int settle(struct measurement *m, const char *what)
         return 0;
     }
     all_verified = false;
-    /* The key this stage trusts signed it: run it, but nothing about it is verified. */
+#ifdef SECBOOT_ALLOW_TEST_KEY
+    /* A test build (SECBOOT_TEST_KEY=1) runs what the published test key signed, as unverified. */
     if (m->verdict == SECBOOT_TEST_KEY)
         return 0;
+#endif
+    /* Enforce is decided at run time too (the key block), so the test key is refused here. */
     if (secboot_enforcing()) {
         printf("secboot: refusing %s\n", what);
         return -1;
