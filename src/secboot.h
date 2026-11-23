@@ -41,8 +41,9 @@ bool secboot_allow_unverified(const char *what);
 
 /*
  * A chosen. line from the payloads. An earlier stage that enforced passes that on in its
- * chosen.aurora,measure-N line; this stage then runs no ESP boot= files and gives no USB host
- * the proxy, whatever it was built with. A forged line can only make a stage stricter.
+ * chosen.aurora,measure-N line; this stage then runs no ESP boot= files, chainloads nothing it
+ * has not verified and gives no USB host the proxy, whatever it was built with. A forged line
+ * can only make a stage stricter.
  */
 void secboot_note_chosen(const char *line);
 

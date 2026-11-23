@@ -267,6 +267,19 @@ static enum secboot_verdict check_record(const u8 *record, size_t record_size, c
 }
 #endif
 
+/* An earlier stage enforced: it would not have started this one otherwise. */
+static bool chain_enforces;
+
+/*
+ * Whether this stage refuses what is not verified: its own policy, or the policy of the stage
+ * that started it. A build without checks verifies nothing, so under an enforcing stage it
+ * refuses every next stage.
+ */
+static bool refuses_unverified(void)
+{
+    return secboot_enforcing() || chain_enforces;
+}
+
 static int settle(struct measurement *m, const char *what)
 {
     char h[17], k[17];
@@ -285,8 +298,9 @@ static int settle(struct measurement *m, const char *what)
         return 0;
 #endif
     /* Enforce is decided at run time too (the key block), so the test key is refused here. */
-    if (secboot_enforcing()) {
-        printf("secboot: refusing %s\n", what);
+    if (refuses_unverified()) {
+        printf("secboot: refusing %s%s\n", what,
+               secboot_enforcing() ? "" : " (an earlier stage enforced)");
         return -1;
     }
     return 0;
@@ -371,9 +385,6 @@ u8 *secboot_payload_next(u8 *p)
 #endif
 }
 
-/* An earlier stage enforced: it would not have started this one otherwise. */
-static bool chain_enforces;
-
 void secboot_note_chosen(const char *line)
 {
     /* chosen.aurora,measure-N=stage;policy;... */
@@ -392,7 +403,7 @@ void secboot_note_chosen(const char *line)
 #ifndef SECBOOT_SECURE_FLAVOUR
 bool secboot_host_proxy_allowed(void)
 {
-    return !secboot_enforcing() && !chain_enforces;
+    return !refuses_unverified();
 }
 
 bool secboot_unrequested_proxy_allowed(void)
@@ -408,7 +419,7 @@ bool secboot_unrequested_proxy_allowed(void)
 bool secboot_allow_unverified(const char *what)
 {
     all_verified = false;
-    if (secboot_enforcing() || chain_enforces) {
+    if (refuses_unverified()) {
         printf("secboot: %s cannot be verified; refusing it under policy enforce\n", what);
         return false;
     }

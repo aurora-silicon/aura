@@ -74,10 +74,13 @@ reboots).
 
 A stage started by one that enforced does the same, whatever it was built with:
 the earlier stage's `chosen.aurora,measure-N` line names its policy, and a
-stage that reads `enforce` there runs no ESP `boot=` files and gives no USB
-host the proxy. It does not check its own payloads under that policy (the
-earlier stage's image trailer covered them) and records its own policy as
-built. A forged line can only make a stage stricter.
+stage that reads `enforce` there runs no ESP `boot=` files, gives no USB
+host the proxy and chainloads only a next stage it has verified. A stage built
+without `SECBOOT` verifies nothing, so under an enforcing stage it refuses
+every `chainload=` target; an audit build goes on with what its key signed. It
+does not check its own payloads under that policy (the earlier stage's image
+trailer covered them) and records its own policy as built. A forged line can
+only make a stage stricter.
 
 ## Signature forms
 

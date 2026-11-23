@@ -362,6 +362,73 @@ def test_a_stage_started_by_an_enforcing_stage_enforces_too(tmp_path):
             assert "boot= 1 proxy 1" in out, (defines, policy, out)
 
 
+LOAD = r"""
+static char *vars[24];
+static size_t var_cnt;
+/* An earlier stage's measure line, as payload.c hands it over; "none" for a stage started alone. */
+static void earlier_stage(const char *policy)
+{
+    static char line[200];
+    snprintf(line, sizeof(line), "chosen.aurora,measure-0=stage1;%s;next-stage;verified;"
+             "0102030405060708;1;%064d", policy, 0);
+    if (strcmp(policy, "none"))
+        secboot_note_chosen(line);
+}
+/* Chainload an image, with or without an aura_sig trailer, with `used` of `capacity` vars taken. */
+static int load(bool trailer, size_t used, size_t capacity, const char *filler)
+{
+    static u8 img[0x100 + 0x1000 + 16];
+    size_t size = sizeof(img);
+    memset(img, 0, sizeof(img));
+    if (trailer) {
+        u64 off = 0x100;
+        memcpy(img + 0x100, "aura_sig", 8);
+        memcpy(img + size - 16, &off, 8);
+        memcpy(img + size - 8, "AURSIGT1", 8);
+    }
+    for (size_t i = 0; i < used; i++)
+        vars[i] = (char *)filler;
+    var_cnt = used;
+    return secboot_check_chainload(img, &size, vars, &var_cnt, capacity);
+}
+"""
+
+CHAIN_TARGET = LOAD + r"""
+int main(int argc, char **argv)
+{
+    earlier_stage(argv[1]);
+    printf("unsigned %d\n", load(false, 0, 4, ""));
+    verify_verdict = 0;
+    printf("good %d\n", load(true, 0, 4, ""));
+    verify_verdict = 3;
+    printf("bad %d\n", load(true, 0, 4, ""));
+    return 0;
+}
+"""
+
+
+def test_a_stage_started_by_an_enforcing_stage_refuses_an_unverified_next_stage(tmp_path):
+    (tmp_path / "own.pub").write_bytes(bytes(range(32)))
+    cases = {
+        # Stage 2 as the distributions build it cannot verify anything: with or without a
+        # trailer, the image is not verified.
+        ("CHAINLOADING", "ESP_STAGE2"): "unsigned -1\ngood -1\nbad -1\n",
+        # An audit Stage 2 can: it goes on with what its key signed, and nothing else.
+        ("CHAINLOADING", "ESP_STAGE2", "SECBOOT_AUDIT"): "unsigned -1\ngood 0\nbad -1\n",
+    }
+    for defines, enforced in cases.items():
+        binary = build(tmp_path, "-".join(defines), list(defines), CHAIN_TARGET,
+                       key=tmp_path / "own.pub")
+        results = lambda out: "".join(l + "\n" for l in out.splitlines()
+                                      if l.split()[0] in ("unsigned", "good", "bad"))
+        out = subprocess.run([str(binary), "enforce"], capture_output=True, text=True).stdout
+        assert results(out) == enforced, (defines, out)
+        # Started alone, or by a stage that does not enforce: as the stage was built.
+        for policy in ("audit", "off", "none"):
+            out = subprocess.run([str(binary), policy], capture_output=True, text=True).stdout
+            assert results(out) == "unsigned 0\ngood 0\nbad 0\n", (defines, policy, out)
+
+
 def test_the_payload_scan_hands_chosen_lines_to_secboot():
     payload = (ROOT / "src/payload.c").read_text()
     branch = payload[payload.index('if (IS_VAR("chosen.")) {'):]
