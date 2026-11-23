@@ -74,7 +74,7 @@ def handoff_source(source):
         region(source, "static int dt_reserve_asc_segments_at(int fdt_node",
                "static int dt_reserve_asc_segments(const char"),
         region(source, "/*\n * The AVE video encoders run firmware that iBoot preloads",
-               "/*\n * The M4, M4 Pro, M5 Pro and A18 Pro Neural Engines"),
+               "static const char *const ane_compatibles[]"),
     ])
 
 

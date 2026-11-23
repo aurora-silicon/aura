@@ -44,7 +44,7 @@ def test_ane_preload_handoff(tmp_path, board):
         start = source.index("static int " + name + "(")
         return source[start:source.index("\n}", start) + 2] + "\n"
 
-    start = source.rindex("/*\n", 0, source.index("Neural Engines run firmware that iBoot preloads"))
+    start = source.index("static const char *const ane_compatibles[]")
     end = source.index("\n}", source.index("static int dt_set_ane_firmware(void)")) + 2
     production = function("dt_get_or_add_reserved_mem") + source[start:end] + "\n"
     header = (ROOT / "src/adt.h").read_text()
