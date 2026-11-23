@@ -8,12 +8,33 @@ The real secboot.c is built with the defines a stage gets from the Makefile. The
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 from host_compiler import host_cc
 
 ROOT = Path(__file__).resolve().parents[2]
 
 HEADERS = {
+    # src/types.h is for the freestanding target: it defines uintptr_t, ptrdiff_t and ssize_t
+    # itself, which a hosted libc whose 64-bit types are not "long" (Darwin) refuses. The host's
+    # own types carry the same names here.
+    "types.h": r'''
+#pragma once
+#include <limits.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+typedef int8_t s8;
+typedef int16_t s16;
+typedef int32_t s32;
+typedef int64_t s64;
+#define UNUSED(x) (void)(x)
+''',
     "adt.h": r'''
 #pragma once
 #include "types.h"
@@ -85,6 +106,17 @@ u32 aura_secboot_verify(const u8 *body, size_t body_len, const u8 *covered, size
 '''
 
 
+def host_source(text, platform=sys.platform):
+    """secboot.c as the host's object format takes it.
+
+    The Stage 1 key block sits in an ELF section the linker script places; Mach-O wants the name
+    as "segment,section". Nothing here depends on where the block lands.
+    """
+    if platform == "darwin":
+        text = text.replace('section(".data.stage1_config")', 'section("__DATA,stage1_config")')
+    return text
+
+
 def build(tmp_path, name, defines, test, key=None):
     """Build src/secboot.c with build_cfg.h defines, the stubs and a test main()."""
     src = tmp_path / name / "src"
@@ -93,9 +125,8 @@ def build(tmp_path, name, defines, test, key=None):
     (stubs / "libfdt").mkdir(parents=True)
     (stubs / "tinf").mkdir()
     (src.parent / "build").mkdir()
-    for f in ("secboot.c", "secboot.h"):
-        shutil.copy(ROOT / "src" / f, src / f)
-    shutil.copy(ROOT / "src/types.h", stubs / "types.h")
+    shutil.copy(ROOT / "src/secboot.h", src / "secboot.h")
+    (src / "secboot.c").write_text(host_source((ROOT / "src/secboot.c").read_text()))
     for f, text in HEADERS.items():
         (stubs / f).write_text(text)
     (src.parent / "build/build_cfg.h").write_text("".join(f"#define {d} 1\n" for d in defines))
@@ -286,3 +317,13 @@ def test_the_payload_scan_hands_chosen_lines_to_secboot():
     # boot= and the proxy are decided after the scan that reads the lines.
     run = payload[payload.index("int payload_run(void)"):]
     assert run.index("payload_scanned = true;") < run.index("boot_storage_load(")
+
+
+def test_the_harness_builds_for_a_darwin_host():
+    # CI runs these tests on macOS too: the stubs carry no target-only type, and the key block's
+    # section is named the way Mach-O accepts.
+    assert "uintptr_t;" not in HEADERS["types.h"] and "ssize_t;" not in HEADERS["types.h"]
+    source = (ROOT / "src/secboot.c").read_text()
+    assert 'section(".data.stage1_config")' in source
+    assert 'section("__DATA,stage1_config")' in host_source(source, "darwin")
+    assert host_source(source, "linux") == source
