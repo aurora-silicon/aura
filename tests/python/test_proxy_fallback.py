@@ -201,9 +201,16 @@ FALLBACK = r'''
 #include <string.h>
 typedef unsigned int u32;
 #define WDT_TRIAL_SECONDS 178
-static bool trial, host;
-static unsigned waited, reboots;
+static bool trial, host, boot_wdt, arm_fails;
+static unsigned waited, reboots, trial_arms;
 static bool aura_trial_enabled(void) { return trial; }
+static bool wdt_boot_watchdog_armed(void) { return boot_wdt; }
+static int wdt_arm_trial(void)
+{
+    trial_arms++;
+    boot_wdt = false;
+    return arm_fails ? -1 : 0;
+}
 static bool uartproxy_wait_host(unsigned int ms)
 {
     waited = ms;
@@ -212,7 +219,7 @@ static bool uartproxy_wait_host(unsigned int ms)
 __attribute__((noreturn)) static void flush_and_reboot(void)
 {
     reboots++;
-    printf("ret=reboot waited=%u reboots=%u\n", waited, reboots);
+    printf("ret=reboot waited=%u reboots=%u arms=%u\n", waited, reboots, trial_arms);
     exit(0);
 }
 @HEADER@
@@ -221,14 +228,16 @@ int main(int argc, char **argv)
 {
     trial = atoi(argv[1]);
     host = atoi(argv[2]);
+    boot_wdt = atoi(argv[3]);
+    arm_fails = atoi(argv[4]);
     bool r = proxy_fallback("NVMe handoff failed");
-    printf("ret=%d waited=%u reboots=%u\n", r, waited, reboots);
+    printf("ret=%d waited=%u reboots=%u arms=%u\n", r, waited, reboots, trial_arms);
     return 0;
 }
 '''
 
 
-def _fallback(tmp_path, trial, host):
+def _fallback(tmp_path, trial, host, boot_wdt=False, arm_fails=False):
     header = (ROOT / "src/proxy_fallback.h").read_text()
     header = header[header.index("#define PROXY_FALLBACK_HOST_MS"):]
     header = header[:header.index("\n")]
@@ -239,23 +248,50 @@ def _fallback(tmp_path, trial, host):
     exe = tmp_path / "f"
     subprocess.run([*host_cc(), "-std=gnu11", "-Wall", "-Werror", "-Wno-unused-function",
                     "-Wno-unused-parameter", str(src), "-o", str(exe)], check=True)
-    out = subprocess.run([str(exe), str(int(trial)), str(int(host))], check=True,
+    out = subprocess.run([str(exe), str(int(trial)), str(int(host)), str(int(boot_wdt)),
+                          str(int(arm_fails))], check=True,
                          capture_output=True, text=True).stdout
     return dict(item.split("=") for item in out.strip().splitlines()[-1].split())
 
 
 def test_not_a_trial_keeps_the_proxy_without_waiting(tmp_path):
     for host in (False, True):
-        assert _fallback(tmp_path, False, host) == {"ret": "0", "waited": "0", "reboots": "0"}
+        for boot_wdt in (False, True):
+            assert _fallback(tmp_path, False, host, boot_wdt) == {
+                "ret": "0", "waited": "0", "reboots": "0", "arms": "0"}
 
 
 def test_trial_without_a_host_reboots_after_the_window(tmp_path):
     assert _fallback(tmp_path, True, False) == {"ret": "reboot", "waited": "15000",
-                                                 "reboots": "1"}
+                                                 "reboots": "1", "arms": "0"}
 
 
 def test_trial_with_a_host_keeps_the_proxy(tmp_path):
-    assert _fallback(tmp_path, True, True) == {"ret": "1", "waited": "15000", "reboots": "0"}
+    assert _fallback(tmp_path, True, True) == {"ret": "1", "waited": "15000", "reboots": "0",
+                                                "arms": "0"}
+
+
+def test_stage1_trial_turns_its_boot_watchdog_into_the_trial_watchdog(tmp_path):
+    """A Stage 1 that took the trial marker still runs its boot watchdog, which the first host
+    turns off. The window must run under the trial watchdog, armed before a host can attach."""
+    assert _fallback(tmp_path, True, True, boot_wdt=True) == {
+        "ret": "1", "waited": "15000", "reboots": "0", "arms": "1"}
+    assert _fallback(tmp_path, True, False, boot_wdt=True) == {
+        "ret": "reboot", "waited": "15000", "reboots": "1", "arms": "1"}
+
+
+def test_stage1_trial_without_a_trial_watchdog_reboots_without_a_window(tmp_path):
+    assert _fallback(tmp_path, True, True, boot_wdt=True, arm_fails=True) == {
+        "ret": "reboot", "waited": "0", "reboots": "1", "arms": "1"}
+
+
+def test_the_trial_watchdog_is_armed_before_the_host_window():
+    fn = _body((ROOT / "src/proxy_fallback.c").read_text(), "bool proxy_fallback(const char *why)")
+    assert fn.index("wdt_arm_trial()") < fn.index("uartproxy_wait_host(")
+    # wdt_host_attached() only turns off the boot watchdog, which wdt_arm_trial() clears.
+    wdt = (ROOT / "src/wdt.c").read_text()
+    assert "wdt_boot_armed = false;" in _body(wdt, "int wdt_arm_trial(void)")
+    assert "if (!wdt_boot_armed)\n        return;" in _body(wdt, "void wdt_host_attached(void)")
 
 
 def test_cdc_cleanup_cancels_a_scheduled_transition():

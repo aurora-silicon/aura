@@ -17,6 +17,17 @@ bool proxy_fallback(const char *why)
     if (!aura_trial_enabled())
         return false;
 
+    /*
+     * A Stage 1 that took the trial marker still runs its boot watchdog, and the first host turns
+     * that one off (wdt_host_attached()). Make it the trial watchdog, with a fresh period, before a
+     * host can attach, so a host that goes away cannot strand the trial. Without a watchdog, a
+     * host window could, so reboot now instead.
+     */
+    if (wdt_boot_watchdog_armed() && wdt_arm_trial()) {
+        printf("\naura-try: %s; no trial watchdog, rebooting to the configured image\n", why);
+        flush_and_reboot();
+    }
+
     /* Shown on the panel */
     printf("\naura-try: %s; waiting %u s for a host, then rebooting to the configured image\n", why,
            PROXY_FALLBACK_HOST_MS / 1000);
