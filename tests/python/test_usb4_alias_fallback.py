@@ -53,6 +53,10 @@ static void dt_copy_usb4_drom(const char *adt_path, const char *alias, u64 uuid)
 {
     (void)adt_path; (void)alias; (void)uuid;
 }
+static void dt_copy_router_ap_fw_tunable(int adt_node, const char *alias)
+{
+    (void)adt_node; (void)alias;
+}
 '''
 
 MAIN = r'''
