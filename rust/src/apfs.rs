@@ -362,12 +362,13 @@ fn read_volume(
     let vol_node = BTreeNodePhys(&vol_node_bytes);
     let root_tree_oid = asb.root_tree_oid()?;
     let fs_root = lookup_omap(&vol_node, root_tree_oid)?;
-    // a B-tree node is one block
-    if fs_root.size()? as usize != block_size {
-        println!("apfs: root tree node of {} bytes", fs_root.size()?);
+    // ov_size: an object is a whole number of blocks, and a node may be more than one
+    let fs_root_size = fs_root.size()? as usize;
+    if fs_root_size == 0 || fs_root_size % block_size != 0 {
+        println!("apfs: root tree node of {} bytes", fs_root_size);
         return None;
     }
-    let mut fs_root_bytes = vec![0; block_size];
+    let mut fs_root_bytes = alloc_read_buf(disk, fs_root_size as u64)?;
     pread(disk, fs_root.paddr()?, &mut fs_root_bytes).ok()?;
     let fs_root_node = BTreeNodePhys(&fs_root_bytes);
     if fs_root_node.oid()? != root_tree_oid {
@@ -534,7 +535,14 @@ mod tests {
 
     /// The volume's root tree: a root directory record "x.gl" and the file's one extent.
     fn fs_root(ext_len: u64) -> Vec<u8> {
-        let mut b = vec![0u8; B];
+        fs_root_node(ext_len, B, 7)
+    }
+
+    /// The root tree as one node of `node_size` bytes, the file's extent at block `data`.
+    fn fs_root_node(ext_len: u64, node_size: usize, data: u64) -> Vec<u8> {
+        let mut b = vec![0u8; node_size];
+        // the value area ends at the B-tree info that closes a root node
+        let vals = node_size - BTreeInfo::SIZE;
         le64(&mut b, 8, ROOT_OID);
         le16(&mut b, 32, BTreeNodePhys::ROOT);
         le32(&mut b, 36, 2);
@@ -549,7 +557,7 @@ mod tests {
         );
         le32(&mut b, keys + 8, name.len() as u32);
         b[keys + 12..keys + 12 + name.len()].copy_from_slice(name);
-        le64(&mut b, VALS - 18, FILE_ID);
+        le64(&mut b, vals - 18, FILE_ID);
         for (o, v) in [(0, 0), (2, drec_key as u16), (4, 18), (6, 18)] {
             le16(&mut b, TOC + o, v);
         }
@@ -558,8 +566,8 @@ mod tests {
             keys + drec_key,
             FILE_ID | (APFS_TYPE_FILE_EXTENT << OBJ_TYPE_SHIFT),
         );
-        le64(&mut b, VALS - 42, ext_len);
-        le64(&mut b, VALS - 42 + 8, 7);
+        le64(&mut b, vals - 42, ext_len);
+        le64(&mut b, vals - 42 + 8, data);
         for (o, v) in [(8, drec_key as u16), (10, 16), (12, 42), (14, 24)] {
             le16(&mut b, TOC + o, v);
         }
@@ -603,6 +611,17 @@ mod tests {
     #[test]
     fn reads_the_gigalocker() {
         assert_eq!(scan(&container()), Ok(vec![0x5a; 64]));
+    }
+
+    #[test]
+    fn reads_a_root_tree_node_of_two_blocks() {
+        // blocks 6 and 7 hold the node, block 8 the gigalocker
+        let mut c = container();
+        c.resize(9 * B, 0);
+        c[5 * B..6 * B].copy_from_slice(&omap_node(5, &[(ROOT_OID, 2 * B as u32, 6)]));
+        c[6 * B..8 * B].copy_from_slice(&fs_root_node(64, 2 * B, 8));
+        c[8 * B..8 * B + 64].fill(0xa5);
+        assert_eq!(scan(&c), Ok(vec![0xa5; 64]));
     }
 
     #[test]
@@ -654,6 +673,12 @@ mod tests {
             ("volume superblock magic", |c| le32(&mut c[3 * B..], 32, 0)),
             ("root tree node of 0 bytes", |c| {
                 le32(&mut c[5 * B..], VALS - 16 + 4, 0)
+            }),
+            ("root tree node of a block and a half", |c| {
+                le32(&mut c[5 * B..], VALS - 16 + 4, (B + B / 2) as u32)
+            }),
+            ("root tree node longer than the partition", |c| {
+                le32(&mut c[5 * B..], VALS - 16 + 4, 16 * B as u32)
             }),
             ("root tree node at another block", |c| {
                 le64(&mut c[6 * B..], 8, ROOT_OID + 1)
