@@ -17,7 +17,7 @@ static void *dt, *adt;
 static int adt_path_offset_trace(void *a,const char *s,int *p) { p[0]=1;p[1]=0;return 0; }
 static const char *adt_get_name(void *a,int n) { return n==1?"usb-drd0":"usb-drd1"; }
 static int adt_get_reg(void *a,int *p,const char *s,int r,u64 *v,void *x) { *v=p[1]==1?0x702280000ULL:0xb02280000ULL; return 0; }
-#define PMGR_DIE_OFFSET 0x2000000000ULL
+static u64 pmgr_die_stride(void) { return 0x2000000000ULL; }
 #define DT_MAX_RANGES 1
 struct dt_ranges_tbl { int unused; };
 static void dt_parse_ranges(void *d,int n,struct dt_ranges_tbl *r) {}
