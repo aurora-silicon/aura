@@ -4618,6 +4618,22 @@ static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits)
 }
 
 /*
+ * The RAM of one ASC firmware segment: reserved no-map as asc-firmware@<phys>, its size rounded
+ * up to whole 16K pages (returned in *rounded). Returns the reserved-memory node.
+ */
+static int dt_reserve_asc_segment_ram(u64 phys, size_t size, size_t *rounded, char *name,
+                                      size_t name_len)
+{
+    snprintf(name, name_len, "asc-firmware@%lx", phys);
+    if (size & (SZ_16K - 1)) {
+        printf("ADT: segment %s uses non 16k aligned size: 0x%06zx\n", name, size);
+        size = ALIGN_UP(size, SZ_16K);
+    }
+    *rounded = size;
+    return dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, phys, size);
+}
+
+/*
  * Reserve the firmware segments of an ASC coprocessor from its ADT
  * segment-ranges and attach them to its FDT node. With dram_only, segments
  * outside DRAM (such as the coprocessor's own SRAM, which the OS maps as MMIO)
@@ -4684,16 +4700,9 @@ static int dt_reserve_asc_segments_at(int fdt_node, const char *adt_path, const 
         u64 iova = (remap ? seg->remap : seg->iova) | base;
 
         char node_name[64];
-        snprintf(node_name, sizeof(node_name), "asc-firmware@%lx", seg->phys);
-
-        size_t seg_size = seg->size;
-        if (seg->size & (SZ_16K - 1)) {
-            printf("ADT: segment %s uses non 16k aligned size: 0x%06zx\n", node_name, seg_size);
-            seg_size = ALIGN_UP(seg_size, SZ_16K);
-        }
-
-        int mem_node =
-            dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, seg->phys, seg_size);
+        size_t seg_size;
+        int mem_node = dt_reserve_asc_segment_ram(seg->phys, seg->size, &seg_size, node_name,
+                                                  sizeof(node_name));
         if (mem_node < 0)
             return mem_node;
         /*

@@ -71,6 +71,8 @@ def handoff_source(source):
                "static int dt_device_set_reserved_mem_from_dart("),
         region(source, "static int dt_get_or_add_reserved_mem(const char *node_name",
                "static int dt_device_add_mem_region("),
+        region(source, "static int dt_reserve_asc_segment_ram(u64 phys",
+               "/*\n * Reserve the firmware segments of an ASC coprocessor"),
         region(source, "static int dt_reserve_asc_segments_at(int fdt_node",
                "static int dt_reserve_asc_segments(const char"),
         region(source, "/*\n * The AVE video encoders run firmware that iBoot preloads",

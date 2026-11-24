@@ -103,7 +103,7 @@ static int dt_set_isp_fwdata(void)
 /* This fixture exercises the legacy optional-camera path, never the T6050 transaction. */
 static int dt_t6050_isp_transaction(void) { abort(); }
 ''' + function("dt_device_set_reserved_mem") +
-        function("dt_reserve_asc_segments_at") + function("dt_reserve_asc_segments") +
+        function("dt_reserve_asc_segment_ram") + function("dt_reserve_asc_segments_at") + function("dt_reserve_asc_segments") +
         function("dt_reserve_asc_firmware") + has_placeholders + set_isp + r'''
 static void world(int which)
 {
