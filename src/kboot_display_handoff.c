@@ -4897,17 +4897,24 @@ static T6050_TEXT u32 t6050_add_node(void *dt, const char *parent, const char *n
     return ph;
 }
 
-/* The `compat` node whose coprocessor (first reg) is at `coproc`, or -1 */
+/*
+ * The unique `compat` node whose coprocessor (first reg) is at `coproc`, or -1 when missing or
+ * ambiguous (more than one matching node).
+ */
 static T6050_TEXT int t6050_node_at(void *dt, const char *compat, u64 coproc)
 {
-    for (int o = fdt_node_offset_by_compatible(dt, -1, compat); o >= 0;
-         o = fdt_node_offset_by_compatible(dt, o, compat)) {
+    int match = -1, o = -1;
+
+    while ((o = fdt_node_offset_by_compatible(dt, o, compat)) >= 0) {
         int len;
         const fdt64_t *reg = fdt_getprop(dt, o, "reg", &len);
-        if (reg && len >= 16 && fdt64_ld(&reg[0]) == coproc)
-            return o;
+        if (reg && len >= 16 && fdt64_ld(&reg[0]) == coproc) {
+            if (match >= 0)
+                return -1;
+            match = o;
+        }
     }
-    return -1;
+    return o == -FDT_ERR_NOTFOUND ? match : -1;
 }
 
 /*
@@ -5817,7 +5824,8 @@ static T6050_TEXT void t6050_ext_handoff(void *dt, int engines, int skip)
 }
 
 /*
- * The ADT dcpextN index whose coprocessor is at `node`'s identity-mapped reg[0], or -1
+ * The ADT dcpextN index whose coprocessor is uniquely mapped at `node`'s identity-mapped reg[0],
+ * or -1
  */
 static T6050_TEXT int t6050_ext_index(void *dt, int node)
 {
@@ -5826,6 +5834,8 @@ static T6050_TEXT int t6050_ext_index(void *dt, int node)
     if (!reg || len < 16 || !t6050_identity_reg(dt, node))
         return -1;
     u64 coproc = fdt64_ld(&reg[0]);
+    if (t6050_node_at(dt, "apple,t6050-dcpext", coproc) != node)
+        return -1;
     for (int n = 0; n < T6050_ENGINES; n++) {
         char a[32];
         u64 adt_coproc;

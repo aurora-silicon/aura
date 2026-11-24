@@ -456,6 +456,7 @@ static int headless(int argc, char **argv)
     u64 vram = arg(argc, argv, "vram", 0), vram_size = arg(argc, argv, "vsize", 0);
     u64 meta_size = arg(argc, argv, "meta", 0), bw = arg(argc, argv, "bw", 0);
     u64 no_pt_region = arg(argc, argv, "no_pt_region", 0);
+    u64 dup_ext = arg(argc, argv, "dup_ext", 0);
     const char *nub = "/arm-io/dcpext0/iop-dcpext0-nub";
 
     prop(nub, "uuid", image(true), 37);
@@ -516,6 +517,15 @@ static int headless(int argc, char **argv)
     int piodma = fdt_add_subnode(dt, ext, "piodma");
     OK(piodma);
     fdt_u32s(dt, piodma, "iommus", 2, PH_DART_DISP, 16, 0, 0);
+    if (dup_ext) {
+        int dup = fdt_dev(dt, soc, "dcpext-dup@389c00000", COPROC, 0);
+        OK(fdt_setprop_string(dt, dup, "compatible", "apple,t6050-dcpext"));
+        OK(fdt_setprop_string(dt, dup, "status", "okay"));
+        fdt_u32s(dt, dup, "mboxes", 1, PH_MBOX, 0, 0, 0);
+        int dpio = fdt_add_subnode(dt, dup, "piodma");
+        OK(dpio);
+        fdt_u32s(dt, dpio, "iommus", 2, PH_DART_DISP, 16, 0, 0);
+    }
     int disp = fdt_add_subnode(dt, soc, "display-subsystem");
     OK(disp);
     OK(fdt_setprop_string(dt, disp, "compatible", "apple,display-subsystem"));
@@ -529,11 +539,14 @@ static int headless(int argc, char **argv)
 
     int chosen = fdt_path_offset(dt, "/chosen");
     const char *said = fdt_getprop(dt, chosen, T6050_STATUS, NULL);
-    printf("result chosen=%s engine=%s subsystem=%s dart-dcp=%s dart-disp=%s mbox=%s pmc=%s\n",
+    printf("result chosen=%s engine=%s subsystem=%s dart-dcp=%s dart-disp=%s mbox=%s pmc=%s",
            said ? said : "none", status(dt, "/soc/dcpext@389c00000"),
            status(dt, "/soc/display-subsystem"), status(dt, "/soc/iommu@389304000"),
            status(dt, "/soc/iommu@389308000"), status(dt, "/soc/mbox@389c08000"),
            status(dt, "/soc/pmc-metadata@510f00000"));
+    if (dup_ext)
+        printf(" dup=%s", status(dt, "/soc/dcpext-dup@389c00000"));
+    printf("\n");
     int len = 0, n, count = 0;
     const fdt32_t *s = fdt_getprop(dt, fdt_path_offset(dt, "/soc/dcpext@389c00000"),
                                    "apple,bw-scratch", &len);
@@ -1127,6 +1140,18 @@ def test_headless_without_pt_region_stays_handed_off(host):
     assert handed_off(r)
     assert not r.said("rejected")
     assert not r.said("the device tree enables")
+
+
+@pytest.mark.parametrize("no_pt_region", [1, 0])
+def test_headless_duplicate_ext_node_refused(host, no_pt_region):
+    # A second, input-enabled apple,t6050-dcpext node at the same coprocessor address makes the
+    # mapping ambiguous: the headless handoff refuses before committing and t6050_ext_reject()
+    # disables the duplicate node too, even when pt-region-* is absent.
+    r = headless(host, no_pt_region=no_pt_region, dup_ext=1)
+    assert r.state == {"chosen": "refused", **DISABLED, "dup": "disabled"}, r.log
+    assert r.reserved == [OSLOG]
+    assert r.said(REFUSED)
+    assert not r.said("handed off")
 
 
 @pytest.mark.parametrize("fail", [0, 1, 2, 3, 4])

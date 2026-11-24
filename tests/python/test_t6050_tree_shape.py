@@ -776,6 +776,7 @@ static void *test_malloc(size_t n)
         definition(source, "static T6050_INIT bool t6050_identity_reg(") + \
         definition(source, "static T6050_TEXT int t6050_check_placement(") + \
         definition(source, "static T6050_TEXT int t6050_check_ext_adt(") + \
+        definition(source, "static T6050_TEXT int t6050_node_at(") + \
         definition(source, "static T6050_TEXT int t6050_ext_index(") + \
         definition(source, "static T6050_TEXT bool t6050_dart_at(") + \
         definition(source, "static T6050_TEXT int t6050_drop_ext_scanout(") + \
@@ -1128,8 +1129,21 @@ int main(void)
     assert(is("/dcpext0", "apple,firmware-compat", &v272));
     assert(!is_disabled("/dcpext1") && is("/dcpext1", "apple,firmware-compat", &old));
     assert(has_scanout_dart(PH_DART1)); cases++;
+    /* Duplicate apple,t6050-dcpext nodes at the same coprocessor address are ambiguous and
+     * rejected rather than exempted by ext_aura or version-stamped. */
+    world();
+    os_firmware = v272;
+    exts[1].pt16[0] = exts[1].pt16[1] = 0;
+    engine_under("/", "dcpext1-dup", exts[1].coproc, "okay", true, PH_DART1);
+    t6050.ext_aura = 1u << 1;
+    t6050_ext_version(tree);
+    t6050.ext_aura = 0;
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old);
+    assert(is_disabled("/dcpext1-dup") && is("/dcpext1-dup", "apple,firmware-compat", &old));
+    cases++;
     printf("PASS dcpext version %d cases\n", cases);
     return 0;
 }
 '''
-    run(tmp_path, "ext-version", code, "PASS dcpext version 22 cases")
+    run(tmp_path, "ext-version", code, "PASS dcpext version 23 cases")
