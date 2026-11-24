@@ -807,6 +807,16 @@ static int g14g_gpu_publish(void *dt, void *arg)
     gpu = gpu26_node(dt, h->fw.t);
     if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,coredump-copy-buffer", h->copy_bytes))
         bail("FDT: GPU: G14G cannot set apple,coredump-copy-buffer\n");
+    /*
+     * As on T8122 27.2 (t8122_gpu_enable_27()): the kernel starts this firmware with no PMP link,
+     * so Linux's pmgr must not arm hardware auto power-gating of the GPU's domain under it.
+     */
+    gpu = gpu26_node(dt, h->fw.t);
+    int len = 0;
+    const fdt32_t *pd = gpu < 0 ? NULL : fdt_getprop(dt, gpu, "power-domains", &len);
+    int domain = pd && len == sizeof(*pd) ? fdt_node_offset_by_phandle(dt, fdt32_ld(pd)) : -1;
+    if (domain < 0 || fdt_setprop_empty(dt, domain, "apple,no-auto-pm"))
+        bail("FDT: GPU: G14G cannot mark the GPU power domain apple,no-auto-pm\n");
     gpu = gpu26_node(dt, h->fw.t);
     if (gpu < 0 || fdt_setprop_string(dt, gpu, "status", "okay"))
         bail("FDT: GPU: G14G cannot set GPU status\n");
