@@ -9392,17 +9392,14 @@ static int adt_get_u32_exact(int node, const char *name, u32 *val)
 
 /*
  * Copies this Mac's PMP values from the ADT onto the FDT node @pmp_node: /chosen's board-id and
- * dram-vendor-id, and the properties of the PMP nub at @nub_path. Scalar values must be exactly
- * a u32; calibration tables stay in their original byte order.
+ * dram-vendor-id, and the properties of the PMP nub node @pmp_iop_anode. Scalar values must be
+ * exactly a u32; calibration tables stay in their original byte order.
  */
-static int dt_fill_pmp_from(int pmp_node, const char *nub_path)
+static int dt_fill_pmp_from_node(int pmp_node, int pmp_iop_anode)
 {
     int chosen_anode = adt_path_offset(adt, "/chosen");
     if (chosen_anode < 0)
         bail("ADT: /chosen not found \n");
-    int pmp_iop_anode = adt_path_offset(adt, nub_path);
-    if (pmp_iop_anode < 0)
-        bail("ADT: %s not found \n", nub_path);
 
     u32 board_id, dram_vendor_id, dram_capacity = 0xFFFFFFFF;
     if (adt_get_u32_exact(chosen_anode, "board-id", &board_id))
@@ -9433,6 +9430,14 @@ static int dt_fill_pmp_from(int pmp_node, const char *nub_path)
     return 0;
 }
 
+static int dt_fill_pmp_from(int pmp_node, const char *nub_path)
+{
+    int pmp_iop_anode = adt_path_offset(adt, nub_path);
+    if (pmp_iop_anode < 0)
+        bail("ADT: %s not found \n", nub_path);
+    return dt_fill_pmp_from_node(pmp_node, pmp_iop_anode);
+}
+
 /* T6000/T8112, and dt_pass_pmp() on T6030 and T8122: the ADT's one PMP */
 static int dt_fill_pmp(int pmp_node)
 {
@@ -9441,10 +9446,12 @@ static int dt_fill_pmp(int pmp_node)
 
 /*
  * The boot arguments the PMP driver patches into the firmware from an optional
- * apple,<name>; the firmware's default for each is 0. iBoot sets them where they
- * apply, e.g. a J616s has dram-channel-disable 0xffff0000.
+ * apple,<name>; the firmware's default for each is 0. Absent properties are
+ * skipped. When @strict is set, a present property that is not a u32 fails the
+ * copy; otherwise it is skipped so legacy alias-based boots keep their prior
+ * behavior.
  */
-static int dt_set_pmp_bootargs(int pmp_node, int pmp_iop_anode)
+static int dt_set_pmp_bootargs(int pmp_node, int pmp_iop_anode, bool strict)
 {
     static const char *const pmp_bootargs[] = {"dram-channel-disable", "pmc-msg-disabled",
                                                "soc-chip-variant"};
@@ -9452,14 +9459,118 @@ static int dt_set_pmp_bootargs(int pmp_node, int pmp_iop_anode)
         u32 val;
         char arg_name[64];
 
-        if (adt_get_u32_exact(pmp_iop_anode, pmp_bootargs[i], &val))
+        if (!adt_getprop(adt, pmp_iop_anode, pmp_bootargs[i], NULL))
             continue;
+        if (adt_get_u32_exact(pmp_iop_anode, pmp_bootargs[i], &val)) {
+            if (strict)
+                bail("ADT: pmp boot argument %s is not a u32\n", pmp_bootargs[i]);
+            continue;
+        }
         snprintf(arg_name, sizeof(arg_name), "apple,%s", pmp_bootargs[i]);
         if (fdt_setprop_u32(dt, pmp_node, arg_name, val))
             bail("FDT: failed to set pmp boot argument %s\n", pmp_bootargs[i]);
         printf("FDT: pmp %s = 0x%x\n", pmp_bootargs[i], val);
     }
     return 0;
+}
+
+/*
+ * Copies /arm-io/pmgr's optional pmc and pmc-pmgr u32s onto @pmp_node when
+ * /arm-io/pmgr is present in the ADT. Pre-existing values are cleared up front
+ * by dt_clear_pmp_props() so a missing /arm-io/pmgr never leaves stale PMC
+ * properties behind. A present property that is not a u32 fails the copy.
+ */
+static int dt_set_pmp_pmgr(int pmp_node)
+{
+    static const char *const pmgr_props[] = {"pmc", "pmc-pmgr"};
+    int pmgr_anode = adt_path_offset(adt, "/arm-io/pmgr");
+
+    if (pmgr_anode < 0)
+        return 0;
+    for (size_t i = 0; i < ARRAY_SIZE(pmgr_props); i++) {
+        u32 val;
+        char prop_name[32];
+
+        if (!adt_getprop(adt, pmgr_anode, pmgr_props[i], NULL))
+            continue;
+        if (adt_get_u32_exact(pmgr_anode, pmgr_props[i], &val))
+            bail("ADT: /arm-io/pmgr %s is not a u32\n", pmgr_props[i]);
+        snprintf(prop_name, sizeof(prop_name), "apple,%s", pmgr_props[i]);
+        if (fdt_setprop_u32(dt, pmp_node, prop_name, val))
+            bail("FDT: failed to set pmp %s\n", prop_name);
+    }
+    return 0;
+}
+
+/*
+ * Drops pre-existing per-unit tunables, PMC fields and optional boot arguments
+ * from @pmp_node inside the atomic snapshot transaction so omitted ADT
+ * properties (or an absent /arm-io/pmgr) never leave another unit's DT values
+ * behind.
+ */
+static int dt_clear_pmp_props(int pmp_node)
+{
+    static const char *const optional_props[] = {
+        "apple,dram-capacity", "apple,dram-channel-disable", "apple,pmc", "apple,pmc-msg-disabled",
+        "apple,pmc-pmgr",      "apple,soc-chip-variant",
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(optional_props); i++) {
+        int err = fdt_delprop(dt, pmp_node, optional_props[i]);
+        if (err && err != -FDT_ERR_NOTFOUND)
+            return err;
+    }
+
+    for (;;) {
+        int prop = fdt_first_property_offset(dt, pmp_node);
+        char drop[128] = {0};
+
+        while (prop >= 0) {
+            const char *name = NULL;
+            if (!fdt_getprop_by_offset(dt, prop, &name, NULL))
+                return -FDT_ERR_BADSTRUCTURE;
+            if (name && !strncmp(name, "apple,tunable-", sizeof("apple,tunable-") - 1)) {
+                snprintf(drop, sizeof(drop), "%s", name);
+                break;
+            }
+            prop = fdt_next_property_offset(dt, prop);
+        }
+        if (!drop[0])
+            return 0;
+        int err = fdt_delprop(dt, pmp_node, drop);
+        if (err)
+            return err;
+    }
+}
+
+static bool adt_name_is_component(const char *s, u32 nlen)
+{
+    if (!s || nlen < 2 || s[nlen - 1] != '\0')
+        return false;
+    for (u32 i = 0; i < nlen - 1; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x21 || c > 0x7e || c == '/')
+            return false;
+    }
+    return true;
+}
+
+static int adt_find_pmp_nub(int pmp_anode, const char *name)
+{
+    char expected[64];
+    int elen = snprintf(expected, sizeof(expected), "iop-%s-nub", name);
+
+    if (elen <= 0 || (size_t)elen >= sizeof(expected))
+        return -1;
+    int child = pmp_anode;
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        u32 nlen = 0;
+        const char *cname = adt_getprop(adt, child, "name", &nlen);
+        if (cname && nlen == (u32)elen + 1 && !memcmp(cname, expected, nlen))
+            return child;
+    }
+    return -1;
 }
 
 /*
@@ -9485,11 +9596,13 @@ static int adt_find_pmp_by_window(u64 address, char *name, size_t name_size)
     int node = arm_io;
     ADT_FOREACH_CHILD(adt, node)
     {
-        u32 len = 0;
+        u32 len = 0, nlen = 0;
         const char *type = adt_getprop(adt, node, "device_type", &len);
-        const char *child = adt_get_name(adt, node);
 
-        if (!type || len != sizeof("pmp") || memcmp(type, "pmp", sizeof("pmp")) || !child)
+        if (!type || len != sizeof("pmp") || memcmp(type, "pmp", sizeof("pmp")))
+            continue;
+        const char *child = adt_getprop(adt, node, "name", &nlen);
+        if (nlen > name_size || !adt_name_is_component(child, nlen))
             continue;
         path[depth] = node;
         for (int i = 0; i < 16; i++) {
@@ -9502,7 +9615,7 @@ static int adt_find_pmp_by_window(u64 address, char *name, size_t name_size)
             if (found >= 0)
                 return -2;
             found = node;
-            snprintf(name, name_size, "%s", child);
+            memcpy(name, child, nlen);
             break;
         }
     }
@@ -9527,7 +9640,7 @@ static int dt_set_pmp_by_window(void)
             continue;
         enabled++;
 
-        char path[64], name[32], nub[96];
+        char path[64], name[32];
         if (fdt_get_path(dt, node, path, sizeof(path)))
             snprintf(path, sizeof(path), "pmp");
         u64 address = dt_get_address(dt, node);
@@ -9540,8 +9653,7 @@ static int dt_set_pmp_by_window(void)
                    address);
             continue;
         }
-        snprintf(nub, sizeof(nub), "/arm-io/%s/iop-%s-nub", name, name);
-        int nub_anode = adt_path_offset(adt, nub);
+        int nub_anode = adt_find_pmp_nub(anode, name);
         void *saved = nub_anode < 0 ? NULL : malloc(dt_bufsize);
         if (!saved) {
             printf("FDT: %s: %s; keeping the DT's values\n", path,
@@ -9549,7 +9661,8 @@ static int dt_set_pmp_by_window(void)
             continue;
         }
         memcpy(saved, dt, dt_bufsize);
-        if (dt_fill_pmp_from(node, nub) || dt_set_pmp_bootargs(node, nub_anode)) {
+        if (dt_clear_pmp_props(node) || dt_fill_pmp_from_node(node, nub_anode) ||
+            dt_set_pmp_bootargs(node, nub_anode, true) || dt_set_pmp_pmgr(node)) {
             memcpy(dt, saved, dt_bufsize);
             printf("FDT: %s: ADT %s values not copied; keeping the DT's values\n", path, name);
         } else {
@@ -9620,7 +9733,7 @@ static int dt_set_pmp(void)
             bail("FDT: failed to transfer pmp tunable");
     }
 
-    if (dt_set_pmp_bootargs(fdt_path_offset(dt, "pmp"), pmp_iop_anode))
+    if (dt_set_pmp_bootargs(fdt_path_offset(dt, "pmp"), pmp_iop_anode, false))
         return -1;
 
     pmp_node = fdt_path_offset(dt, "pmp");

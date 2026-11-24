@@ -10,11 +10,11 @@
 typedef uint32_t u32;
 typedef uint64_t u64;
 #define ARRAY_SIZE(s) (sizeof(s) / sizeof((s)[0]))
-#define T6000 0x6000
-#define T8112 0x8112
-#define T8122 0x8122
-#define T6041 0x6041
-#define T6050 0x6050
+#define T6000         0x6000
+#define T8112         0x8112
+#define T8122         0x8122
+#define T6041         0x6041
+#define T6050         0x6050
 #define bail(...)                                                                                  \
     do {                                                                                           \
         printf(__VA_ARGS__);                                                                       \
@@ -22,21 +22,34 @@ typedef uint64_t u64;
     } while (0)
 static void *dt, *adt;
 static int dt_bufsize = 8192;
-static u32 chip_id, bdid, dvid, capacity, variant[2];
-static u32 bdid_len, dvid_len, capacity_len;
+static u32 chip_id, bdid, dvid, capacity, variant[2], pmc_val, pmc_pmgr_val;
+static u32 bdid_len, dvid_len, capacity_len, variant_len, pmc_len, pmc_pmgr_len;
 static bool chosen_present, nub_present, capacity_present, bdid_present, dvid_present;
+static bool variant_present, pmgr_present, pmc_present, pmc_pmgr_present;
 static unsigned adt_reads;
 /*
- * T6050's ADT: /arm-io has a DART that shares pmp0's PMP window (not a PMP), pmp0 and pmp1. The
- * PMP nodes' first reg is the ASC, as in the ADT; the DT's first is the PMP window.
+ * T6050's ADT: /arm-io has an unnamed non-PMP child, a DART that shares pmp0's PMP window
+ * (not a PMP), pmp0, pmp1, and an optional malformed-name PMP. The PMP nodes' first reg is the
+ * ASC, as in the ADT; the DT's first is the PMP window.
  */
-enum { ARM_IO = 3, PMP0 = 4, NUB0 = 5, PMP1 = 6, NUB1 = 7, DART_PMP0 = 8 };
-static int arm_io_children[] = {DART_PMP0, PMP0, PMP1};
+enum {
+    ARM_IO = 3,
+    PMP0 = 4,
+    NUB0 = 5,
+    PMP1 = 6,
+    NUB1 = 7,
+    DART_PMP0 = 8,
+    PMGR = 9,
+    UNNAMED_OTHER = 10,
+    BADNAME_PMP = 11,
+};
+static int arm_io_children[] = {UNNAMED_OTHER, DART_PMP0, BADNAME_PMP, PMP0, PMP1};
 static unsigned arm_io_child_count;
 static const u64 pmp0_regs[] = {0x284e00000, 0x284850000, 0x284500000, 0x284250000};
 static const u64 pmp1_regs[] = {0x2284e00000, 0x2284500000};
 static const u64 dart_regs[] = {0x284500000};
 static bool nub0_present, nub1_present, pmp0_moved, pmp1_claims_pmp0, fail_malloc;
+static int pmp0_bad_name;
 static void *test_malloc(size_t size)
 {
     return fail_malloc ? NULL : malloc(size);
@@ -59,15 +72,28 @@ static struct adt_property props[] = {
 #define ADT_FOREACH_PROPERTY(tree, node, prop)                                                     \
     for (const struct adt_property *prop = props; prop < props + sizeof(props) / sizeof(*props);   \
          prop++)
+static int test_child_at(int parent, unsigned idx)
+{
+    if (parent == ARM_IO)
+        return idx < arm_io_child_count ? arm_io_children[idx] : -1;
+    if (parent == PMP0)
+        return (idx == 0 && nub0_present) ? NUB0 : -1;
+    if (parent == PMP1)
+        return (idx == 0 && nub1_present) ? NUB1 : -1;
+    assert(0);
+    return -1;
+}
 #define ADT_FOREACH_CHILD(tree, node)                                                              \
-    for (unsigned _i = (assert((node) == ARM_IO), 0);                                              \
-         _i < arm_io_child_count && ((node) = arm_io_children[_i], 1); _i++)
+    for (int _parent = (node), _next = 0, _i = 0;                                                  \
+         (_next = test_child_at(_parent, (unsigned)_i)) >= 0 && ((node) = _next, 1); _i++)
 static int adt_path_offset(void *tree, const char *path)
 {
     (void)tree;
     adt_reads++;
     if (!strcmp(path, "/chosen"))
         return chosen_present ? 1 : -1;
+    if (!strcmp(path, "/arm-io/pmgr"))
+        return pmgr_present ? PMGR : -1;
     if (!strcmp(path, "/arm-io/pmp0/iop-pmp0-nub"))
         return nub0_present ? NUB0 : -1;
     if (!strcmp(path, "/arm-io/pmp1/iop-pmp1-nub"))
@@ -103,11 +129,6 @@ static int adt_get_reg(void *tree, int *trace, const char *prop, int index, u64 
         *addr = 0x284500000;
     return 0;
 }
-static const char *adt_get_name(void *tree, int node)
-{
-    (void)tree;
-    return node == PMP0 ? "pmp0" : node == PMP1 ? "pmp1" : node == DART_PMP0 ? "dart-pmp0" : NULL;
-}
 static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
 {
     (void)tree;
@@ -127,17 +148,57 @@ static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
         p = &capacity;
         size = capacity_len;
     }
-    if ((node == NUB0 || node == NUB1) && !strcmp(name, "soc-chip-variant")) {
+    if ((node == 2 || node == NUB0 || node == NUB1) && !strcmp(name, "soc-chip-variant") &&
+        variant_present) {
         p = &variant[node == NUB1];
-        size = 4;
+        size = variant_len;
     }
-    if ((node == PMP0 || node == PMP1) && !strcmp(name, "device_type")) {
+    if (node == PMGR && pmc_present && !strcmp(name, "pmc")) {
+        p = &pmc_val;
+        size = pmc_len;
+    }
+    if (node == PMGR && pmc_pmgr_present && !strcmp(name, "pmc-pmgr")) {
+        p = &pmc_pmgr_val;
+        size = pmc_pmgr_len;
+    }
+    if ((node == PMP0 || node == PMP1 || node == BADNAME_PMP) && !strcmp(name, "device_type")) {
         p = "pmp";
         size = 4;
     }
     if (node == DART_PMP0 && !strcmp(name, "device_type")) {
         p = "dart";
         size = 5;
+    }
+    if (node == PMP0 && !strcmp(name, "name")) {
+        if (pmp0_bad_name == 1) {
+            p = "pmp0";
+            size = 4; /* missing NUL terminator */
+        } else if (pmp0_bad_name == 2) {
+            p = "\xff\xfe";
+            size = 3; /* invalid UTF-8 */
+        } else if (pmp0_bad_name == 3) {
+            p = "pmp/0";
+            size = 6; /* path separator */
+        } else {
+            p = "pmp0";
+            size = 5;
+        }
+    }
+    if (node == PMP1 && !strcmp(name, "name")) {
+        p = "pmp1";
+        size = 5;
+    }
+    if (node == NUB0 && !strcmp(name, "name")) {
+        p = "iop-pmp0-nub";
+        size = 13;
+    }
+    if (node == NUB1 && !strcmp(name, "name")) {
+        p = "iop-pmp1-nub";
+        size = 13;
+    }
+    if (node == BADNAME_PMP && !strcmp(name, "name")) {
+        p = "bad";
+        size = 3; /* missing NUL terminator */
     }
     if (len)
         *len = size;
@@ -161,10 +222,14 @@ static int setup(char *tree, u32 chip, bool alias, const char *status)
     bdid = 0x12345678;
     dvid = 0x89abcdef;
     capacity = 0x10203040;
-    bdid_len = dvid_len = capacity_len = 4;
+    bdid_len = dvid_len = capacity_len = variant_len = pmc_len = pmc_pmgr_len = 4;
+    pmc_val = 0x1357;
+    pmc_pmgr_val = 0x2468;
     chosen_present = nub_present = capacity_present = bdid_present = dvid_present = true;
+    variant_present = pmgr_present = pmc_present = pmc_pmgr_present = true;
     nub0_present = nub1_present = true;
     pmp0_moved = pmp1_claims_pmp0 = fail_malloc = false;
+    pmp0_bad_name = 0;
     arm_io_child_count = ARRAY_SIZE(arm_io_children);
     variant[0] = 0;
     variant[1] = 0x2;
@@ -223,7 +288,9 @@ static int add_t6050_pmp(int soc, const char *name, u64 window, const char *stat
     assert(!fdt_setprop_u32(dt, pmp, "apple,pmc", 1));
     assert(!fdt_setprop_u32(dt, pmp, "apple,pmc-pmgr", 63));
     assert(!fdt_setprop(dt, pmp, "apple,tunable-soc-device", stale, sizeof(stale)));
-    assert(!fdt_setprop_string(dt, pmp, "apple,tunable-firmware-name", "t6050pmp"));
+    assert(!fdt_setprop_string(dt, pmp, "apple,tunable-stale-only", "other-unit"));
+    assert(!fdt_setprop_u32(dt, pmp, "apple,dram-channel-disable", 0xdeadbeef));
+    assert(!fdt_setprop_u32(dt, pmp, "apple,dram-capacity", 0x99999999));
     if (status)
         assert(!fdt_setprop_string(dt, pmp, "status", status));
     return pmp;
@@ -257,10 +324,13 @@ static void check_t6050(const char *path, u32 chip_variant)
 {
     int pmp = fdt_path_offset(dt, path);
     check_data(pmp, "okay");
-    check_scalar(pmp, "apple,pmc", 1);
-    check_scalar(pmp, "apple,pmc-pmgr", 63);
-    check_scalar(pmp, "apple,soc-chip-variant", chip_variant);
-    assert(!strcmp(fdt_getprop(dt, pmp, "apple,tunable-firmware-name", NULL), "t6050pmp"));
+    check_scalar(pmp, "apple,pmc", pmc_val);
+    check_scalar(pmp, "apple,pmc-pmgr", pmc_pmgr_val);
+    if (variant_present)
+        check_scalar(pmp, "apple,soc-chip-variant", chip_variant);
+    else
+        assert(!fdt_getprop(dt, pmp, "apple,soc-chip-variant", NULL));
+    assert(!fdt_getprop(dt, pmp, "apple,tunable-stale-only", NULL));
     assert(!fdt_getprop(dt, pmp, "apple,dram-channel-disable", NULL));
     assert(!fdt_getprop(dt, pmp, "apple,pmc-msg-disabled", NULL));
 }
@@ -281,11 +351,37 @@ static void t6050_cases(void)
     assert(!dt_set_pmp());
     check_t6050("/soc/pmp@284e00000", 0);
     check_t6050("/soc/pmp@2284e00000", 0x2);
-    /* No dram-capacity in the nub: none in the DT */
+    /* No dram-capacity in the nub: stale DT value is dropped */
     setup_t6050(tree, "okay", false);
     capacity_present = false;
     assert(!dt_set_pmp());
     check_t6050("/soc/pmp@284e00000", 0);
+    /* Clean DT with no board-id, dram-vendor-id, pmc, pmc-pmgr, or tunables: filled from ADT */
+    setup_t6050(tree, "okay", false);
+    int pmp0 = fdt_path_offset(dt, "/soc/pmp@284e00000");
+    assert(!fdt_delprop(dt, pmp0, "apple,board-id"));
+    assert(!fdt_delprop(dt, pmp0, "apple,dram-vendor-id"));
+    assert(!fdt_delprop(dt, pmp0, "apple,pmc"));
+    assert(!fdt_delprop(dt, pmp0, "apple,pmc-pmgr"));
+    assert(!fdt_delprop(dt, pmp0, "apple,tunable-soc-device"));
+    assert(!fdt_delprop(dt, pmp0, "apple,tunable-stale-only"));
+    pmc_val = 2;
+    pmc_pmgr_val = 0x3f;
+    assert(!dt_set_pmp());
+    check_t6050("/soc/pmp@284e00000", 0);
+    /* Malformed optional bootarg or pmgr u32 rolls back atomically (no mixed DT) */
+    setup_t6050(tree, "okay", false);
+    variant_len = 2;
+    check_unchanged("a malformed optional boot argument");
+    setup_t6050(tree, "okay", false);
+    pmc_pmgr_len = 2;
+    check_unchanged("a malformed pmgr pmc-pmgr");
+    /* A PMP node with an unterminated, non-UTF-8 or slash ADT name is skipped safely */
+    for (int bad = 1; bad <= 3; bad++) {
+        setup_t6050(tree, "okay", false);
+        pmp0_bad_name = bad;
+        check_unchanged("a PMP with a malformed ADT name");
+    }
 
     /* A board that leaves pmp0 off: no ADT read, nothing written */
     setup_t6050(tree, "disabled", false);
@@ -330,6 +426,37 @@ static void t6050_cases(void)
     setup_t6050(tree, "okay", false);
     assert(!fdt_pack(dt));
     check_unchanged("a full DT");
+    /* Absent /arm-io/pmgr still clears stale apple,pmc and apple,pmc-pmgr */
+    setup_t6050(tree, "okay", false);
+    pmp0 = fdt_path_offset(dt, "/soc/pmp@284e00000");
+    assert(!fdt_setprop_u32(dt, pmp0, "apple,pmc", 0xdeadbeef));
+    assert(!fdt_setprop_u32(dt, pmp0, "apple,pmc-pmgr", 0xfeedface));
+    pmgr_present = false;
+    assert(!dt_set_pmp());
+    pmp0 = fdt_path_offset(dt, "/soc/pmp@284e00000");
+    assert(!fdt_getprop(dt, pmp0, "apple,pmc", NULL));
+    assert(!fdt_getprop(dt, pmp0, "apple,pmc-pmgr", NULL));
+    /* Legacy alias path keeps skipping malformed optional bootargs instead of aborting boot */
+    int pmp_alias = setup(tree, T6041, true, "disabled");
+    variant_len = 2;
+    assert(!dt_set_pmp());
+    check_data(pmp_alias, "okay");
+    assert(!fdt_getprop(dt, pmp_alias, "apple,soc-chip-variant", NULL));
+    /* Legacy alias path still propagates FDT write failures from optional bootargs */
+    pmp_alias = setup(tree, T6041, true, "disabled");
+    assert(!dt_set_pmp());
+    check_scalar(pmp_alias, "apple,soc-chip-variant", variant[0]);
+    pmp_alias = setup(tree, T6041, true, "disabled");
+    assert(!fdt_setprop_u32(dt, pmp_alias, "apple,board-id", bdid));
+    assert(!fdt_setprop_u32(dt, pmp_alias, "apple,dram-vendor-id", dvid));
+    assert(!fdt_setprop_u32(dt, pmp_alias, "apple,dram-capacity", capacity));
+    assert(
+        !fdt_setprop(dt, pmp_alias, "apple,tunable-soc-device", calibration, sizeof(calibration)));
+    assert(
+        !fdt_setprop(dt, pmp_alias, "apple,tunable-ptd-range", calibration, sizeof(calibration)));
+    assert(!fdt_pack(dt));
+    assert(dt_set_pmp() < 0);
+    assert(!strcmp(fdt_getprop(dt, pmp_alias, "status", NULL), "disabled"));
     /* No memory for the snapshot: nothing written */
     setup_t6050(tree, "okay", false);
     fail_malloc = true;
