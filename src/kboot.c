@@ -11456,19 +11456,22 @@ static int dt_set_j713_isp_one(unsigned int unused)
 }
 
 /*
- * Only a disabled ISP with the placeholders is a handoff target. A tree without them (no camera,
- * or a kernel that reserves the firmware itself and enables the ISP) is left as it is. A refused
- * handoff leaves the camera disabled; the boot goes on.
+ * Only a disabled ISP with the placeholders is a handoff target, on any T8132 machine: the tree
+ * asks for the handoff by describing the ISP disabled with isp-firmware-text, isp-firmware-data
+ * and the isp-heap window, as t8132-isp.dtsi does for every T8132 laptop. A tree without them (no
+ * camera, or a kernel that reserves the firmware itself and enables the ISP) is left as it is. A
+ * refused handoff leaves the camera disabled; the boot goes on.
  */
 static void dt_set_j713_isp(void)
 {
-    if (chip_id != T8132 || (fdt_node_check_compatible(dt, 0, "apple,j713") &&
-                             fdt_node_check_compatible(dt, 0, "apple,j604")))
-        return; /* No other M4 board's camera handoff is qualified. */
+    if (chip_id != T8132)
+        return;
     int isp = fdt_node_offset_by_compatible(dt, -1, "apple,t8132-isp");
     const char *status = isp < 0 ? NULL : fdt_getprop(dt, isp, "status", NULL);
     if (!status || strcmp(status, "disabled") ||
-        fdt_path_offset(dt, "/reserved-memory/isp-firmware-text") < 0)
+        fdt_path_offset(dt, "/reserved-memory/isp-firmware-text") < 0 ||
+        fdt_path_offset(dt, "/reserved-memory/isp-firmware-data") < 0 ||
+        fdt_path_offset(dt, "/reserved-memory/isp-heap") < 0)
         return;
     if (dt_display_transaction(dt_set_j713_isp_one, 0))
         printf("FDT: J713 ISP handoff refused; keeping the camera disabled\n");
