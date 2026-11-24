@@ -20,6 +20,22 @@ For a plain boot using an existing trace manifest, set these build overrides:
 This suppresses instrumentation and aura's timed-wake/stop settings. It does not
 establish that full macOS sleep or wake works.
 
+A GPU trace has no host to set it up either, so its build sets the GPU tracer's
+knobs (`src/sptm_virt_gpu.c`) along with the trace mask: for example
+`-DSPTM_VIRT_ESP_TRACE=0x40 -DSPTM_VIRT_GPU_STOP_SECS=<s> -DSPTM_VIRT_GPU_PRINT_MAX=200`
+parks in the proxy `<s>` seconds after the first GPU access, and the host then
+reads the ring over the debug link. `SPTM_VIRT_GPU_STOP_BOOT_SECS`, `_STOP_MSG`,
+`_RING_MIB` and `_PMP` are the build's versions of the other `AURA_GPU_*` settings.
+`-DSPTM_VIRT_GPU_HOP_PAGES` hooks only the GPU pages its driver uses at run time
+(and not the PMP); hooking the whole GPU window can fault XNU's boot.
+`-DSPTM_VIRT_GPU_PARK_ARM_SECS=<a> -DSPTM_VIRT_GPU_PARK_KICKS=<n>` parks at the
+`<n>`-th kick on an app's queue rings instead, which are the rings configured
+`<a>` seconds or more after the first GPU access (the ring ids differ from boot
+to boot); the time park stays as a fallback. With
+`-DSPTM_VIRT_GPU_PARK_BURST=<b>` the park comes at kick `<n>` of the app's
+`<b>`-th burst: a quiet gap of `SPTM_VIRT_GPU_PARK_GAP_MS` (1500) ends a burst,
+and only bursts of `SPTM_VIRT_GPU_PARK_BIG` (100) kicks or more count.
+
 ## Bundle
 
 `tools/esp-macos/make_bundle.py` takes the stock images, their BuildIdentity,

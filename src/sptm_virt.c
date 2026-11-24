@@ -534,13 +534,20 @@ bool sptm_virt_cpu_in_xnu(void)
  * and with the other cores still printing the link died (J813, ten cores, 2026-11-15).
  */
 volatile int sptm_virt_parking_cpu = -1;
+volatile u64 sptm_virt_parked_mask; /* the cores held so, for the host to check */
+
+static void __attribute__((noreturn)) sptm_virt_park_hold(void)
+{
+    __atomic_fetch_or(&sptm_virt_parked_mask, BIT(smp_id()), __ATOMIC_RELAXED);
+    while (1)
+        sysop("wfe");
+}
 
 /* First thing in every exception entry: a core other than the parking one stops here. */
 void sptm_virt_park_check(void)
 {
     if (sptm_virt_parking_cpu >= 0 && sptm_virt_parking_cpu != smp_id())
-        while (1)
-            sysop("wfe");
+        sptm_virt_park_hold();
 }
 
 /* Only one core may own the proxy: a core that loses the election parks like the others. */
@@ -551,8 +558,7 @@ void sptm_virt_park_others(void)
     if (!__atomic_compare_exchange_n(&sptm_virt_parking_cpu, &none, me, false, __ATOMIC_SEQ_CST,
                                      __ATOMIC_SEQ_CST) &&
         none != me)
-        while (1)
-            sysop("wfe");
+        sptm_virt_park_hold();
     sysop("dsb sy");
     udelay(300000);
 }
