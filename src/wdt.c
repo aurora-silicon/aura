@@ -2,12 +2,19 @@
 
 #include "wdt.h"
 #include "adt.h"
+#include "memory.h"
 #include "types.h"
 #include "utils.h"
 
 #define WDT_COUNT 0x10
 #define WDT_ALARM 0x14
 #define WDT_CTL   0x1c
+
+#define WDT_CTL_RESET_EN BIT(2)
+
+/* The block's third watchdog, which an OS arms where it doesn't use the primary */
+#define WDT2_CTL        0x2c
+#define WDT2_CTL_ENABLE BIT(0)
 
 static u64 wdt_base = 0;
 
@@ -64,6 +71,86 @@ void wdt_reboot(void)
     write32(wdt_base + WDT_ALARM, 0x100000);
     write32(wdt_base + WDT_COUNT, 0);
     write32(wdt_base + WDT_CTL, 4);
+}
+
+/*
+ * The ADT's version 2 layout that wdt_s2r_guard_enter() needs: the primary block (both watchdogs
+ * an OS may arm) and the secondary. The primary's base is kept for wdt_reboot() and cleaned to
+ * memory, so that a wake, with the caches off, can still reset the SoC through it.
+ */
+bool wdt_s2r_guard_supported(void)
+{
+    int path[8];
+    int node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
+    u64 primary, primary_size, secondary, secondary_size;
+    u32 version;
+
+    if (node < 0 || ADT_GETPROP(adt, node, "wdt-version", &version) < 0 || version != 2 ||
+        adt_get_reg(adt, path, "reg", 0, &primary, &primary_size) || (primary & 3) ||
+        primary_size < WDT2_CTL + 4 ||
+        adt_get_reg(adt, path, "reg", 2, &secondary, &secondary_size) || secondary_size != 4)
+        return false;
+    wdt_base = primary;
+    dc_cvac_range(&wdt_base, sizeof(wdt_base));
+    return true;
+}
+
+/*
+ * A dead-man for a step on the way back from a system sleep, with the OS live. The watchdogs
+ * are read before anything is written. If the OS left one of the two it uses armed (the
+ * primary, as Linux's T8103 sleep does, or the third), that covers the step and nothing is
+ * written.
+ * Otherwise, on the ADT's version 2 layout with the secondary watchdog off (wdt_arm()'s
+ * conditions), the primary is borrowed: armed for the given time and read back. -1: the step
+ * has no watchdog and must not run.
+ */
+int wdt_s2r_guard_enter(struct wdt_guard *guard, unsigned seconds)
+{
+    int path[8];
+    int node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
+    u64 primary, primary_size, secondary, secondary_size;
+    u32 version;
+
+    guard->borrowed = false;
+    if (seconds < 1 || seconds > 178 || node < 0 ||
+        adt_get_reg(adt, path, "reg", 0, &primary, &primary_size) || (primary & 3) ||
+        primary_size < WDT2_CTL + 4)
+        return -1;
+
+    guard->base = primary;
+    guard->ctl = read32(primary + WDT_CTL);
+    guard->count = read32(primary + WDT_COUNT);
+    guard->alarm = read32(primary + WDT_ALARM);
+    if ((guard->ctl & WDT_CTL_RESET_EN) || (read32(primary + WDT2_CTL) & WDT2_CTL_ENABLE))
+        return 0;
+
+    if (ADT_GETPROP(adt, node, "wdt-version", &version) < 0 || version != 2 ||
+        adt_get_reg(adt, path, "reg", 2, &secondary, &secondary_size) || secondary_size != 4 ||
+        read32(secondary))
+        return -1;
+
+    u32 alarm = seconds * 24000000u;
+    guard->borrowed = true;
+    write32(primary + WDT_CTL, 0);
+    write32(primary + WDT_COUNT, 0);
+    write32(primary + WDT_ALARM, alarm);
+    write32(primary + WDT_CTL, WDT_CTL_RESET_EN);
+    sysop("dsb sy");
+    if (read32(primary + WDT_ALARM) != alarm || !(read32(primary + WDT_CTL) & WDT_CTL_RESET_EN))
+        return -1;
+    return 0;
+}
+
+/* A borrowed primary watchdog back as it was read; the secondary is never touched. */
+void wdt_s2r_guard_exit(const struct wdt_guard *guard)
+{
+    if (!guard->borrowed)
+        return;
+    write32(guard->base + WDT_CTL, 0);
+    write32(guard->base + WDT_COUNT, guard->count);
+    write32(guard->base + WDT_ALARM, guard->alarm);
+    write32(guard->base + WDT_CTL, guard->ctl);
+    sysop("dsb sy");
 }
 
 static int wdt_arm(unsigned seconds)
