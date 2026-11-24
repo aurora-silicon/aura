@@ -288,7 +288,7 @@ OBJECTS := \
 	smc.o \
 	ctxr_exec.o \
 	smp.o \
-	spmi.o pmu_counter.o ace3.o \
+	spmi.o pmu_counter.o proxy_fallback.o ace3.o \
 	start.o \
 	startup.o \
 	string.o \
