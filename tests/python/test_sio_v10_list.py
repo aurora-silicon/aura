@@ -28,7 +28,7 @@ def build(tmp_path, fail_at=0):
 #include <string.h>
 typedef uint8_t u8;
 typedef uint32_t u32;
-typedef uint64_t u64;
+typedef unsigned long u64;
 #define PACKED __attribute__((packed))
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
