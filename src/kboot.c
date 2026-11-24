@@ -6237,9 +6237,9 @@ static bool dt_t8122_dcpext_shares_image(const char *alias)
  * With the boot.bin config line chosen.asahi,t8122-dcpext=1 it is armed; any other value turns it
  * off. Without a line it is on by default where the external processor runs the image the
  * internal handoff pinned (dt_t8122_dcpext_shares_image()), unless a config line was lost (an
- * owner's =0 may be among them). Otherwise it stays off without the line: on an M3 Air with 14.x
- * firmware a published marker lets the kernel enable dcpext, and the internal DCP then crashes
- * after disp0 DART faults, leaving the panel dark.
+ * owner's =0 may be among them). Otherwise it stays off without the line: an external DCP that
+ * does not run the image the internal handoff pinned is not known to work. (Pre-aurora15 kernels
+ * crashed the internal DCP after disp0 DART faults with dcpext enabled.)
  */
 static bool dt_t8122_dcpext_armed(const char *alias)
 {
