@@ -547,6 +547,7 @@ void deep_wfi(void);
 
 bool is_heap(void *addr);
 bool supports_arch_retention(void);
+bool mmu_uses_sprr(void);
 bool supports_gxf(void);
 bool supports_pan(void);
 u64 top_of_memory_alloc(size_t size);

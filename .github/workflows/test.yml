@@ -69,6 +69,12 @@ jobs:
       - name: Test PMP boot data fixups
         run: sh tests/run-pmp-boot-data.sh
 
+      - name: Test keeping an FDT node off with no free space
+        run: sh tests/run-fdt-disable.sh
+
+      - name: Test locked-DART AOP OS-RAM reservation and failure handling
+        run: sh tests/run-aop-os-ram.sh
+
       - name: Test RTKit placed-buffer DART range check and bounded crash log parse
         run: sh tests/run-rtkit-placed-buffer.sh
 

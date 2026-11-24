@@ -765,7 +765,7 @@ void mmu_init(void)
     mmu_init_pagetables();
     mmu_add_default_mappings();
     mmu_configure();
-    if (cpu_features->mmu_sprr)
+    if (mmu_uses_sprr())
         mmu_init_sprr();
 
     // Enable EL0 memory access by EL1
@@ -793,7 +793,7 @@ void mmu_publish_secondary(void)
 void mmu_init_secondary_local(void)
 {
     mmu_configure();
-    if (cpu_features->mmu_sprr)
+    if (mmu_uses_sprr())
         mmu_init_sprr();
 
     // Enable EL0 memory access by EL1

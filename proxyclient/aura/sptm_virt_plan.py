@@ -329,6 +329,63 @@ def adt_drop_props(root, drop_props, notes):
         notes.append(f"drop: {path}/{name} {'removed' if len(node.props) < before else 'absent'}")
 
 
+def no_exclave_adt(adt):
+    """Nodes to hide and RTBuddy routes properties to drop when booting without cL4, read from the
+    ADT itself so every SoC gets its own nodes without a chip table."""
+    root, _ = adt_parse(adt)
+    try:
+        arm_io = adt_find(root, "arm-io")
+    except KeyError:
+        return [], []
+    hide, drop = [], []
+    for child in arm_io.kids:
+        name = child.name()
+        lname = name.lower()
+        if (("exclave" in lname and lname != "hib-exclave-watchdog")
+                or lname.startswith("exdisplaypipe")):
+            hide.append(f"/arm-io/{name}")
+        for grand in child.kids:
+            gname = grand.name()
+            if gname.startswith("iop-") and gname.endswith("-nub"):
+                if any(pr[0] == "routes" for pr in grand.props):
+                    drop.append((f"/arm-io/{name}/{gname}", "routes"))
+    return hide, drop
+
+
+# The /chosen properties that name the root to boot (relative paths; children must exist). TXM
+# reads the previous stage's cryptex digest from asmb/lp-spih.
+CHOSEN_PROPS = ("boot-uuid", "apfs-preboot-uuid", "boot-objects-path", "root-snapshot-name",
+                "boot-manifest-hash", "asmb/lp-spih")
+
+
+def adt_set_chosen(root, props, notes):
+    """Set boot metadata (property path relative to /chosen -> bytes) in place, appending what
+    the node lacks."""
+    chosen = adt_find(root, "chosen")
+    for path, val in props.items():
+        if path not in CHOSEN_PROPS:
+            raise ValueError(f"chosen: {path} is not a root property ({', '.join(CHOSEN_PROPS)})")
+        node_path, _, name = path.rpartition("/")
+        node = adt_find(chosen, node_path) if node_path else chosen
+        if node is None:
+            raise ValueError(f"chosen: no /chosen/{node_path} node")
+        for pr in node.props:
+            if pr[0] == name:
+                old = pr[1]
+                pr[1] = val
+                break
+        else:
+            old = None
+            node.props.append([name, val, 0])
+
+        def show(v):
+            if v is None:
+                return "absent"
+            t = v.rstrip(b"\0")
+            return t.decode() if t and all(32 <= c < 127 for c in t) else v.hex()
+        notes.append(f"chosen: {path} {show(old)} -> {show(val)}")
+
+
 def adt_set_serial_device(root, node_path, notes):
     """Point XNU's console (/defaults/serial-device) at ``node_path`` by phandle. The SPTM
     emulator's HV does this (uart0) so XNU's IOKit serial stack never takes over the
@@ -354,7 +411,7 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
               placement_shift=None, blob_base=None, hide_nodes=(), xnu_serial=None,
               drop_props=(), cl4_regions=None, cl4_entry=0, cl4_virt=0,
               exclave_integrity=b"", exclave_trustcache=b"", iboot_copies=(),
-              diag_record=False, os_long_version=None, video=None):
+              diag_record=False, os_long_version=None, video=None, chosen_props=None):
     """Compute the whole iBoot->SPTM handoff.
 
     sptm/txm/xnu are the raw Mach-O files, ``adt`` the live device tree,
@@ -376,6 +433,10 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
 
     ``video``: iBoot's boot framebuffer (base, display, stride, width, height, depth) to hand on,
     refused unless it lies in DRAM with a sane geometry; None hands over none.
+
+    ``chosen_props``: root and boot metadata to retarget ({path relative to /chosen: bytes}, see
+    CHOSEN_PROPS), for booting a volume group other than the one iBoot booted: on a Mac whose
+    Stage 1 lives in a stub volume group, the live tree names the stub's root.
     """
     notes = []
     si, ti, xi = macho_info(sptm), macho_info(txm), macho_info(xnu)
@@ -389,6 +450,8 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
     adt_drop_props(root, drop_props, notes)
     if xnu_serial:
         adt_set_serial_device(root, xnu_serial, notes)
+    if chosen_props:
+        adt_set_chosen(root, chosen_props, notes)
 
     mm = adt_find(root, MEMORY_MAP_PATH)
 
