@@ -105,6 +105,8 @@ struct rtkit_dev {
 
     u64 dva_base;
     u32 timeout_usec;
+    /* A patient warm start's wait for HELLO (rtkit_boot_warm_patient()); 0: 1 s. */
+    u32 hello_timeout_usec;
     struct rtkit_buffer oslog_bfr;
 
     enum rtkit_power_state iop_power;
@@ -654,6 +656,7 @@ static bool rtkit_wait_for_power(rtkit_dev_t *rtk, enum rtkit_power_state *state
                                  enum rtkit_power_state target, u32 timeout_usec, const char *name)
 {
     u64 timeout = timeout_usec ? timeout_calculate(timeout_usec) : 0;
+    u64 start = get_ticks();
 
     while (*state != target) {
         struct rtkit_message rtk_msg;
@@ -666,11 +669,14 @@ static bool rtkit_wait_for_power(rtkit_dev_t *rtk, enum rtkit_power_state *state
             return false;
 
         if (timeout && timeout_expired(timeout)) {
-            rtkit_printf("timed out waiting for %s power state %#x (last %#x)\n", name, target,
-                         *state);
+            rtkit_printf("timed out waiting for %s power state %#x (last %#x) after %lu ms\n", name,
+                         target, *state, ticks_to_msecs(get_ticks() - start));
             return false;
         }
     }
+    if (rtk->hello_timeout_usec)
+        rtkit_printf("%s power state %#x after %lu ms\n", name, target,
+                     ticks_to_msecs(get_ticks() - start));
 
     return true;
 }
@@ -700,11 +706,16 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
         return false;
     }
 
-    if (!asc_recv_timeout(rtk->asc, &msg, USEC_PER_SEC)) {
-        rtkit_printf("did not receive HELLO\n");
+    u64 hello_start = get_ticks();
+    if (!asc_recv_timeout(rtk->asc, &msg,
+                          rtk->hello_timeout_usec ? rtk->hello_timeout_usec : USEC_PER_SEC)) {
+        rtkit_printf("did not receive HELLO in %lu ms\n",
+                     ticks_to_msecs(get_ticks() - hello_start));
         rtk->no_hello = true;
         return false;
     }
+    if (rtk->hello_timeout_usec)
+        rtkit_printf("HELLO after %lu ms\n", ticks_to_msecs(get_ticks() - hello_start));
 
     if (msg.msg1 != RTKIT_EP_MGMT) {
         rtkit_printf("expected HELLO but got message for EP 0x%x", msg.msg1);
@@ -860,6 +871,21 @@ bool rtkit_boot_warm(rtkit_dev_t *rtk, u32 last_mask)
 {
     rtk->inherited = true;
     return rtkit_boot_internal(rtk, RTKIT_WARM_TIMEOUT_US, true, last_mask);
+}
+
+/*
+ * A warm start whose firmware may be busy, as the M4 mini's ANS is for minutes after a macOS
+ * session (its NAND): wait timeout_usec for HELLO and for each power report, as XNU does (it gives
+ * its AP power notification 20 s), with the times logged. A start that gives up early can't be
+ * retried cleanly: the late report then arrives in place of the next HELLO (11-20, l01).
+ */
+bool rtkit_boot_warm_patient(rtkit_dev_t *rtk, u32 last_mask, u32 timeout_usec)
+{
+    rtk->inherited = true;
+    rtk->hello_timeout_usec = timeout_usec;
+    bool ok = rtkit_boot_internal(rtk, timeout_usec, true, last_mask);
+    rtk->hello_timeout_usec = 0;
+    return ok;
 }
 
 /* Boot the IOP, or adopt the session of one a previous stage left running. Such

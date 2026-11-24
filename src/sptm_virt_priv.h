@@ -99,6 +99,17 @@ void sptm_virt_rg_stop_wd2(void);
 void sptm_virt_rg_disarm(void);
 void sptm_virt_mmio_rw(u64 addr, u64 *val, bool write, int width);
 
+/* sptm_virt_park.c */
+struct uartproxy_msg_start;
+void sptm_virt_park_release(void);
+void sptm_virt_park_forever(void) __attribute__((noreturn));
+int sptm_virt_proxy_hold(struct uartproxy_msg_start *start);
+int sptm_virt_park_proxy(struct exc_info *ctx, u32 code);
+void sptm_virt_park_oneway(struct uartproxy_msg_start *start) __attribute__((noreturn));
+bool sptm_virt_park_requested(bool gl);
+void sptm_virt_park_host(struct exc_info *ctx);
+void sptm_virt_park_arrive(void);
+
 /* sptm_virt_s2r.c */
 extern volatile bool sptm_virt_s2r_quiet;
 void sptm_virt_s2r_setup(bool cdc);
@@ -112,9 +123,11 @@ void sptm_virt_s2r_dump_tail(u64 n);
 void sptm_virt_s2r_dump_prio(u64 near, u64 far);
 void sptm_virt_s2r_wd_stopped(void);
 bool sptm_virt_s2r_wfi(u64 *regs, u64 esr);
+bool sptm_virt_s2r_hooks_page(u64 page);
 
 /* sptm_virt_gpu.c */
 void sptm_virt_gpu_setup(void);
+void sptm_virt_gfxrec_tap(u64 addr, const u64 *val, bool write, int width);
 void sptm_virt_pmu_setup(void);
 void sptm_virt_pmu_tick(void);
 void sptm_virt_pmu_xnu_entry(void);

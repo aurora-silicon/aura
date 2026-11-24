@@ -52,6 +52,32 @@ Environment (all optional; 1 enables a switch):
                            AURA_GPU_STOP_MSG=0x0081000000000000: the first InitData doorbell)
   AURA_GPU_STOP_EP=<ep>    and only a mailbox message to endpoint ep (e.g. 0x20)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
+  AURA_GPU_NARROW=1        with AURA_GPU_TRACE, hook only the GPU/PMP record's pages: the gfx-asc
+                           and pmp-asc mailbox pages, sgx +0xe00000 (MMIO_PROTECTED), +0x1000000
+                           (AXI2AF), +0xd60000 (the host block); not the rest of sgx, not pmp-ptd
+  AURA_GPU_MSG_PARK=0      the write AURA_GPU_STOP_MSG names doesn't park (it snapshots, below)
+  AURA_GPU_SNAP=<n>        copy the GPU firmware's memory (its page tables, the objects the
+                           doorbell names, the chains) at every n-th such write, before it is
+                           performed (tools/dump_snapshot.py reads it at a park)
+  AURA_GPU_SNAP_MAX=<k>    k snapshots in all (default 1); AURA_GPU_SNAP_MIB=<m> buffer (32)
+  AURA_GPU_SNAP_PARTS=<m>  what snapshots after the first take: 1 regions, 2 walk, 4 objects,
+                           8 chains (default 12)
+  AURA_GPU_SNAP_ROOTS=<va,...>  the objects' roots after all (default: the doorbell's address)
+  AURA_GPU_SNAP_CHAINS=<s> pointer chains from the InitData root, copied whole:
+                           name=step/step:len;... or @path/to/preset (aura/hvsnap.py)
+  AURA_GPU_SNAP_WATCH=<name+off:bytes,...>  words of a chain kept in the snapshot's header
+  AURA_GPU_MBOX=<n>        log n GPU-ASC mailbox messages, both ways, from the first such write
+  AURA_GPU_MBOX_STOP=<msg>,<mask>,<ep>[,<after>]  and end the log at the after+1-th message to
+                           the GPU that matches (the first work submission)
+  AURA_GFXPMP=<ms>         the GPU/PMP record: from the write AURA_GPU_STOP_MSG names, which then
+                           doesn't park, ms of every gfx-asc and pmp-asc mailbox message both ways,
+                           sgx +0xd60000..+0xd60067, +0x1000104, +0x1000108 writes and the GFX PS
+                           word's writes; the MMIO ring stops at its end (aura/hvgfxrec.py reads both
+                           at a park). Needs AURA_GPU_TRACE; refuses anything that parks the guest
+  AURA_GFXPMP_MAX=<n>      its records (default 262144, 32 bytes each)
+  AURA_GFXPMP_BLK=<pa>,<len>  the block whose every access (SPTM's and XNU's, from the first trap
+                           to the window's end) the record keeps apart (default sgx +0xe00000,
+                           0x4000: MMIO_PROTECTED); AURA_GFXPMP_BLK_MAX=<n> its records (131072)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
@@ -65,7 +91,12 @@ Environment (all optional; 1 enables a switch):
   AURA_SPTM_DIAG           give SPTM a diagnostic record (boot_args revision 3, SPTMDebug)
   AURA_OS_LONG_VERSION     the guest's Ap,OSLongVersion (--os-long-version)
   AURA_KEEP_BOOT_VIDEO     hand iBoot's boot framebuffer to XNU, aura's console off it
-  AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
+  AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle; a park
+                           (the HV's START) ends the tail at once and says whether it resumes
+  AURA_PARK_AFTER_SECS=<n> while tailing, ask the guest to park n s after entry (as SIGUSR1 to
+                           this process does at any time); then tools/sptm_park.py --continue
+  AURA_XNU_PATCH_LOG=<f>   record every XNU word patched (quirk, PA, original, patch) in f, as
+                           JSON: sptm_park.py --restore-nvram-write --patch-log f takes it
   AURA_AMCC_NOLOCK=<mask>  which of SPTM's AMCC range locks aura shadows (bit 0 +0xacc, 1 +0xadc,
                            2 +0xaec; default 1, the one over aura's image; 0 lets SPTM lock all)
   AURA_WFI_WATCH=1|2       trap XNU's WFIs (2: and WFEs) and report every 10 s (idle vs. dead)
@@ -83,6 +114,14 @@ Environment (all optional; 1 enables a switch):
   AURA_ANS_COLD=<mode>     ANS for XNU to start cold: sleep, idle or off (default: sleep on
                            T8140 and for an ANS an earlier stage powered off, else off)
   AURA_ANS_PROBE=0         skip the cold handoff's HELLO check
+  AURA_ANS_COLDPATH=<mode> an ANS an earlier stage idled and powered off (Stage 1 1.0.0b13 on
+                           T8132): aura starts it from off, then hands it over quiesced (XNU
+                           wakes it, "quiesced" kept) or stopped (SLEEP and reset, XNU starts it
+                           cold). Instead of AURA_ANS_COLD; needs AURA_ANS_SART
+  AURA_ANS_COLDPATH_CLEAR=1  quiesced: clear every aura stage's SART entries (default: those in
+                           memory nothing will allocate are kept, for a firmware that goes on with
+                           its buffers; the rest are cleared)
+  AURA_ANS_COLDPATH_AUTO=1   last: iBoot's auto-enable back on the APCIe storage/GP power words
   AURA_ANS_SART=<v>        the nvme.sart= value tools/ans_sart.py printed on the stage that
                            powered ANS off (route: the host chainloads this image from its proxy)
   XNU_BOOTARGS             XNU's command line
@@ -155,12 +194,29 @@ KNOWN_ENV = {
     "AURA_S2R_USB_RETAKE_MS",
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
+    "AURA_PARK_AFTER_SECS",
+    "AURA_XNU_PATCH_LOG",
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_STOP_BOOT_SECS",
     "AURA_GPU_STOP_MSG",
     "AURA_GPU_STOP_MSG_MASK",
     "AURA_GPU_STOP_EP",
     "AURA_GPU_PRINT_MAX",
+    "AURA_GPU_NARROW",
+    "AURA_GPU_MSG_PARK",
+    "AURA_GPU_SNAP",
+    "AURA_GPU_SNAP_MAX",
+    "AURA_GPU_SNAP_MIB",
+    "AURA_GPU_SNAP_PARTS",
+    "AURA_GPU_SNAP_ROOTS",
+    "AURA_GPU_SNAP_CHAINS",
+    "AURA_GPU_SNAP_WATCH",
+    "AURA_GPU_MBOX",
+    "AURA_GPU_MBOX_STOP",
+    "AURA_GFXPMP",
+    "AURA_GFXPMP_MAX",
+    "AURA_GFXPMP_BLK",
+    "AURA_GFXPMP_BLK_MAX",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
     "AURA_XNU_ENTRY",
@@ -184,6 +240,9 @@ KNOWN_ENV = {
     "AURA_ANS_PROBE",
     "AURA_ANS_DROP",
     "AURA_ANS_SART",
+    "AURA_ANS_COLDPATH",
+    "AURA_ANS_COLDPATH_CLEAR",
+    "AURA_ANS_COLDPATH_AUTO",
 } | set(CONFIG_FLAGS)
 
 # The debug link's USB-C port: XNU must never drive it (it resets the port about 3 s into IOKit
@@ -486,6 +545,33 @@ def check_running_image(iface, sym, elf):
     print(f"running image matches {elf} at base 0x{sym.run_base:x}")
 
 
+COLDPATH_STOPPED, COLDPATH_CLEAR, COLDPATH_AUTO = 1, 2, 4  # src/nvme.h NVME_COLDPATH_*
+
+
+def ans_coldpath_mode(env, ans_off, sart_passed):
+    """AURA_ANS_COLDPATH=quiesced|stopped, or None. Refused unless ANS is off with its SART entries
+    passed on, and never together with AURA_ANS_COLD (the older cold handoff)."""
+    mode = env.get("AURA_ANS_COLDPATH", "")
+    if not mode:
+        for knob in ("AURA_ANS_COLDPATH_CLEAR", "AURA_ANS_COLDPATH_AUTO"):
+            if env.get(knob):
+                raise SystemExit(f"{knob} needs AURA_ANS_COLDPATH")
+        return None
+    if mode not in ("quiesced", "stopped"):
+        raise SystemExit(f"AURA_ANS_COLDPATH={mode}: quiesced or stopped")
+    if env.get("AURA_ANS_COLD"):
+        raise SystemExit("AURA_ANS_COLDPATH and AURA_ANS_COLD are two different handoffs: one only")
+    if mode == "quiesced" and "quiesced" in env.get("AURA_ANS_DROP", "").split(","):
+        raise SystemExit("AURA_ANS_COLDPATH=quiesced keeps \"quiesced\" for XNU: not with "
+                         "AURA_ANS_DROP=quiesced")
+    if not ans_off:
+        raise SystemExit("AURA_ANS_COLDPATH: ANS is on here; it's for an ANS a stage powered off")
+    if not sart_passed:
+        raise SystemExit("AURA_ANS_COLDPATH: ANS is off and its SART entries weren't passed on "
+                         "(AURA_ANS_SART)")
+    return mode
+
+
 def ans_drop_props():
     """AURA_ANS_DROP=quiesced,running: ANS was powered off and back with its CPU stopped, so XNU
     starts it as after a sleep instead of waking iBoot's quiesced session."""
@@ -626,7 +712,11 @@ def rewrite_sptm_seq(p, sym, entry, seq):
     print(f"rewrote {len(new)} instructions at 0x{pa:x} (MTE tag storage from the window)")
 
 
-def patch_xnu(p, sym, plan, patches):
+# What patch_xnu wrote, for AURA_XNU_PATCH_LOG: the late NVRAM write enable puts nvram_ro's back.
+XNU_PATCHES = []
+
+
+def patch_xnu(p, sym, plan, patches, quirk=None):
     for what, region, off, expected, new in patches:
         if region not in plan.regions:
             raise SystemExit(f"{what}: the plan has no {region} region")
@@ -638,6 +728,17 @@ def patch_xnu(p, sym, plan, patches):
         p.write32(pa, new)
         p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80)
         print(f"XNU {what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
+        XNU_PATCHES.append(dict(quirk=quirk, what=what, region=region, off=off, pa=pa,
+                                original=before, patched=new))
+
+
+def write_patch_log():
+    path = os.environ.get("AURA_XNU_PATCH_LOG")
+    if path:
+        import json
+
+        pathlib.Path(path).write_text(json.dumps(XNU_PATCHES, indent=1) + "\n")
+        print(f"XNU patches recorded in {path} ({len(XNU_PATCHES)} words)")
 
 
 def patch_xnu_entry(p, sym, plan, kernelcache):
@@ -672,7 +773,7 @@ def set_xnu_rorgn(p, sym, plan, quirks):
     p.write64(sym["sptm_virt_xnu_rorgn"], lo)
     p.write64(sym["sptm_virt_xnu_rorgn"] + 8, hi & ~0xfff)
     print(f"XNU read-only region 0x{lo:x}-0x{hi:x}")
-    patch_xnu(p, sym, plan, quirks["rorgn"])
+    patch_xnu(p, sym, plan, quirks["rorgn"], "rorgn")
     base = plan.regions["BootKC-ro"][0]
     for off, value in zip(quirks["rorgn_globals"], (lo, hi)):
         p.write64(base + off, value)
@@ -821,6 +922,22 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
         p.write32(sym["sptm_virt_gpu_stop_ep"], env_int("AURA_GPU_STOP_EP") + 1)
     if os.environ.get("AURA_GPU_PRINT_MAX"):
         p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
+    if env_on("AURA_GPU_NARROW"):
+        p.write32(sym["sptm_virt_gpu_narrow"], 1)
+        print("GPU trace: the record's pages only (AURA_GPU_NARROW)")
+    from aura import hvsnap
+
+    try:
+        hvsnap.configure(p, sym, os.environ)
+    except ValueError as e:
+        raise SystemExit(f"AURA_GPU_SNAP_*: {e}")
+    from aura import hvgfxrec
+
+    hvgfxrec.configure(p, sym, os.environ)
+    if os.environ.get("AURA_GFXPMP"):
+        p.write32(sym["sptm_virt_gpu_msg_park"], 0)
+        print(f"GPU/PMP record: {os.environ['AURA_GFXPMP']} ms from the named write, which doesn't "
+              f"park")
     if env_on("AURA_S2R_DCP_PKT"):
         p.write32(sym["sptm_virt_s2r_dcp_pkt"], 1)
         print("coprocessor trace: DCP IOMFB packets copied into the ring")
@@ -873,45 +990,57 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
 
 
 def tail_console(iface, secs, idle):
-    """Keep reading the console after the entry call: a serial read error reopens the device,
-    and the tail stops after secs, or after idle seconds of silence."""
+    """Keep reading the console after the entry call: a serial read error reopens the device, and
+    the tail stops after secs, after idle seconds of silence, or at once when the HV parks (its
+    START, which says whether P_EXIT resumes the guest). AURA_PARK_AFTER_SECS, and SIGUSR1 at any
+    time, ask the guest to park."""
+    import signal
+
     import serial
+    from aura import hvpark
 
     end = time.time() + secs
-    last = time.time()
     dev = iface.dev
-    buf = b""
+    dev.timeout = 0.5
+    ask = {"at": time.time() + env_int("AURA_PARK_AFTER_SECS")
+           if os.environ.get("AURA_PARK_AFTER_SECS") else None}
+    signal.signal(signal.SIGUSR1, lambda *a: ask.update(at=time.time()))
+
+    def poll():
+        if ask["at"] is not None and time.time() >= ask["at"]:
+            ask["at"] = None
+            hvpark.request(dev)
+            print("--- tail: park requested ---", flush=True)
+
+    tail = hvpark.ConsoleTail(dev)
     print(f"--- tailing console for up to {secs}s (stop after {idle:g}s silent) ---", flush=True)
-    while time.time() < end:
-        if idle and time.time() - last > idle:
-            print(f"--- tail: console silent for {idle:g}s ---", flush=True)
+    while True:
+        res = tail.run(max(0.0, end - time.time()), idle, poll)
+        if res[0] != "gone":
             break
+        print(f"--- tail: read error ({res[1]}); reopening ---", flush=True)
         try:
-            chunk = dev.read(4096)
-        except (serial.serialutil.SerialException, OSError) as e:
-            print(f"--- tail: read error ({e}); reopening ---", flush=True)
+            dev.close()
+        except Exception:
+            pass
+        for _ in range(100):
             try:
-                dev.close()
-            except Exception:
-                pass
-            for _ in range(100):
-                try:
-                    dev.open()
-                    print("--- tail: reopened ---", flush=True)
-                    break
-                except (serial.serialutil.SerialException, OSError):
-                    time.sleep(0.2)
-            else:
-                print("--- tail: device gone ---", flush=True)
+                dev.open()
+                print("--- tail: reopened ---", flush=True)
                 break
-            continue
-        if not chunk:
-            continue
-        last = time.time()
-        buf += chunk
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            print("TTY> " + line.decode("latin1", "replace").rstrip("\r"), flush=True)
+            except (serial.serialutil.SerialException, OSError):
+                time.sleep(0.2)
+        else:
+            print("--- tail: device gone ---", flush=True)
+            break
+    tail.flush()
+    if res[0] == "park":
+        st = res[1]
+        then = ("the guest waits for the host: tools/sptm_park.py --continue resumes it"
+                if st.resumes else "a one-way park: the guest stays stopped")
+        print(f"--- tail: the HV parked in its proxy ({st}); {then} ---", flush=True)
+    elif res[0] == "idle":
+        print(f"--- tail: console silent for {idle:g}s ---", flush=True)
     print("--- tail done ---", flush=True)
 
 
@@ -920,6 +1049,11 @@ def main():
     unknown = sorted(k for k in os.environ if k.startswith("AURA_") and k not in KNOWN_ENV)
     if unknown:
         print("not run_guest_sptm.py switches, ignored:", " ".join(unknown))
+    from aura import hvgfxrec
+
+    refused = hvgfxrec.check_env(os.environ)
+    if refused:
+        raise SystemExit(f"refused before anything was sent: {refused}")
 
     from aura import sptm_patch, sptm_virt_plan as plan_mod
     from aura.proxy import AuraProxy, UartInterface
@@ -993,16 +1127,39 @@ def main():
     print(f"ANS {'powered off' if ans_off else 'on'}, "
           f"{'SART entries passed on' if ans_state & 2 else 'no SART entries passed on'}")
     t8140 = u.adt["/chosen"].chip_id == 0x8140
-    ans_cold = os.environ.get("AURA_ANS_COLD", "sleep" if t8140 or ans_off else "off")
-    if ans_cold not in ("sleep", "idle", "off"):
-        raise SystemExit(f"AURA_ANS_COLD={ans_cold}: sleep, idle or off")
-    if ans_off and ans_cold == "off":
+    coldpath = ans_coldpath_mode(os.environ, ans_off, bool(ans_state & 2))
+    if coldpath:
+        flags = ((COLDPATH_STOPPED if coldpath == "stopped" else 0) |
+                 (COLDPATH_CLEAR if env_on("AURA_ANS_COLDPATH_CLEAR") else 0) |
+                 (COLDPATH_AUTO if env_on("AURA_ANS_COLDPATH_AUTO") else 0))
+        # nvme_init() from off: two warm starts of up to 6 s each, the queues, then the handoff.
+        to, iface.dev.timeout = iface.dev.timeout, 120
+        try:
+            rc = p.call(sym["sptm_virt_ans_coldpath"], flags)
+        finally:
+            iface.dev.timeout = to
+        rc &= 0xffffffff
+        rc = rc - (1 << 32) if rc >= 1 << 31 else rc
+        if rc != 0:
+            raise SystemExit(f"ANS coldpath ({coldpath}) failed ({rc}): no XNU (see aura's console)")
+        if p.call(sym["sptm_virt_place"], scratch) != 0 or \
+                (p.read64(scratch), p.read64(scratch + 8)) != (managed_base, managed_end):
+            raise SystemExit("the managed window moved during the ANS coldpath: stop")
+        print(f"ANS coldpath: {coldpath.upper()} for XNU")
+    if coldpath:
+        # Quiesced: XNU wakes it as iBoot's session ("quiesced" kept); stopped: it starts it cold.
+        ans_cold = "off" if coldpath == "quiesced" else "coldpath"
+    else:
+        ans_cold = os.environ.get("AURA_ANS_COLD", "sleep" if t8140 or ans_off else "off")
+        if ans_cold not in ("sleep", "idle", "off"):
+            raise SystemExit(f"AURA_ANS_COLD={ans_cold}: sleep, idle or off")
+    if ans_off and ans_cold == "off" and not coldpath:
         raise SystemExit("ANS is powered off: XNU can only start it cold (AURA_ANS_COLD=sleep)")
     if ans_off and not ans_state & 2:
         raise SystemExit("ANS is powered off and its SART entries weren't passed on: run "
                          "tools/ans_sart.py --start on the stage that powered it off, before the "
                          "chainload, and pass what it prints as AURA_ANS_SART")
-    if ans_cold != "off":
+    if ans_cold not in ("off", "coldpath"):
         # An unanswered RTKit or controller step takes seconds, more than a read's timeout.
         to, iface.dev.timeout = iface.dev.timeout, 30
         try:
@@ -1089,19 +1246,20 @@ def main():
     if env_on("AURA_XNU_RO_RELAX"):
         if not quirks["ro_relax"]:
             raise SystemExit("AURA_XNU_RO_RELAX: no RO-zone patch matches this kernelcache")
-        patch_xnu(p, sym, plan, quirks["ro_relax"])
+        patch_xnu(p, sym, plan, quirks["ro_relax"], "ro_relax")
     if quirks.get("rorgn"):
         set_xnu_rorgn(p, sym, plan, quirks)
     if quirks.get("nvram_mutable"):
-        patch_xnu(p, sym, plan, quirks["nvram_mutable"])
+        patch_xnu(p, sym, plan, quirks["nvram_mutable"], "nvram_mutable")
     if quirks.get("pac_keys") and not env_on("AURA_XNU_TASK_KEYS"):
-        patch_xnu(p, sym, plan, quirks["pac_keys"])
+        patch_xnu(p, sym, plan, quirks["pac_keys"], "pac_keys")
     if quirks.get("nvram_ro") and not env_on("AURA_SHARE_NVRAM"):
-        patch_xnu(p, sym, plan, quirks["nvram_ro"])
+        patch_xnu(p, sym, plan, quirks["nvram_ro"], "nvram_ro")
     if env_on("AURA_XNU_TC_FORCE") and quirks.get("tc_force"):
-        patch_xnu(p, sym, plan, quirks["tc_force"])
+        patch_xnu(p, sym, plan, quirks["tc_force"], "tc_force")
     if env_on("AURA_XNU_ENTRY"):
         patch_xnu_entry(p, sym, plan, images["xnu"])
+    write_patch_log()
     configure(p, sym, plan, live_adt, ctl_cookie)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")

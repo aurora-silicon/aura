@@ -262,17 +262,13 @@ void print_regs(u64 *regs, int el12)
     }
 }
 
-void exc_sync(u64 *regs)
+static void exc_sync_handle(u64 *regs)
 {
     u32 insn;
     int el12 = 0;
     bool in_gl = in_gl12();
     bool el3 = in_el3();
 
-#ifdef SPTM_VIRT
-    sptm_virt_crumb_fault();
-    sptm_virt_park_check();
-#endif
     /* One of the virtualized SPTM's fault-tolerant reads faulted: skip it. */
     if (sptm_virt_peek_fault(in_gl))
         return;
@@ -446,11 +442,8 @@ void exc_sync(u64 *regs)
     sysop("dsb sy");
 }
 
-void exc_irq(u64 *regs)
+static void exc_irq_handle(u64 *regs)
 {
-#ifdef SPTM_VIRT
-    sptm_virt_park_check();
-#endif
 #ifdef SPTM_VIRT
     if (nv2_handle_async(regs, 1))
         return;
@@ -472,11 +465,8 @@ void exc_irq(u64 *regs)
     // print_regs(regs);
 }
 
-void exc_fiq(u64 *regs)
+static void exc_fiq_handle(u64 *regs)
 {
-#ifdef SPTM_VIRT
-    sptm_virt_park_check();
-#endif
 #ifdef SPTM_VIRT
     /* aura's own sampling timer while a core is still inside SPTM. */
     if (sptm_virt_sample_fiq(regs))
@@ -587,11 +577,8 @@ void exc_fiq(u64 *regs)
     // print_regs(regs);
 }
 
-void exc_serr(u64 *regs)
+static void exc_serr_handle(u64 *regs)
 {
-#ifdef SPTM_VIRT
-    sptm_virt_park_check();
-#endif
 #ifdef SPTM_VIRT
     if (nv2_handle_async(regs, 3))
         return;
@@ -616,3 +603,30 @@ void exc_serr(u64 *regs)
     sysop("dsb sy");
     sysop("isb");
 }
+
+/*
+ * The vectors' entry points. Under the virtualized SPTM a core counts as inside aura from its
+ * entry to its return, and stops at its entry while another core owns a park (sptm_virt_park.c).
+ */
+#ifdef SPTM_VIRT
+#define EXC_ENTRY(name, first)                                                                     \
+    void name(u64 *regs)                                                                           \
+    {                                                                                              \
+        first;                                                                                     \
+        int park = sptm_virt_park_enter();                                                         \
+        name##_handle(regs);                                                                       \
+        sptm_virt_park_exit(park);                                                                 \
+    }
+#else
+#define EXC_ENTRY(name, first)                                                                     \
+    void name(u64 *regs)                                                                           \
+    {                                                                                              \
+        name##_handle(regs);                                                                       \
+    }
+#endif
+
+/* A fault with the MMU off, on a core out of reset, stops before anything else. */
+EXC_ENTRY(exc_sync, sptm_virt_crumb_fault())
+EXC_ENTRY(exc_irq, (void)0)
+EXC_ENTRY(exc_fiq, (void)0)
+EXC_ENTRY(exc_serr, (void)0)

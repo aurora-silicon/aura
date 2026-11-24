@@ -74,6 +74,7 @@ int pmgr_power_is_on(int die, const char *name);
 int pmgr_power_is_requested(int die, const char *name);
 /* Power state register of the real (not virtual) device `name`, 0 if none */
 uintptr_t pmgr_psreg_by_name(int die, const char *name);
+int pmgr_device_at(u32 i, const char **name, uintptr_t *psreg);
 int pmgr_power_steps(int die, const char *name, bool on);
 
 int pmgr_set_mode(uintptr_t addr, u8 target_mode);
