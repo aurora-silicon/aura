@@ -9874,6 +9874,17 @@ static int dt_set_sio_fwdata(const char *adt_path, const char *fdt_alias)
             bail_cleanup("FDT: couldn't append to SIO parameters\n");
     }
 
+    /* The parameters for a firmware that reports protocol 10, where they differ */
+    for (int i = 0; i < siodata->num_fwparams_v10; i++) {
+        struct sio_fwparam *param = &siodata->fwparams_v10[i];
+
+        if (fdt_appendprop_u32(dt, node, "apple,sio-firmware-params-v10", param->key))
+            bail_cleanup("FDT: couldn't append to SIO parameters\n");
+
+        if (fdt_appendprop_u32(dt, node, "apple,sio-firmware-params-v10", param->value))
+            bail_cleanup("FDT: couldn't append to SIO parameters\n");
+    }
+
 err:
     free(siodata);
     return 0;
