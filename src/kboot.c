@@ -8678,8 +8678,7 @@ static int j713_display_page(u64 iova, u64 physical, void *opaque)
 static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u32 count,
                                     u64 dram_start, u64 dram_size, bool hdmi)
 {
-    const char *piodma_alias = fdt_get_alias(dt, "disp0-piodma") ?
-                                   "disp0-piodma" : "disp0_piodma";
+    const char *piodma_alias = fdt_get_alias(dt, "disp0-piodma") ? "disp0-piodma" : "disp0_piodma";
     const char *aliases[] = {"disp0", piodma_alias};
     const u8 streams[] = {0, 16};
     struct j713_display_maps maps[2] = {
