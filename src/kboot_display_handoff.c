@@ -62,8 +62,8 @@
  *
  * T6031 (M3 Max, J514C/J516C only; nothing at all on another board or chip, so not on a T6034):
  * the T8122 handoff with T6031 values, armed by chosen.asahi,t6031-dcp=1, as on T6030 and T8122.
- * On a J516C dt_set_m3_defaults() (kboot.c) sets it unless a config line set it; a J514C still
- * needs the boot.bin config line. The kernel decides whether to take the display over (a kernel
+ * dt_set_m3_defaults() (kboot.c) sets it on J514C and J516C unless a config line set it.
+ * The kernel decides whether to take the display over (a kernel
  * may leave that to its command line), so the handoff must be harmless when ignored: the nodes
  * stay disabled and only the marker and the memory description are added. On every boot, armed or
  * not, the __OS_LOG buffers of dcp and dcpext0..3, taken from the ADT, are reserved. Armed, the
