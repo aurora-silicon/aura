@@ -8958,6 +8958,18 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
     u32 len = 0, flen = 0;
     const u8 *raw_ids = disp < 0 ? NULL : adt_getprop(adt, disp, "clock-ids", &len);
     const u8 *freq = arm < 0 ? NULL : adt_getprop(adt, arm, "clock-frequencies", &flen);
+    /*
+     * An empty list (every T602x disp0/dispext<n> on 27.2) says the firmware takes no provider
+     * clocks. Publish it as such: without apple,clock-ids the kernel refuses a firmware-27 DCP.
+     * The display clock the node already has stays its own.
+     */
+    if (raw_ids && !len) {
+        int ret = fdt_setprop_empty(dt, node, "apple,clock-ids");
+        if (!ret)
+            printf("FDT: %s: %s lists no firmware clocks; empty apple,clock-ids published\n",
+                   alias, adt_engine);
+        return ret;
+    }
     u32 nclk = raw_ids ? len / sizeof(u32) : 0;
     if (!nclk || len % sizeof(u32) || nclk > 8 || !freq || flen % sizeof(u32)) {
         printf("FDT: %s: no firmware clocks in the ADT; left unchanged\n", alias);
@@ -9028,6 +9040,22 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
     if (!ret)
         printf("FDT: %s: %u firmware clocks published from %s\n", alias, nclk, adt_engine);
     return ret;
+}
+
+/*
+ * Every display processor the tree names: dcp runs /arm-io/disp0 and dcpext<n> runs
+ * /arm-io/dispext<n>; a tree with one external processor calls it dcpext (dispext0).
+ */
+static void dt_set_dcp_fw27_clocks_all(void)
+{
+    if (dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
+        printf("FDT: dcp: publishing the firmware clocks failed\n");
+    for (size_t n = 0; n < ARRAY_SIZE(dcpext_aliases); n++) {
+        char engine[24];
+        snprintf(engine, sizeof(engine), "/arm-io/dispext%u", n ? (unsigned)(n - 1) : 0);
+        if (dt_set_dcp_fw27_clocks(dcpext_aliases[n], engine))
+            printf("FDT: %s: publishing the firmware clocks failed\n", dcpext_aliases[n]);
+    }
 }
 
 static bool fw_log_overlaps(u64 a, u64 size, u64 b, u64 bytes)
@@ -9521,10 +9549,7 @@ static int dt_set_display(void)
         return ret;
 
     /* Without them the firmware-27 DCP does not start, but the rest of the boot does. */
-    if (dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
-        printf("FDT: dcp: publishing the firmware clocks failed\n");
-    if (dt_set_dcp_fw27_clocks("dcpext", "/arm-io/dispext0"))
-        printf("FDT: dcpext: publishing the firmware clocks failed\n");
+    dt_set_dcp_fw27_clocks_all();
 
     /*
      * Ignore errors for dcpext firmware reservation, nodes should be disabled
