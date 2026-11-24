@@ -5,6 +5,7 @@ static bool debug_enabled;
 static bool console_requested;
 static bool proxy_requested;
 static bool trial_running;
+static bool wdt_keep;
 static bool is_stage1;
 
 static bool boot_space(char c)
@@ -45,6 +46,7 @@ void boot_options_init(const char *line, size_t capacity)
     console_requested = boot_option_present(line, capacity, "aura-console");
     proxy_requested = boot_option_present(line, capacity, "aura-proxy");
     trial_running = boot_option_present(line, capacity, "aura-trial");
+    wdt_keep = boot_option_present(line, capacity, "m1n1.wdt=keep");
     is_stage1 = true;
 }
 
@@ -86,6 +88,16 @@ bool aura_trial_enabled(void)
 void boot_options_set_trial(bool trial)
 {
     trial_running = trial;
+}
+
+/*
+ * m1n1.wdt=keep, in the boot arguments as iBoot passes them: a first stage that is not aura armed
+ * the watchdog for this one and has a fallback behind it (wdt_disable_at_start()). Only the line
+ * itself counts, up to its terminator; nothing past it is read, as iBoot defines no bytes there.
+ */
+bool boot_wdt_keep_enabled(void)
+{
+    return wdt_keep;
 }
 
 bool boot_options_append(char *line, size_t capacity, const char *option)

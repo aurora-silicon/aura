@@ -17,6 +17,19 @@ The boot-argument tokens are matched exactly:
   NVRAM: `touch <esp>/aura-proxy` to turn it on, `rm <esp>/aura-proxy` to turn
   it off. Without either, Stage 1 boots straight through.
 
+- `m1n1.wdt=keep` leaves the SoC watchdog as this stage found it, if it is
+  armed, instead of disabling it at start. It is for a first stage that is not
+  aura, armed the watchdog before starting this one and has a fallback of its
+  own (an A/B m1n1 stage 1 does: a reset before the OS counts as a failed boot,
+  and it then boots its other slot). A hang in this stage or in a kernel that
+  never takes the watchdog over then resets the Mac. A stage with the token that
+  would stop in the proxy waits 15 s for a host and then reboots, as an
+  `aura-try` trial does. Nothing feeds the watchdog: a host that needs longer
+  than its period disarms it (`P_WDT_DISABLE`). Linux's `apple_wdt` keeps an
+  armed watchdog fed once it probes. The token is read from the boot arguments
+  up to their terminator only, and it keeps the spelling of the stage that
+  writes it. It does not belong in the NVRAM boot-args.
+
 - `aura-console` keeps the debug UART as the OS console (see below) without
   the rest of `aura-debug`. `aura-debug` keeps it too.
 

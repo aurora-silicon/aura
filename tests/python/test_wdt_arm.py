@@ -27,6 +27,7 @@ typedef uint64_t u64;
 static u32 chip_id = T6040, adt_version = 2, regs[8], secondary_value;
 static u64 primary = 0x1000, primary_size = 0x4000, secondary_size = 4;
 static u64 wdt_base;
+static bool wdt_kept;
 static unsigned writes;
 static bool bad_readback;
 static void *adt;

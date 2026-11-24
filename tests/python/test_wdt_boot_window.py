@@ -39,6 +39,7 @@ typedef uint64_t u64;
 static u32 chip_id = 0x8112, adt_version = 2, regs[8], secondary_value;
 static u64 primary = 0x1000, primary_size = 0x4000, secondary_size = 4;
 static u64 wdt_base;
+static bool wdt_kept;
 static unsigned writes, disables;
 static void *adt;
 static void wdt_disable(void)
@@ -131,7 +132,7 @@ def function_body(source, signature):
 
 def test_stage1_arms_it_after_disarming_iboot_and_stage2_does_not():
     body = function_body((ROOT / 'src/main.c').read_text(), 'void aura_main(void)')
-    disable = body.index('wdt_disable();')
+    disable = body.index('wdt_disable_at_start();')
     arm = body.index('wdt_arm_boot()')
     assert disable < arm < body.index('run_actions();')
     guard = body.rindex('#if', 0, arm)

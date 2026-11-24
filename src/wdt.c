@@ -2,6 +2,7 @@
 
 #include "wdt.h"
 #include "adt.h"
+#include "boot_options.h"
 #include "types.h"
 #include "utils.h"
 
@@ -10,9 +11,11 @@
 #define WDT_CTL   0x1c
 
 static u64 wdt_base = 0;
+static bool wdt_kept;
 
 void wdt_disable(void)
 {
+    wdt_kept = false;
     int path[8];
     int node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
 
@@ -48,6 +51,37 @@ void wdt_disable(void)
     }
 }
 
+/*
+ * m1n1.wdt=keep: a first stage that is not aura (the J716s' A/B m1n1 stage 1 arms 150 s) armed the
+ * watchdog for this stage, so that a hang before the OS takes it over resets the Mac, iBoot counts
+ * a failed boot and that stage boots its fallback. Leave the primary and the secondary as they
+ * are if the primary is armed; otherwise disable both as usual. Nothing in aura feeds it: as on an
+ * aura-try trial, a host that needs longer than the period disarms it (P_WDT_DISABLE), and every
+ * other disarm or re-arm in this stage ends the keep.
+ */
+void wdt_disable_at_start(void)
+{
+    int path[8];
+    u64 base = 0;
+
+    if (boot_wdt_keep_enabled() && adt_path_offset_trace(adt, "/arm-io/wdt", path) >= 0 &&
+        !adt_get_reg(adt, path, "reg", 0, &base, NULL) && base && (read32(base + WDT_CTL) & 4)) {
+        wdt_base = base;
+        wdt_kept = true;
+        printf("Primary WDT register @ 0x%lx\n", wdt_base);
+        printf("Primary WDT left armed (m1n1.wdt=keep)\n");
+        return;
+    }
+    if (boot_wdt_keep_enabled())
+        printf("WDT: m1n1.wdt=keep, but the watchdog is not armed\n");
+    wdt_disable();
+}
+
+bool wdt_left_armed(void)
+{
+    return wdt_kept;
+}
+
 void wdt_reboot(void)
 {
     /* A fault before wdt_disable() (early init) must still reset the Mac, not spin */
@@ -80,6 +114,7 @@ static int wdt_arm(unsigned seconds)
         return -1;
 
     u32 alarm = seconds * 24000000u;
+    wdt_kept = false;
     write32(primary + WDT_CTL, 0);
     write32(primary + WDT_COUNT, 0);
     write32(primary + WDT_ALARM, alarm);

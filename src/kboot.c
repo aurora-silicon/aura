@@ -47,6 +47,7 @@
 #include "usb_dwc3.h"
 #include "utils.h"
 #include "vsprintf.h"
+#include "wdt.h"
 #include "xnuboot.h"
 
 #include "libfdt/libfdt.h"
@@ -977,11 +978,12 @@ static int dt_reserve_secondary_ro(void)
  * On an aura-try trial each aura stage arms the trial watchdog (wdt.c) so a hang anywhere before
  * Linux feeds it resets into the configured Stage 2. U-Boot with WATCHDOG_AUTOSTART takes the
  * watchdog over and services it from its own loops, so a U-Boot that waits forever (on a disk it
- * cannot reach, say) would never be reset. Tell it to leave the watchdog alone on a trial boot.
+ * cannot reach, say) would never be reset. Tell it to leave the watchdog alone on a trial boot,
+ * and on one whose first stage armed it for a fallback of its own (m1n1.wdt=keep).
  */
 static void dt_set_trial_watchdog(void)
 {
-    if (!aura_trial_enabled())
+    if (!aura_trial_enabled() && !wdt_left_armed())
         return;
     /* The compatibles U-Boot's apple_wdt driver binds to */
     static const char *const compat[] = {"apple,t8103-wdt", "apple,wdt"};
@@ -993,7 +995,8 @@ static void dt_set_trial_watchdog(void)
             if (fdt_setprop(dt, node, "u-boot,noautostart", NULL, 0))
                 printf("FDT: couldn't mark the watchdog for the trial\n");
             else
-                printf("FDT: trial boot: U-Boot leaves the watchdog to the trial budget\n");
+                printf("FDT: %s: U-Boot leaves the watchdog to the boot's budget\n",
+                       aura_trial_enabled() ? "trial boot" : "m1n1.wdt=keep");
         }
     }
 }
@@ -12887,6 +12890,9 @@ int kboot_prepare_dt(void *fdt)
 
     /* setup console log buffer early to capture as much log as possible */
     dt_setup_mtd_phram();
+    /* Repeated for the OS log: wdt_disable_at_start() ran before the log buffer existed */
+    if (wdt_left_armed())
+        printf("kboot: watchdog left armed for the OS (m1n1.wdt=keep)\n");
 
     if (dt_set_m3_defaults())
         return -1;
