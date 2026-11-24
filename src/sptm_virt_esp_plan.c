@@ -107,11 +107,12 @@ AURA_XTEXT static bool esp_num(const char *s, u64 *v)
     return true;
 }
 
-AURA_XTEXT static bool esp_sha(const char *s, u8 out[32])
+/* Exactly 2 * n lowercase hex digits into out[n]. */
+AURA_XTEXT static bool esp_hex(const char *s, u8 *out, u64 n)
 {
-    if (!s || strlen(s) != 64)
+    if (!s || strlen(s) != 2 * n)
         return false;
-    for (int i = 0; i < 64; i++) {
+    for (u64 i = 0; i < 2 * n; i++) {
         char c = s[i];
         int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
         if (d < 0)
@@ -119,6 +120,11 @@ AURA_XTEXT static bool esp_sha(const char *s, u8 out[32])
         out[i / 2] = (out[i / 2] << 4) | d;
     }
     return true;
+}
+
+AURA_XTEXT static bool esp_sha(const char *s, u8 out[32])
+{
+    return esp_hex(s, out, 32);
 }
 
 AURA_XTEXT static void esp_copy(char *dst, const char *src, u64 cap)
@@ -256,6 +262,33 @@ AURA_XTEXT int esp_manifest_parse(struct esp_manifest *m, char *text, u64 len, c
             if (strlen(tok[1]) >= sizeof(m->love))
                 FAIL("manifest: love too long");
             esp_copy(m->love, tok[1], sizeof(m->love));
+        } else if (!strcmp(k, "chosen") && nt == 3) {
+            /* A root property to retarget: a path relative to /chosen ("node/name" or "name") */
+            if (m->nchosen >= ESP_MAX_CHOSEN)
+                FAIL("manifest: too many chosen lines");
+            const char *slash = strchr(tok[1], '/');
+            const char *name = slash ? slash + 1 : tok[1];
+            u64 hl = strlen(tok[2]);
+            if (tok[1][0] == '/' || !name[0] || strlen(name) >= 32 || !hl || hl % 2 ||
+                hl / 2 > ESP_CHOSEN_VAL || strlen(tok[1]) + 8 >= ESP_PATH ||
+                (slash && strchr(slash + 1, '/')))
+                FAIL("manifest: bad chosen line");
+            struct esp_chosen *ch = &m->chosen[m->nchosen];
+            esp_copy(ch->node, "/chosen", ESP_PATH);
+            if (slash) {
+                memcpy(ch->node + 7, "/", 1);
+                memcpy(ch->node + 8, tok[1], slash - tok[1]);
+                ch->node[8 + (slash - tok[1])] = 0;
+            }
+            esp_copy(ch->name, name, sizeof(ch->name));
+            for (u32 i = 0; i < m->nchosen; i++)
+                if (!strcmp(m->chosen[i].node, ch->node) && !strcmp(m->chosen[i].name, ch->name))
+                    FAIL("manifest: duplicate chosen line");
+            ch->len = hl / 2;
+            memset(ch->val, 0, sizeof(ch->val));
+            if (!esp_hex(tok[2], ch->val, ch->len))
+                FAIL("manifest: bad chosen line");
+            m->nchosen++;
         } else if (!strcmp(k, "video") && nt == 2) {
             m->video = !strcmp(tok[1], "1");
         } else if (!strcmp(k, "bootargs")) {
@@ -377,8 +410,10 @@ struct aw {
     u64 used[8]; /* region-id-N in use, N < 512 */
     u64 oslog_base, rtb_dst, rtb_size;
     bool oslog;
+    u32 chosen_done; /* the manifest's chosen properties whose node the walk wrote, by bit */
     char err[96];
 };
+_Static_assert(ESP_MAX_CHOSEN <= 32, "chosen_done bitmask");
 
 ESP_INLINE u32 rd32(const u8 *p)
 {
@@ -662,6 +697,9 @@ AURA_XTEXT static u32 aw_node(struct aw *w, u32 off, char *path, u32 plen, int d
     bool xbar = !strncmp(path, "/arm-io/display-crossbar", 24) && !strchr(path + 8, '/');
     bool seen[ESP_MAX_REGIONS] = {0}, seen24 = false;
     bool mp = in->m->love[0] && !strcmp(path, "/chosen/manifest-properties"), love = false;
+    /* Set /chosen/mix-n-match-prevention-status to 0 (or inject it), matching plan_boot. */
+    bool chosen = !strcmp(path, "/chosen"), mix = false;
+    bool cseen[ESP_MAX_CHOSEN] = {0};
 
     aw_hdr(w, 0, 0);
     u32 p = off + 8;
@@ -674,6 +712,15 @@ AURA_XTEXT static u32 aw_node(struct aw *w, u32 off, char *path, u32 plen, int d
         if (aw_dropped(w, path, name))
             continue;
         onp++;
+        int ci = -1;
+        for (u32 k = 0; k < in->m->nchosen; k++)
+            if (!strcmp(in->m->chosen[k].node, path) && !strcmp(in->m->chosen[k].name, name))
+                ci = k;
+        if (ci >= 0) {
+            aw_prop(w, name, in->m->chosen[ci].val, in->m->chosen[ci].len, fl);
+            cseen[ci] = true;
+            continue;
+        }
         if (mm) {
             int r = -1;
             for (u32 k = 0; k < pl->nregion; k++)
@@ -710,6 +757,14 @@ AURA_XTEXT static u32 aw_node(struct aw *w, u32 off, char *path, u32 plen, int d
             }
             aw_prop(w, name, in->m->love, n + 1, fl);
             love = true;
+            continue;
+        }
+        if (chosen && !strcmp(name, "mix-n-match-prevention-status") && len >= 4 &&
+            len < sizeof(aw_val)) {
+            memcpy(aw_val, v, len);
+            memset(aw_val, 0, 4);
+            aw_prop(w, name, aw_val, len, fl);
+            mix = true;
             continue;
         }
         if (w->have_ph && !strcmp(path, "/defaults") && !strcmp(name, "serial-device")) {
@@ -765,6 +820,19 @@ AURA_XTEXT static u32 aw_node(struct aw *w, u32 off, char *path, u32 plen, int d
                 aw_region(w, pl->region[k].name, pl->region[k].pa, pl->region[k].size);
                 onp++;
             }
+    for (u32 k = 0; k < in->m->nchosen; k++)
+        if (!strcmp(in->m->chosen[k].node, path))
+            w->chosen_done |= 1U << k;
+    for (u32 k = 0; k < in->m->nchosen; k++)
+        if (!cseen[k] && !strcmp(in->m->chosen[k].node, path)) {
+            aw_prop(w, in->m->chosen[k].name, in->m->chosen[k].val, in->m->chosen[k].len, 0);
+            onp++;
+        }
+    if (chosen && !mix) {
+        static const u8 zero[4];
+        aw_prop(w, "mix-n-match-prevention-status", zero, sizeof(zero), 0);
+        onp++;
+    }
     if (mp && !love) {
         aw_prop(w, "love", in->m->love, strlen(in->m->love) + 1, 0);
         onp++;
@@ -827,9 +895,14 @@ AURA_XTEXT int esp_plan(const struct esp_plan_in *in, struct esp_plan *out, u8 *
                  esp_seglen(xi, "__TEXT") + esp_seglen(xi, "__PRELINK_TEXT") +
                  esp_seglen(xi, "__DATA_CONST") + esp_seglen(xi, "__DATA_SPTM") + cl4_total +
                  adt_space + tc_size + PAGE;
-    if ((xi->virtlo & L2_INDEX_MASK) <= before)
+    /* With exclaves and a large device tree (the M5 Ultra's) the pieces below SPTM can exceed the
+     * BootKC's L2 index. That lead only sets the layout when the blob starts at the DRAM base;
+     * above it, the placement shift below moves the blob to SPTM's first mapped block and
+     * supersedes it, as plan_boot does. */
+    u64 l2_index = xi->virtlo & L2_INDEX_MASK;
+    if (l2_index <= before && in->phys_base <= in->dram_base)
         FAIL("plan: the BootKC L2 index leaves no room below SPTM");
-    c.head += (xi->virtlo & L2_INDEX_MASK) - before;
+    c.head += l2_index > before ? l2_index - before : 0;
     c.tail = c.head;
     u64 first_mapped = (in->phys_base + BLOCK) & ~(BLOCK - 1);
     if (in->phys_base > c.head) {
@@ -1001,6 +1074,9 @@ AURA_XTEXT int esp_plan(const struct esp_plan_in *in, struct esp_plan *out, u8 *
     if (!w->have_mm || !w->have_chosen)
         FAIL("adt: no /chosen/memory-map");
     aw_node(w, 0, path, 0, 0);
+    for (u32 k = 0; k < in->m->nchosen; k++)
+        if (!(w->chosen_done & (1U << k)))
+            FAIL("adt: no %s node for the chosen %s", in->m->chosen[k].node, in->m->chosen[k].name);
     if (w->bad)
         FAIL("adt: %s", w->err[0] ? w->err : "edited tree outgrew its space");
     u64 len = rp(w->n);

@@ -226,6 +226,98 @@ static const struct adt_tunable_info atc_tunables_t6030_dp[] = {
     {"tunable_CLKMON_CFG", "apple,tunable-dp-calibration", 0x2600, 0x100, true},
 };
 
+/*
+ * T8152 (J873g): the ADT's groups by name, at the PHY window offsets they apply to, in the order
+ * the Linux PHY applies each list. A port that runs only USB3 on lane 0 (apple,fixed-usb3: the
+ * front hub's) takes the USBC0 groups and lane 0's USB list; every other port runs CIO on both
+ * lanes, lane 1 at lane 0 + 0x9000. The ADT has lane 0's groups only. One ACIOPHY_CMN_DFLT row
+ * differs between the four PHYs of the same Mac, so it is calibration: it has to come from each
+ * Mac's own ADT.
+ */
+static const struct adt_tunable_info atc_tunables_t8152_cio[] = {
+    {"tunable_ACIOPHY_CMN_DFLT", "apple,tunable-common-a", 0x800, 0x100, true},
+    {"tunable_CIOPLL_CORE_DFLT", "apple,tunable-common-a", 0x1600, 0x100, true},
+    {"tunable_ATC_FABRIC", "apple,tunable-common-b", 0x6c000, 0x200, true},
+    {"tunable_DPPLL_CORE_DFLT", "apple,tunable-common-b", 0x1000, 0x200, true},
+    {"tunable_DPPLL_TOP_DFLT", "apple,tunable-common-b", 0xe00, 0x100, true},
+    {"tunable_CIOPLL_TOP_DFLT", "apple,tunable-common-b", 0x1400, 0x100, true},
+    {"tunable_CIO_SHIM_CIO", "apple,tunable-common-b", 0x1a00, 0x100, true},
+    {"tunable_LN0_ARBITER_REGS_DFLT", "apple,tunable-lane0-cio", 0x8280, 0x100, true},
+    {"tunable_LN0_RX_TOP_REGS_DFLT", "apple,tunable-lane0-cio", 0x8cf0, 0x100, true},
+    {"tunable_LN0_RX_DFE_REGS_DFLT", "apple,tunable-lane0-cio", 0x77c0, 0x100, true},
+    {"tunable_LN0_SMGR_REGS_DFLT", "apple,tunable-lane0-cio", 0x7d80, 0x100, true},
+    {"tunable_LN0_RXAEQ_TOP_REGS_DFLT", "apple,tunable-lane0-cio", 0x79c0, 0x400, true},
+    {"tunable_LN0_RX_SHM_REGS_DFLT", "apple,tunable-lane0-cio", 0x8700, 0x100, true},
+    {"tunable_LN0_TXSEQ_REGS_DFLT", "apple,tunable-lane0-cio", 0x4c80, 0x100, true},
+    {"tunable_LN0_TX_SHM_AHB_DFLT", "apple,tunable-lane0-cio", 0x4f90, 0x100, true},
+    {"tunable_LN0_ASDC_TXSPL_CM_DFLT", "apple,tunable-lane0-cio", 0x4e20, 0x100, true},
+    {"tunable_LN0_ASDC_TXSPL_CM_DFLT", "apple,tunable-lane0-cio", 0x8980, 0x100, true},
+    {"tunable_LN0_DIV40_REGS_DFLT", "apple,tunable-lane0-cio", 0x8580, 0x100, true},
+    {"tunable_LN0_RX_PCTRL_REGS_DFLT", "apple,tunable-lane0-cio", 0x8600, 0x100, true},
+    {"tunable_LN0_CTLE_EQ_REGS_DFLT", "apple,tunable-lane0-cio", 0x7f80, 0x100, true},
+    {"tunable_L0_RXCALACC_HALFUI_DFLT", "apple,tunable-lane0-cio", 0x7300, 0x100, true},
+    {"tunable_L0_RXCALACC_EDSKEW_DFLT", "apple,tunable-lane0-cio", 0x7280, 0x100, true},
+    {"tunable_LN0_TXSPL_TXDCC_DFLT", "apple,tunable-lane0-cio", 0x4d80, 0x100, true},
+    {"tunable_LN0_CTLE_EQ_REGS_CIO", "apple,tunable-lane0-cio", 0x7f80, 0x100, true},
+    {"tunable_LN0_SMGR_REGS_CIO", "apple,tunable-lane0-cio", 0x7d80, 0x100, true},
+    {"tunable_LN0_RXAEQ_TOP_REGS_CIO", "apple,tunable-lane0-cio", 0x79c0, 0x200, true},
+    {"tunable_LN0_RXTX_TXD_CFG_CIO", "apple,tunable-lane0-cio", 0x8af0, 0x100, true},
+    {"tunable_LN0_RXTX_TXD_CFG_CIO", "apple,tunable-lane0-cio", 0x4e90, 0x100, true},
+    {"tunable_LN0_ARBITER_REGS_DFLT", "apple,tunable-lane1-cio", 0x11280, 0x100, true},
+    {"tunable_LN0_RX_TOP_REGS_DFLT", "apple,tunable-lane1-cio", 0x11cf0, 0x100, true},
+    {"tunable_LN0_RX_DFE_REGS_DFLT", "apple,tunable-lane1-cio", 0x107c0, 0x100, true},
+    {"tunable_LN0_SMGR_REGS_DFLT", "apple,tunable-lane1-cio", 0x10d80, 0x100, true},
+    {"tunable_LN0_RXAEQ_TOP_REGS_DFLT", "apple,tunable-lane1-cio", 0x109c0, 0x400, true},
+    {"tunable_LN0_RX_SHM_REGS_DFLT", "apple,tunable-lane1-cio", 0x11700, 0x100, true},
+    {"tunable_LN0_TXSEQ_REGS_DFLT", "apple,tunable-lane1-cio", 0xdc80, 0x100, true},
+    {"tunable_LN0_TX_SHM_AHB_DFLT", "apple,tunable-lane1-cio", 0xdf90, 0x100, true},
+    {"tunable_LN0_ASDC_TXSPL_CM_DFLT", "apple,tunable-lane1-cio", 0xde20, 0x100, true},
+    {"tunable_LN0_ASDC_TXSPL_CM_DFLT", "apple,tunable-lane1-cio", 0x11980, 0x100, true},
+    {"tunable_LN0_DIV40_REGS_DFLT", "apple,tunable-lane1-cio", 0x11580, 0x100, true},
+    {"tunable_LN0_RX_PCTRL_REGS_DFLT", "apple,tunable-lane1-cio", 0x11600, 0x100, true},
+    {"tunable_LN0_CTLE_EQ_REGS_DFLT", "apple,tunable-lane1-cio", 0x10f80, 0x100, true},
+    {"tunable_L0_RXCALACC_HALFUI_DFLT", "apple,tunable-lane1-cio", 0x10300, 0x100, true},
+    {"tunable_L0_RXCALACC_EDSKEW_DFLT", "apple,tunable-lane1-cio", 0x10280, 0x100, true},
+    {"tunable_LN0_TXSPL_TXDCC_DFLT", "apple,tunable-lane1-cio", 0xdd80, 0x100, true},
+    {"tunable_LN0_CTLE_EQ_REGS_CIO", "apple,tunable-lane1-cio", 0x10f80, 0x100, true},
+    {"tunable_LN0_SMGR_REGS_CIO", "apple,tunable-lane1-cio", 0x10d80, 0x100, true},
+    {"tunable_LN0_RXAEQ_TOP_REGS_CIO", "apple,tunable-lane1-cio", 0x109c0, 0x200, true},
+    {"tunable_LN0_RXTX_TXD_CFG_CIO", "apple,tunable-lane1-cio", 0x11af0, 0x100, true},
+    {"tunable_LN0_RXTX_TXD_CFG_CIO", "apple,tunable-lane1-cio", 0xde90, 0x100, true},
+};
+static const struct adt_tunable_info atc_tunables_t8152_usb3[] = {
+    {"tunable_ACIOPHY_CMN_DFLT", "apple,tunable-common-a", 0x800, 0x100, true},
+    {"tunable_CIOPLL_CORE_DFLT", "apple,tunable-common-a", 0x1600, 0x100, true},
+    {"tunable_ATC_FABRIC", "apple,tunable-common-b", 0x6c000, 0x200, true},
+    {"tunable_DPPLL_CORE_DFLT", "apple,tunable-common-b", 0x1000, 0x200, true},
+    {"tunable_DPPLL_TOP_DFLT", "apple,tunable-common-b", 0xe00, 0x100, true},
+    {"tunable_CIOPLL_TOP_DFLT", "apple,tunable-common-b", 0x1400, 0x100, true},
+    {"tunable_ACIOPHY_USBC0_DFLT", "apple,tunable-common-b", 0x15c00, 0x100, true},
+    {"tunable_ACIOPHY_USBC0_USB", "apple,tunable-common-b", 0x15c00, 0x100, true},
+    {"tunable_LN0_ARBITER_REGS_DFLT", "apple,tunable-lane0-usb", 0x8280, 0x100, true},
+    {"tunable_LN0_RX_TOP_REGS_DFLT", "apple,tunable-lane0-usb", 0x8cf0, 0x100, true},
+    {"tunable_LN0_RX_DFE_REGS_DFLT", "apple,tunable-lane0-usb", 0x77c0, 0x100, true},
+    {"tunable_LN0_SMGR_REGS_DFLT", "apple,tunable-lane0-usb", 0x7d80, 0x100, true},
+    {"tunable_LN0_RXAEQ_TOP_REGS_DFLT", "apple,tunable-lane0-usb", 0x79c0, 0x400, true},
+    {"tunable_LN0_RX_SHM_REGS_DFLT", "apple,tunable-lane0-usb", 0x8700, 0x100, true},
+    {"tunable_LN0_TXSEQ_REGS_DFLT", "apple,tunable-lane0-usb", 0x4c80, 0x100, true},
+    {"tunable_LN0_TX_SHM_AHB_DFLT", "apple,tunable-lane0-usb", 0x4f90, 0x100, true},
+    {"tunable_LN0_ASDC_TXSPL_CM_DFLT", "apple,tunable-lane0-usb", 0x4e20, 0x100, true},
+    {"tunable_LN0_ASDC_TXSPL_CM_DFLT", "apple,tunable-lane0-usb", 0x8980, 0x100, true},
+    {"tunable_LN0_DIV40_REGS_DFLT", "apple,tunable-lane0-usb", 0x8580, 0x100, true},
+    {"tunable_LN0_RX_PCTRL_REGS_DFLT", "apple,tunable-lane0-usb", 0x8600, 0x100, true},
+    {"tunable_LN0_CTLE_EQ_REGS_DFLT", "apple,tunable-lane0-usb", 0x7f80, 0x100, true},
+    {"tunable_L0_RXCALACC_HALFUI_DFLT", "apple,tunable-lane0-usb", 0x7300, 0x100, true},
+    {"tunable_L0_RXCALACC_EDSKEW_DFLT", "apple,tunable-lane0-usb", 0x7280, 0x100, true},
+    {"tunable_LN0_TXSPL_TXDCC_DFLT", "apple,tunable-lane0-usb", 0x4d80, 0x100, true},
+    {"tunable_LN0_SMGR_REGS_USB", "apple,tunable-lane0-usb", 0x7d80, 0x100, true},
+    {"tunable_LN0_DETECTOR_REGS_USB", "apple,tunable-lane0-usb", 0x8480, 0x100, true},
+    {"tunable_LN0_DIV40_REGS_USB", "apple,tunable-lane0-usb", 0x8580, 0x100, true},
+    {"tunable_LN0_CTLE_EQ_REGS_USB", "apple,tunable-lane0-usb", 0x7f80, 0x100, true},
+    {"tunable_LN0_RXAEQ_TOP_REGS_USB", "apple,tunable-lane0-usb", 0x79c0, 0x200, true},
+    {"tunable_LN0_TXSEQ_REGS_USB", "apple,tunable-lane0-usb", 0x4c80, 0x100, true},
+};
+
 static const struct atc_fuse_info atc_fuses_t8103_port0[] = {
     {0x23d2bc434, 9, 6, CIO3PLL_DCO_NCTRL, CIO3PLL_DCO_COARSEBIN_EFUSE0},
     {0x23d2bc434, 15, 6, CIO3PLL_DCO_NCTRL, CIO3PLL_DCO_COARSEBIN_EFUSE1},
@@ -361,6 +453,7 @@ static const struct atc_fuse_info atc_fuses_t8112_port1[] = {
 // Order "atc-phy" compatibles in reverse chronologically order to deal with mutliple compatible
 // strings in ADT atc-phy nodes.
 static const struct atc_fuse_hw atc_fuses[] = {
+    {"atc-phy,t8152", -1, NULL, 0},
     {"atc-phy,t8142", -1, NULL, 0},
     {"atc-phy,t8132", -1, NULL, 0},
     {"atc-phy,t8130", -1, NULL, 0},
@@ -966,7 +1059,15 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
         goto cleanup;
     }
 
-    if (adt_is_compatible_at(adt, adt_node, "atc-phy,t8130", 0)) {
+    if (adt_is_compatible_at(adt, adt_node, "atc-phy,t8152", 0)) {
+        if (fdt_getprop(dt, fdt_node, "apple,fixed-usb3", NULL)) {
+            tunables = atc_tunables_t8152_usb3;
+            tunable_count = ARRAY_SIZE(atc_tunables_t8152_usb3);
+        } else {
+            tunables = atc_tunables_t8152_cio;
+            tunable_count = ARRAY_SIZE(atc_tunables_t8152_cio);
+        }
+    } else if (adt_is_compatible_at(adt, adt_node, "atc-phy,t8130", 0)) {
         tunables = atc_tunables_t8130;
         tunable_count = ARRAY_SIZE(atc_tunables_t8130);
     } else if (adt_is_compatible_at(adt, adt_node, "atc-phy,t8142", 0) ||
@@ -1057,6 +1158,10 @@ cleanup:
         fdt_delprop(dt, fdt_node, atc_tunables[i].fdt_name);
     for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8122); i++)
         fdt_delprop(dt, fdt_node, atc_tunables_t8122[i].fdt_name);
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_cio); i++)
+        fdt_delprop(dt, fdt_node, atc_tunables_t8152_cio[i].fdt_name);
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_usb3); i++)
+        fdt_delprop(dt, fdt_node, atc_tunables_t8152_usb3[i].fdt_name);
     for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8130); i++)
         if (chip_id != T8140 || fdt_node_check_compatible(dt, 0, "apple,j700") ||
             strcmp(atc_tunables_t8130[i].fdt_name, "apple,tunable-axi2af"))
@@ -1072,8 +1177,6 @@ struct j614s_atc_tunable {
     const char *adt_name, *fdt_name, *resource;
     u32 bias, window, limit;
     bool controller_source, controller_target;
-    /* A port without this ADT list still exports the others (the DT property is removed). */
-    bool optional;
 };
 
 static const struct j614s_atc_tunable j614s_atc_tunables[] = {
@@ -1087,9 +1190,6 @@ static const struct j614s_atc_tunable j614s_atc_tunables[] = {
     {"tunable_AUSPLL_CORE", "apple,tunable-auspll", "core", 0x3200, 0, 0, false, false},
     {"tunable_CIO4PLL_CORE", "apple,tunable-cio4pll", "core", 0x3a00, 0, 0, false, false},
     {"tunable_USB2PHY_HOST", "apple,tunable-usb2-host", "bank0", 0, 0, 0, false, false},
-    /* USB2 device mode (Linux phy-apple-t6040-usb2): default list, then the device list. */
-    {"tunable_USB2PHY_DFLT", "apple,tunable-usb2-default", "bank0", 0, 0, 0, false, false, true},
-    {"tunable_USB2PHY_DEV", "apple,tunable-usb2-device", "bank0", 0, 0, 0, false, false, true},
     {"tunable_PIPE_HANDLER_DEFAULT", "apple,tunable-pipehandler", "pipehandler", 0, 0, 0, true,
      false},
     {"tunable_DRD_USB31_GBL_DEFAULT", "apple,tunable-gbl-default", "dwc3-core", 0, 0xc100, 0x600,
@@ -1125,6 +1225,56 @@ static int j614s_resource_size(void *dt, int node, const char *name, u64 *size)
     return *size ? 0 : -1;
 }
 
+/*
+ * Optional USB2 device mode pair (Linux phy-apple-t6040-usb2): export both lists on bank0 or
+ * neither, clearing any stale properties. Missing or invalid ADT lists omit the pair without
+ * disabling the port so USB2 host and USB3 stay usable; only an FDT write error fails the port.
+ */
+static int j614s_export_usb2_device_pair(void *dt, int port, int src, const char *phy_path)
+{
+    static const char *const names[][2] = {
+        {"tunable_USB2PHY_DFLT", "apple,tunable-usb2-default"},
+        {"tunable_USB2PHY_DEV", "apple,tunable-usb2-device"},
+    };
+    int phy = fdt_path_offset(dt, phy_path);
+    u64 size;
+    if (phy < 0 || j614s_resource_size(dt, phy, "bank0", &size))
+        return -1;
+
+    for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+        int ret = fdt_delprop(dt, phy, names[i][1]);
+        if (ret && ret != -FDT_ERR_NOTFOUND)
+            return -1;
+    }
+
+    const char *missing = NULL, *invalid = NULL;
+    for (size_t i = 0; i < ARRAY_SIZE(names) && !missing && !invalid; i++) {
+        u32 plen;
+        const struct atc_tunable *list = adt_getprop(adt, src, names[i][0], &plen);
+        if (!list || !plen)
+            missing = names[i][0];
+        else if (plen % sizeof(*list))
+            invalid = names[i][0];
+        /* Keep in step with dt_append_atc_tunable()'s size, alignment, and bounds checks. */
+        for (u32 j = 0; !missing && !invalid && j < plen / sizeof(*list); j++)
+            if (list[j].size != 32 || list[j].offset % 4 || (u64)list[j].offset + 4 > size)
+                invalid = names[i][0];
+    }
+    if (missing || invalid) {
+        printf("FDT: ATC%d: %s %s, USB2 device tunables omitted\n", port,
+               missing ? "no" : "invalid", missing ? missing : invalid);
+        return 0;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+        struct adt_tunable_info info = {names[i][0], names[i][1], 0, size, true};
+        phy = fdt_path_offset(dt, phy_path);
+        if (phy < 0 || dt_append_atc_tunable(dt, src, phy, &info))
+            return -1;
+    }
+    return 0;
+}
+
 static int j614s_export_atc(void *dt, int port)
 {
     char adt_path[32];
@@ -1157,13 +1307,6 @@ static int j614s_export_atc(void *dt, int port)
         int src = item->controller_source ? usb_source : source;
         u64 size;
         u32 len;
-        if (item->optional && target >= 0 &&
-            (!adt_getprop(adt, src, item->adt_name, &len) || !len)) {
-            int ret = fdt_delprop(dt, target, item->fdt_name);
-            if (ret && ret != -FDT_ERR_NOTFOUND)
-                return -1;
-            continue;
-        }
         if (target < 0 || j614s_resource_size(dt, target, item->resource, &size) ||
             item->window > size || (item->limit && item->limit > size - item->window) ||
             item->bias >= (item->limit ? item->limit : size - item->window) ||
@@ -1178,6 +1321,8 @@ static int j614s_export_atc(void *dt, int port)
     }
     if (port == 3)
         return 0; /* The PMP-aware display gate owns PHY power. */
+    if (j614s_export_usb2_device_pair(dt, port, source, phy_path))
+        return -1;
     phy = fdt_path_offset(dt, phy_path);
     if (phy < 0 || fdt_setprop_string(dt, phy, "status", "okay"))
         return -1;
@@ -1201,7 +1346,7 @@ static void t6040_export_usb2_device_tunables(void *dt)
 
     for (int port = 0; port < 3; port++) {
         char path[24];
-        int trace[8] = {0}, len, n = 0;
+        int trace[8] = {0}, len;
         int phy = fdt_path_offset(dt, j614s_phys[port]);
 
         snprintf(path, sizeof(path), "/arm-io/atc-phy%d", port);
@@ -1230,29 +1375,40 @@ static void t6040_export_usb2_device_tunables(void *dt)
             continue;
         }
 
-        for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+        /* Check both lists before touching the node: replace the pair, or leave it alone. */
+        const char *missing = NULL, *invalid = NULL;
+        for (size_t i = 0; i < ARRAY_SIZE(names) && !missing && !invalid; i++) {
             u32 plen;
-            int ret = fdt_delprop(dt, phy, names[i][1]);
-            if (ret && ret != -FDT_ERR_NOTFOUND) {
-                n = -1;
-                break;
-            }
-            if (!adt_getprop(adt, src, names[i][0], &plen) || !plen)
-                continue;
-            struct adt_tunable_info info = {names[i][0], names[i][1], 0, size, true};
-            if (dt_append_atc_tunable(dt, src, phy, &info)) {
-                for (size_t j = 0; j < ARRAY_SIZE(names); j++)
-                    fdt_delprop(dt, phy, names[j][1]);
-                n = -1;
-                break;
-            }
-            n++;
+            const struct atc_tunable *list = adt_getprop(adt, src, names[i][0], &plen);
+            if (!list || !plen)
+                missing = names[i][0];
+            else if (plen % sizeof(*list))
+                invalid = names[i][0];
+            for (u32 j = 0; !missing && !invalid && j < plen / sizeof(*list); j++)
+                if (list[j].size != 32 || list[j].offset % 4 || (u64)list[j].offset + 4 > size)
+                    invalid = names[i][0];
         }
-        printf("FDT: T6040 ATC%d USB2 device tunables: %s\n", port,
-               n < 0    ? "invalid, none exported"
-               : n == 2 ? "default + device"
-               : n      ? "partial"
-                        : "none");
+        if (missing || invalid) {
+            printf("FDT: T6040 ATC%d: %s %s, USB2 device tunables left as in the DT\n", port,
+                   missing ? "no" : "invalid", missing ? missing : invalid);
+            continue;
+        }
+
+        int ret = 0;
+        for (size_t i = 0; i < ARRAY_SIZE(names) && !ret; i++) {
+            struct adt_tunable_info info = {names[i][0], names[i][1], 0, size, true};
+            ret = fdt_delprop(dt, phy, names[i][1]);
+            if (!ret || ret == -FDT_ERR_NOTFOUND)
+                ret = dt_append_atc_tunable(dt, src, phy, &info);
+        }
+        if (ret) {
+            /* Only an FDT write can fail here; never leave half a pair behind. */
+            for (size_t i = 0; i < ARRAY_SIZE(names); i++)
+                fdt_delprop(dt, phy, names[i][1]);
+            printf("FDT: T6040 ATC%d: FDT write failed, no USB2 device tunables\n", port);
+            continue;
+        }
+        printf("FDT: T6040 ATC%d USB2 device tunables: default + device\n", port);
     }
 }
 
@@ -1415,8 +1571,7 @@ int kboot_setup_atc(void *dt)
         free(scratch);
         return 0;
     }
-    if (chip_id == T6040)
-        t6040_export_usb2_device_tunables(dt);
+    t6040_export_usb2_device_tunables(dt);
 
     for (int i = 0; i < MAX_ATC_DEVS; ++i) {
         memset(adt_path, 0, sizeof(adt_path));

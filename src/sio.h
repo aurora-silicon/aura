@@ -25,6 +25,9 @@ struct sio_data {
     struct sio_fwparam fwparams[MAX_FWPARAMS];
     int num_fwdata;
     int num_fwparams;
+    /* Low-window SIO: the parameters for a firmware that reports protocol 10, if any */
+    struct sio_fwparam fwparams_v10[MAX_FWPARAMS];
+    int num_fwparams_v10;
 };
 
 struct sio_data *sio_setup_fwdata(const char *adt_path);

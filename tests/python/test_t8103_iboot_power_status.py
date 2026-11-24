@@ -170,6 +170,8 @@ static unsigned delays;
 static int display_start_dcp(void) { return 0; }
 static int dcp_connect_dptx(dcp_dev_t *d) { (void)d; assert(!"no DPTX on the internal panel"); return -1; }
 static int dcp_dptx_hpd(void *dptx, u32 port, bool hpd) { (void)dptx; (void)port; (void)hpd; assert(!"no DPTX on the internal panel"); return -1; }
+static bool dcp_dptx_needs_ap_hpd(dcp_dev_t *d) { (void)d; assert(!"no DPTX on the internal panel"); return false; }
+static int dcp_hdmi_hpd_level(dcp_dev_t *d) { (void)d; assert(!"no DPTX on the internal panel"); return -1; }
 static int dcp_work(dcp_dev_t *d) { (void)d; return 0; }
 static void mdelay(unsigned ms) { (void)ms; delays++; }
 static u64 get_ticks(void) { return 0; }

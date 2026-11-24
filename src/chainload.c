@@ -37,7 +37,7 @@ _Static_assert(offsetof(struct chainload_header, run_base) == CHAINLOAD_HDR_RUN_
  * Return how many bytes from its base an image needs to run at a run_base below its staged copy
  * (chainload.h), or 0 if it does not support that.
  */
-static u64 chainload_run_footprint(const void *image, size_t size)
+static u64 chainload_run_footprint(const void *image, size_t size, u32 *flags)
 {
     struct chainload_header hdr;
 
@@ -48,7 +48,31 @@ static u64 chainload_run_footprint(const void *image, size_t size)
         !(hdr.flags & CHAINLOAD_HDR_F_RUN_BASE) || hdr.run_base || !hdr.footprint ||
         (hdr.footprint & (SZ_16K - 1)) || hdr.footprint > size)
         return 0;
+    if (flags)
+        *flags = hdr.flags;
     return hdr.footprint;
+}
+
+/* DISPLAY_LIVE_ADT_PROP and DISPLAY_LIVE_RTKIT_ADT_PROP, in this order */
+#define LIVE_DCP_ADT_ENTRY_SIZE                                                                    \
+    (2 * sizeof(struct adt_property) + sizeof(u64) + DISPLAY_LIVE_RTKIT_RECORD_SIZE)
+_Static_assert(!(DISPLAY_LIVE_RTKIT_RECORD_SIZE & 3), "ADT property values are padded to 4 bytes");
+
+/* A copied tree has the new properties before its memory-map child. */
+static int chainload_set_adt_range(void *copy, int node, const char *name, u64 range[2])
+{
+    if (!copy)
+        return adt_setprop(adt, node, name, range, 2 * sizeof(u64));
+
+    u32 size;
+    const u8 *value = adt_getprop(adt, node, name, &size);
+    if (!value || size != 2 * sizeof(u64))
+        return -1;
+    size_t offset = value - (const u8 *)adt;
+    if (offset > cur_boot_args.devtree_size || size > cur_boot_args.devtree_size - offset)
+        return -1;
+    memcpy((u8 *)copy + offset + LIVE_DCP_ADT_ENTRY_SIZE, range, size);
+    return 0;
 }
 
 int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
@@ -56,8 +80,9 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     u64 new_base = (u64)_base;
     u64 image_size = size;
     u64 ram_end, ro_start = 0, ro_end = 0;
-    u64 live_heap = heapblock_high_water();
+    u64 live_heap;
     u64 inherited_top = cur_boot_args.top_of_kernel_data;
+    u64 protected_heap_start = inherited_top;
     int ro_status = memory_fw_ro_range(&ro_start, &ro_end);
 
     printf("chainload: Preparing image...\n");
@@ -65,9 +90,23 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     if (!image || !size || ro_status < 0 ||
         cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size)
         return -1;
+    u32 target_flags = 0;
+    u64 target_footprint = chainload_run_footprint(image, size, &target_flags);
+    /* A receiver built before the RTKit record advertises only F_LIVE_DCP and would ignore it */
+    const u32 live_flags = CHAINLOAD_HDR_F_LIVE_DCP | CHAINLOAD_HDR_F_LIVE_RTKIT;
+    if ((target_flags & live_flags) != live_flags && display_needs_live_receiver()) {
+        printf("chainload: next image cannot inherit the running DCP\n");
+        return -1;
+    }
+    /* Capture any newly retained DCP buffers before laying out the next image. */
+    if (display_prepare_live_handoff() < 0)
+        return -1;
+    live_heap = heapblock_high_water();
     ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+    display_inherited_live_heap(&protected_heap_start);
     if (new_base < cur_boot_args.phys_base || new_base >= ram_end || live_heap > ram_end ||
-        inherited_top > ram_end)
+        inherited_top > ram_end || protected_heap_start > inherited_top ||
+        protected_heap_start < cur_boot_args.phys_base)
         return -1;
 
     for (size_t i = 0; i < var_cnt; i++) {
@@ -108,6 +147,31 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     if (fw_bootargs_off > UINT64_MAX - SZ_16K)
         return -1;
     u64 fw_size = fw_bootargs_off + SZ_16K;
+    int chosen = -1, prop_offset = -1;
+    size_t adt_size = cur_boot_args.devtree_size;
+    u64 adt_off = fw_size;
+    struct display_live_rtkit_record rec;
+    if (display_handed_on_live()) {
+        /* The next stage must describe the session to the kernel: none, no chainload */
+        if (display_live_rtkit_record(&rec) < 0) {
+            printf("chainload: cannot describe the running DCP's RTKit session\n");
+            return -1;
+        }
+        /* Build a private ADT copy for the next stage. The current stage may retry. */
+        chosen = adt_path_offset(adt, "/chosen");
+        if (chosen < 0)
+            return -1;
+        if (adt_get_property_count(adt, chosen) <= 0)
+            return -1;
+        prop_offset = adt_first_property_offset(adt, chosen);
+        if (prop_offset < 0 || (size_t)prop_offset > adt_size ||
+            adt_size > UINT32_MAX - LIVE_DCP_ADT_ENTRY_SIZE)
+            return -1;
+        adt_size += LIVE_DCP_ADT_ENTRY_SIZE;
+        if (fw_size > UINT64_MAX - ALIGN_UP(adt_size, SZ_16K))
+            return -1;
+        fw_size += ALIGN_UP(adt_size, SZ_16K);
+    }
     if (image_size > UINT64_MAX - fw_size || new_base > UINT64_MAX - image_size - fw_size)
         return -1;
 
@@ -123,7 +187,7 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
          * base (start.S) while its payload, SEPFW and boot_args stay in the staged copy, below
          * the new high-water.
          */
-        footprint = chainload_run_footprint(image, size);
+        footprint = target_footprint;
         if (!footprint || (new_base & (SZ_16K - 1)) || new_base >= ro_start ||
             footprint > ro_start - new_base) {
             printf("chainload: image overlaps firmware RO and cannot run below it\n");
@@ -133,7 +197,8 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     } else if (packed_end > ram_end) {
         printf("chainload: image destination is invalid or overlaps firmware RO\n");
         return -1;
-    } else if (live_heap > inherited_top && image_end > inherited_top && new_base < live_heap) {
+    } else if (live_heap > protected_heap_start && image_end > protected_heap_start &&
+               new_base < live_heap) {
         /*
          * The next stage is larger than the room our caller left between our base and the heap
          * (a Stage 1 smaller than its Stage 2 plus the firmware block), so a copy to our base
@@ -141,19 +206,19 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
          * it is staged instead and move only its first footprint bytes to our base, which is
          * safe while those stay below the heap.
          */
-        footprint = chainload_run_footprint(image, size);
-        if (!footprint || (new_base & (SZ_16K - 1)) || inherited_top <= new_base ||
-            footprint > inherited_top - new_base) {
+        footprint = target_footprint;
+        if (!footprint || (new_base & (SZ_16K - 1)) || protected_heap_start <= new_base ||
+            footprint > protected_heap_start - new_base) {
             printf("chainload: image span overlaps the live heap\n");
             return -1;
         }
         must_stage = true;
     }
 
-    bool park_fw =
-        !run_base && !must_stage &&
-        ((ro_status == 1 && packed_end > ro_start && image_end < ro_end) ||
-         (live_heap > inherited_top && packed_end > inherited_top && image_end < live_heap));
+    bool park_fw = !run_base && !must_stage &&
+                   ((ro_status == 1 && packed_end > ro_start && image_end < ro_end) ||
+                    (live_heap > protected_heap_start && packed_end > protected_heap_start &&
+                     image_end < live_heap));
     u8 *parked = NULL;
     u64 fw_base = image_end;
     if (park_fw) {
@@ -189,7 +254,7 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
         copy_size + stub_size <= ram_end - staged &&
         !(ro_status == 1 && staged < ro_end && staged + copy_size + stub_size > ro_start);
     if (!run_base && !park_fw && fits_staged) {
-        u64 run_footprint = chainload_run_footprint(image, size);
+        u64 run_footprint = target_footprint;
         if (run_footprint && !(new_base & (SZ_16K - 1)) && staged >= new_base + run_footprint &&
             (ro_status != 1 || new_base + run_footprint <= ro_start || new_base >= ro_end)) {
             footprint = run_footprint;
@@ -243,28 +308,47 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
         high_water = max(high_water, ro_end);
     new_boot_args->top_of_kernel_data = high_water;
 
-    u64 new_sepfw[2] = {fw_base, sepfw[1]};
-    if (adt_setprop(adt, anode, "SEPFW", new_sepfw, sizeof(new_sepfw)) < 0) {
-        free(new_image);
-        free(parked);
-        return -1;
+    u8 *next_adt = NULL;
+    if (chosen >= 0) {
+        next_adt = fw_data + adt_off;
+        struct adt_property *prop = (void *)(next_adt + prop_offset);
+        struct adt_node_hdr *node = (void *)(next_adt + chosen);
+        u64 next_adt_pa = fw_base + adt_off;
+
+        memcpy(next_adt, adt, prop_offset);
+        memcpy(prop->name, DISPLAY_LIVE_ADT_PROP, sizeof(DISPLAY_LIVE_ADT_PROP));
+        prop->size = sizeof(inherited_top);
+        memcpy(prop->value, &inherited_top, sizeof(inherited_top));
+        /* The RTKit session only this stage negotiated, for the stage that boots the kernel */
+        prop = (void *)(prop->value + sizeof(inherited_top));
+        memcpy(prop->name, DISPLAY_LIVE_RTKIT_ADT_PROP, sizeof(DISPLAY_LIVE_RTKIT_ADT_PROP));
+        prop->size = sizeof(rec);
+        memcpy(prop->value, &rec, sizeof(rec));
+        memcpy(prop->value + sizeof(rec), (u8 *)adt + prop_offset,
+               cur_boot_args.devtree_size - prop_offset);
+        node->property_count += 2;
+        new_boot_args->devtree =
+            (void *)(next_adt_pa - cur_boot_args.phys_base + cur_boot_args.virt_base);
+        new_boot_args->devtree_size = adt_size;
+        u64 tree_range[2] = {next_adt_pa, ALIGN_UP(adt_size, SZ_16K)};
+        if (adt_getprop(adt, anode, "DeviceTree", NULL) &&
+            chainload_set_adt_range(next_adt, anode, "DeviceTree", tree_range) < 0)
+            goto bad_adt_range;
     }
+
+    u64 new_sepfw[2] = {fw_base, sepfw[1]};
+    if (chainload_set_adt_range(next_adt, anode, "SEPFW", new_sepfw) < 0)
+        goto bad_adt_range;
     if (preoslog[1]) {
         preoslog[0] = fw_base + fw_preoslog_off;
-        if (adt_setprop(adt, anode, "preoslog", preoslog, sizeof(preoslog)) < 0) {
-            free(new_image);
-            free(parked);
-            return -1;
-        }
+        if (chainload_set_adt_range(next_adt, anode, "preoslog", preoslog) < 0)
+            goto bad_adt_range;
     }
     /* Point the memory map at the moved boot arguments, where the ADT lists them. */
     u64 bootargs_map[2] = {fw_base + fw_bootargs_off, SZ_16K};
     if (adt_getprop(adt, anode, "BootArgs", NULL) &&
-        adt_setprop(adt, anode, "BootArgs", bootargs_map, sizeof(bootargs_map)) < 0) {
-        free(new_image);
-        free(parked);
-        return -1;
-    }
+        chainload_set_adt_range(next_adt, anode, "BootArgs", bootargs_map) < 0)
+        goto bad_adt_range;
     if (parked) {
         dc_cvac_range(parked, fw_size);
         sysop("dsb sy");
@@ -291,6 +375,11 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     next_stage.args[4] = new_base + CHAINLOAD_ENTRY_OFFSET;
     next_stage.restore_logo = false;
     return 0;
+
+bad_adt_range:
+    free(new_image);
+    free(parked);
+    return -1;
 }
 
 #ifdef CHAINLOADING

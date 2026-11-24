@@ -237,6 +237,7 @@ HV_OBJECTS := $(patsubst %,hv/%, \
 OBJECTS := \
 	boot_storage.o \
 	adt.o \
+	adt_gpio.o \
 	afk.o \
 	aic.o \
 	asc.o \
@@ -256,6 +257,7 @@ OBJECTS := \
 	dockchannel_uart.o \
 	exception.o exception_asm.o \
 	fb.o font.o font_retina.o \
+	fdt_disable.o \
 	firmware.o \
 	gxf.o gxf_asm.o \
 	heapblock.o \
@@ -287,7 +289,7 @@ OBJECTS := \
 	smc.o \
 	ctxr_exec.o \
 	smp.o \
-	spmi.o pmu_counter.o ace3.o \
+	spmi.o pmu_counter.o proxy_fallback.o ace3.o \
 	start.o \
 	startup.o \
 	string.o \
