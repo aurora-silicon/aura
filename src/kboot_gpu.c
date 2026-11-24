@@ -4943,6 +4943,10 @@ static int gpu_leave_disabled(void *dt, int sgx)
 
 int dt_set_gpu(void *dt)
 {
+    /* Select G17C by its block compatible; dt_set_gpu_g17c() validates the ADT layout. */
+    if (t6050_g17c_node(dt) >= 0)
+        return dt_set_gpu_g17c(dt);
+
     if (chip_id == T8152) {
         extern int dt_set_gpu_t8152(void *dt);
         return dt_set_gpu_t8152(dt);
@@ -4955,9 +4959,6 @@ int dt_set_gpu(void *dt)
         return dt_set_gpu_g17(dt, &g17_soc_t8140);
     if (chip_id == T8142)
         return dt_set_gpu_g17(dt, &g17_soc_t8142);
-
-    if (chip_id == T6050 && t6050_g17c_node(dt) >= 0)
-        return dt_set_gpu_g17c(dt);
 
     if (chip_id == T6040)
         return dt_set_gpu_t6040(dt);

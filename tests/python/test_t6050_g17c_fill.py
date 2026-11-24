@@ -79,6 +79,23 @@ static u32 read32(u64 addr)
 {
     return 0x5ea10000u + (u32)(addr - LEAK_BASE - 0x74198);
 }
+
+/* Stubs for non-G17C paths in dt_set_gpu()'s dispatch prologue. */
+#define T8152 0x8152
+#define T8132 0x8132
+#define T8140 0x8140
+#define T8142 0x8142
+#define T6040 0x6040
+#define T6041 0x6041
+#define T6050 0x6050
+#define T6051 0x6051
+static u32 chip_id;
+static int g17_soc_t8140, g17_soc_t8142;
+int dt_set_gpu_t8152(void *tree) { (void)tree; return -2; }
+static int dt_set_gpu_m4(void *tree) { (void)tree; return -2; }
+static int dt_set_gpu_g17(void *tree, const void *soc) { (void)tree; (void)soc; return -2; }
+static int dt_set_gpu_t6040(void *tree) { (void)tree; return -2; }
+static int dt_set_gpu_t6041(void *tree) { (void)tree; return -2; }
 '''
 
 ADT = r'''
@@ -762,6 +779,21 @@ int main(void)
     set_cells(GPU_PATH, "apple,leakage-calibration-words",
               (const u32[]){0x11110000, 0x22220000, 0x33330000}, 3);
     expect_accepted("leakage words unreadable, stale words in the tree");
+
+    /* dt_set_gpu() routes apple,agx-g17c by compatible regardless of chip_id. */
+    static const u32 chips[] = {T6051, T8140, 0};
+    for (size_t c = 0; c < ARRAY_SIZE(chips); c++) {
+        world(c % 2 ? ALIAS : COMPATIBLE);
+        chip_id = chips[c];
+        assert(dt_set_gpu(dt) == 0);
+        assert(!strcmp(status(GPU_PATH), "okay"));
+        puts("PASS dispatch: dt_set_gpu selects G17C by compatible regardless of chip_id");
+    }
+    world(COMPATIBLE);
+    chip_id = T6051;
+    assert(!fdt_setprop_string(dt, node(GPU_PATH), "compatible", "apple,agx-g17s"));
+    assert(dt_set_gpu(dt) == -2);
+    puts("PASS dispatch: dt_set_gpu skips G17C when compatible is not apple,agx-g17c");
     return 0;
 }
 '''
@@ -782,9 +814,13 @@ def test_t6050_g17c_fill(tmp_path):
     g17c = g17c[:min(g17c.index(marker) for marker in (
         "\n/* The firmware version whose initdata layout", "\nint dt_set_gpu(void *dt)\n{")
         if marker in g17c)]
+    dispatch = (source[source.index("int dt_set_gpu(void *dt)\n{"):
+                       source.index("    bool has_cs_afr = false;")] +
+                "    return -2;\n}\n")
     code = (HARNESS + function(kboot, "int kboot_fdt_path_exact(") + ADT + leak + aux +
             max_states + function(source, "static int dt_set_resvmem(") +
-            function(source, "static T6050_GPU_TEXT_FN int t6050_gpu_leakage(") + g17c + MAIN)
+            function(source, "static T6050_GPU_TEXT_FN int t6050_gpu_leakage(") + g17c +
+            dispatch + MAIN)
     cfile = tmp_path / "t6050-g17c-fill.c"
     cfile.write_text(code)
     libfdt = ROOT / "src/libfdt"
@@ -800,4 +836,4 @@ def test_t6050_g17c_fill(tmp_path):
     assert built.returncode == 0, built.stdout + built.stderr
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 78, result.stdout
+    assert result.stdout.count("PASS") == 82, result.stdout
