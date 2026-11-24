@@ -12131,6 +12131,304 @@ T6050_SLEEP_INIT static void dt_set_t6050_sleep(void)
     dt_set_t6050_sleep_prop(node, "apple,pinctrl-skip-pins", pins, npins);
 }
 
+/*
+ * Single-die T6050 system cache handoff (apple,t6050-mcc).
+ *
+ * Single-die T6050 boards (M5 Pro and both 460 GB/s and 614 GB/s M5 Max SKUs) share a disabled
+ * apple,t6050-mcc node because fused-off AMCC apertures cannot be probed safely from Linux.
+ * Populate reg with one 16 KiB aperture per plane of every enabled AMCC from the live ADT
+ * (/arm-io/mcc and /chosen/lock-regs/amcc), verified against the parent bus ranges, and set
+ * status = "okay". Already-enabled nodes (such as two-die M5 Ultra) are left alone; any missing
+ * or inconsistent ADT or DT property leaves the node disabled with its original reg intact.
+ */
+#define T6050_MCC_PLANE_SIZE 0x4000ULL
+#define T6050_MCC_MAX_PLANES 64U
+
+/* Return 1 if present and decoded (4 or 8 bytes), 0 if absent, -1 on wrong width. */
+static int dt_adt_get_u64(int node, const char *name, u64 *out)
+{
+    u32 len = 0;
+    const void *p = adt_getprop(adt, node, name, &len);
+
+    if (!p)
+        return 0;
+    if (len == sizeof(u32)) {
+        u32 v;
+        memcpy(&v, p, sizeof(v));
+        *out = v;
+        return 1;
+    }
+    if (len == sizeof(u64)) {
+        memcpy(out, p, sizeof(*out));
+        return 1;
+    }
+    return -1;
+}
+
+static u64 dt_fdt_read_cells(const fdt32_t *cells, int count)
+{
+    u64 v = 0;
+
+    while (count--)
+        v = (v << 32) | fdt32_ld(cells++);
+    return v;
+}
+
+static int dt_explicit_cells(const void *fdt, int node, const char *name)
+{
+    int len = 0;
+    const fdt32_t *prop = fdt_getprop(fdt, node, name, &len);
+
+    if (!prop || len != (int)sizeof(*prop))
+        return -1;
+    u32 val = fdt32_ld(prop);
+    if (val < 1 || val > 2)
+        return -1;
+    return (int)val;
+}
+
+static int dt_ranges_step(const void *fdt, int bus, int parent, u64 *addr, u64 size, bool forward)
+{
+    int len = 0;
+    const fdt32_t *ranges = fdt_getprop(fdt, bus, "ranges", &len);
+    int child_ac = dt_explicit_cells(fdt, bus, "#address-cells");
+    int child_sc = dt_explicit_cells(fdt, bus, "#size-cells");
+    int parent_ac = dt_explicit_cells(fdt, parent, "#address-cells");
+
+    if (!ranges || child_ac < 0 || child_sc < 0 || parent_ac < 0)
+        return -1;
+    int src_ac = forward ? child_ac : parent_ac;
+    int dst_ac = forward ? parent_ac : child_ac;
+    if (src_ac == 1 && (*addr > UINT32_MAX || size - 1 > UINT32_MAX - *addr))
+        return -1;
+    if (!len) {
+        if (dst_ac == 1 && (*addr > UINT32_MAX || size - 1 > UINT32_MAX - *addr))
+            return -1;
+        return 0;
+    }
+
+    int stride = child_ac + parent_ac + child_sc;
+    if (len % (int)(stride * sizeof(*ranges)))
+        return -1;
+
+    int entries = len / (int)(stride * sizeof(*ranges));
+    for (int i = 0; i < entries; i++, ranges += stride) {
+        u64 rchild = dt_fdt_read_cells(ranges, child_ac);
+        u64 rparent = dt_fdt_read_cells(ranges + child_ac, parent_ac);
+        u64 rsize = dt_fdt_read_cells(ranges + child_ac + parent_ac, child_sc);
+
+        if (!rsize || rchild > UINT64_MAX - rsize || rparent > UINT64_MAX - rsize)
+            return -1;
+        u64 rsrc = forward ? rchild : rparent;
+        u64 rdst = forward ? rparent : rchild;
+        if (*addr < rsrc || *addr - rsrc >= rsize)
+            continue;
+        u64 off = *addr - rsrc;
+        if (size > rsize - off) {
+            if (forward)
+                return -1;
+            continue;
+        }
+        u64 mapped = rdst + off;
+        if (dst_ac == 1 && (mapped > UINT32_MAX || size - 1 > UINT32_MAX - mapped))
+            return -1;
+        *addr = mapped;
+        return 0;
+    }
+    return -1;
+}
+
+static int dt_untranslate_range(const void *fdt, int bus, u64 phys, u64 size, u64 *out)
+{
+    int chain[8];
+    int depth = 0;
+
+    if (!size || phys > UINT64_MAX - size)
+        return -1;
+
+    for (int cur = bus; cur > 0;) {
+        if (depth >= (int)ARRAY_SIZE(chain))
+            return -1;
+        chain[depth++] = cur;
+        cur = fdt_parent_offset(fdt, cur);
+        if (cur < 0)
+            return -1;
+    }
+
+    u64 addr = phys;
+    for (int d = depth - 1; d >= 0; d--) {
+        int p = d + 1 < depth ? chain[d + 1] : 0;
+        if (dt_ranges_step(fdt, chain[d], p, &addr, size, false))
+            return -1;
+    }
+
+    /* Confirm Linux's forward child-first ranges walk maps addr back to phys. */
+    u64 roundtrip = addr;
+    for (int d = 0; d < depth; d++) {
+        int p = d + 1 < depth ? chain[d + 1] : 0;
+        if (dt_ranges_step(fdt, chain[d], p, &roundtrip, size, true))
+            return -1;
+    }
+    if (roundtrip != phys)
+        return -1;
+
+    *out = addr;
+    return 0;
+}
+
+static void dt_set_t6050_mcc(void)
+{
+    int node = fdt_node_offset_by_compatible(dt, -1, "apple,t6050-mcc");
+    if (node < 0)
+        return;
+
+    const char *why = "DT";
+    u64 *buf = NULL;
+
+    if (fdt_node_offset_by_compatible(dt, node, "apple,t6050-mcc") >= 0)
+        goto err;
+
+    int slen = 0;
+    const char *status = fdt_getprop(dt, node, "status", &slen);
+    if (!status || slen != (int)sizeof("disabled") ||
+        memcmp(status, "disabled", sizeof("disabled")))
+        return;
+
+    int parent = fdt_parent_offset(dt, node);
+    if (parent < 0 || dt_explicit_cells(dt, parent, "#address-cells") != 2 ||
+        dt_explicit_cells(dt, parent, "#size-cells") != 2)
+        goto err;
+
+    why = "ADT";
+    int armio = adt_path_offset(adt, "/arm-io");
+    u64 dies = 0, die_mask = 0;
+    int r_dies = armio >= 0 ? dt_adt_get_u64(armio, "die-count", &dies) : 0;
+    int path[8];
+    int anode = adt_path_offset_trace(adt, "/arm-io/mcc", path);
+    if (r_dies < 0 || (r_dies > 0 && dies != 1) || anode < 0 ||
+        !adt_is_compatible(adt, anode, "mcc,t6050"))
+        goto err;
+
+    int r_dmask = dt_adt_get_u64(anode, "die-enable-mask", &die_mask);
+    if (r_dmask < 0 || (r_dmask > 0 && die_mask != 1) || (!r_dies && !r_dmask))
+        goto err;
+
+    u64 reg_idx = 0, amcc_count = 0, amcc_mask = 0;
+    if (dt_adt_get_u64(anode, "amcc-reg-idx", &reg_idx) <= 0 || reg_idx > INT32_MAX ||
+        dt_adt_get_u64(anode, "amcc-count", &amcc_count) <= 0 || !amcc_count || amcc_count > 64 ||
+        dt_adt_get_u64(anode, "amcc-enable-mask", &amcc_mask) <= 0)
+        goto err;
+
+    u64 all_amccs = amcc_count == 64 ? ~0ULL : (1ULL << amcc_count) - 1;
+    if (!amcc_mask || (amcc_mask & ~all_amccs))
+        goto err;
+
+    u64 ch_mask = 0, channels = 0;
+    int r = dt_adt_get_u64(anode, "dcs-channel-enable-mask", &ch_mask);
+    if (r < 0)
+        goto err;
+    if (r > 0) {
+        if (dt_adt_get_u64(anode, "dcs-count-per-amcc", &channels) <= 0 || !channels ||
+            channels > 64 / amcc_count)
+            goto err;
+        u64 all_ch = amcc_count * channels == 64 ? ~0ULL : (1ULL << (amcc_count * channels)) - 1;
+        if (!ch_mask || (ch_mask & ~all_ch))
+            goto err;
+        for (u64 b = 0; b < amcc_count * channels; b++) {
+            if ((ch_mask & (1ULL << b)) && !(amcc_mask & (1ULL << (b / channels))))
+                goto err;
+        }
+    }
+
+    why = "lock-regs";
+    int lnode = adt_path_offset(adt, "/chosen/lock-regs/amcc");
+    u64 planes = 0, stride = 0;
+    if (lnode < 0 || dt_adt_get_u64(lnode, "plane-count", &planes) <= 0 || !planes ||
+        planes > T6050_MCC_MAX_PLANES || dt_adt_get_u64(lnode, "plane-stride", &stride) <= 0 ||
+        stride < T6050_MCC_PLANE_SIZE || (stride & (T6050_MCC_PLANE_SIZE - 1)))
+        goto err;
+
+    u64 pmask = 0;
+    u64 expect = planes == 64 ? ~0ULL : (1ULL << planes) - 1;
+    r = dt_adt_get_u64(anode, "amcc-plane-enable-mask", &pmask);
+    if (r < 0 || (r > 0 && pmask != expect))
+        goto err;
+
+    unsigned int enabled_amccs = __builtin_popcountll(amcc_mask);
+    if (planes > T6050_MCC_MAX_PLANES / enabled_amccs ||
+        (planes - 1) > (UINT64_MAX - T6050_MCC_PLANE_SIZE) / stride)
+        goto err;
+    unsigned int total_planes = enabled_amccs * (unsigned int)planes;
+    u64 reach = (planes - 1) * stride + T6050_MCC_PLANE_SIZE;
+
+    u32 ap_len = 0;
+    const u8 *apertures = adt_getprop(adt, lnode, "aperture-phys-addr", &ap_len);
+    if (!apertures || !ap_len || (ap_len % sizeof(u64)))
+        goto err;
+    u32 ap_count = ap_len / sizeof(u64);
+    u64 listed_aps = 0, aperture_size = 0;
+    r = dt_adt_get_u64(lnode, "aperture-count", &listed_aps);
+    if (r < 0 || (r > 0 && listed_aps != ap_count))
+        goto err;
+    r = dt_adt_get_u64(lnode, "aperture-size", &aperture_size);
+    if (r < 0 || (r > 0 && aperture_size < reach))
+        goto err;
+
+    buf = malloc(total_planes * 3 * sizeof(*buf));
+    if (!buf) {
+        why = "OOM";
+        goto err;
+    }
+    fdt64_t *reg = (fdt64_t *)buf;
+    u64 *seen = buf + total_planes * 2;
+
+    why = "ranges";
+    unsigned int out_idx = 0;
+    for (u64 i = 0; i < amcc_count; i++) {
+        if (!(amcc_mask & (1ULL << i)))
+            continue;
+        u64 base = 0, size = 0;
+        if (reg_idx > (u64)INT32_MAX - i ||
+            adt_get_reg(adt, path, "reg", (int)(reg_idx + i), &base, &size) < 0 || !base ||
+            (base & (T6050_MCC_PLANE_SIZE - 1)) || size < reach || base > UINT64_MAX - size)
+            goto err;
+        bool listed = false;
+        for (u32 j = 0; j < ap_count && !listed; j++) {
+            u64 ap;
+            memcpy(&ap, apertures + j * sizeof(u64), sizeof(ap));
+            listed = ap == base;
+        }
+        if (!listed || (aperture_size && size != aperture_size))
+            goto err;
+        for (u64 p = 0; p < planes; p++) {
+            u64 phys = base + p * stride;
+            for (unsigned int k = 0; k < out_idx; k++)
+                if (phys < seen[k] + T6050_MCC_PLANE_SIZE && seen[k] < phys + T6050_MCC_PLANE_SIZE)
+                    goto err;
+            u64 bus_addr = 0;
+            if (dt_untranslate_range(dt, parent, phys, T6050_MCC_PLANE_SIZE, &bus_addr))
+                goto err;
+            seen[out_idx] = phys;
+            reg[out_idx * 2] = cpu_to_fdt64(bus_addr);
+            reg[out_idx * 2 + 1] = cpu_to_fdt64(T6050_MCC_PLANE_SIZE);
+            out_idx++;
+        }
+    }
+
+    why = "FDT write";
+    if (fdt_setprop(dt, node, "reg", reg, total_planes * 2 * sizeof(*reg)) ||
+        fdt_setprop_string(dt, node, "status", "okay"))
+        goto err;
+
+    free(buf);
+    printf("FDT: T6050 MCC: enabled (%u AMCCs, %u planes)\n", enabled_amccs, total_planes);
+    return;
+
+err:
+    free(buf);
+    printf("FDT: T6050 MCC: %s; leaving disabled\n", why);
+}
+
 void kboot_set_initrd(void *start, size_t size)
 {
     initrd_start = start;
@@ -13069,6 +13367,7 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_t6040_sleep_dcpext())
         return -1;
     dt_set_t6050_sleep();
+    dt_set_t6050_mcc();
 #ifndef RELEASE
     if (dt_transfer_virtios())
         return 1;
