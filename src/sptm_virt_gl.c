@@ -335,28 +335,25 @@ void sptm_virt_ctrr_publish_rorgn(void)
 {
     if (!sptm_virt_xnu_rorgn[0])
         return;
-    /*
-     * A T8142 secondary whose CTRR_D iBoot locked: the write is undefined there and the guarded
-     * retry never ends (J813, cpus=2: the core spun here at its XNU entry). It keeps the locked
-     * pair; ten cores reached XNU and slept and woke with this skip in place.
-     */
-    if (chip_id == T8142 && !is_boot_cpu())
-        return;
 
-    int exc_before = exc_count;
-    exc_guard = GUARD_MARK | GUARD_SILENT;
-    msr(SYS_IMP_APL_CTRR_D_LWR_EL2, sptm_virt_xnu_rorgn[0]);
-    msr(SYS_IMP_APL_CTRR_D_UPR_EL2, sptm_virt_xnu_rorgn[1]);
+    /*
+     * Runs in GL2, where exc_guard writes ELR_EL2 rather than GL2's mirrored ELR_EL1 (causing an
+     * infinite retry on UNDEF). SAFE_MSR/SAFE_MRS (sptm_virt_peek_fault) handles UNDEFs cleanly
+     * in GL2 on both CTRR v1 CPUs without CTRR_D and CPUs whose CTRR_D is locked.
+     */
+    bool faulted = false;
+    faulted |= SAFE_MSR("s3_0_c11_c1_2", sptm_virt_xnu_rorgn[0]); /* SYS_IMP_APL_CTRR_D_LWR_EL2 */
+    faulted |= SAFE_MSR("s3_0_c11_c1_3", sptm_virt_xnu_rorgn[1]); /* SYS_IMP_APL_CTRR_D_UPR_EL2 */
     sysop("isb");
-    u64 lwr = mrs(SYS_IMP_APL_CTRR_D_LWR_EL2), upr = mrs(SYS_IMP_APL_CTRR_D_UPR_EL2);
-    exc_guard = GUARD_OFF;
+    u64 lwr = SAFE_MRS("s3_0_c11_c1_2");
+    u64 upr = SAFE_MRS("s3_0_c11_c1_3");
 
     if (!rorgn_logged) {
         rorgn_logged = true;
         printf("SPTM-virt[ctrr]: XNU's read-only region 0x%lx-0x%lx -> CTRR_D_*_EL2 reads "
                "0x%lx-0x%lx%s\n",
                sptm_virt_xnu_rorgn[0], sptm_virt_xnu_rorgn[1] | 0xfff, lwr, upr | 0xfff,
-               exc_count != exc_before ? " (the write faulted)" : "");
+               faulted ? " (the write faulted)" : "");
     }
 }
 
