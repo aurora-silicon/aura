@@ -8646,6 +8646,7 @@ struct j713_display_maps {
     const struct adt_segment_ranges *segments;
     u32 count;
     u64 bytes[32];
+    u64 fb_base, fb_size; /* the retained framebuffer a stream may also map; none when 0 */
 };
 
 static int j713_display_page(u64 iova, u64 physical, void *opaque)
@@ -8662,13 +8663,24 @@ static int j713_display_page(u64 iova, u64 physical, void *opaque)
         maps->bytes[i] += SZ_16K;
         return 0;
     }
+    if (physical >= maps->fb_base && physical - maps->fb_base < maps->fb_size)
+        return 0;
     return -1; /* Never drop an inherited mapping that we cannot describe. */
 }
 
+/*
+ * Describe the display frontend's inherited mappings: SID0 (disp0) and SID16 (PIODMA) of the
+ * display DART. With a panel SID0 maps two DCP segments, and the devices are enabled. With an
+ * HDMI DCP (hdmi) SID0 maps one segment and may still map pages of the retained framebuffer
+ * (/vram), which disp0 is given as a "framebuffer" region; the devices are left as the tree
+ * has them, and a tree that already describes disp0 is not changed.
+ */
 static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u32 count,
-                                    u64 dram_start, u64 dram_size)
+                                    u64 dram_start, u64 dram_size, bool hdmi)
 {
-    const char *aliases[] = {"disp0", "disp0_piodma"};
+    const char *piodma_alias = fdt_get_alias(dt, "disp0-piodma") ?
+                                   "disp0-piodma" : "disp0_piodma";
+    const char *aliases[] = {"disp0", piodma_alias};
     const u8 streams[] = {0, 16};
     struct j713_display_maps maps[2] = {
         {.segments = segments, .count = count},
@@ -8676,9 +8688,26 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
     };
     u32 phandles[2];
 
-    /* The T8132 disp0 DART (every M4 ADT); reading tables must not enable/reset streams. */
+    if (hdmi) {
+        int vram_path[8], disp0 = fdt_path_offset(dt, "disp0");
+        if (disp0 >= 0 && fdt_getprop(dt, disp0, "memory-region", NULL))
+            return 0;
+        if (adt_path_offset_trace(adt, "/vram", vram_path) < 0 ||
+            adt_get_reg(adt, vram_path, "reg", 0, &maps[0].fb_base, &maps[0].fb_size) < 0 ||
+            !maps[0].fb_size || (maps[0].fb_base | maps[0].fb_size) & (SZ_16K - 1))
+            return -1;
+    }
+
+    /* Read the inherited tables without enabling or resetting the streams. */
+    int dart_path[8];
+    u64 dart_base, dart_size;
+    if (adt_path_offset_trace(adt, "/arm-io/dart-disp0", dart_path) < 0 ||
+        adt_get_reg(adt, dart_path, "reg", 0, &dart_base, &dart_size) < 0 || !dart_base ||
+        (dart_base & (sizeof(u32) - 1)) || !dart_size || dart_size > UINT64_MAX - dart_base)
+        return -1;
+
     for (u32 n = 0; n < 2; n++) {
-        if (dart_walk_locked_t8110(0x30a300000, 0xc000, streams[n], dram_start, dram_size,
+        if (dart_walk_locked_t8110(dart_base, dart_size, streams[n], dram_start, dram_size,
                                    j713_display_page, &maps[n]))
             return -1;
         u32 regions = 0;
@@ -8689,7 +8718,7 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
                 return -1;
             regions++;
         }
-        if (regions != (n == 0 ? 2 : 1))
+        if (regions != (n == 0 && !hdmi ? 2 : 1))
             return -1;
     }
 
@@ -8721,15 +8750,28 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
                 return -1;
         }
         for (u32 n = 0; n < 2; n++) {
-            if (maps[n].bytes[i] && dt_device_add_mem_region(aliases[n], phandle, NULL))
+            if (maps[n].bytes[i] &&
+                dt_device_add_mem_region(aliases[n], phandle, hdmi ? name : NULL))
                 return -1;
         }
     }
-    int piodma = fdt_path_offset(dt, "disp0_piodma");
+    if (hdmi) {
+        char name[64];
+        snprintf(name, sizeof(name), "framebuffer@%lx", maps[0].fb_base);
+        int node = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, maps[0].fb_base,
+                                              maps[0].fb_size);
+        if (node < 0 || dt_device_add_mem_region("disp0", fdt_get_phandle(dt, node), "framebuffer"))
+            return -1;
+        printf("FDT: M4 HDMI DISP0 SID0/SID16 mappings and framebuffer [0x%lx, +0x%lx) "
+               "published\n",
+               maps[0].fb_base, maps[0].fb_size);
+        return 0;
+    }
+    int piodma = fdt_path_offset(dt, piodma_alias);
     int dart = dt_get_iommu_node(piodma, 0);
     if (dart < 0 || fdt_setprop_string(dt, dart, "status", "okay"))
         return -1;
-    piodma = fdt_path_offset(dt, "disp0_piodma");
+    piodma = fdt_path_offset(dt, piodma_alias);
     if (fdt_setprop_empty(dt, piodma, "apple,j713-inherited-mappings"))
         return -1;
     if (fdt_setprop_string(dt, piodma, "status", "okay"))
@@ -8750,12 +8792,38 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
     return 0;
 }
 
+/* The display transaction callback takes an index; handoff runs single-threaded. */
+static struct {
+    const struct adt_segment_ranges *segments;
+    u32 count;
+    u64 dram_start;
+    u64 dram_size;
+} hdmi_display_maps;
+
+static int dt_set_hdmi_display_maps(unsigned int index)
+{
+    (void)index;
+    return dt_set_j713_display_maps(hdmi_display_maps.segments, hdmi_display_maps.count,
+                                    hdmi_display_maps.dram_start, hdmi_display_maps.dram_size,
+                                    true);
+}
+
 static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine);
 
 /*
- * Publish the inherited DCP firmware mapping without starting a display driver, on any M4 Mac
- * whose ADT describes an internal panel on disp0, whatever its firmware. The kernel picks the
- * display backend from the firmware the DCP runs.
+ * A T8132 Mac without a panel (the Mac mini) drives a fixed HDMI port from its main DCP. The
+ * tree says so on the DCP node; the ADT says so with disp0's "external".
+ */
+static bool dt_dcp_is_hdmi(int dcp_node)
+{
+    int len;
+    const char *type = fdt_getprop(dt, dcp_node, "apple,connector-type", &len);
+    return type && len == sizeof("HDMI-A") && !memcmp(type, "HDMI-A", len);
+}
+
+/*
+ * Publish the inherited DCP firmware mapping without starting a display driver.
+ * The ADT and device tree must agree on whether disp0 drives a panel or HDMI.
  */
 static int dt_set_m4_dcp_handoff(void)
 {
@@ -8764,10 +8832,14 @@ static int dt_set_m4_dcp_handoff(void)
         return 0; /* Older DT with simple-framebuffer only. */
     if (chip_id != T8132 || fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
         bail("FDT: unsupported native DCP handoff target\n");
-    /* A Mac mini's disp0 is external: its DCP drives a port, not a panel. */
+
+    bool hdmi = dt_dcp_is_hdmi(dcp_node);
     int disp0 = adt_path_offset(adt, "/arm-io/disp0");
-    if (disp0 < 0 || adt_getprop(adt, disp0, "external", NULL))
-        bail("FDT: no internal panel, no native DCP handoff\n");
+    if (disp0 < 0 || hdmi != !!adt_getprop(adt, disp0, "external", NULL))
+        bail("FDT: device tree and ADT disagree about the native DCP output\n");
+
+    if (hdmi && fdt_getprop(dt, dcp_node, "memory-region", NULL))
+        bail("FDT: HDMI DCP already has memory-region in the tree, no native DCP handoff\n");
 
     int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
     if (nub < 0)
@@ -8815,16 +8887,25 @@ static int dt_set_m4_dcp_handoff(void)
 
     bool maps = false;
     dcp_node = fdt_path_offset(dt, "dcp");
-    if (fdt_getprop(dt, dcp_node, "apple,j713-native-piodma", NULL)) {
+    if (!hdmi && fdt_getprop(dt, dcp_node, "apple,j713-native-piodma", NULL)) {
         /*
          * The walk checks every inherited SID0/SID16 page against the segments of the image
          * the DCP runs and publishes nothing unless all of them match, so it needs no list of
          * firmware versions.
          */
-        if (dt_set_j713_display_maps(segments, count, dram_start, dram_size))
+        if (dt_set_j713_display_maps(segments, count, dram_start, dram_size, false))
             printf("FDT: M4 PIODMA handoff unqualified; retaining disabled device\n");
         else
             maps = true;
+    }
+    /* Fail-soft: without it the kernel only leaves the display frontend alone. */
+    if (hdmi) {
+        hdmi_display_maps.segments = segments;
+        hdmi_display_maps.count = count;
+        hdmi_display_maps.dram_start = dram_start;
+        hdmi_display_maps.dram_size = dram_size;
+        if (dt_display_transaction(dt_set_hdmi_display_maps, 0))
+            printf("FDT: M4 HDMI display frontend regions refused; DCP mappings kept\n");
     }
 
     /*
@@ -8836,7 +8917,8 @@ static int dt_set_m4_dcp_handoff(void)
     if (maps && dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
         printf("FDT: M4 DCP firmware clocks not published\n");
 
-    printf("FDT: M4 DCP firmware mappings published; display device status unchanged\n");
+    printf("FDT: M4 DCP firmware mappings published%s; display device status unchanged\n",
+           hdmi ? " (HDMI DCP, external disp0)" : "");
     return 0;
 }
 
