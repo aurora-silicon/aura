@@ -1,5 +1,7 @@
 # Aurora Silicon assistant policy
 
+**Rulebook:** follow the Aurora Silicon rulebook, https://github.com/aurora-silicon/agent-guidelines/blob/main/AGENTS.md. It applies to every agent and contributor, whoever runs them. This file adds the repo specifics.
+
 This is Aurora Silicon's own policy for AI coding assistants working in
 this repository. It is the only assistant instruction file this tree
 carries. Upstream projects' instruction files are never carried here.
