@@ -26,7 +26,10 @@ def test_dcp_fw27_clocks_every_m2_board(tmp_path):
     aliases = kboot[start:kboot.index("\n};", start) + 3] + "\n"
     start = kboot.index("static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)\n{")
     clocks = kboot[start:kboot.index("\n}", start) + 2] + "\n"
-    production = (aliases + function(kboot, "dt_dcp_fw_clocks", "static bool ") + clocks +
+    # The firmware-27 rule may sit in its own helper or inline in the publisher.
+    rule = (function(kboot, "dt_dcp_fw_clocks", "static bool ")
+            if "static bool dt_dcp_fw_clocks(" in kboot else "")
+    production = (aliases + rule + clocks +
                   function(kboot, "dt_set_dcp_fw27_clocks_all", "static void "))
 
     source = r'''

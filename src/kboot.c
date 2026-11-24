@@ -8938,8 +8938,7 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
     if (raw_ids && !len) {
         int ret = fdt_setprop_empty(dt, node, "apple,clock-ids");
         if (!ret)
-            printf("FDT: %s: %s lists no firmware clocks; empty apple,clock-ids published\n",
-                   alias, adt_engine);
+            printf("FDT: %s: no firmware clocks in %s; empty apple,clock-ids\n", alias, adt_engine);
         return ret;
     }
     u32 nclk = raw_ids ? len / sizeof(u32) : 0;
