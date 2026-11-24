@@ -465,6 +465,10 @@ static void t6050_cases(void)
     setup_t6050(tree, "okay", false);
     assert(!fdt_delprop(dt, fdt_path_offset(dt, "/soc/pmp@284e00000"), "reg"));
     check_unchanged("a node without reg");
+    /* An unterminated status property is ignored safely (not paired) */
+    setup_t6050(tree, "okay", false);
+    assert(!fdt_setprop(dt, fdt_path_offset(dt, "/soc/pmp@284e00000"), "status", "okay", 4));
+    check_unchanged("an unterminated status");
 }
 int main(void)
 {

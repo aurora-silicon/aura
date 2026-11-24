@@ -9535,6 +9535,8 @@ static int dt_clear_pmp_props(int pmp_node)
             }
             prop = fdt_next_property_offset(dt, prop);
         }
+        if (prop < 0 && prop != -FDT_ERR_NOTFOUND)
+            return prop;
         if (!drop[0])
             return 0;
         int err = fdt_delprop(dt, pmp_node, drop);
@@ -9636,7 +9638,9 @@ static int dt_set_pmp_by_window(void)
     while ((node = fdt_node_offset_by_compatible(dt, node, "apple,t6000-pmp-v2")) >= 0) {
         int len;
         const char *status = fdt_getprop(dt, node, "status", &len);
-        if (status ? strcmp(status, "okay") && strcmp(status, "ok") : len != -FDT_ERR_NOTFOUND)
+        if (status ? (len <= 0 || status[len - 1] != '\0' ||
+                      (strcmp(status, "okay") && strcmp(status, "ok")))
+                   : len != -FDT_ERR_NOTFOUND)
             continue;
         enabled++;
 
