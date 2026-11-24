@@ -212,3 +212,47 @@ def test_unknown_profile_does_not_match_unknown_firmware(tmp_path):
     assert "no qualified OS firmware for apple,t6041-dcp: nothing done" in result.stdout
     assert "nothing done: the device tree is byte for byte unchanged" in result.stdout
     assert "nothing done: no MMIO access at all" in result.stdout
+
+
+@pytest.fixture(scope="module")
+def t6050_host(tmp_path_factory):
+    return build_host(tmp_path_factory.mktemp("t6050"), host_source="t6050_display_host.c")
+
+
+T6050_SCENARIOS = re.findall(r'^    \{"(t6050-[a-z0-9.-]+)", "',
+                             (ROOT / "tests/t6050_display_host.c").read_text(), re.M)
+T6050_ADOPTED = "dcp and disp0 are enabled already: the kernel adopts the internal DCP"
+T6050_REFUSED = "internal display handoff refused; the boot framebuffer keeps the panel"
+# As REASONS: the log line of the path each T6050 scenario is meant to take
+T6050_REASONS = {
+    "t6050-27.3": "internal display handed off: firmware ",
+    "t6050-adopted": T6050_ADOPTED,
+    "t6050-adopted-existing-pmc": T6050_ADOPTED,
+    "t6050-adopted-pmc-other-bus": T6050_ADOPTED,
+    "t6050-adopted-pmc-mismatch": "could not publish the PMC metadata for the external engines",
+    "t6050-adopted-no-status": T6050_ADOPTED,
+    "t6050-adopted-dcp-only": T6050_REFUSED,
+    "t6050-adopted-reserved": T6050_REFUSED,
+    "t6050-adopted-wrong-compat": T6050_REFUSED,
+    "t6050-adopted-dangling-alias": T6050_REFUSED,
+    "t6050-adopted-mapped-bus": "dcp is not on an identity-mapped bus: external engines not handed off",
+}
+
+
+def test_t6050_scenario_list_matches(t6050_host):
+    assert scenarios(t6050_host) == T6050_SCENARIOS
+    assert sorted(T6050_REASONS) == sorted(T6050_SCENARIOS)
+
+
+@pytest.mark.parametrize("scenario", T6050_SCENARIOS)
+def test_t6050_scenario(t6050_host, scenario):
+    result = run(t6050_host, scenario)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert T6050_REASONS[scenario] in result.stdout, result.stdout
+    if T6050_REASONS[scenario] != T6050_ADOPTED:
+        assert T6050_ADOPTED not in result.stdout, result.stdout
+    handed_off = scenario in ("t6050-27.3", "t6050-adopted", "t6050-adopted-existing-pmc",
+                              "t6050-adopted-pmc-other-bus", "t6050-adopted-no-status")
+    assert ("dcpext0 handed off: bw-scratch" in result.stdout) == handed_off, result.stdout
+    assert result.stdout.rstrip().endswith(f"{scenario}: pass"), result.stdout
+    assert "FAIL" not in result.stdout, result.stdout
