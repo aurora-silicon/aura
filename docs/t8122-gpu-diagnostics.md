@@ -123,11 +123,15 @@ UUIDs and other machine-derived values outside git.
 
 This switch runs the same fail-soft G15 GPU setup that `chosen.asahi,t6030-gpu=1`
 runs on the M3 Pro (`dt_set_gpu_g15()` in `src/kboot_gpu.c`), with the T8122
-entry of its SoC table. On the M3 MacBook Airs (J613, J615) and the 14" M3
-MacBook Pro (J504), a normal build sets it by default, together with
-`asahi,t8122-dcp`, the stand-in power model (`asahi,t8122-gpu-power-standin`)
-and the leakage fuse (`asahi,t8122-gpu-fuse-leakage`), unless a config line set
-it (`dt_set_m3_defaults()` in `src/kboot.c`). `chosen.asahi,t8122-gpu=0` keeps
+entry of its SoC table. On the M3 MacBook Airs (J613, J615), a normal build
+sets it by default, together with `asahi,t8122-dcp`, the stand-in power model
+(`asahi,t8122-gpu-power-standin`) and the leakage fuse
+(`asahi,t8122-gpu-fuse-leakage`), unless a config line set it
+(`dt_set_m3_defaults()` in `src/kboot.c`). The 14" M3 MacBook Pro (J504) gets
+only the `asahi,t8122-dcp` default: the stand-in power model was worked out on
+the J613, not measured on it, so its GPU stays off unless the owner writes
+`chosen.asahi,t8122-gpu=1` and `chosen.asahi,t8122-gpu-power-standin=1`
+(the GPU line alone has no power model). `chosen.asahi,t8122-gpu=0` keeps
 the GPU off; `chosen.asahi,t8122-dcp=0` or `chosen.asahi,m3-defaults=0` keeps
 the default GPU switches off too, while an owner's own GPU line still counts.
 Other T8122 boards (the J433/J434 iMacs) get no default. Without the switch a

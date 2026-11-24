@@ -492,12 +492,33 @@ def booted(r):
 
 # ---- a complete config: unchanged ----
 
-@pytest.mark.parametrize("board", ["j613", "j615", "j504"])
+@pytest.mark.parametrize("board", ["j613", "j615"])
 @pytest.mark.parametrize("build", STAGE2)
 def test_no_config_gets_the_whole_air_recipe(tools, build, board):
     b = boot(tools, build, b"", board=board)
     booted(b)
     assert set(AIR) <= b.armed and b.select == "g15-standin"
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_the_j504_gets_the_display_default_only(tools, build):
+    """Its GPU power inputs are the J613's stand-ins, so no GPU line goes in by default"""
+    b = boot(tools, build, b"", board="j504")
+    booted(b)
+    assert b.armed & set(AIR) == {"asahi,t8122-dcp"}
+    assert not any(n.startswith("asahi,t8122-gpu") for n in b.chosen), b.stdout
+    assert b.select == "reservation-only" and not b.probes
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_a_j504_owner_can_turn_its_gpu_on(tools, build):
+    # The T8122 GPU needs the stand-in power model as well as the GPU line: without it
+    # g15_soc_t8122 has no power model and the GPU stays off.
+    b = boot(tools, build, GPU_ON + b"chosen.asahi,t8122-gpu-power-standin=1\n", board="j504")
+    booted(b)
+    assert b.armed & set(AIR) == {"asahi,t8122-dcp", "asahi,t8122-gpu",
+                                  "asahi,t8122-gpu-power-standin"}
+    assert b.select == "g15-standin", b.stdout
 
 
 @pytest.mark.parametrize("board", ["j514s", "j516s"])
@@ -526,7 +547,7 @@ def t6031_lines(r):
     return {k: v for k, v in r.chosen.items() if k.startswith("asahi,t6031-")}
 
 
-@pytest.mark.parametrize("board", ["j514c", "j516c"])
+@pytest.mark.parametrize("board", ["j516c"])
 @pytest.mark.parametrize("build", STAGE2)
 def test_the_t6031_boards_get_display_and_gpu_without_config(tools, build, board):
     """A boot.bin with no config: both switches are armed, and the real T6031 GPU entry sees its
@@ -553,7 +574,7 @@ def test_the_t6031_boards_get_display_and_gpu_without_config(tools, build, board
      "t6031-disabled"),
 ], ids=["gpu-off", "gpu-on-then-off", "gpu-on", "master-off", "master-off-gpu-on",
         "master-off-dcp-on", "dcp-on", "dcp-off", "both-off"])
-@pytest.mark.parametrize("board", ["j514c", "j516c"])
+@pytest.mark.parametrize("board", ["j516c"])
 @pytest.mark.parametrize("build", STAGE2)
 def test_t6031_owner_lines_are_kept(tools, build, board, config, lines, select):
     b = boot(tools, build, config, board=board)
@@ -561,6 +582,34 @@ def test_t6031_owner_lines_are_kept(tools, build, board, config, lines, select):
     assert t6031_lines(b) == lines and b.select == select
     assert bool(b.probes) == (select == "t6031-g15")
     assert b.armed & {MAX_DCP, MAX_GPU} == {k for k, v in lines.items() if v == "1"}
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_the_j514c_gets_the_display_default_only(tools, build):
+    """Its GPU power inputs are stand-ins, so the GPU stays off and nothing is read or probed"""
+    b = boot(tools, build, b"", board="j514c")
+    booted(b)
+    assert t6031_lines(b) == {MAX_DCP: "1"} and b.select == "t6031-disabled"
+    assert not b.probes
+
+
+@pytest.mark.parametrize("config,lines,select", [
+    (b"chosen.asahi,t6031-gpu=0\n", {MAX_DCP: "1", MAX_GPU: "0"}, "t6031-disabled"),
+    (b"chosen.asahi,t6031-gpu=1\nchosen.asahi,t6031-gpu=0\n", {MAX_DCP: "1", MAX_GPU: "0"},
+     "t6031-disabled"),
+    (b"chosen.asahi,t6031-gpu=1\n", MAX, "t6031-g15"),
+    (b"chosen.asahi,m3-defaults=0\n", {}, "t6031-disabled"),
+    (b"chosen.asahi,m3-defaults=0\nchosen.asahi,t6031-gpu=1\n", {MAX_GPU: "1"}, "t6031-g15"),
+    (b"chosen.asahi,t6031-dcp=1\n", {MAX_DCP: "1"}, "t6031-disabled"),
+    (b"chosen.asahi,t6031-dcp=0\n", {MAX_DCP: "0"}, "t6031-disabled"),
+], ids=["gpu-off", "gpu-on-then-off", "gpu-on", "master-off", "master-off-gpu-on", "dcp-on",
+        "dcp-off"])
+@pytest.mark.parametrize("build", STAGE2)
+def test_j514c_owner_lines_are_kept(tools, build, config, lines, select):
+    b = boot(tools, build, config, board="j514c")
+    booted(b)
+    assert t6031_lines(b) == lines and b.select == select
+    assert bool(b.probes) == (select == "t6031-g15")
 
 
 @pytest.mark.parametrize("board", ["j293", "j433"])
@@ -579,7 +628,7 @@ def test_other_maxes_and_macs_get_no_default(tools, build, board):
     (b"chosen.asahi,t6031-gpu=1\nchosen.asahi,t6031-dcp=1\n", MAX),
 ], ids=["gpu", "gpu-dcp"])
 @pytest.mark.parametrize("build", STAGE2)
-def test_explicit_j514c_enable_lines_match_normal_defaults(tools, build, config, lines):
+def test_explicit_j514c_gpu_lines_turn_its_gpu_on(tools, build, config, lines):
     b = boot(tools, build, config, board="j514c")
     booted(b)
     assert t6031_lines(b) == lines and b.select == "t6031-g15"
@@ -1033,9 +1082,11 @@ def test_pre_m4_ignores_sart_entries(tools, build):
 
 @pytest.mark.parametrize("build", STAGE2)
 @pytest.mark.parametrize("config,gpu,display", [
-    (b"", True, True),
+    (b"", False, True),                       # the display default only: stand-in power inputs
+    (b"chosen.asahi,t6034-gpu=1\n", True, True),  # the owner opts in
     (b"chosen.asahi,t6034-gpu=0\n", False, True),
-    (b"chosen.asahi,t6034-dcp=0\n", True, False),
+    (b"chosen.asahi,t6034-dcp=0\n", False, False),
+    (b"chosen.asahi,t6034-dcp=0\nchosen.asahi,t6034-gpu=1\n", True, False),
     (b"chosen.asahi,m3-defaults=0\n", False, False),
     (b"chosen.asahi,m3-defaults=0\nchosen.asahi,t6034-gpu=1\n", True, False),
     (b"chosen.asahi,m3-defaults=0\nchosen.asahi,t6034-dcp=1\n", False, True),
