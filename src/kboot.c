@@ -3333,9 +3333,25 @@ static int dt_find_dart_by_address(u64 address)
     return found;
 }
 
+/* The size of a DART node's first register window, or 0 if its device tree does not give one. */
+static u64 dt_dart_window(int dart)
+{
+    int parent = fdt_parent_offset(dt, dart);
+    int ac = parent < 0 ? -1 : fdt_address_cells(dt, parent);
+    int sc = parent < 0 ? -1 : fdt_size_cells(dt, parent);
+    int len;
+    const fdt32_t *reg = fdt_getprop(dt, dart, "reg", &len);
+
+    if (!reg || ac < 1 || sc < 1 || sc > 2 || len < (int)((ac + sc) * sizeof(*reg)))
+        return 0;
+    if (sc == 1)
+        return fdt32_ld(&reg[ac]);
+    return ((u64)fdt32_ld(&reg[ac]) << 32) | fdt32_ld(&reg[ac + 1]);
+}
+
 static int dt_copy_dart_tunable(int adt_node, const char *adt_name, u64 address)
 {
-    const struct adt_tunable_info tunable = {
+    struct adt_tunable_info tunable = {
         .adt_name = adt_name,
         .fdt_name = "apple,tunable",
         .reg_size = 0x4000,
@@ -3349,6 +3365,13 @@ static int dt_copy_dart_tunable(int adt_node, const char *adt_name, u64 address)
     }
     if (fdt_getprop(dt, dart, tunable.fdt_name, NULL))
         return 0;
+    /*
+     * Every row must fall inside the DART's register window as its device tree node gives it
+     * (the T8152 USB4 DARTs have rows past 0x4000 in a 0xc000 one). Without one, 0x4000.
+     */
+    u64 window = dt_dart_window(dart);
+    if (window)
+        tunable.reg_size = window;
     if (dt_append_dart_tunable(adt_node, dart, &tunable)) {
         /* The converter can have appended valid rows before rejecting one. */
         fdt_delprop(dt, dart, tunable.fdt_name);
@@ -3365,7 +3388,11 @@ static int dt_copy_dart_tunable(int adt_node, const char *adt_name, u64 address)
  * from a consumer's phandle order: ADT reg[N] and the DT DART's translated
  * register address must name the same physical window.
  */
-static void dt_copy_dart_tunables(void)
+/*
+ * Copy every ADT DART table to the enabled DART at its address that has none. With @only (a
+ * NULL-terminated list of ADT node name prefixes), only those ADT DARTs are copied.
+ */
+static void dt_copy_dart_tunables(const char *const *only)
 {
     int path[8];
     int arm_io = adt_path_offset_trace(adt, "/arm-io", path);
@@ -3390,6 +3417,14 @@ static void dt_copy_dart_tunables(void)
 
         if (!name || strncmp(name, "dart-", 5))
             continue;
+        if (only) {
+            const char *const *prefix = only;
+
+            while (*prefix && strncmp(name, *prefix, strlen(*prefix)))
+                prefix++;
+            if (!*prefix)
+                continue;
+        }
         path[depth] = node;
 
         for (unsigned int instance = 0; instance < 64; instance++) {
@@ -12567,6 +12602,23 @@ static int dt_prepare_t8152(void)
         return -1;
     if (dt_set_mac_addresses())
         return -1;
+    /*
+     * USB-C: the ATC PHYs', USB4 routers', PCIe-C and their DARTs' tunables and the routers'
+     * DROMs, from this Mac's ADT, for the nodes the device tree links by alias (atcphyN,
+     * usb4-N-*: ADT acioN/apciecN/atc-phyN). Fail-soft: a port without them stays off in Linux.
+     */
+    if (kboot_setup_atc(dt))
+        printf("FDT: T8152 ATC tunables not set\n");
+    if (dt_set_acio_tunables())
+        printf("FDT: T8152 USB4 router tunables not set\n");
+    if (dt_set_pcie_tunables())
+        printf("FDT: T8152 PCIe-C tunables not set\n");
+    /*
+     * Only the USB4 routers' and PCIe-C DARTs: the other T8152 DARTs are locked or
+     * firmware-owned, and their device tree describes them without a table.
+     */
+    static const char *const usb4_darts[] = {"dart-acio", "dart-apciec", NULL};
+    dt_copy_dart_tunables(usb4_darts);
     if (dt_set_fb2_t8152())
         return -1;
     if (dt_set_memory())
@@ -13060,7 +13112,7 @@ int kboot_prepare_dt(void *fdt)
         bail("FDT: J813 N1 preparation failed\n");
 
     /* Fail-soft: one malformed or unmatched ADT table must not stop boot. */
-    dt_copy_dart_tunables();
+    dt_copy_dart_tunables(NULL);
 
     /* T8140 PCIe status is known only after pcie_init() in kboot_boot(). */
     if (chip_id != T8140 && fdt_pack(dt))
