@@ -1112,6 +1112,7 @@ static bool display_internal_panel_absent(int node, int product)
 
 int display_init(void)
 {
+#ifdef SPTM_VIRT
     u64 carveout_base, carveout_limit;
 
     /*
@@ -1123,6 +1124,7 @@ int display_init(void)
         printf("display: SPTM-virt guest owns the display, leaving it as iBoot left it\n");
         return 0;
     }
+#endif
 
     if (chip_id == T8152) {
         display_is_external = true;
