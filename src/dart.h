@@ -37,7 +37,8 @@ void dart_free_l2(dart_dev_t *dart, uintptr_t iova);
 void *dart_translate(dart_dev_t *dart, uintptr_t iova);
 void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova);
 int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram_base, u64 dram_size,
-                           int (*visit)(u64 iova, u64 paddr, void *opaque), void *opaque);
+                           u32 levels, int (*visit)(u64 iova, u64 paddr, void *opaque),
+                           void *opaque);
 bool dart_is_locked(dart_dev_t *dart);
 u64 dart_search(dart_dev_t *dart, void *paddr);
 u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len);
