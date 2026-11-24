@@ -22,14 +22,43 @@ static bool dt_iommu_shared(const void *dt, u32 phandle, int skip)
     int node;
 
     for (node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
-        int len;
-        const fdt32_t *iommus = node == skip ? NULL : fdt_getprop(dt, node, "iommus", &len);
+        if (node == skip)
+            continue;
 
-        for (int i = 0; iommus && i + 1 < len / (int)sizeof(*iommus); i += 2)
-            if (fdt32_ld(&iommus[i]) == phandle)
+        int len;
+        const fdt32_t *iommus = fdt_getprop(dt, node, "iommus", &len);
+        if (!iommus) {
+            if (len != -FDT_ERR_NOTFOUND)
                 return true;
+            continue;
+        }
+
+        if (len % sizeof(*iommus))
+            return true;
+
+        int cells = len / sizeof(*iommus);
+        for (int i = 0; i < cells;) {
+            u32 provider_phandle = fdt32_ld(&iommus[i++]);
+            if (provider_phandle == phandle)
+                return true;
+
+            /* If the next tuple cannot be located, ownership is uncertain. */
+            int provider = fdt_node_offset_by_phandle(dt, provider_phandle);
+            if (provider < 0)
+                return true;
+
+            int size;
+            const fdt32_t *args = fdt_getprop(dt, provider, "#iommu-cells", &size);
+            if (!args || size != sizeof(*args))
+                return true;
+
+            u32 count = fdt32_ld(args);
+            if (count > (u32)(cells - i))
+                return true;
+            i += count;
+        }
     }
-    return false;
+    return node != -FDT_ERR_NOTFOUND;
 }
 
 /*
