@@ -504,7 +504,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_CDC_SCHEDULE:
-            if (request->args[0] > 15000 || request->args[1] || request->args[2] > 7 ||
+            if (request->args[0] > 15000 || request->args[1] || request->args[2] > 0xf ||
                 usb_cdc_schedule(request->args[0], request->args[1], request->args[2]))
                 reply->status = S_ERROR;
             break;
