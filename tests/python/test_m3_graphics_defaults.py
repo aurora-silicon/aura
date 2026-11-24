@@ -130,6 +130,7 @@ static const char *air[] = {"asahi,t8122-dcp", "asahi,t8122-gpu", "asahi,t8122-g
                             "asahi,t8122-gpu-fuse-leakage"};
 static const char *pro[] = {"asahi,t6030-dcp", "asahi,t6030-gpu"};
 static const char *max[] = {"asahi,t6031-dcp", "asahi,t6031-gpu"};
+static const char *max14[] = {"asahi,t6034-dcp", "asahi,t6034-gpu"};
 static const char *never[] = {"asahi,t8122-dcpext", "asahi,t6030-dcpext", "asahi,t6030-dispext",
                               "asahi,t8122-gpu-asc-preflight",
                               "asahi,t8122-gpu-handoff-diag", "asahi,m3-defaults"};
@@ -141,10 +142,10 @@ static int listed(const char *name, const char **list, int n)
 /* want armed; every other default switch of every board, and the never-defaults, absent */
 static void expect_only(const char **want, int n_want)
 {
-    const char **lists[] = {air, pro, max};
-    int sizes[] = {N(air), N(pro), N(max)};
+    const char **lists[] = {air, pro, max, max14};
+    int sizes[] = {N(air), N(pro), N(max), N(max14)};
     for (int i = 0; i < n_want; i++) assert(armed(want[i]));
-    for (int l = 0; l < 3; l++)
+    for (int l = 0; l < 4; l++)
         for (int i = 0; i < sizes[l]; i++)
             if (!listed(lists[l][i], want, n_want)) assert(!present(lists[l][i]));
     for (int i = 0; i < N(never); i++) assert(!present(never[i]));
@@ -153,7 +154,7 @@ static void expect_only(const char **want, int n_want)
 #define UNTOUCHED(c) do { RESET(c); assert(!run()); expect_none(); assert(entries() == 0); } while (0)
 int main(void)
 {
-    /* the five boards get their own recipe and nothing else */
+    /* supported boards get their own recipe and nothing else */
     RESET(J613); assert(!run()); expect_only(air, 4);
     RESET(J615); assert(!run()); expect_only(air, 4);
     RESET(J504); assert(!run()); expect_only(air, 4);
@@ -163,10 +164,10 @@ int main(void)
     assert(entries() == 2 && defaults() == 2 && chosen_is_default[0] && chosen_is_default[1]);
     assert(slot("asahi,t6031-dcp") == 0 && slot("asahi,t6031-gpu") == 1);
 
-    /* J514C gets normal defaults; T6034 Maxes, a Max board name on another SoC or none, unknown M3 boards, a
+    /* J514C and J514M get independent defaults; other Maxes, mismatched roots, unknown boards, a
        board without its SoC, M1/M2: untouched */
     RESET(J514C); assert(!run()); expect_only(max, 2);
-    UNTOUCHED(J514M);
+    RESET(J514M); assert(!run()); expect_only(max14, 2);
     UNTOUCHED(J433);
     UNTOUCHED("apple,j504\0apple,arm-platform");
     UNTOUCHED("apple,j504\0apple,t6030\0apple,arm-platform");
@@ -660,7 +661,7 @@ def test_j514c_normal_build_keeps_exact_board_soc_and_owner_optout(tmp_path):
 int main(void) {
     RESET(J514C); assert(!run()); expect_only(max, N(max));
     RESET(J516C); assert(!run()); expect_only(max, N(max));
-    RESET(J514M); assert(!run()); expect_none();
+    RESET(J514M); assert(!run()); expect_only(max14, N(max14));
     RESET(J516M); assert(!run()); expect_none();
     RESET("apple,j514c\0apple,t6034\0apple,arm-platform");
     assert(!run()); expect_none();
@@ -679,5 +680,28 @@ int main(void) {
 }
 '''
     run_c(tmp_path, 'j514c-default',
+          '#pragma GCC diagnostic ignored "-Wunused-function"\n'
+          '#pragma GCC diagnostic ignored "-Wunused-variable"\n' + source + main)
+
+
+def test_j514m_normal_build_and_independent_owner_optouts(tmp_path):
+    source = harness().split('int main(void)', 1)[0]
+    main = r'''
+int main(void) {
+    RESET(J514M); assert(!run()); expect_only(max14, N(max14));
+    RESET(J516M); assert(!run()); expect_none();
+    RESET("apple,j514m\0apple,t6031\0apple,arm-platform");
+    assert(!run()); expect_none();
+    RESET(J514M); assert(!kboot_set_chosen("asahi,t6034-gpu", "0"));
+    assert(!run()); assert(armed("asahi,t6034-dcp") && !armed("asahi,t6034-gpu"));
+    RESET(J514M); assert(!kboot_set_chosen("asahi,t6034-dcp", "0"));
+    assert(!run()); assert(!armed("asahi,t6034-dcp") && armed("asahi,t6034-gpu"));
+    RESET(J514M); assert(!kboot_set_chosen("asahi,m3-defaults", "0"));
+    assert(!run()); assert(!present("asahi,t6034-gpu") && !present("asahi,t6034-dcp"));
+    RESET(J514M); chosen_lost = true; assert(!run()); expect_none();
+    return 0;
+}
+'''
+    run_c(tmp_path, 'j514m-default',
           '#pragma GCC diagnostic ignored "-Wunused-function"\n'
           '#pragma GCC diagnostic ignored "-Wunused-variable"\n' + source + main)

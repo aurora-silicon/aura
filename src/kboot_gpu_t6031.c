@@ -214,16 +214,16 @@ static const char *const identity_u32[] = {
     "core-mask-2",  "id-counts-1", "id-counts-2",
 };
 
-int t6031_identity_node(void *dt, int nps)
+int t6031_identity_node_named(void *dt, int nps, const char *node_name)
 {
     fdt64_t zero64[T6031_PS_MAX] = {0};
     fdt32_t zero32[T6031_PS_MAX] = {0};
     int chosen = fdt_path_offset(dt, "/chosen");
 
     if (nps < 0 || nps > T6031_PS_MAX || chosen < 0 ||
-        fdt_subnode_offset(dt, chosen, T6031_GPU_IDENTITY) >= 0)
+        fdt_subnode_offset(dt, chosen, node_name) >= 0)
         return -1;
-    int node = fdt_add_subnode(dt, chosen, T6031_GPU_IDENTITY);
+    int node = fdt_add_subnode(dt, chosen, node_name);
     if (node < 0)
         return -1;
     int err = fdt_setprop_u32(dt, node, "schema-version", 1);
@@ -242,18 +242,24 @@ int t6031_identity_node(void *dt, int nps)
     return node;
 }
 
+int t6031_identity_node(void *dt, int nps)
+{
+    return t6031_identity_node_named(dt, nps, T6031_GPU_IDENTITY);
+}
+
 static int set_u32(void *dt, int node, const char *name, u32 value)
 {
     fdt32_t v = cpu_to_fdt32(value);
     return fdt_setprop_inplace(dt, node, name, &v, sizeof(v));
 }
 
-int t6031_identity_publish(void *dt, const struct t8122_powered_identity *id,
-                           const struct t6031_closure *c)
+int t6031_identity_publish_named(void *dt, const struct t8122_powered_identity *id,
+                                 const struct t6031_closure *c, const char *node_name)
 {
     fdt64_t addr[T6031_PS_MAX];
     fdt32_t before[T6031_PS_MAX], after[T6031_PS_MAX];
-    int node = fdt_path_offset(dt, "/chosen/" T6031_GPU_IDENTITY);
+    int chosen = fdt_path_offset(dt, "/chosen");
+    int node = chosen < 0 ? chosen : fdt_subnode_offset(dt, chosen, node_name);
 
     if (node < 0)
         return -1;
@@ -277,6 +283,12 @@ int t6031_identity_publish(void *dt, const struct t8122_powered_identity *id,
     return set_u32(dt, node, "probe-result", id->result);
 }
 
+int t6031_identity_publish(void *dt, const struct t8122_powered_identity *id,
+                           const struct t6031_closure *c)
+{
+    return t6031_identity_publish_named(dt, id, c, T6031_GPU_IDENTITY);
+}
+
 /* ---- the loaded GPU firmware image ---- */
 
 /*
@@ -286,7 +298,7 @@ int t6031_identity_publish(void *dt, const struct t8122_powered_identity *id,
  * is the one of the 14.8.3 stub that loads them (it reports itself as 14.7). The image itself is
  * not pinned: the kernel identifies it by UUID and contents before it starts anything.
  */
-const struct fw_version_info *dt_t6031_gpu_image(void *dt)
+const struct fw_version_info *dt_t6031_gpu_image_named(void *dt, const char *node_name)
 {
     struct gfx_fw_image_info image;
     char rtkit[GFX_FW_VERSION_MAX] = "";
@@ -327,9 +339,9 @@ const struct fw_version_info *dt_t6031_gpu_image(void *dt)
     }
 
     int chosen = fdt_path_offset(dt, "/chosen");
-    int node = chosen < 0 ? chosen : fdt_add_subnode(dt, chosen, T6031_GPU_IMAGE);
+    int node = chosen < 0 ? chosen : fdt_add_subnode(dt, chosen, node_name);
     if (node < 0) {
-        printf("FDT: GPU: T6031 could not add /chosen/" T6031_GPU_IMAGE " (%d)\n", node);
+        printf("FDT: GPU: could not add /chosen/%s (%d)\n", node_name, node);
         return why ? NULL : &fw_versions[V14_8_3];
     }
     int err = 0;
@@ -346,11 +358,16 @@ const struct fw_version_info *dt_t6031_gpu_image(void *dt)
               fdt_setprop_string(dt, node, "family-check", why ? why : "passed");
     if (err) {
         /* All or nothing: remove the node this call added */
-        printf("FDT: GPU: T6031 could not fill /chosen/" T6031_GPU_IMAGE "\n");
+        printf("FDT: GPU: could not fill /chosen/%s\n", node_name);
         chosen = fdt_path_offset(dt, "/chosen");
-        node = chosen < 0 ? -1 : fdt_subnode_offset(dt, chosen, T6031_GPU_IMAGE);
+        node = chosen < 0 ? -1 : fdt_subnode_offset(dt, chosen, node_name);
         if (node >= 0)
             fdt_del_node(dt, node);
     }
     return why ? NULL : &fw_versions[V14_8_3];
+}
+
+const struct fw_version_info *dt_t6031_gpu_image(void *dt)
+{
+    return dt_t6031_gpu_image_named(dt, T6031_GPU_IMAGE);
 }
