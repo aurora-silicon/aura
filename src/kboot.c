@@ -5367,7 +5367,8 @@ static int dt_set_ave_dapf(void)
  * since iBoot loaded it, so it may start the preloaded firmware itself.
  */
 static const char *const ane_compatibles[] = {
-    "apple,t6041-ane", "apple,t6050-ane", "apple,t8132-ane", "apple,t8140-ane", "apple,t8142-ane",
+    "apple,t6041-ane", "apple,t6050-ane", "apple,t8122-ane",
+    "apple,t8132-ane", "apple,t8140-ane", "apple,t8142-ane",
 };
 
 static int dt_ane_fill_region(int resv, uint32_t phandle, const char *kind, u64 phys, u64 size)
@@ -5424,8 +5425,16 @@ static int dt_set_ane_node(int node, const char *compat)
         goto disable;
     }
 
-    u32 preloaded;
-    if (ADT_GETPROP(adt, anode, "pre-loaded", &preloaded) != sizeof(preloaded) || preloaded != 1) {
+    u32 preloaded = 0;
+    bool is_preloaded =
+        ADT_GETPROP(adt, anode, "pre-loaded", &preloaded) == sizeof(preloaded) && preloaded == 1;
+    if (!is_preloaded) {
+        int nub = adt_subnode_offset(adt, anode, "iop-ane-nub");
+        if (nub >= 0 && ADT_GETPROP(adt, nub, "pre-loaded", &preloaded) == sizeof(preloaded) &&
+            preloaded == 1)
+            is_preloaded = true;
+    }
+    if (!is_preloaded) {
         reason = "firmware not preloaded";
         goto disable;
     }
