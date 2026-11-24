@@ -4242,7 +4242,7 @@ static const struct {
         u32 text, fill[8][2]; /* fw-text's size, its boot-filled ranges */
         u8 sha[32];
         char name[8], gpu; /* G17<gpu> for the log */
-    } build[4];
+    } build[5];
 } t6050_gpu = {
     /* The UAT ranges (base, size), then the bounds of both roles' __DATA and SRO */
     {"gpu-region-base", "gpu-region-size", "gfx-shared-region-base", "gfx-shared-region-size",
@@ -4289,6 +4289,25 @@ static const struct {
        0x1b, 0x82, 0x5f, 0x12, 0x59, 0x8c, 0xb8, 0x6e, 0x4d, 0x2a, 0x0e,
        0x38, 0x44, 0xf1, 0x4f, 0xa5, 0x05, 0x9f, 0x38, 0xf6, 0xcb},
       "26B8125",
+      'S'},
+     /*
+      * 26B123 (27.2) G17S, which the macOS 27.2 stub loads (J716s): the same ranges as 26B8125,
+      * and its own digest of the 27.2 restore image's G17S firmware, primary then secondary,
+      * with these ranges zeroed
+      */
+     {T6050_GPU_TEXT,
+      {{0x224, 4},
+       {0x23c, 8},
+       {0x49764, 0x740},
+       {0x49ea4, 0x231},
+       {0x50224, 4},
+       {0x5023c, 8},
+       {0x9d1ec, 0x740},
+       {0x9d92c, 0x231}},
+      {0x2b, 0x46, 0x13, 0xc6, 0x2a, 0x8a, 0x00, 0x7f, 0x22, 0xa9, 0x41,
+       0x01, 0x70, 0x2c, 0x9a, 0xc6, 0xc4, 0xe9, 0x0f, 0x2e, 0x12, 0x3f,
+       0x3b, 0x36, 0xfb, 0xe6, 0xff, 0xea, 0x91, 0x3f, 0x0f, 0xd9},
+      "26B123",
       'S'},
      /* 26A428 (27.0) G17D, J775D: Linux's hw/t6050.rs CONFIG_ULTRA */
      {T6050_GPU_TEXT_D,
