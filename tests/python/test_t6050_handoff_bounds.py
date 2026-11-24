@@ -621,6 +621,8 @@ static int prewired(int argc, char **argv)
     u64 fail_scratch = arg(argc, argv, "fail_scratch", 0);
     u64 pack = arg(argc, argv, "pack", 0);
     u64 nested = arg(argc, argv, "nested", 0);
+    u64 dup_ext = arg(argc, argv, "dup_ext", 0);
+    u64 no_piodma = arg(argc, argv, "no_piodma", 0);
     u64 vram = arg(argc, argv, "vram", 0), vram_size = arg(argc, argv, "vsize", 0);
     u64 meta_size = arg(argc, argv, "meta", 0), ram = cur_boot_args.phys_base;
     const char *uuid = image(true);
@@ -830,9 +832,23 @@ static int prewired(int argc, char **argv)
             fdt_u32s(dt, ext, "apple,firmware-compat", 3, 27, 0, 0, 0);
             fdt_u32s(dt, ext, "apple,firmware-version", 3, 27, 0, 0, 0);
         }
-        int epio = fdt_add_subnode(dt, ext, "piodma");
-        OK(epio);
-        fdt_u32s(dt, epio, "iommus", 2, dph, 16, 0, 0);
+        if (!(e == 1 && no_piodma)) {
+            int epio = fdt_add_subnode(dt, ext, "piodma");
+            OK(epio);
+            fdt_u32s(dt, epio, "iommus", 2, dph, 16, 0, 0);
+        }
+        if (e == 1 && dup_ext) {
+            int dup = fdt_dev(dt, soc, "dcpext1-dup", ext_coproc[e], 0);
+            OK(fdt_setprop_string(dt, dup, "compatible", "apple,t6050-dcpext"));
+            OK(fdt_setprop_string(dt, dup, "status", "okay"));
+            fdt_u32s(dt, dup, "apple,firmware-compat", 3, 27, 0, 0, 0);
+            fdt_u32s(dt, dup, "apple,firmware-version", 3, 27, 0, 0, 0);
+            if (!no_piodma) {
+                int dpio = fdt_add_subnode(dt, dup, "piodma");
+                OK(dpio);
+                fdt_u32s(dt, dpio, "iommus", 2, dph, 16, 0, 0);
+            }
+        }
     }
 
     int disp = fdt_add_subnode(dt, soc, "display-subsystem");
@@ -887,10 +903,20 @@ static int prewired(int argc, char **argv)
     if (v1)
         snprintf(v1s, sizeof(v1s), "%u.%u.%u", fdt32_ld(&v1[0]), fdt32_ld(&v1[1]), fdt32_ld(&v1[2]));
     printf("result chosen=%s dcp=%s subsystem=%s ext0=%s ext1=%s ext0_fw=%s ext1_fw=%s "
-           "ext1_ver=%s\n",
+           "ext1_ver=%s",
            said ? said : "none", status(dt, "/soc/dcp@48ae00000"),
            status(dt, "/soc/display-subsystem"), status(dt, "/soc/dcpext0"),
            e1 < 0 ? "deleted" : status(dt, ext1_path), c0s, c1s, v1s);
+    if (dup_ext) {
+        int dup = fdt_path_offset(dt, "/soc/dcpext1-dup");
+        const fdt32_t *dc = dup < 0 ? NULL : fdt_getprop(dt, dup, "apple,firmware-compat", &len);
+        char dcs[32] = "none";
+        if (dc)
+            snprintf(dcs, sizeof(dcs), "%u.%u.%u", fdt32_ld(&dc[0]), fdt32_ld(&dc[1]),
+                     fdt32_ld(&dc[2]));
+        printf(" dup=%s dup_fw=%s", dup < 0 ? "deleted" : status(dt, "/soc/dcpext1-dup"), dcs);
+    }
+    printf("\n");
     disp = fdt_path_offset(dt, "/soc/display-subsystem");
     const fdt32_t *io = fdt_getprop(dt, disp, "iommus", &len);
     printf("iommus");
@@ -1280,6 +1306,27 @@ def test_prewired_panel_drops_rejected_scanout_from_enabled_oversized_iommus(hos
     assert r.iommus == expected_iommus
     if not fail_scratch:
         assert r.state["ext0"] == "okay" and r.state["ext0_fw"] == "27.2.0"
+
+
+def test_prewired_panel_rejects_packed_and_no_piodma_duplicate_ext_nodes(host):
+    # Packed DT with two healthy duplicate ext1 nodes (both having piodma): deleting the first
+    # duplicate must not let the second survive as unique, stay okay, or get version-stamped.
+    r = run(host, "prewired", pack=1, absent_status=1, dup_ext=1, fail=0, meta=META_SIZE,
+            vram=VRAM, vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["ext0"] == "okay"
+    assert r.state["ext1"] == "deleted"
+    assert r.state["dup"] == "disabled" and r.state["dup_fw"] == "27.0.0"
+    assert r.iommus == [2, 0, 11, 0]
+
+    # Duplicate healthy ext1 nodes that both lack piodma: both are disabled and PH_EXT1_DISP (12)
+    # is still removed from display-subsystem iommus via the preserved ADT index.
+    r = run(host, "prewired", dup_ext=1, no_piodma=1, fail=0, meta=META_SIZE, vram=VRAM,
+            vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["chosen"] == "refused", r.log
+    assert r.state["ext0"] == "okay" and r.state["ext0_fw"] == "27.2.0"
+    assert r.state["ext1"] == "disabled" and r.state["ext1_fw"] == "27.0.0"
+    assert r.state["dup"] == "disabled" and r.state["dup_fw"] == "27.0.0"
+    assert r.iommus == [2, 0, 11, 0]
 
 
 @pytest.mark.parametrize("mode", ["headless", "panel"])

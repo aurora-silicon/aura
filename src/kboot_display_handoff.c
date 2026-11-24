@@ -5824,18 +5824,21 @@ static T6050_TEXT void t6050_ext_handoff(void *dt, int engines, int skip)
 }
 
 /*
- * The ADT dcpextN index whose coprocessor is uniquely mapped at `node`'s identity-mapped reg[0],
- * or -1
+ * The ADT dcpextN index whose coprocessor is at `node`'s identity-mapped reg[0], or -1.
+ * When `unique` is non-NULL, sets `*unique` to whether `node` is the only apple,t6050-dcpext
+ * node at that coprocessor address.
  */
-static T6050_TEXT int t6050_ext_index(void *dt, int node)
+static T6050_TEXT int t6050_ext_index(void *dt, int node, bool *unique)
 {
     int len;
     const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+    if (unique)
+        *unique = false;
     if (!reg || len < 16 || !t6050_identity_reg(dt, node))
         return -1;
     u64 coproc = fdt64_ld(&reg[0]);
-    if (t6050_node_at(dt, "apple,t6050-dcpext", coproc) != node)
-        return -1;
+    if (unique)
+        *unique = t6050_node_at(dt, "apple,t6050-dcpext", coproc) == node;
     for (int n = 0; n < T6050_ENGINES; n++) {
         char a[32];
         u64 adt_coproc;
@@ -5963,16 +5966,35 @@ static T6050_TEXT void t6050_ext_reject(void *dt)
 {
     void *scratch = NULL;
     bool in_place = false, changed = false;
-    int err = 0, at = fdt_node_offset_by_compatible(dt, -1, "apple,t6050-dcpext");
+    u32 ambig = 0;
+    int err = 0, at = -1;
 
+    /*
+     * Record ambiguous ADT mappings before mutating or deleting nodes can make a survivor look
+     * unique.
+     */
+    while ((at = fdt_node_offset_by_compatible(dt, at, "apple,t6050-dcpext")) >= 0) {
+        bool unique;
+        int n = t6050_ext_index(dt, at, &unique);
+        if (n >= 0 && !unique)
+            ambig |= 1u << n;
+    }
+    if (at != -FDT_ERR_NOTFOUND) {
+        dlog("could not disable rejected external engines: nothing changed\n");
+        return;
+    }
+
+    at = fdt_node_offset_by_compatible(dt, -1, "apple,t6050-dcpext");
     while (at >= 0) {
         void *cur = scratch ? scratch : dt;
         if (!t6050_available(cur, at)) {
             at = fdt_node_offset_by_compatible(cur, at, "apple,t6050-dcpext");
             continue;
         }
-        int n = t6050_ext_index(cur, at);
-        if (n >= 0 && ((t6050.ext_aura & (1u << n)) || !t6050_check_ext_adt(n))) {
+        bool unique;
+        int n = t6050_ext_index(cur, at, &unique);
+        if (n >= 0 && unique && !(ambig & (1u << n)) &&
+            ((t6050.ext_aura & (1u << n)) || !t6050_check_ext_adt(n))) {
             at = fdt_node_offset_by_compatible(cur, at, "apple,t6050-dcpext");
             continue;
         }
@@ -6054,11 +6076,11 @@ static T6050_TEXT void t6050_ext_version(void *dt)
     if (!scratch)
         return;
     while (!err && (at = fdt_node_offset_by_compatible(scratch, at, "apple,t6050-dcpext")) >= 0) {
-        bool set = false;
+        bool set = false, unique;
         if (!t6050_available(scratch, at))
             continue;
-        int n = t6050_ext_index(scratch, at);
-        if (n < 0 || (t6050.ext_aura & (1u << n)) || t6050_check_ext_adt(n))
+        int n = t6050_ext_index(scratch, at, &unique);
+        if (n < 0 || !unique || (t6050.ext_aura & (1u << n)) || t6050_check_ext_adt(n))
             continue;
         for (size_t i = 0; !err && i < ARRAY_SIZE(props); i++) {
             /* apple,firmware-compat (props[0]) always; apple,firmware-version only if present */

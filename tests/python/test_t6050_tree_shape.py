@@ -808,12 +808,14 @@ static int engine_under(const char *parent, const char *name, u64 coproc, const 
         assert(!fdt_setprop(tree, n, "apple,firmware-version", v, sizeof(v)));
     if (status)
         assert(!fdt_setprop_string(tree, n, "status", status));
-    char ep[160];
-    int elen = snprintf(ep, sizeof(ep), "%s%s%s", strcmp(parent, "/") ? parent : "", "/", name);
-    assert(elen > 0 && (size_t)elen < sizeof(ep));
-    int pio = node_at(ep, "piodma");
-    fdt32_t io[2] = {cpu_to_fdt32(dart_ph), cpu_to_fdt32(16)};
-    assert(!fdt_setprop(tree, pio, "iommus", io, sizeof(io)));
+    if (dart_ph) {
+        char ep[160];
+        int elen = snprintf(ep, sizeof(ep), "%s%s%s", strcmp(parent, "/") ? parent : "", "/", name);
+        assert(elen > 0 && (size_t)elen < sizeof(ep));
+        int pio = node_at(ep, "piodma");
+        fdt32_t io[2] = {cpu_to_fdt32(dart_ph), cpu_to_fdt32(16)};
+        assert(!fdt_setprop(tree, pio, "iommus", io, sizeof(io)));
+    }
     return n;
 }
 /* Whether @prop of node @name is @want's cells */
@@ -1142,8 +1144,53 @@ int main(void)
     assert_rejected("/dcpext1", PH_DART1, &old);
     assert(is_disabled("/dcpext1-dup") && is("/dcpext1-dup", "apple,firmware-compat", &old));
     cases++;
+    /* Packed DT with two healthy duplicates (both having piodma): deleting the first duplicate
+     * must not let the second appear unique, stay enabled, or get version-stamped. */
+    fresh();
+    reset_adt();
+    os_firmware = v273;
+    assert(!fdt_setprop_u32(tree, 0, "#address-cells", 2));
+    assert(!fdt_setprop_u32(tree, 0, "#size-cells", 2));
+    dart_node("iommu@48a300000", DART_DISP0, PH_DISP0);
+    dart_node("iommu@2b2300000", exts[0].dart_disp, PH_DART0);
+    dart_node("iommu@2b3300000", exts[1].dart_disp, PH_DART1);
+    disp = node_at("/", "display");
+    assert(!fdt_setprop_string(tree, disp, "compatible", "apple,display-subsystem"));
+    fdt32_t io_dup[6] = {cpu_to_fdt32(PH_DISP0), 0, cpu_to_fdt32(PH_DART0), 0,
+                         cpu_to_fdt32(PH_DART1), 0};
+    assert(!fdt_setprop(tree, disp, "iommus", io_dup, sizeof(io_dup)));
+    engine_under("/", "dcpext0", exts[0].coproc, "okay", true, PH_DART0);
+    engine_under("/", "dcpext1", exts[1].coproc, NULL, true, PH_DART1);
+    engine_under("/", "dcpext1-dup", exts[1].coproc, "okay", true, PH_DART1);
+    assert(!fdt_pack(tree));
+    t6050_ext_version(tree);
+    assert(fdt_path_offset(tree, "/dcpext1") < 0);
+    assert_rejected("/dcpext1-dup", PH_DART1, &old);
+    assert(is("/dcpext0", "apple,firmware-compat", &v273) && !is_disabled("/dcpext0"));
+    cases++;
+    /* Two duplicates that both lack piodma (with healthy ADT state): both are still disabled and
+     * their scanout DART is still removed via the preserved ADT index. */
+    fresh();
+    reset_adt();
+    os_firmware = v272;
+    assert(!fdt_setprop_u32(tree, 0, "#address-cells", 2));
+    assert(!fdt_setprop_u32(tree, 0, "#size-cells", 2));
+    dart_node("iommu@48a300000", DART_DISP0, PH_DISP0);
+    dart_node("iommu@2b2300000", exts[0].dart_disp, PH_DART0);
+    dart_node("iommu@2b3300000", exts[1].dart_disp, PH_DART1);
+    disp = node_at("/", "display");
+    assert(!fdt_setprop_string(tree, disp, "compatible", "apple,display-subsystem"));
+    assert(!fdt_setprop(tree, disp, "iommus", io_dup, sizeof(io_dup)));
+    engine_under("/", "dcpext0", exts[0].coproc, "okay", true, PH_DART0);
+    engine_under("/", "dcpext1", exts[1].coproc, "okay", true, 0);
+    engine_under("/", "dcpext1-dup", exts[1].coproc, "okay", true, 0);
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old);
+    assert(is_disabled("/dcpext1-dup") && is("/dcpext1-dup", "apple,firmware-compat", &old));
+    cases++;
     printf("PASS dcpext version %d cases\n", cases);
     return 0;
 }
 '''
-    run(tmp_path, "ext-version", code, "PASS dcpext version 23 cases")
+    run(tmp_path, "ext-version", code, "PASS dcpext version 25 cases")
