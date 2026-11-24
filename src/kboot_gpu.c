@@ -2239,9 +2239,6 @@ int dt_gpu_t8122_27_machine_values_read(u32 val[T8122_27_VALUES])
     return 0;
 }
 
-/* Boot config opt-in for the G14G (T8112) firmware handoff: chosen.asahi,t8112-gpu=1. */
-#define G14G_HANDOFF_OPTIN "asahi,t8112-gpu"
-
 /* Whether /chosen has `name` = "1" */
 static bool g15_optin(void *dt, const char *name)
 {
@@ -4616,24 +4613,17 @@ int dt_set_gpu(void *dt)
 
     /*
      * Without an initdata layout for this firmware (T8112's G14G on 27.2), aura cannot set the
-     * GPU up, so it is left disabled instead of refusing the whole boot. The exception, only with
-     * the boot config line chosen.asahi,t8112-gpu=1, is a loaded image that firmware_gfx_version()
-     * identifies, which the kernel starts itself from the handoff (dt_set_gpu_g14g_handoff()): the
-     * operating points are published below as usual, then the handoff. The kernel's 27.2 backend
-     * is compute-only, and desktop userspace that finds its render node uses it for GL and fails,
-     * so without the opt-in the GPU stays disabled. Any other image, any operating-point or
-     * ADT problem on the handoff path, or a handoff the ADT does not describe also leaves the GPU
-     * disabled; the boot continues.
+     * GPU up, so it is left disabled instead of refusing the whole boot. The exception is a loaded
+     * image that firmware_gfx_version() identifies, which the kernel starts itself from the
+     * handoff (dt_set_gpu_g14g_handoff()): the operating points are published below as usual,
+     * then the handoff. A kernel without a backend for that firmware refuses the GPU node at
+     * probe. Any other image, any operating-point or ADT problem on the handoff path, or a
+     * handoff the ADT does not describe leaves the GPU disabled; the boot continues.
      */
     const struct fw_version_info *handoff = NULL;
     if (rust_gpu_initdata_size(compat->num[0], compat->num[1], &data_a_size, &data_b_size,
                                &globals_size) == -1) {
         handoff = downstream_dtb ? firmware_gfx_version(chip_id) : NULL;
-        if (handoff && !g15_optin(dt, G14G_HANDOFF_OPTIN)) {
-            printf("FDT: GPU: firmware %s identified; its handoff needs chosen.%s=1\n",
-                   handoff->string, G14G_HANDOFF_OPTIN);
-            handoff = NULL;
-        }
         if (!handoff)
             return gpu_leave_disabled(dt, sgx);
     }
