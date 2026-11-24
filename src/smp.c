@@ -552,7 +552,7 @@ void smp_s2r_return_to_os(void)
 {
     u64 entry = s2r_mailbox.resume_pa;
 
-    /* exception_initialize() unmasked everything. */
+    /* exception_initialize() left everything masked; the OS expects it so. */
     msr(DAIF, 0xf << 6);
 
     /* A reset the OS didn't arm: reboot rather than guess what state it's in. */
