@@ -933,6 +933,12 @@ bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout_usec)
     return rtkit_boot_internal(rtk, timeout_usec, false, 0);
 }
 
+/* The last start failed because the firmware sent no HELLO: it never answered at all. */
+bool rtkit_no_hello(const rtkit_dev_t *rtk)
+{
+    return rtk->no_hello;
+}
+
 u32 rtkit_get_timeout(rtkit_dev_t *rtk)
 {
     return rtk->timeout_usec;

@@ -559,6 +559,99 @@ static void nvme_ans_drain(void)
         printf("nvme: discarded %u stale ANS message%s\n", count, count == 1 ? "" : "s");
 }
 
+/* The firmware's start after a power loss: the run bit, then the HELLO it sends unasked. */
+static bool nvme_ans_start_warm(void)
+{
+    if (!rtkit_boot_warm(nvme_rtkit, BIT(0))) {
+        printf("nvme: no warm handshake (CPU status 0x%x)\n", asc_cpu_status(nvme_asc));
+        return false;
+    }
+    if (poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
+        printf("nvme: BOOT_STATUS 0x%x after the handshake\n",
+               read32(nvme_base + NVME_BOOT_STATUS));
+        return false;
+    }
+    return true;
+}
+
+/*
+ * The firmware's power report may come late after a start from a reset, as after a power loss
+ * (rtkit_boot_warm()); a start that says HELLO and never reports fails rather than hanging.
+ */
+#define NVME_ANS_COLD_TIMEOUT_US (6 * USEC_PER_SEC)
+
+/* The normal RTKit start, for a reset ANS: the run bit, INIT, then HELLO. */
+static bool nvme_ans_start_cold(void)
+{
+    if (!rtkit_boot_timed(nvme_rtkit, NVME_ANS_COLD_TIMEOUT_US)) {
+        printf("nvme: no cold handshake (CPU status 0x%x)\n", asc_cpu_status(nvme_asc));
+        return false;
+    }
+    if (poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
+        printf("nvme: BOOT_STATUS 0x%x after the handshake\n",
+               read32(nvme_base + NVME_BOOT_STATUS));
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Stop ANS's CPU and reset ANS alone through PMGR, after a power cycle of ANS and its PCIe block
+ * when asked, then put the SART entries back and take a fresh RTKit instance for the next start.
+ * A start that got far enough to grant the firmware buffers keeps them, as rtkit_free() does,
+ * and isn't retried.
+ */
+static bool nvme_ans_reset_for_start(bool power_cycle)
+{
+    if (rtkit_has_owned_buffers(nvme_rtkit)) {
+        printf("nvme: the failed start granted ANS buffers; not starting it again\n");
+        return false;
+    }
+    rtkit_stop(nvme_rtkit);
+    rtkit_free(nvme_rtkit);
+    nvme_rtkit = NULL;
+    if (power_cycle && (pcie_ans_power_off() || pcie_ans_power_on())) {
+        printf("nvme: couldn't power-cycle ANS\n");
+        return false;
+    }
+
+    u32 before = asc_cpu_status(nvme_asc);
+    int ret = pmgr_reset_held(nvme_die, "ANS");
+    /* Some machines call it ANS2, as nvme_ans_sleep_and_reset() notes. */
+    if (ret)
+        ret = pmgr_reset_held(nvme_die, "ANS2");
+    printf("nvme: ANS reset%s: CPU status 0x%x before, 0x%x after\n", ret ? " FAILED" : "", before,
+           asc_cpu_status(nvme_asc));
+    if (ret)
+        return false;
+    nvme_ans_drain();
+    if (!sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt)) {
+        printf("nvme: couldn't restore the %d SART entries\n", nvme_sart_saved_cnt);
+        return false;
+    }
+
+    nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false);
+    return nvme_rtkit != NULL;
+}
+
+/*
+ * A failed start that got no HELLO at all. A firmware that answered may be resuming (NAND work
+ * around these transitions, a slow power report) and isn't reset under it.
+ */
+static bool nvme_ans_silent(void)
+{
+    return nvme_rtkit && rtkit_no_hello(nvme_rtkit);
+}
+
+/*
+ * Post-M4, ANS off: power, the SART entries back, then the firmware's start after a power loss.
+ *
+ * A firmware whose CPU was stopped without a reset since it last ran (an earlier owner's idle
+ * that the SoC reset caught halfway, a watchdog reset with ANS stopped for sleep) sends no HELLO
+ * after the run bit, then or later, and the state survives warm reboots. Such a start is made
+ * again from a reset ANS, warm and then cold: first after a reset of ANS alone, then after a
+ * power cycle of ANS and its PCIe block as well. Only a start that got no HELLO is made again.
+ */
 static bool nvme_ans_power_on(void)
 {
     bool ok = !pcie_ans_power_on();
@@ -569,13 +662,36 @@ static bool nvme_ans_power_on(void)
         nvme_ans_drain();
     if (ok && !(ok = sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt)))
         printf("nvme: couldn't restore the %d SART entries\n", nvme_sart_saved_cnt);
-    if (ok && !(ok = rtkit_boot_warm(nvme_rtkit, BIT(0))))
-        printf("nvme: no warm handshake (CPU status 0x%x)\n", asc_cpu_status(nvme_asc));
-    if (ok && !(ok = poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK,
-                            USEC_PER_SEC) >= 0))
-        printf("nvme: BOOT_STATUS 0x%x after the handshake\n",
-               read32(nvme_base + NVME_BOOT_STATUS));
     if (!ok) {
+        printf("nvme: ANS didn't start from off; it stays down until a reboot\n");
+        return false;
+    }
+
+    bool started = nvme_ans_start_warm();
+    for (int attempt = 0; !started && attempt < 2; attempt++) {
+        if (!nvme_ans_silent()) {
+            printf("nvme: ANS answered but didn't finish its start; not resetting it\n");
+            break;
+        }
+        printf("nvme: ANS didn't start from off (CPU status 0x%x); %s\n", asc_cpu_status(nvme_asc),
+               attempt ? "power-cycling and resetting it" : "resetting it");
+        if (!nvme_ans_reset_for_start(attempt > 0))
+            break;
+        started = nvme_ans_start_warm();
+        if (!started) {
+            if (!nvme_ans_silent()) {
+                printf("nvme: ANS answered but didn't finish its start; not resetting it\n");
+                break;
+            }
+            printf("nvme: no warm start after the reset; starting ANS cold\n");
+            if (!nvme_ans_reset_for_start(false))
+                break;
+            started = nvme_ans_start_cold();
+        }
+        if (started)
+            printf("nvme: ANS started from a reset\n");
+    }
+    if (!started) {
         printf("nvme: ANS didn't start from off; it stays down until a reboot\n");
         return false;
     }
