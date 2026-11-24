@@ -1,0 +1,7 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Stub csrutil: SIP enabled.
+case "$1" in
+    status) echo "System Integrity Protection status: enabled." ;;
+    *)      echo "System Integrity Protection status: enabled." ;;
+esac

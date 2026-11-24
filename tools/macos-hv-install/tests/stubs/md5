@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Stub md5 (macOS-style) backed by the host's md5sum. common.sh md5hex() and
+# enroll-stage1.sh md5_ok() both use `md5 -q <file>` -> lowercase 32-hex digest.
+case "$1" in
+    -q) md5sum "$2" | cut -d' ' -f1 ;;
+    *)  f=$1; echo "MD5 ($f) = $(md5sum "$f" | cut -d' ' -f1)" ;;
+esac
