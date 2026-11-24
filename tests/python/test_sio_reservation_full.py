@@ -30,6 +30,8 @@ struct sio_data {
     struct sio_mapping fwdata[1];
     struct sio_fwparam fwparams[1];
     int num_fwdata, num_fwparams;
+    struct sio_fwparam fwparams_v10[1];
+    int num_fwparams_v10;
 };
 static void *dt;
 static int enabled, reserve_calls;
