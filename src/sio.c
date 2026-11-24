@@ -4,6 +4,7 @@
 #include "errno.h"
 #include "malloc.h"
 #include "sio.h"
+#include "firmware.h"
 #include "soc.h"
 #include "types.h"
 #include "utils.h"
@@ -325,9 +326,13 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
 
     /*
      * T6030 reports the same protocol 10 as the high-window firmware but takes its own layout
-     * (7e7981d2), and nothing in the ADT tells the two apart.
+     * (7e7981d2), and nothing in the ADT tells the two apart. The low-window SIO firmware paired
+     * with system firmware 27 takes that layout too (the Mac mini M2 on 27.2: given the earlier
+     * one, it crashes at its first DMA channel configuration, "Fifo allocation overflow"). Its
+     * ADT describes the SIO exactly as the 13.5 one does, so the generation of the paired
+     * firmware is the only thing that tells which layout the SIO firmware takes.
      */
-    if (chip_id == T6030) {
+    if (chip_id == T6030 || (!high && os_firmware.version >= V27_0)) {
         rules = copy_rules_v10;
         nrules = ARRAY_SIZE(copy_rules_v10);
         layout = "T6030";
