@@ -650,6 +650,7 @@ static void sptm_virt_s2_activity(struct exc_info *ctx)
            n - n_last, (now - t_last) / f, n, ctx->far, ctx->esr, ctx->elr);
     n_last = n;
     t_last = now;
+    sptm_virt_usb_pump();
 }
 
 /* A stage-2 abort from the OS at virtual EL2: a trapped page, emulated by the HV's MMIO code. */

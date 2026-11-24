@@ -567,6 +567,12 @@ void sptm_virt_park_others(void)
     udelay(300000);
 }
 
+void sptm_virt_usb_pump(void)
+{
+    if (uartproxy_iodev >= IODEV_USB0 && uartproxy_iodev < IODEV_MAX)
+        iodev_handle_events(uartproxy_iodev);
+}
+
 /* A GEXIT into XNU's normal world: this core runs XNU from now on. */
 void sptm_virt_cpu_enters_xnu(int cpu)
 {
@@ -581,6 +587,7 @@ void sptm_virt_cpu_enters_xnu(int cpu)
     sptm_virt_s2_enter_xnu(cpu);
     if (sptm_virt_wfi_watch)
         nv2_hcr_update(HCR_TWI | (sptm_virt_wfi_watch > 1 ? HCR_TWE : 0), 0);
+    sptm_virt_usb_pump();
 }
 
 __attribute__((used, retain)) void sptm_virt_enter(void)
@@ -646,6 +653,7 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
     }
     dc_cvac_range((void *)&sptm_smp_crumbs, sizeof(sptm_smp_crumbs));
 
+    iodev_console_flush();
     nv2_enter_os(sptm_entry_pa, sptm_handoff_pa, 0, 0);
 }
 

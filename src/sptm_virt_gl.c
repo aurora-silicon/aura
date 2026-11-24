@@ -1146,6 +1146,7 @@ static bool sptm_virt_wfe_watched(u64 *regs, u64 esr)
         }
         n_last = n;
         t_last = now;
+        sptm_virt_usb_pump();
     }
     msr(ELR_EL2, pc + 4);
     return true;
@@ -1165,6 +1166,7 @@ static bool sptm_virt_wfi_watched(u64 esr)
                n - n_last, (now - t_last) / f, n, mrs(ELR_EL2));
         n_last = n;
         t_last = now;
+        sptm_virt_usb_pump();
     }
     sysop("dsb sy");
     sysop("wfi");
