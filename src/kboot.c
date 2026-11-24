@@ -11285,7 +11285,7 @@ static int dt_set_isp(void)
 }
 
 /*
- * J713 and J604: iBoot loads the camera firmware, and the kernel starts it as iBoot left it. The
+ * T8132: iBoot loads the camera firmware, and the kernel starts it as iBoot left it. The
  * segments move with the boot firmware, so the device tree describes the ISP disabled, with empty
  * placeholders isp-firmware-text and isp-firmware-data and an isp-heap window for the
  * firmware's main memory. Fill the placeholders from this boot's ADT isp segment-ranges: reg,
