@@ -5359,7 +5359,9 @@ static int dt_set_ave_dapf(void)
  * that describes the two regions as placeholders gets them filled in place, renamed to their
  * physical addresses and enabled; a DT without them gets them added. The node's status is left as
  * the DT has it, except that a node whose preload cannot be handed over is
- * disabled. For the block with a legacy disk-loaded path, this handoff is optional.
+ * disabled. For the block with a legacy disk-loaded path, this handoff is optional: it is
+ * published only on bare metal, together with the cold-boot marker, and otherwise leaves the
+ * FDT untouched.
  *
  * When aura runs on bare metal (EL2, booted from iBoot, not a guest of a
  * hypervisor that may have run another OS first) and the hand-off succeeds,
@@ -5416,6 +5418,17 @@ static int dt_set_ane_node(int node, const char *compat, bool optional)
         bail("FDT: ANE node path too long\n");
 
     const char *reason = "invalid ADT firmware segments";
+    /*
+     * An optional handoff is only useful with cold ownership: the driver starts preloaded
+     * firmware only with the bare-metal marker. Without it (a guest of a hypervisor that may
+     * have run another OS first), leave the node and the FDT as they are so the legacy loader
+     * keeps working.
+     */
+    if (optional && !in_el2()) {
+        reason = "no cold-boot ownership (not bare metal)";
+        goto unavailable;
+    }
+
     int anode = adt_path_offset(adt, "/arm-io/ane0");
     if (anode < 0)
         anode = adt_path_offset(adt, "/arm-io/ane");

@@ -302,14 +302,28 @@ int main(void)
     assert(!memcmp(before, blob, sizeof(blob)));
     printf("no ANE node, DT unchanged: ok\n");
 
-    /* Under a hypervisor (EL1 guest) the regions are handed over without the marker. */
-    reset_adt();
-    el2 = false;
-    build(true, "okay", true);
-    assert(dt_set_ane_firmware() == 0);
-    assert(!marker());
-    assert(fdt_getprop(dt, ane_node(), "apple,firmware-iovas", NULL));
-    printf("EL1 guest: regions handed over, no cold-boot marker: ok\n");
+    /*
+     * Under a hypervisor (EL1 guest) the regions are handed over without the marker. An
+     * optional handoff has no cold ownership there, so a valid native-size ADT leaves the
+     * FDT exactly as it was (no apple,firmware-preloaded: the legacy loader stays usable).
+     */
+    for (int form = 0; form < 2; form++) {
+        reset_adt();
+        el2 = false;
+        build(form, "okay", true);
+        memcpy(before, blob, sizeof(blob));
+        assert(dt_set_ane_firmware() == 0);
+        assert(!marker());
+        assert(!strcmp(status(), "okay"));
+        if (@OPTIONAL@) {
+            assert(!memcmp(before, blob, sizeof(blob)));
+            assert(!fdt_getprop(dt, ane_node(), "apple,firmware-preloaded", NULL));
+            assert(!fdt_getprop(dt, ane_node(), "apple,firmware-iovas", NULL));
+        } else {
+            assert(fdt_getprop(dt, ane_node(), "apple,firmware-iovas", NULL));
+        }
+    }
+    printf("EL1 guest: no cold-boot marker, optional handoff leaves the FDT: ok\n");
 
     check_refused(no_ane0, "no ADT node");
     check_refused(not_preloaded, "not preloaded");
