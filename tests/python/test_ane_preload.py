@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""The M4, M4 Pro, M5 Pro and A18 Pro ANE preload handoff: reservations, memory regions and
-firmware IOVAs.
+"""ANE preload handoff: reservations, memory regions and firmware IOVAs.
 
 Runs kboot.c's dt_set_ane_firmware(), dt_set_ane_node(), dt_ane_fill_region() and
 dt_get_or_add_reserved_mem() as they are, on real FDTs built with aura's libfdt, against a
 fake ADT. Segment values are the J616s 26.6.2 /arm-io/ane0, the Neo (J700) 26.6.2 /arm-io/ane,
 the J713 26.6.2 /arm-io/ane and the J714s 27.0 /arm-io/ane0 segment-ranges. The J714s DT also has a soc@200000000 ahead of
-the /soc that holds the ANE, which libfdt resolves "/soc" to.
+the /soc that holds the ANE, which libfdt resolves "/soc" to. The J473 firmware
+ranges and IOVAs come from its macOS 27.2 ADT.
 """
 
 from pathlib import Path
@@ -27,6 +27,11 @@ BOARDS = {
     "j714s": dict(compat="apple,t6050-ane", node="neural-processor@508000000",
                   adt="/arm-io/ane0", text=0x10000DC0000, data=0x10002114000,
                   phys_base=0x10003B40000, sibling=1),
+    "j473": dict(compat="apple,t8112-ane", node="ane@26a000000",
+                 adt="/arm-io/ane", text=0x80093C000, data=0x800BE8000,
+                 phys_base=0x802000000, sibling=0, dram_base=0x800000000,
+                 text_iova=0x800000000, text_size=0xd8000, data_size=0x614000,
+                 optional=1),
 }
 
 
@@ -39,7 +44,7 @@ def test_ane_preload_handoff(tmp_path, board):
         start = source.index("static int " + name + "(")
         return source[start:source.index("\n}", start) + 2] + "\n"
 
-    start = source.rindex("/*\n", 0, source.index("Neural Engines run firmware that iBoot preloads"))
+    start = source.index("static const char *const ane_compatibles[]")
     end = source.index("\n}", source.index("static int dt_set_ane_firmware(void)")) + 2
     production = function("dt_get_or_add_reserved_mem") + source[start:end] + "\n"
     header = (ROOT / "src/adt.h").read_text()
@@ -114,10 +119,10 @@ static void reset_adt(void)
     el2 = true;
     have_ane0 = true;
     preloaded = 1;
-    dram_base = 0x10000000000UL;
-    segments[0] = (struct adt_segment_ranges){@TEXT@UL, 0, 0x10000000000UL, 0xc0000, 1};
-    segments[1] = (struct adt_segment_ranges){@DATA@UL, 0xc0000, 0x100000c0000UL,
-                                              0x2ac000, 0};
+    dram_base = @DRAM_BASE@UL;
+    segments[0] = (struct adt_segment_ranges){@TEXT@UL, 0, @TEXT_IOVA@UL, @TEXT_SIZE@, 1};
+    segments[1] = (struct adt_segment_ranges){@DATA@UL, @TEXT_SIZE@,
+                                              @TEXT_IOVA@UL + @TEXT_SIZE@, @DATA_SIZE@, 0};
     segments_len = sizeof(segments);
     segment_names = "__TEXT;__DATA";
     names_len = 14;
@@ -207,24 +212,30 @@ static void check_handoff(const char *want_status)
     assert(!strcmp(status(), want_status));
     const fdt32_t *regions = fdt_getprop(dt, ane, "memory-region", &len);
     assert(regions && len == 8);
-    check_region(regions, 0, "ane-firmware-text@@TEXTN@", @TEXT@UL, 0xc0000);
-    check_region(regions, 1, "ane-firmware-data@@DATAN@", @DATA@UL, 0x2ac000);
+    check_region(regions, 0, "ane-firmware-text@@TEXTN@", @TEXT@UL, @TEXT_SIZE@);
+    check_region(regions, 1, "ane-firmware-data@@DATAN@", @DATA@UL, @DATA_SIZE@);
     const char *names = fdt_getprop(dt, ane, "memory-region-names", &len);
     assert(names && len == 28 && !memcmp(names, "firmware-text\0firmware-data", 28));
     const fdt64_t *iovas = fdt_getprop(dt, ane, "apple,firmware-iovas", &len);
     assert(iovas && len == 16);
-    assert(fdt64_ld(&iovas[0]) == 0x10000000000UL && fdt64_ld(&iovas[1]) == 0x100000c0000UL);
+    assert(fdt64_ld(&iovas[0]) == @TEXT_IOVA@UL);
+    assert(fdt64_ld(&iovas[1]) == @TEXT_IOVA@UL + @TEXT_SIZE@);
+    const void *preload = fdt_getprop(dt, ane, "apple,firmware-preloaded", &len);
+    assert(@OPTIONAL@ ? (preload && len == 0) : !preload);
 }
 
-/* A refused handoff disables the node and never reserves anything. */
+/* A refused handoff never claims memory or changes the optional consumer's FDT. */
 static void check_refused(void (*fault)(void), const char *what)
 {
     for (int form = 0; form < 2; form++) {
         reset_adt();
         fault();
         build(form, "okay", true);
+        memcpy(before, blob, sizeof(blob));
         assert(dt_set_ane_firmware() == 0);
-        assert(!strcmp(status(), "disabled"));
+        assert(!strcmp(status(), @OPTIONAL@ ? "okay" : "disabled"));
+        if (@OPTIONAL@)
+            assert(!memcmp(before, blob, sizeof(blob)));
         int resv = fdt_path_offset(dt, "/reserved-memory");
         int count = 0, child;
         fdt_for_each_subnode(child, dt, resv) {
@@ -291,14 +302,28 @@ int main(void)
     assert(!memcmp(before, blob, sizeof(blob)));
     printf("no ANE node, DT unchanged: ok\n");
 
-    /* Under a hypervisor (EL1 guest) the regions are handed over without the marker. */
-    reset_adt();
-    el2 = false;
-    build(true, "okay", true);
-    assert(dt_set_ane_firmware() == 0);
-    assert(!marker());
-    assert(fdt_getprop(dt, ane_node(), "apple,firmware-iovas", NULL));
-    printf("EL1 guest: regions handed over, no cold-boot marker: ok\n");
+    /*
+     * Under a hypervisor (EL1 guest) the regions are handed over without the marker. An
+     * optional handoff has no cold ownership there, so a valid native-size ADT leaves the
+     * FDT exactly as it was (no apple,firmware-preloaded: the legacy loader stays usable).
+     */
+    for (int form = 0; form < 2; form++) {
+        reset_adt();
+        el2 = false;
+        build(form, "okay", true);
+        memcpy(before, blob, sizeof(blob));
+        assert(dt_set_ane_firmware() == 0);
+        assert(!marker());
+        assert(!strcmp(status(), "okay"));
+        if (@OPTIONAL@) {
+            assert(!memcmp(before, blob, sizeof(blob)));
+            assert(!fdt_getprop(dt, ane_node(), "apple,firmware-preloaded", NULL));
+            assert(!fdt_getprop(dt, ane_node(), "apple,firmware-iovas", NULL));
+        } else {
+            assert(fdt_getprop(dt, ane_node(), "apple,firmware-iovas", NULL));
+        }
+    }
+    printf("EL1 guest: no cold-boot marker, optional handoff leaves the FDT: ok\n");
 
     check_refused(no_ane0, "no ADT node");
     check_refused(not_preloaded, "not preloaded");
@@ -321,15 +346,33 @@ int main(void)
     assert(stray >= 0 && !fdt_setprop_u32(dt, stray, "phandle", 0x20));
     fdt32_t regions[2] = {cpu_to_fdt32(0x10), cpu_to_fdt32(0x20)};
     assert(!fdt_setprop(dt, ane_node(), "memory-region", regions, sizeof(regions)));
+    memcpy(before, blob, sizeof(blob));
     assert(dt_set_ane_firmware() == 0);
-    assert(!strcmp(status(), "disabled"));
+    assert(!strcmp(status(), @OPTIONAL@ ? "okay" : "disabled"));
+    if (@OPTIONAL@)
+        assert(!memcmp(before, blob, sizeof(blob)));
     printf("stray placeholder refused: ok\n");
+
+    if (@OPTIONAL@) {
+        /* Optional handoff rolls back even if publishing the cold-boot marker fails. */
+        reset_adt();
+        build(false, "okay", true);
+        assert(!fdt_del_node(dt, fdt_path_offset(dt, "/chosen")));
+        memcpy(before, blob, sizeof(blob));
+        assert(dt_set_ane_firmware() == 0);
+        assert(!memcmp(before, blob, sizeof(blob)));
+    }
     return 0;
 }
 '''
     for key, value in (("@ADT@", b["adt"]), ("@COMPAT@", b["compat"]), ("@NODE@", b["node"]),
                        ("@TEXTN@", "%x" % b["text"]), ("@DATAN@", "%x" % b["data"]),
                        ("@TEXT@", "0x%x" % b["text"]), ("@DATA@", "0x%x" % b["data"]),
-                       ("@PHYS_BASE@", "0x%x" % b["phys_base"]), ("@SIBLING@", str(b["sibling"]))):
+                       ("@PHYS_BASE@", "0x%x" % b["phys_base"]), ("@SIBLING@", str(b["sibling"])),
+                       ("@DRAM_BASE@", hex(b.get("dram_base", 0x10000000000))),
+                       ("@TEXT_IOVA@", hex(b.get("text_iova", 0x10000000000))),
+                       ("@TEXT_SIZE@", hex(b.get("text_size", 0xc0000))),
+                       ("@DATA_SIZE@", hex(b.get("data_size", 0x2ac000))),
+                       ("@OPTIONAL@", str(b.get("optional", 0)))):
         program = program.replace(key, value)
     run_c(tmp_path, "ane-preload-" + board, program)
