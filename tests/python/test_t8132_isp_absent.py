@@ -66,6 +66,23 @@ int main(void)
     assert(!dt_disable_t8132_absent_isp(dt));
     assert(off("/isp@48c000000") && off("/iommu@48e8c0000") && off("/iommu@48e8e0000") &&
            !off("/iommu@48e900000"));
+    /* A two-cell provider can precede a shared one-cell DART. */
+    tree(true, false);
+    int provider = fdt_add_subnode(dt, 0, "iommu@0");
+    assert(provider >= 0 && !fdt_setprop_u32(dt, provider, "phandle", 20));
+    assert(!fdt_setprop_u32(dt, provider, "#iommu-cells", 2));
+    fdt32_t mixed[] = {cpu_to_fdt32(20), 0, 0, cpu_to_fdt32(12), 0};
+    assert(!fdt_setprop(dt, fdt_path_offset(dt, "/other@0"), "iommus", mixed, sizeof(mixed)));
+    assert(!dt_disable_t8132_absent_isp(dt));
+    assert(off("/isp@48c000000") && off("/iommu@48e8c0000") && off("/iommu@48e8e0000") &&
+           !off("/iommu@48e900000"));
+    /* An unknown provider makes it impossible to establish exclusive ownership. */
+    tree(true, false);
+    fdt32_t unknown[] = {cpu_to_fdt32(20), 0};
+    assert(!fdt_setprop(dt, fdt_path_offset(dt, "/other@0"), "iommus", unknown, sizeof(unknown)));
+    assert(!dt_disable_t8132_absent_isp(dt));
+    assert(off("/isp@48c000000") && !off("/iommu@48e8c0000") && !off("/iommu@48e8e0000") &&
+           !off("/iommu@48e900000"));
     /* A broken iommus list still leaves the ISP disabled. */
     tree(true, false);
     assert(!fdt_setprop(dt, fdt_path_offset(dt, "/isp@48c000000"), "iommus", "\0\0\0\x63\0", 5));
