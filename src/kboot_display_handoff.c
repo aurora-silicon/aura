@@ -3523,6 +3523,54 @@ static T6050_TEXT bool t6050_pick_image(const char *uuid, u32 len)
     return false;
 }
 
+/*
+ * An engine's memory stays out of the OS's RAM [phys_base, +mem_size): every segment of the nub at
+ * `nub_path` but __OS_LOG (dcp6_reserve_oslogs() reserves those) and, for each of the `nstreams`
+ * streams (ADT DART darts[i], stream sids[i]), its ADT page-table region pt-region-<sid>, which
+ * must be page-aligned and hold the stream's l1-tt root page. With `vram_seg`, it says whether
+ * [vram, +vram_size) is one of the segments.
+ */
+static T6050_TEXT int t6050_check_placement(const char *nub_path, const char *const *darts,
+                                            const u8 *sids, int nstreams, u64 vram, u64 vram_size,
+                                            bool *vram_seg)
+{
+    u64 ram = cur_boot_args.phys_base, ram_size = cur_boot_args.mem_size;
+    u32 len = 0;
+    int nub = adt_path_offset(adt, nub_path);
+    const struct adt_segment_ranges *seg =
+        nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &len);
+
+    if (!seg || !len || len % sizeof(*seg) || len > 16 * sizeof(*seg))
+        bail("%s: no or bad segment-ranges\n", nub_path);
+    if (vram_seg)
+        *vram_seg = false;
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        struct adt_segment_ranges r;
+        memcpy(&r, &seg[i], sizeof(r));
+        u64 size = ALIGN_UP((u64)r.size, SZ_16K);
+        if (vram_seg)
+            *vram_seg |= r.phys == vram && size == vram_size;
+        if (r.unk != SEG_FLAGS_OSLOG && dcp6_overlaps(r.phys, size, ram, ram_size))
+            bail("%s: segment %u (0x%lx) lies in the OS's RAM\n", nub_path, i, r.phys);
+    }
+
+    for (int i = 0; i < nstreams; i++) {
+        char name[16];
+        u64 lo, hi, l1, count;
+        int node = adt_path_offset(adt, darts[i]);
+        snprintf(name, sizeof(name), "l1-tt-%u", sids[i]);
+        if (node < 0 || dcp6_adt_u64_pair(node, name, &l1, &count))
+            bail("%s: no %s\n", darts[i], name);
+        snprintf(name, sizeof(name), "pt-region-%u", sids[i]);
+        if (dcp6_adt_u64_pair(node, name, &lo, &hi) || hi <= lo ||
+            ((lo | hi | l1) & (DART_PAGE - 1)) || l1 < lo || l1 > hi - DART_PAGE ||
+            dcp6_overlaps(lo, hi - lo, ram, ram_size))
+            bail("%s: %s is missing, does not hold l1-tt-%u or lies in the OS's RAM\n", darts[i],
+                 name, sids[i]);
+    }
+    return 0;
+}
+
 /* The ADT side: firmware, VRAM and segments, bandwidth agent, clocks, panel */
 static T6050_INIT int t6050_check_adt(void)
 {
@@ -3539,25 +3587,15 @@ static T6050_INIT int t6050_check_adt(void)
         bail("the DCP is not running an internal panel\n");
 
     /* /vram holds the boot framebuffer; it and the firmware stay out of the OS's RAM */
-    u64 ram = cur_boot_args.phys_base, ram_size = cur_boot_args.mem_size;
     u64 fb = cur_boot_args.video.base,
         fb_size = cur_boot_args.video.stride * cur_boot_args.video.height;
-    const struct adt_segment_ranges *seg = adt_getprop(adt, nub, "segment-ranges", &len);
-    bool vram_seg = false;
+    bool vram_seg;
     if (t6050_adt_reg("/vram", 0, &t6050.vram, &t6050.vram_size) || !t6050.vram_size ||
         ((t6050.vram | t6050.vram_size) & (SZ_16K - 1)) || !fb || fb < t6050.vram ||
-        fb - t6050.vram >= t6050.vram_size || fb_size > t6050.vram + t6050.vram_size - fb || !seg ||
-        !len || len % sizeof(*seg) || len > 16 * sizeof(*seg))
-        bail("no /vram holding the boot framebuffer, or bad segment-ranges\n");
-    for (u32 i = 0; i < len / sizeof(*seg); i++) {
-        struct adt_segment_ranges r;
-        memcpy(&r, &seg[i], sizeof(r));
-        u64 size = ALIGN_UP((u64)r.size, SZ_16K);
-        vram_seg |= r.phys == t6050.vram && size == t6050.vram_size;
-        /* __OS_LOG is reserved by dcp6_reserve_oslogs() */
-        if (r.unk != SEG_FLAGS_OSLOG && dcp6_overlaps(r.phys, size, ram, ram_size))
-            bail("DCP segment %u (0x%lx) lies in the OS's RAM\n", i, r.phys);
-    }
+        fb - t6050.vram >= t6050.vram_size || fb_size > t6050.vram + t6050.vram_size - fb)
+        bail("no /vram holding the boot framebuffer\n");
+    if (t6050_check_placement(DCP6_NUB, NULL, NULL, 0, t6050.vram, t6050.vram_size, &vram_seg))
+        return -1;
     if (!vram_seg)
         bail("/vram is not a DCP segment\n");
 
@@ -3891,7 +3929,8 @@ static T6050_TEXT int t6050_ext_node(void *dt, u64 coproc)
  * dcpext0..3), so that a driver can take each over and stop it for a sleep. A disabled
  * apple,t6050-dcpext node whose coprocessor is ADT dcpextN, running the internal display's
  * image, powered, with its DCP and PIODMA streams (SID 23 on dart-dcpextN, 16 on dart-dispextN)
- * locked on the ADT's roots, gets the firmware version, uuid and its bandwidth scratch, and its
+ * locked on the ADT's roots, and its firmware segments (but __OS_LOG) and both streams' page-table
+ * regions outside the OS's RAM, gets the firmware version, uuid and its bandwidth scratch, and its
  * node, mailbox and both DARTs are enabled. One that fails a check is left disabled.
  */
 static T6050_TEXT int t6050_ext_one(void *dt, int n)
@@ -3907,6 +3946,14 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
     if (!dcp6_is_uuid(uuid, len) || strcmp(uuid, t6050.uuid) ||
         dcp6_adt_u32(nub, "running", &val) || val != 1)
         bail("dcpext%d: not running the pinned image\n", n);
+    /* Its firmware and both streams' page tables stay out of the OS's RAM, as the internal DCP's */
+    char dd[2][32];
+    const char *darts[2] = {dd[0], dd[1]};
+    static const u8 sids[2] = {23, 16};
+    snprintf(dd[0], sizeof(dd[0]), "/arm-io/dart-dcpext%d", n);
+    snprintf(dd[1], sizeof(dd[1]), "/arm-io/dart-dispext%d", n);
+    if (t6050_check_placement(a, darts, sids, 2, 0, 0, NULL))
+        bail("dcpext%d: its memory is not outside the OS's RAM\n", n);
     snprintf(a, sizeof(a), "/arm-io/dcpext%d", n);
     if (t6050_adt_reg(a, 0, &coproc, NULL))
         bail("dcpext%d: no ADT reg\n", n);
@@ -4147,6 +4194,8 @@ static T6050_TEXT int t6050_headless_check(void *dt, int engine, u64 *vram, u64 
         ((*vram | *vram_size) & (SZ_16K - 1)) || !fb || fb < *vram || fb - *vram >= *vram_size ||
         fb_size > *vram + *vram_size - fb || dcp6_resv_conflict(dt, *vram, *vram_size, "/vram"))
         bail("no /vram holding the boot framebuffer\n");
+    if (dcp6_overlaps(*vram, *vram_size, cur_boot_args.phys_base, cur_boot_args.mem_size))
+        bail("/vram 0x%lx+0x%lx lies in the OS's RAM\n", *vram, *vram_size);
     return engine;
 }
 
