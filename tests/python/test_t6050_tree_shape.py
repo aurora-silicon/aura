@@ -261,7 +261,7 @@ def test_t6050_external_scanout_darts_resolved(tmp_path):
 #define dlog(fmt, ...) printf(fmt, ##__VA_ARGS__)
 ''' + layout + r'''
 static struct { u64 phys_base, mem_size; } cur_boot_args = {0x10000000000UL, 0x200000000UL};
-static struct { const char *uuid; } t6050;
+static struct { const char *uuid; u32 ext_aura; } t6050;
 static void *adt;
 #define DART_DCP 0x48a340000UL
 #define DART_DISP0 0x48a300000UL
@@ -637,7 +637,7 @@ struct fw_version_info {
 ''' + layout + r'''
 static struct fw_version_info os_firmware;
 static struct { u64 phys_base, mem_size; } cur_boot_args = {0x10000000000UL, 0x200000000UL};
-static struct { const char *uuid; } t6050;
+static struct { const char *uuid; u32 ext_aura; } t6050;
 static struct { const char *name; } soc = {"t6050"};
 static struct { const typeof(soc) *soc; } dcp6 = {&soc};
 static void *adt;
@@ -1117,8 +1117,19 @@ int main(void)
     t6050_ext_version(tree);
     assert(is("/dcpext0", "apple,firmware-compat", &v272));
     assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    /* An engine Aura just enabled itself (ext_aura bit) is left untouched by t6050_ext_version(),
+     * even if its ADT lacks pt-region. */
+    world();
+    os_firmware = v272;
+    exts[1].pt16[0] = exts[1].pt16[1] = 0;
+    t6050.ext_aura = 1u << 1;
+    t6050_ext_version(tree);
+    t6050.ext_aura = 0;
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert(!is_disabled("/dcpext1") && is("/dcpext1", "apple,firmware-compat", &old));
+    assert(has_scanout_dart(PH_DART1)); cases++;
     printf("PASS dcpext version %d cases\n", cases);
     return 0;
 }
 '''
-    run(tmp_path, "ext-version", code, "PASS dcpext version 21 cases")
+    run(tmp_path, "ext-version", code, "PASS dcpext version 22 cases")

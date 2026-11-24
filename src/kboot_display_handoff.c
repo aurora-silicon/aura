@@ -4830,6 +4830,7 @@ static struct {
     u32 bw_offset, nits, nclk, clk_id[T6050_CLOCKS], clk_hz[T6050_CLOCKS], pmc_ph;
     const char *gamut;
     const char *uuid; /* the pinned image of the running OS firmware */
+    u32 ext_aura;     /* external engines Aura enabled itself (bit n for dcpextN) */
     bool ext;
     bool headless; /* no panel: t6050_headless_handoff() */
     bool prewired; /* clocks and bandwidth scratch prewired: t6050_prewired() */
@@ -5810,6 +5811,8 @@ static T6050_TEXT void t6050_ext_handoff(void *dt, int engines, int skip)
             continue;
         if (ret || dcp6_commit(dt, scratch))
             dlog("dcpext%d stays with iBoot: no handoff\n", n);
+        else
+            t6050.ext_aura |= 1u << n;
     }
 }
 
@@ -5937,7 +5940,8 @@ static T6050_TEXT int t6050_ext_walk(void *dt, int target, int *ord, int want_or
 }
 
 /*
- * Disable every available apple,t6050-dcpext node that has no identity-mapped ADT match or fails
+ * Disable every available apple,t6050-dcpext node already enabled in the input DT (not one Aura
+ * just enabled via t6050_ext_one()) that has no identity-mapped ADT match or fails
  * t6050_check_ext_adt(), and strip it from any display-subsystem scanout iommus. Runs on a
  * scratch copy when available (falling back to editing `dt` in place if scratch allocation fails)
  * before firmware-version writes, independent of os_firmware and without rolling back if a packed
@@ -5958,7 +5962,7 @@ static T6050_TEXT void t6050_ext_reject(void *dt)
             continue;
         }
         int n = t6050_ext_index(cur, at);
-        if (n >= 0 && !t6050_check_ext_adt(n)) {
+        if (n >= 0 && ((t6050.ext_aura & (1u << n)) || !t6050_check_ext_adt(n))) {
             at = fdt_node_offset_by_compatible(cur, at, "apple,t6050-dcpext");
             continue;
         }
@@ -6044,7 +6048,7 @@ static T6050_TEXT void t6050_ext_version(void *dt)
         if (!t6050_available(scratch, at))
             continue;
         int n = t6050_ext_index(scratch, at);
-        if (n < 0 || t6050_check_ext_adt(n))
+        if (n < 0 || (t6050.ext_aura & (1u << n)) || t6050_check_ext_adt(n))
             continue;
         for (size_t i = 0; !err && i < ARRAY_SIZE(props); i++) {
             /* apple,firmware-compat (props[0]) always; apple,firmware-version only if present */
@@ -6195,6 +6199,7 @@ static T6050_TEXT void t6050_headless_handoff(void *dt, int engine)
                     t6050_headless_publish(scratch, engine, vram, vram_size))) {
         free(scratch);
     } else if (scratch && !dcp6_commit(dt, scratch)) {
+        t6050.ext_aura |= 1u << engine;
         dlog("dcpext%d handed off with the display subsystem: firmware %s, framebuffer "
              "0x%lx+0x%lx\n",
              engine, os_firmware.string, vram, vram_size);

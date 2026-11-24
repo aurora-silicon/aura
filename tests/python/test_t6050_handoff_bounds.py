@@ -455,6 +455,7 @@ static int headless(int argc, char **argv)
     static _Alignas(8) char dt[0x10000];
     u64 vram = arg(argc, argv, "vram", 0), vram_size = arg(argc, argv, "vsize", 0);
     u64 meta_size = arg(argc, argv, "meta", 0), bw = arg(argc, argv, "bw", 0);
+    u64 no_pt_region = arg(argc, argv, "no_pt_region", 0);
     const char *nub = "/arm-io/dcpext0/iop-dcpext0-nub";
 
     prop(nub, "uuid", image(true), 37);
@@ -469,7 +470,8 @@ static int headless(int argc, char **argv)
         prop_u64s(d, "vm-base", VM_BASE, 0, 1);
         prop_u64s(d, "vm-size", VM_SIZE, 0, 1);
         prop_u64s(d, i ? "l1-tt-16" : "l1-tt-23", l1, 1, 2);
-        prop_u64s(d, i ? "pt-region-16" : "pt-region-23", l1 - 0x4000, l1 + 0x40000, 2);
+        if (!no_pt_region)
+            prop_u64s(d, i ? "pt-region-16" : "pt-region-23", l1 - 0x4000, l1 + 0x40000, 2);
         word(base + DART_T8110_PROTECT, DART_T8110_PROTECT_TTBR_TCR);
         word(base + DART_T8110_TCR(sid), T6050_TCR_WANT);
         word(base + DART_T8110_TTBR(sid),
@@ -1115,6 +1117,16 @@ def test_panel_framebuffer_must_lie_in_vram(host, fb, size, taken):
         assert r.log == []
     else:
         assert r.state["rc"] == "-1" and len(r.log) == 1
+
+
+def test_headless_without_pt_region_stays_handed_off(host):
+    # t6050_ext_version() / t6050_ext_reject() apply only to engines already enabled in the input
+    # DT, not engines Aura just enabled via t6050_ext_one(): omitting pt-region-* from the
+    # headless ADT still leaves dcpext0, display-subsystem, and their providers enabled.
+    r = headless(host, no_pt_region=1)
+    assert handed_off(r)
+    assert not r.said("rejected")
+    assert not r.said("the device tree enables")
 
 
 @pytest.mark.parametrize("fail", [0, 1, 2, 3, 4])
