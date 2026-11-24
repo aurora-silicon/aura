@@ -13,8 +13,8 @@ Ways it can fail, and the check for each:
 4. The window takes the DockChannel from a CDC carrier, or a byte stream without the sync word
    counts as a host.
 5. The window outlives the trial watchdog, which would then reset the Mac with no log line.
-6. A stage that is not a trial waits or reboots (it must stop in the proxy as before), or a trial
-   with a host in the window reboots under it.
+6. A stage that is neither a trial nor booted with m1n1.wdt=keep waits or reboots (it must stop
+   in the proxy as before), or one with a host in the window reboots under it.
 7. A handoff failure leaves the panel dark (FB_SILENT_MODE), or a CDC transition still scheduled
    runs from the window's usb_cdc_poll() after USB was shut down for the handoff.
 """
@@ -201,9 +201,10 @@ FALLBACK = r'''
 #include <string.h>
 typedef unsigned int u32;
 #define WDT_TRIAL_SECONDS 178
-static bool trial, host, boot_wdt, arm_fails;
+static bool trial, host, boot_wdt, arm_fails, keep;
 static unsigned waited, reboots, trial_arms;
 static bool aura_trial_enabled(void) { return trial; }
+static bool boot_wdt_keep_enabled(void) { return keep; }
 static bool wdt_boot_watchdog_armed(void) { return boot_wdt; }
 static int wdt_arm_trial(void)
 {
@@ -230,6 +231,7 @@ int main(int argc, char **argv)
     host = atoi(argv[2]);
     boot_wdt = atoi(argv[3]);
     arm_fails = atoi(argv[4]);
+    keep = atoi(argv[5]);
     bool r = proxy_fallback("NVMe handoff failed");
     printf("ret=%d waited=%u reboots=%u arms=%u\n", r, waited, reboots, trial_arms);
     return 0;
@@ -237,7 +239,7 @@ int main(int argc, char **argv)
 '''
 
 
-def _fallback(tmp_path, trial, host, boot_wdt=False, arm_fails=False):
+def _fallback(tmp_path, trial, host, boot_wdt=False, arm_fails=False, keep=False):
     header = (ROOT / "src/proxy_fallback.h").read_text()
     header = header[header.index("#define PROXY_FALLBACK_HOST_MS"):]
     header = header[:header.index("\n")]
@@ -249,7 +251,7 @@ def _fallback(tmp_path, trial, host, boot_wdt=False, arm_fails=False):
     subprocess.run([*host_cc(), "-std=gnu11", "-Wall", "-Werror", "-Wno-unused-function",
                     "-Wno-unused-parameter", str(src), "-o", str(exe)], check=True)
     out = subprocess.run([str(exe), str(int(trial)), str(int(host)), str(int(boot_wdt)),
-                          str(int(arm_fails))], check=True,
+                          str(int(arm_fails)), str(int(keep))], check=True,
                          capture_output=True, text=True).stdout
     return dict(item.split("=") for item in out.strip().splitlines()[-1].split())
 
@@ -282,6 +284,26 @@ def test_stage1_trial_turns_its_boot_watchdog_into_the_trial_watchdog(tmp_path):
 
 def test_stage1_trial_without_a_trial_watchdog_reboots_without_a_window(tmp_path):
     assert _fallback(tmp_path, True, True, boot_wdt=True, arm_fails=True) == {
+        "ret": "reboot", "waited": "0", "reboots": "1", "arms": "1"}
+
+
+def test_wdt_keep_without_a_host_reboots_after_the_window(tmp_path):
+    """m1n1.wdt=keep: the first stage's fallback is behind a reset, whether or not the watchdog it
+    armed still runs. aura arms no watchdog of its own for it."""
+    for boot_wdt in (False, True):
+        assert _fallback(tmp_path, False, False, boot_wdt, keep=True) == {
+            "ret": "reboot", "waited": "15000", "reboots": "1", "arms": "0"}
+
+
+def test_wdt_keep_with_a_host_keeps_the_proxy(tmp_path):
+    assert _fallback(tmp_path, False, True, keep=True) == {"ret": "1", "waited": "15000",
+                                                            "reboots": "0", "arms": "0"}
+
+
+def test_a_trial_under_wdt_keep_is_a_trial(tmp_path):
+    assert _fallback(tmp_path, True, True, boot_wdt=True, keep=True) == {
+        "ret": "1", "waited": "15000", "reboots": "0", "arms": "1"}
+    assert _fallback(tmp_path, True, True, boot_wdt=True, arm_fails=True, keep=True) == {
         "ret": "reboot", "waited": "0", "reboots": "1", "arms": "1"}
 
 
