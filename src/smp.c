@@ -571,9 +571,9 @@ static void smp_s2r_pcie_reinit(void)
     int ret = pmgr_adt_power_enable("/arm-io/ans");
     if (!ret)
         ret = pcie_reinit_after_sleep();
-    wdt_s2r_guard_exit(&guard);
     if (ret)
         reboot();
+    wdt_s2r_guard_exit(&guard);
 }
 
 /*
