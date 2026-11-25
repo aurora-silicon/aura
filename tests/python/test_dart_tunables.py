@@ -32,6 +32,7 @@ def test_dart_tunables_map_by_physical_address(tmp_path):
             "static int dt_append_dart_tunable(",
             "static bool dt_node_is_apple_dart(",
             "static int dt_find_dart_by_address(",
+            "static u64 dt_dart_window(",
             "static int dt_copy_dart_tunable(",
             "static void dt_copy_dart_tunables(",
         )
@@ -88,8 +89,16 @@ static const struct fake_dart darts[] = {
 };
 _Static_assert(ARRAY_SIZE(darts) == 37, "lab DART union changed");
 static int shape, malformed_node = -1, no_table_node = -1, bad_value_node = -1;
+static int far_node = -1, beyond_node = -1;
 static struct acio_tunable row = {
     .offset = 0x20, .size = 4, .mask = 0x00ff00ff, .value = 0x00550011,
+};
+/* Rows past 0x4000, inside a 0xc000 register window, and just past one. */
+static struct acio_tunable far_row = {
+    .offset = 0x4600, .size = 4, .mask = 0x00ff00ff, .value = 0x00550011,
+};
+static struct acio_tunable beyond_row = {
+    .offset = 0xc000, .size = 4, .mask = 0x00ff00ff, .value = 0x00550011,
 };
 static struct acio_tunable bad_row = {
     .offset = 0x24, .size = 4, .mask = 0x0000000f, .value = 0x00000010,
@@ -174,6 +183,10 @@ static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
         return NULL;
     if (len)
         *len = node - 1 == malformed_node ? sizeof(row) - 1 : sizeof(row);
+    if (node - 1 == far_node)
+        return &far_row;
+    if (node - 1 == beyond_node)
+        return &beyond_row;
     return node - 1 == bad_value_node ? &bad_row : &row;
 }
 static u64 dt_get_address(void *tree, int node)
@@ -206,6 +219,12 @@ static void add_dart(const char *name, u64 base, const char *status)
     if (status)
         assert(!fdt_setprop_string(dt, node, "status", status));
 }
+static void set_window(int node, u64 window)
+{
+    const fdt64_t *old = fdt_getprop(dt, node, "reg", NULL);
+    fdt64_t reg[] = {old[0], cpu_to_fdt64(window)};
+    assert(!fdt_setprop(dt, node, "reg", reg, sizeof(reg)));
+}
 static void reset(int which)
 {
     static unsigned char blob[32768];
@@ -214,7 +233,12 @@ static void reset(int which)
     malformed_node = -1;
     no_table_node = -1;
     bad_value_node = -1;
+    far_node = -1;
+    beyond_node = -1;
     assert(!fdt_create_empty_tree(dt, sizeof(blob)));
+    /* Each DART's reg is a 64-bit address and a 64-bit window size. */
+    assert(!fdt_setprop_u32(dt, 0, "#address-cells", 2));
+    assert(!fdt_setprop_u32(dt, 0, "#size-cells", 2));
 
     /* Reverse both node and instance order: phandle/FDT order must be irrelevant. */
     int count = adt_get_child_count(adt, 100);
@@ -251,7 +275,7 @@ int main(void)
 {
     for (int i = 0; i < 4; i++) {
         reset(i);
-        dt_copy_dart_tunables();
+        dt_copy_dart_tunables(NULL);
         verify_all();
     }
 
@@ -261,7 +285,7 @@ int main(void)
     const fdt32_t board[] = {cpu_to_fdt32(4), cpu_to_fdt32(1), cpu_to_fdt32(1)};
     assert(!fdt_setprop(dt, beta, "apple,tunable", board, sizeof(board)));
     assert(!fdt_setprop_string(dt, alpha0, "status", "disabled"));
-    dt_copy_dart_tunables();
+    dt_copy_dart_tunables(NULL);
     assert(!fdt_getprop(dt, dart_node(0, 0), "apple,tunable", NULL));
     assert(fdt_getprop(dt, dart_node(0, 1), "apple,tunable", NULL));
     int len;
@@ -271,7 +295,7 @@ int main(void)
     /* A malformed node is rolled back without losing a different node's table. */
     reset(0);
     malformed_node = 1;
-    dt_copy_dart_tunables();
+    dt_copy_dart_tunables(NULL);
     assert(fdt_getprop(dt, dart_node(0, 0), "apple,tunable", NULL));
     assert(fdt_getprop(dt, dart_node(0, 1), "apple,tunable", NULL));
     assert(!fdt_getprop(dt, dart_node(1, 0), "apple,tunable", NULL));
@@ -279,7 +303,7 @@ int main(void)
     /* A value outside its field mask is rejected; later DARTs still copy. */
     reset(0);
     bad_value_node = 0;
-    dt_copy_dart_tunables();
+    dt_copy_dart_tunables(NULL);
     assert(!fdt_getprop(dt, dart_node(0, 0), "apple,tunable", NULL));
     assert(!fdt_getprop(dt, dart_node(0, 1), "apple,tunable", NULL));
     assert(fdt_getprop(dt, dart_node(1, 0), "apple,tunable", NULL));
@@ -288,16 +312,48 @@ int main(void)
     reset(0);
     u64 duplicate = fake_base(0, 0);
     add_dart("duplicate", duplicate, NULL);
-    dt_copy_dart_tunables();
+    dt_copy_dart_tunables(NULL);
     assert(!fdt_getprop(dt, dart_node(0, 0), "apple,tunable", NULL));
     assert(!fdt_getprop(dt, path("/duplicate"), "apple,tunable", NULL));
 
     /* Keep the established PCIe-C empty-table marker when ADT has no rows. */
     reset(0);
     no_table_node = 3; /* dart-apciec0 in the M1 Pro shape */
-    dt_copy_dart_tunables();
+    dt_copy_dart_tunables(NULL);
     out = fdt_getprop(dt, dart_node(3, 0), "apple,tunable", &len);
     assert(out && len == 0);
+
+    /*
+     * The DART's own register window bounds its rows: a row past 0x4000 is taken inside a
+     * 0xc000 window and refused in a 0x4000 one; a row at 0xc000 is past a 0xc000 window.
+     */
+    reset(0);
+    far_node = 0;    /* dart-isp0: 0x4600 */
+    beyond_node = 1; /* dart-apcie0: 0xc000 */
+    set_window(dart_node(0, 0), 0xc000);
+    set_window(dart_node(1, 0), 0xc000);
+    dt_copy_dart_tunables(NULL);
+    out = fdt_getprop(dt, dart_node(0, 0), "apple,tunable", &len);
+    assert(out && len == 12 && fdt32_to_cpu(out[0]) == 0x4600);
+    assert(!fdt_getprop(dt, dart_node(0, 1), "apple,tunable", NULL)); /* 0x4000 window */
+    assert(!fdt_getprop(dt, dart_node(1, 0), "apple,tunable", NULL));
+    assert(fdt_getprop(dt, dart_node(2, 0), "apple,tunable", NULL));
+
+    /* With a prefix list, only those ADT DARTs are copied (T8152: the USB4 ones). */
+    static const char *const usb4[] = {"dart-acio", "dart-apciec", NULL};
+    for (int i = 0; i < 4; i++) {
+        reset(i);
+        dt_copy_dart_tunables(usb4);
+        int count = adt_get_child_count(adt, 100);
+        for (int n = 0; n < count; n++) {
+            int index;
+            const struct fake_dart *dart = fake_at(n, &index);
+            bool wanted = !strncmp(dart->name, "dart-acio", 9) ||
+                          !strncmp(dart->name, "dart-apciec", 11);
+            for (unsigned j = 0; j < dart->instances[shape]; j++)
+                assert(!!fdt_getprop(dt, dart_node(index, j), "apple,tunable", NULL) == wanted);
+        }
+    }
 
     puts("PASS: all synthetic DART shapes joined only by physical address");
     return 0;

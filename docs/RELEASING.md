@@ -15,6 +15,15 @@ Aura has its own version series, starting at `v0.1.0`. Keep feature work in the 
 
 Main-branch builds produce Actions artifacts but do not create GitHub releases. A manual dispatch also builds artifacts without publishing or creating a release. Re-running a tag build may replace assets on its existing draft; it preserves edited release notes.
 
+A tag build labels its images from the tag and `VERSION`. `v<VERSION>` is labelled `VERSION`. A maintenance tag `v<VERSION>.<n>` is labelled `VERSION-g<commit>`, which is what a source build of that commit carries: the distributions' Stage 2 updaters parse the Stage 1 version as `<x.y.z>b<N>` with an optional `-g<commit>`, so a maintenance release keeps `VERSION`. Any other tag is refused.
+
+To replace the assets of a draft that was built under a wrong label:
+
+1. Run the `release` workflow manually with `tag` set to the release's tag. It checks out the tag and builds under the tag's label. It uploads only the `aura-release` artifact and does not touch the draft.
+2. Download that artifact and check `SHA256SUMS`.
+3. Delete the draft's old assets that the new names don't replace, with `gh release delete-asset <tag> <name>`. `--clobber` replaces only assets with the same name.
+4. Upload the new files with `gh release upload <tag> dist/* --clobber`. That also replaces `SHA256SUMS`.
+
 Local packaging uses `tools/package_release.py` after a clean-source `RELEASE=1 CHAINLOADING=1` build, with `ESP_STAGE2=0` for `stage1` or `ESP_STAGE2=1` for `stage2`. Set `AURA_VERSION_TAG` to the release tag and pass the same value to `--version`. Use `--compiler` to record the actual compiler when cross-compiling.
 
 The release archives contain Aura components. A complete UEFI boot bundle additionally needs board-matching DTBs and a matching U-Boot payload; those versions and their hashes must be recorded separately. No deployment or firmware installation is performed by release CI.

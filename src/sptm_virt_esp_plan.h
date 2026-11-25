@@ -46,6 +46,16 @@ enum esp_s2r {
 #define ESP_MAX_LOADS   48
 #define ESP_MAX_REGIONS 64
 #define ESP_PATH        64
+#define ESP_MAX_CHOSEN  8
+#define ESP_CHOSEN_VAL  192 /* proxyclient/aura/esp_macos.py CHOSEN_MAX */
+
+/* A /chosen root property to set or add: node path, name, value. */
+struct esp_chosen {
+    char node[ESP_PATH];
+    char name[33];
+    u8 val[ESP_CHOSEN_VAL];
+    u32 len;
+};
 
 struct esp_seg {
     char name[17];
@@ -89,10 +99,12 @@ struct esp_manifest {
     u64 trace;          /* sptm_virt_config's flags */
     u32 s2r[ESP_S2R_N]; /* the runner's symbol switches, by enum esp_s2r */
     bool s2r_set[ESP_S2R_N];
-    u64 ctrr_stash;   /* sptm_virt_ctrr_stash_off */
-    u32 link_phys[2]; /* sptm_virt_link_phys: the debug link's USB PHYs */
-    char love[96];    /* /chosen/manifest-properties love, "" to leave it */
-    bool video;       /* hand XNU the native boot video */
+    u64 ctrr_stash;                           /* sptm_virt_ctrr_stash_off */
+    u32 link_phys[2];                         /* sptm_virt_link_phys: the debug link's USB PHYs */
+    char love[96];                            /* /chosen/manifest-properties love, "" to leave it */
+    struct esp_chosen chosen[ESP_MAX_CHOSEN]; /* another volume group's root, as plan_boot */
+    u32 nchosen;
+    bool video; /* hand XNU the native boot video */
     char bootargs[1024];
 };
 

@@ -52,6 +52,10 @@ jobs:
         run: |
           export MAKE=gmake NM="$(brew --prefix llvm)/bin/llvm-nm"
           sh tools/stage1_size.sh clang-macos BUILTIN_LOGO=aurora
+      - name: Link the ESP Stage 2
+        run: |
+          gmake clean
+          gmake -j3 RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1 BUILTIN_LOGO=aurora
 
   fedora:
     # As fedora-aurora's aura.spec builds it: Fedora clang and Rust, core built from rust-src.
@@ -62,6 +66,12 @@ jobs:
         run: dnf install -y --setopt=install_weak_deps=False clang llvm lld rust rust-src cargo make python3 git
       - uses: actions/checkout@v7
       - name: Stage 1 room
+        # rpmbuild's %build exports Fedora's RUSTFLAGS (%build_rustflags); aura must link the
+        # same Stage 1 with them set.
+        env:
+          RUSTFLAGS: >-
+            -Copt-level=3 -Cdebuginfo=2 -Ccodegen-units=1 -Cstrip=none -Cforce-frame-pointers=yes
+            -Clink-arg=-specs=/usr/lib/rpm/redhat/redhat-package-notes --cap-lints=warn
         run: sh tools/stage1_size.sh fedora USE_CLANG=1 BUILTIN_LOGO=aurora BUILDSTD=1
 
   alarm:
@@ -80,7 +90,14 @@ jobs:
             sed -i -e "s/^CheckSpace/#CheckSpace/" -e "/^\[options\]/a DisableSandbox" /etc/pacman.conf
             pacman-key --init >/dev/null
             pacman-key --populate archlinuxarm >/dev/null
-            pacman -Syu --noconfirm --needed clang lld llvm rustup make python >/dev/null
+            # mirror.archlinuxarm.org stalls now and then ("Operation too slow"); a stalled
+            # download fails the whole transaction, so try it again before giving up.
+            for try in 1 2 3; do
+              pacman -Syu --noconfirm --needed clang lld llvm rustup make python >/dev/null && break
+              [ "$try" = 3 ] && exit 1
+              echo "pacman: download failed (try $try of 3), retrying in 60 s"
+              sleep 60
+            done
             # The toolchain alarm-aurora packages/aura/PKGBUILD pins.
             rustup toolchain install 1.99.0 --profile minimal --target aarch64-unknown-none-softfloat >/dev/null
             export RUSTUP_TOOLCHAIN=1.99.0
@@ -92,7 +109,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
+      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32.0.0
       - name: Stage 1 room
         run: |
           nix build --impure -L --out-link stage1-size --expr '

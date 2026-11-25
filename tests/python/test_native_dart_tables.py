@@ -51,6 +51,7 @@ int main(void) {
  assert(!collect(2)&&count==2); /* walker accepts these attributes; no new roots */
  setup();tcr|=DART_T8110_TCR_BYPASS_DART;assert(collect(4)==-3&&!count);
  setup();tcr|=DART_T8110_TCR_REMAP_EN;assert(collect(4)==-3&&!count);
+ setup();tcr|=DART_T8110_TCR_FOUR_LEVEL;assert(collect(4)==-3&&!count);
  setup();tcr=0;assert(collect(4)==-3&&!count);
  setup();protect=0;assert(collect(4)==-3&&!count);
  setup();ttbr=0;assert(collect(4)==-3&&!count);

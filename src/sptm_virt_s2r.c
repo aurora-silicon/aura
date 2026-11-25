@@ -137,7 +137,7 @@ static struct {
 static bool s2r_go, s2r_fulltrace, s2r_coproc, s2r_drop_usb;
 static u64 s2r_arm_at;
 /* Cores with their last WFI trapped (stop mode), parked there, and the core that committed. */
-static volatile u32 s2r_twi_mask, s2r_parked_mask;
+static volatile u64 s2r_twi_mask, s2r_parked_mask;
 /* Go mode: the ring position where the first core opened the sleep window (0: none yet). */
 static volatile u64 s2r_sleep_head;
 static volatile int s2r_timer_cpu = -1;
@@ -477,13 +477,13 @@ static void s2r_quiesce(void)
  * trap (TWI) and aura executes them, so that it can count them.
  */
 static spmi_dev_t *s2r_crumb_dev;
-static volatile u32 s2r_crumb_wfi;
+static volatile u64 s2r_crumb_wfi;
 
 static void s2r_crumb(u8 step)
 {
     if (!s2r_crumb_dev)
         return;
-    u32 m = s2r_crumb_wfi;
+    u64 m = s2r_crumb_wfi;
     u8 b[3] = {step, m, m >> 8};
     spmi_ext_write_long(s2r_crumb_dev, 0xe, 0x830d, b, sizeof(b));
 }
@@ -751,7 +751,7 @@ static void __attribute__((noreturn)) s2r_stop_before_timer(struct exc_info *ctx
     s2r_marker("S2RSTOP", addr);
     s2r_stop_link_back();
     printf("SPTM-virt[s2r]: cpu%d is starting the S2R timer ([0x%lx] = 0x%lx, pc 0x%lx): NOT "
-           "performed (stop mode). TWI armed 0x%x, parked 0x%x, %lu records. Stopping in the "
+           "performed (stop mode). TWI armed 0x%lx, parked 0x%lx, %lu records. Stopping in the "
            "proxy.\n",
            smp_id(), addr, val, ctx->elr, s2r_twi_mask, s2r_parked_mask, sptm_virt_s2r_head);
     if (s2r_nvme_quiet_page)
@@ -842,7 +842,7 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
         while (1)
             sysop("wfe");
     }
-    printf("SPTM-virt[s2r]: macOS reached its final WFI on the S2R-timer core cpu%d; parked 0x%x; "
+    printf("SPTM-virt[s2r]: macOS reached its final WFI on the S2R-timer core cpu%d; parked 0x%lx; "
            "%lu records. Stopping in the proxy (stop mode).\n",
            cpu, s2r_parked_mask, sptm_virt_s2r_head);
     /* whole classes, newest first: the proxy read-out fails with ten cores */
@@ -1012,6 +1012,7 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         s2r_rw128(addr, val, write);
         sptm_virt_s2r_note(ctx, addr, val[0], write, 3);
         sptm_virt_s2r_note(ctx, addr + 8, val[1], write, 3);
+        s2r_dcp_watch(addr, val, 4);
         return true;
     }
     if (width > 4) {
@@ -1023,6 +1024,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     if (timer)
         s2r_crumb(0x30);
     sptm_virt_s2r_note(ctx, addr, *val, write, width);
+    /* The DCP's RPC records at each of its mailbox messages (AURA_S2R_DCP_PKT). */
+    s2r_dcp_watch(addr, val, width);
     /* host: AURA_S2R_PROBE_AT, a guest write after a wake that, once performed, triggers the
      * AURA_S2R_PROBE reads (once per wake): where in macOS's own sequence a block becomes
      * readable. */
@@ -1798,6 +1801,19 @@ void sptm_virt_s2r_setup(bool cdc)
         };
         for (unsigned i = 0; i < ARRAY_SIZE(mb); i++)
             s2r_hook_adt(mb[i].path, 0, mb[i].what, 0x8000, 0x4000);
+        /* These go through s2r_hook, not the generic coprocessor trace: register the DCP for
+         * the RPC record copy here (s2r_hook calls s2r_dcp_watch). */
+        /* Registered whatever the switch: s2r_dcp_watch reads it at each access. */
+        for (unsigned i = 0; i < 2; i++) {
+            static const char *const dcps[] = {"dcp", "dcpext"};
+            char path[24];
+            int dp[8];
+            u64 dpa, dsz;
+            snprintf(path, sizeof(path), "/arm-io/%s", dcps[i]);
+            if (adt_path_offset_trace(adt, path, dp) >= 0 &&
+                adt_get_reg(adt, dp, "reg", 0, &dpa, &dsz) >= 0)
+                s2r_dcp_add(dcps[i], dpa + 0x8000);
+        }
         /* Without stage 2 in the secure kernel's world these see XNU's side only. */
         s2r_hook_adt("/arm-io/aop-exclave-mailbox", 0, "aopx-mbox", 0, 0);
         s2r_hook_adt("/arm-io/aop2-exclave-mailbox", 0, "aop2x-mbox", 0, 0);

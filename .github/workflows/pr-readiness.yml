@@ -1,0 +1,53 @@
+name: pr-readiness
+
+# Merge-readiness comment and labels on every open pull request.
+# The logic lives in aurora-silicon/.github; this file only says when to run.
+# Rules: https://github.com/aurora-silicon/agent-guidelines/blob/main/docs/MAINTAINER-HANDBOOK.md
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, ready_for_review, converted_to_draft, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+  issue_comment:
+    types: [created, edited]
+  schedule:
+    - cron: "20 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number (empty = every open pull request)
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: read
+  statuses: read
+
+jobs:
+  readiness:
+    # Skipped (no runner used): reviews on pull requests from forks (read-only
+    # token; the sweep picks those up), bot comments, edits that change
+    # neither title, body nor base, and labels other than the human holds.
+    if: >-
+      github.repository_owner == 'aurora-silicon' &&
+      (github.event.action != 'edited' || github.event_name != 'pull_request_target' ||
+       github.event.changes.body != null || github.event.changes.title != null ||
+       github.event.changes.base != null) &&
+      (!contains(fromJSON('["labeled","unlabeled"]'), github.event.action) ||
+       contains(fromJSON('["hold","blocked","hw-row-ok"]'), github.event.label.name)) &&
+      (github.event_name != 'pull_request_review' ||
+       github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'issue_comment' ||
+       (github.event.issue.pull_request && github.event.comment.user.type != 'Bot'))
+    # One group per pull request, on the job so that skipped events never
+    # enter it: a burst collapses into one pending run, which reads the
+    # current state anyway.
+    concurrency:
+      group: pr-readiness-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr || 'sweep' }}
+      cancel-in-progress: false
+    uses: aurora-silicon/.github/.github/workflows/pr-readiness.yml@main
+    with:
+      pr: ${{ format('{0}', github.event.pull_request.number || github.event.issue.number || inputs.pr || '') }}

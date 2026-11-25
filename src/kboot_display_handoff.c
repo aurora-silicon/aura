@@ -318,6 +318,16 @@ static const struct dcp_soc dcp_soc_t6030 = {
  */
 static const char *const dcp_boards_t8122[] = {"apple,j613", "apple,j615", NULL};
 
+/*
+ * T8122 (M3 MacBook Air J613/J615) DCP images by OS. The 14.7 native image stays pinned; 27.2
+ * generalises J613/J615 off the 25G83-only special profile below and onto this profile with
+ * the 27.2 image UUID. The exact-UUID and segment validation are kept for both builds.
+ */
+static const struct dcp_fw dcp_fws_t8122[] = {
+    {.os_fw = V14_7, .os_fw_name = "14.7", .uuid = DCP8_UUID},
+    {.os_fw = V27_2, .os_fw_name = "27.2", .uuid = "93FA4B31-BB97-3B2A-8673-49EA489EE9C1"},
+};
+
 static const struct dcp_soc dcp_soc_t8122 = {
     .name = "T8122",
     .chip = T8122,
@@ -336,9 +346,10 @@ static const struct dcp_soc dcp_soc_t8122 = {
     .oslog_always = true,
     .describe = true,
     .adt_psreg = true,
+    /* Only read when no build matches (the dry-run/lock decision), as before the build rows. */
     .uuid = DCP8_UUID,
-    .os_fw = V14_7,
-    .os_fw_name = "14.7",
+    .fws = dcp_fws_t8122,
+    .nfws = ARRAY_SIZE(dcp_fws_t8122),
     .pmgr_disp_cpu = 0x2d0710000UL,
 };
 
@@ -611,6 +622,15 @@ static bool dcp6_overlaps(u64 a, u64 a_size, u64 b, u64 b_size)
     return a_size && b_size && a < b_end && b < a_end;
 }
 
+/* The boot framebuffer's size; 0 when it is empty or does not fit in 64 bits */
+static u64 dcp6_fb_size(void)
+{
+    u64 size;
+    return __builtin_mul_overflow(cur_boot_args.video.stride, cur_boot_args.video.height, &size)
+               ? 0
+               : size;
+}
+
 static int dcp6_adt_u32(int node, const char *name, u32 *val)
 {
     u32 len = 0;
@@ -618,6 +638,28 @@ static int dcp6_adt_u32(int node, const char *name, u32 *val)
     if (!p || len != sizeof(*val))
         return -1;
     memcpy(val, p, sizeof(*val));
+    return 0;
+}
+
+/*
+ * Panel user-accessible SDR maximum in nits (16.16 fixed point in ADT /backlight-override or
+ * /backlight), or 0 when absent or out of range (1..10000). When /backlight-override carries the
+ * property, its value decides so an invalid override does not fall back to /backlight.
+ */
+static u32 dcp6_adt_max_nits(void)
+{
+    static const char *const paths[] = {"/backlight-override", "/backlight"};
+
+    for (size_t i = 0; i < ARRAY_SIZE(paths); i++) {
+        int bl = adt_path_offset(adt, paths[i]);
+        if (bl < 0 || !adt_getprop(adt, bl, "user-accessible-max-nits", NULL))
+            continue;
+        u32 val;
+        if (dcp6_adt_u32(bl, "user-accessible-max-nits", &val))
+            return 0;
+        u32 nits = val >> 16;
+        return nits && nits <= 10000 ? nits : 0;
+    }
     return 0;
 }
 
@@ -2552,6 +2594,16 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
         return -1;
     if (dcp6.fw && dcp6.fw->disp0_clocks && dcp6_publish_disp0_clocks(dt, n->dcp))
         return -1;
+    u32 nits = dcp6_adt_max_nits();
+    if (nits) {
+        dcp = fdt_path_offset(dt, n->dcp);
+        if (dcp < 0)
+            return -1;
+        int panel = fdt_subnode_offset(dt, dcp, "panel");
+        if (panel >= 0 && !fdt_getprop(dt, panel, "apple,max-brightness", NULL) &&
+            fdt_setprop_u32(dt, panel, "apple,max-brightness", nits))
+            return -1;
+    }
     return 0;
 }
 
@@ -3302,7 +3354,7 @@ static int t6041_headless_display(void *dt)
      * is no /vram here (the ADT has no internal panel to scan out).
      */
     u64 fb = kboot_fb_base();
-    u64 fb_size = ALIGN_UP(cur_boot_args.video.stride * cur_boot_args.video.height, SZ_16K);
+    u64 fb_size = ALIGN_UP(dcp6_fb_size(), SZ_16K);
     char name[48];
     snprintf(name, sizeof(name), "framebuffer@%lx", fb);
     if (!fb || !fb_size || dcp6_resv_conflict(dt, fb, fb_size, name))
@@ -3446,6 +3498,23 @@ static T6050_TEXT int t6050_adt_reg(const char *path, int idx, u64 *addr, u64 *s
                                                    : adt_get_reg(adt, p, "reg", idx, addr, size);
 }
 
+/* A bandwidth scratch word: non-zero, 32-bit aligned, and inside the PMC metadata */
+static bool t6050_bw_valid(u32 bw, u64 meta_size)
+{
+    return bw && !(bw & 3) && meta_size >= 4 && bw <= meta_size - 4;
+}
+
+/* /vram holds the boot framebuffer: whole 16K pages, non-empty, and containing the framebuffer */
+static T6050_TEXT int t6050_check_vram(u64 *vram, u64 *vram_size)
+{
+    u64 fb = cur_boot_args.video.base, fb_size = dcp6_fb_size();
+    if (t6050_adt_reg("/vram", 0, vram, vram_size) || !*vram_size ||
+        ((*vram | *vram_size) & (SZ_16K - 1)) || !fb || !fb_size || fb < *vram ||
+        fb - *vram >= *vram_size || fb_size > *vram + *vram_size - fb)
+        return -1;
+    return 0;
+}
+
 static T6050_TEXT int t6050_setprop(void *dt, int which, const char *prop, const void *val, int len)
 {
     int node = kboot_fdt_path_exact(dt, which < 0 ? "/chosen" : t6050.path[which]);
@@ -3497,13 +3566,9 @@ static T6050_INIT int t6050_check_adt(void)
 
     /* /vram holds the boot framebuffer; it and the firmware stay out of the OS's RAM */
     u64 ram = cur_boot_args.phys_base, ram_size = cur_boot_args.mem_size;
-    u64 fb = cur_boot_args.video.base,
-        fb_size = cur_boot_args.video.stride * cur_boot_args.video.height;
     const struct adt_segment_ranges *seg = adt_getprop(adt, nub, "segment-ranges", &len);
     bool vram_seg = false;
-    if (t6050_adt_reg("/vram", 0, &t6050.vram, &t6050.vram_size) || !t6050.vram_size ||
-        ((t6050.vram | t6050.vram_size) & (SZ_16K - 1)) || !fb || fb < t6050.vram ||
-        fb_size > t6050.vram + t6050.vram_size - fb || !seg || !len || len % sizeof(*seg) ||
+    if (t6050_check_vram(&t6050.vram, &t6050.vram_size) || !seg || !len || len % sizeof(*seg) ||
         len > 16 * sizeof(*seg))
         bail("no /vram holding the boot framebuffer, or bad segment-ranges\n");
     for (u32 i = 0; i < len / sizeof(*seg); i++) {
@@ -3534,7 +3599,7 @@ static T6050_INIT int t6050_check_adt(void)
         if (agents[off] == 1 && birq == fn[2])
             t6050.bw_offset = T6050_BW_BASE + agents[off + 2] * T6050_BW_STRIDE;
     }
-    if (!t6050.bw_offset || t6050.bw_offset > t6050.pmc_size - 4)
+    if (!t6050_bw_valid(t6050.bw_offset, t6050.pmc_size))
         bail("no bandwidth agent scratch for BIRQ 0x%x\n", fn[2]);
 
     /* The firmware's clocks: clock-ids index /arm-io clock-frequencies from 256 */
@@ -3554,11 +3619,9 @@ static T6050_INIT int t6050_check_adt(void)
     }
 
     /* The panel's brightness scale, in nits (16.16) */
-    int bl = adt_path_offset(adt, "/backlight-override");
-    if (bl < 0 || dcp6_adt_u32(bl, "user-accessible-max-nits", &val) || !(val >> 16) ||
-        (val >> 16) > 10000)
+    t6050.nits = dcp6_adt_max_nits();
+    if (!t6050.nits)
         bail("no panel user-accessible-max-nits\n");
-    t6050.nits = val >> 16;
 
     int product = adt_path_offset(adt, "/product");
     t6050.gamut = product < 0 ? NULL : adt_getprop(adt, product, "artwork-display-gamut", &len);
@@ -3936,7 +3999,7 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
         bw = fdt32_ld(&v[3]);
         if (!r || len != 16 || t6050_adt_reg(b, 4, &meta, &meta_size) || fdt64_ld(&r[0]) != meta ||
             fdt64_ld(&r[1]) != meta_size || fdt32_ld(&v[1]) || fdt32_ld(&v[2]) != T6050_NDISP ||
-            bw > meta_size - 4)
+            !t6050_bw_valid(bw, meta_size))
             bail("dcpext%d: apple,bw-scratch is not in %s's PMC metadata\n", n, b);
     } else {
         int disp = adt_path_offset(adt, b), pmgr = adt_path_offset(adt, "/arm-io/pmgr");
@@ -3954,7 +4017,7 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
         v[1] = 0;
         v[2] = cpu_to_fdt32(T6050_NDISP);
         v[3] = cpu_to_fdt32(bw);
-        if (!bw || bw > t6050.pmc_size - 4 || !t6050.pmc_ph)
+        if (!t6050_bw_valid(bw, t6050.pmc_size) || !t6050.pmc_ph)
             bail("dcpext%d: no bandwidth agent scratch\n", n);
     }
 
@@ -4100,11 +4163,7 @@ static T6050_TEXT int t6050_headless_check(void *dt, int engine, u64 *vram, u64 
         bail("OS firmware %s with dcpext%d image %s is not a known pair for external engines\n",
              os_firmware.string, engine, dcp6_is_uuid(uuid, len) ? uuid : "(none)");
 
-    u64 fb = cur_boot_args.video.base,
-        fb_size = cur_boot_args.video.stride * cur_boot_args.video.height;
-    if (t6050_adt_reg("/vram", 0, vram, vram_size) || !*vram_size ||
-        ((*vram | *vram_size) & (SZ_16K - 1)) || !fb || fb < *vram ||
-        fb_size > *vram + *vram_size - fb || dcp6_resv_conflict(dt, *vram, *vram_size, "/vram"))
+    if (t6050_check_vram(vram, vram_size) || dcp6_resv_conflict(dt, *vram, *vram_size, "/vram"))
         bail("no /vram holding the boot framebuffer\n");
     return engine;
 }

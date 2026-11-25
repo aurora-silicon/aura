@@ -101,6 +101,7 @@ struct cpu_info {
     u8 die;
     u8 cluster;
     u8 core;
+    u32 reg;
     u64 impl_reg;
 };
 
@@ -880,7 +881,14 @@ static int smp_init_t8152(void)
             return -1;
         present |= BIT(id);
         cpu_nodes[id] = node;
-        cpu_info[id] = (struct cpu_info){true, 0, (reg >> 8) & 0xff, reg & 0xff, impl[0]};
+        cpu_info[id] = (struct cpu_info){
+            .valid = true,
+            .die = 0,
+            .cluster = (reg >> 8) & 0xff,
+            .core = reg & 0xff,
+            .reg = reg,
+            .impl_reg = impl[0],
+        };
     }
     int boot_cpu = t8152_cpu_index(mrs(MPIDR_EL1));
     if (present != 0xfff || boot_cpu < 0)
@@ -1076,6 +1084,7 @@ int smp_init(void)
         cpu_info[i].valid = true;
         cpu_info[i].core = FIELD_GET(CPU_REG_CORE, reg);
         cpu_info[i].cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
+        cpu_info[i].reg = reg;
         /* T6050 Ultra's reg puts the die at bit 12 (die 1 = 0x1000); use die-id where given. */
         u32 die_id;
         if (ADT_GETPROP(adt, cpu_node, "die-id", &die_id) == sizeof(die_id))
@@ -1457,7 +1466,8 @@ static u64 smp_guest_mpidr(int i)
         if (type && boot && len && boot_len && type[0] == boot[0])
             aff2 = boot_aff2;
     }
-    return ((u64)cpu->cluster << 8) | cpu->core | (aff2 << 16);
+    /* Preserve Aff0, Aff1, and die bits from ADT reg (bit 11 on M1/M2 Ultra, bit 12 on T6050). */
+    return (u64)(cpu->reg & 0xffff) | (aff2 << 16);
 }
 
 /*

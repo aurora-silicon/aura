@@ -764,10 +764,6 @@ static int afkv2_command(afk_epic_ep_t *epic, int channel, u16 type, void *txbuf
         struct afk_qe *qe;
         if (afk_epic_rx(epic, &qe) < 0)
             return -1;
-#ifdef AFK_TRACE
-        printf("AFKV2: command receive size=%u\n", qe->size);
-        hexdump(qe, min((size_t)qe->size + sizeof(*qe), 128));
-#endif
         struct afkv2_hdr *hdr;
         struct afkv2_msg *msg;
         void *payload;
@@ -917,9 +913,6 @@ static void afk_epic_notify_handler(afk_epic_ep_t *epic)
                 printf("AFKV2: failed to handle callback\n");
         } else
             printf("AFKV2: malformed async message\n");
-#ifdef AFK_TRACE
-        hexdump(rmsg, min((size_t)rmsg->size + sizeof(*rmsg), 128));
-#endif
         afk_epic_rx_ack(epic);
         return;
     }
@@ -1017,6 +1010,18 @@ int afk_epic_shutdown_ep(afk_epic_ep_t *epic)
     return 0;
 }
 
+/* The endpoints whose sessions run, as bits from endpoint 0x20. */
+u32 afk_epic_live_endpoints(const afk_epic_t *afk)
+{
+    u32 mask = 0;
+
+    for (int i = 0; afk && i < 0x10; i++)
+        if (afk->endpoint[i] && afk->endpoint[i]->started)
+            mask |= BIT(i);
+
+    return mask;
+}
+
 static const afk_epic_service_ops_t *afk_match_service(afk_epic_ep_t *ep, const char *name)
 {
     const afk_epic_service_ops_t *ops;
@@ -1076,12 +1081,6 @@ int afk_epic_start_interface(afk_epic_ep_t *epic, void *intf, int expected, size
         ret = afk_epic_rx(epic, &msg);
         if (ret < 0)
             return ret;
-
-#ifdef AFK_TRACE
-        printf("AFK[ep:%02x]: service message channel=%u type=%u size=%u\n", epic->ep, msg->channel,
-               msg->type, msg->size);
-        hexdump(msg, min((size_t)msg->size + sizeof(*msg), 128));
-#endif
 
         if (msg->type != TYPE_NOTIFY && msg->type != TYPE_REPLY) {
             dprintf("AFK[ep:%02x]: got unexpected message type %d during iface start\n", epic->ep,

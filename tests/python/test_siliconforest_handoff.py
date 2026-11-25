@@ -24,7 +24,7 @@ def run_c(tmp_path, name, source):
          "-Wno-unused-parameter", "-I", str(lib), "-x", "c", "-",
          *map(str, (lib / f for f in (
              "fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_sw.c", "fdt_wip.c",
-             "fdt_empty_tree.c", "fdt_strerror.c"))), "-o", str(binary)],
+             "fdt_empty_tree.c", "fdt_strerror.c", "fdt_addresses.c"))), "-o", str(binary)],
         input=source, text=True, check=True,
     )
     subprocess.run([str(binary)], check=True)

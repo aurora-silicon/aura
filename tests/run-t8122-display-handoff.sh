@@ -46,7 +46,7 @@ extra=""
 [ -n "${J613_25G83:-}" ] && extra="missing-clock wrong-os missing-profile"
 for dtb in $dtbs; do
     echo "### $(basename "$dtb")"
-    for s in unarmed publish repeat wrong-image not-running outside-segment power-off \
+    for s in unarmed publish publish-27_2 repeat wrong-image not-running outside-segment power-off \
         contract-selftest $extra; do
         if ! "$tmp/t8122-display-host" "$dtb" "$s" > "$tmp/$s.log" 2>&1; then
             fail=1

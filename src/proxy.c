@@ -107,6 +107,11 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                                      request->args[3], request->args[4]);
             break;
         case P_VECTOR:
+            if (display_needs_live_receiver()) {
+                printf("proxy: raw vector cannot hand over the running DCP\n");
+                reply->status = S_ERROR;
+                break;
+            }
             // forcefully restore tps6598x IRQs
             usb_hpm_restore_irqs(1);
             iodev_console_flush();
@@ -431,10 +436,10 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_KBOOT_BOOT:
-#ifdef SPTM_VIRT_ESP
-            /* The Linux kboot/DT/GPU/PCIe tree is gated out of SPTM_VIRT_ESP builds (see
-             * payload.c); a macOS-only ESP stage 2 never services this proxy command. */
-            panic("proxy: P_KBOOT_BOOT is gated out of SPTM_VIRT_ESP builds\n");
+#ifdef SPTM_VIRT
+            /* The Linux kboot/DT/GPU/PCIe tree is gated out of SPTM_VIRT builds (see
+             * payload.c); an SPTM-virt image never services this proxy command. */
+            panic("proxy: P_KBOOT_BOOT is gated out of SPTM_VIRT builds\n");
 #else
             if (kboot_boot((void *)request->args[0]) == 0)
                 return 1;
@@ -447,8 +452,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             kboot_set_initrd((void *)request->args[0], request->args[1]);
             break;
         case P_KBOOT_PREPARE_DT:
-#ifdef SPTM_VIRT_ESP
-            panic("proxy: P_KBOOT_PREPARE_DT is gated out of SPTM_VIRT_ESP builds\n");
+#ifdef SPTM_VIRT
+            panic("proxy: P_KBOOT_PREPARE_DT is gated out of SPTM_VIRT builds\n");
 #else
             reply->retval = kboot_prepare_dt((void *)request->args[0]);
 #endif

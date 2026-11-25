@@ -61,24 +61,41 @@ void iovad_shutdown(iova_domain_t *iovad, dart_dev_t *dart)
         free(blk_free);
     }
 
-    if (dart)
-        for (u64 addr = iovad->base; addr < iovad->limit; addr += SZ_32M)
-            dart_free_l2(dart, addr);
+    /* Count the L2 tables instead of stepping an address up to the limit:
+     * past a limit in the last table below 2^64 the address wraps to 0. */
+    if (dart) {
+        u64 tables = (iovad->limit - iovad->base - 1) / SZ_32M + 1;
+
+        for (u64 i = 0; i < tables; i++)
+            dart_free_l2(dart, iovad->base + i * SZ_32M);
+    }
 
     free(iovad);
 }
 
 bool iova_reserve(iova_domain_t *iovad, u64 iova, size_t sz)
 {
-    iova = ALIGN_DOWN(iova, SZ_16K);
-    sz = ALIGN_UP(sz, SZ_16K);
-
-    if (iova == 0) {
-        iova += SZ_16K;
-        sz -= SZ_16K;
-    }
+    /* a zero-size range holds no page, whatever its address */
     if (sz == 0)
         return true;
+
+    /* Widen to whole pages from the range's end, so an unaligned range that
+     * straddles a page boundary keeps both pages. */
+    const u64 top = ALIGN_DOWN(UINT64_MAX, SZ_16K);
+    if (sz > top || iova > top - sz) {
+        printf("iova_reserve: [%lx; +%lx] wraps\n", iova, sz);
+        return false;
+    }
+    u64 end = ALIGN_UP(iova + sz, SZ_16K);
+    iova = ALIGN_DOWN(iova, SZ_16K);
+
+    /* page 0 is never handed out */
+    if (iova == 0)
+        iova = SZ_16K;
+    /* nothing left: the range was inside page 0 */
+    if (end <= iova)
+        return true;
+    sz = end - iova;
 
     if (!iovad->free_list) {
         printf("iova_reserve: trying to reserve iova range but empty free list\n");
@@ -89,7 +106,7 @@ bool iova_reserve(iova_domain_t *iovad, u64 iova, size_t sz)
     struct iova_block *blk_prev = NULL;
     while (blk != NULL) {
         if (iova >= blk->iova && iova < (blk->iova + blk->sz)) {
-            if (iova + sz >= (blk->iova + blk->sz)) {
+            if (sz > blk->iova + blk->sz - iova) {
                 printf("iova_reserve: tried to reserve [%lx; +%lx] but block in free list has "
                        "range [%lx; +%lx]\n",
                        iova, sz, blk->iova, blk->sz);
@@ -102,7 +119,7 @@ bool iova_reserve(iova_domain_t *iovad, u64 iova, size_t sz)
                 if (blk_prev)
                     blk_prev->next = blk->next;
                 else
-                    iovad->free_list = NULL;
+                    iovad->free_list = blk->next;
 
                 free(blk);
                 return true;
@@ -142,6 +159,12 @@ bool iova_reserve(iova_domain_t *iovad, u64 iova, size_t sz)
 
 u64 iova_alloc(iova_domain_t *iovad, size_t sz)
 {
+    /* Nothing to hand out for 0, and a size that rounds up past SIZE_MAX
+     * would become 0: both would match the first free block without taking
+     * anything from it. */
+    if (sz == 0 || sz > ALIGN_DOWN(SIZE_MAX, SZ_16K))
+        return 0;
+
     sz = ALIGN_UP(sz, SZ_16K);
 
     struct iova_block *blk_prev = NULL;
@@ -175,62 +198,55 @@ u64 iova_alloc(iova_domain_t *iovad, size_t sz)
 
 void iova_free(iova_domain_t *iovad, u64 iova, size_t sz)
 {
+    if (sz == 0)
+        return;
+
+    /* Only ranges iova_alloc() can have handed out may come back: anything
+     * else would put addresses outside the domain on the free list. */
+    u64 first = iovad->base ? iovad->base : SZ_16K;
+    if (iova != ALIGN_DOWN(iova, SZ_16K) || iova < first || iova >= iovad->limit ||
+        sz > iovad->limit - iova)
+        panic("iova_free: [%lx; +%lx] is outside the domain [%lx; %lx)\n", iova, sz, first,
+              iovad->limit);
+    /* limit is page aligned, so the rounded size still ends inside it */
     sz = ALIGN_UP(sz, SZ_16K);
 
+    /* The free list is sorted and coalesced: find the blocks around the range. */
     struct iova_block *blk_prev = NULL;
     struct iova_block *blk = iovad->free_list;
-
-    /* create a new free list if it's empty */
-    if (!blk) {
-        blk = calloc(1, sizeof(*blk));
-        if (!blk)
-            panic("out of memory in iovad_free");
-        blk->iova = iova;
-        blk->sz = sz;
-        blk->next = NULL;
-        iovad->free_list = blk;
-        return;
-    }
-
-    while (blk != NULL) {
-        if ((iova + sz) == blk->iova) {
-            /* extend the block at the beginning */
-            blk->iova -= sz;
-            blk->sz += sz;
-
-            /* if we have just extended the start of the free list we're already done */
-            if (!blk_prev)
-                return;
-
-            /* check if we can merge two blocks otherwise */
-            if ((blk_prev->iova + blk_prev->sz) == blk->iova) {
-                blk_prev->sz += blk->sz;
-                blk_prev->next = blk->next;
-                free(blk);
-            }
-
-            return;
-        } else if ((iova + sz) < blk->iova) {
-            /* create a new block */
-            struct iova_block *blk_new = calloc(1, sizeof(*blk_new));
-            if (!blk_new)
-                panic("iova_free: out of memory\n");
-
-            blk_new->iova = iova;
-            blk_new->sz = sz;
-            blk_new->next = blk;
-
-            if (blk_prev)
-                blk_prev->next = blk_new;
-            else
-                iovad->free_list = blk_new;
-
-            return;
-        }
-
+    while (blk && blk->iova < iova + sz) {
         blk_prev = blk;
         blk = blk->next;
     }
 
-    panic("iovad_free: corruption detected, unable to insert freed range\n");
+    /* The range must not overlap a free block (double free or corruption). */
+    if (blk_prev && blk_prev->iova + blk_prev->sz > iova)
+        panic("iova_free: [%lx; +%lx] is already free\n", iova, sz);
+
+    bool join_prev = blk_prev && blk_prev->iova + blk_prev->sz == iova;
+    bool join_next = blk && iova + sz == blk->iova;
+
+    if (join_prev && join_next) {
+        blk_prev->sz += sz + blk->sz;
+        blk_prev->next = blk->next;
+        free(blk);
+    } else if (join_prev) {
+        blk_prev->sz += sz;
+    } else if (join_next) {
+        blk->iova = iova;
+        blk->sz += sz;
+    } else {
+        struct iova_block *blk_new = calloc(1, sizeof(*blk_new));
+        if (!blk_new)
+            panic("iova_free: out of memory\n");
+
+        blk_new->iova = iova;
+        blk_new->sz = sz;
+        blk_new->next = blk;
+
+        if (blk_prev)
+            blk_prev->next = blk_new;
+        else
+            iovad->free_list = blk_new;
+    }
 }

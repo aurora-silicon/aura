@@ -34,6 +34,35 @@ def load_header():
     return defines + "\n" + struct[:struct.index("};") + 2] + "\n"
 
 
+def _between(text, start, end):
+    start = text.index(start)
+    return text[start:text.index(end, start)]
+
+
+def live_rtkit_record():
+    """The record layout, its property names and its maker, from rtkit.h, display.h and display.c,
+    and chainload.c's size of the entries it adds to the ADT copy."""
+    rtkit_h = (REPO / "src/rtkit.h").read_text()
+    display_h = (REPO / "src/display.h").read_text()
+    display_c = (REPO / "src/display.c").read_text()
+    chainload_c = (REPO / "src/chainload.c").read_text()
+    live_prop = next(line for line in display_h.splitlines()
+                     if line.startswith("#define DISPLAY_LIVE_ADT_PROP "))
+    return "\n".join((
+        _between(rtkit_h, "#define RTKIT_LIVE_MAX_BUFFERS", "bool rtkit_get_live_state("),
+        live_prop,
+        _between(display_h, "#define DISPLAY_LIVE_RTKIT_ADT_PROP", "int display_live_rtkit_record("),
+        _between(display_c, "_Static_assert(sizeof(struct display_live_rtkit_record)",
+                 "/*\n * The record of the DCP this stage handed on running"),
+        _between(chainload_c, "/* DISPLAY_LIVE_ADT_PROP and DISPLAY_LIVE_RTKIT_ADT_PROP",
+                 "/* A copied tree has"),
+        "typedef struct { const char dcp_alias[8]; } display_config_t;",
+        "static const display_config_t *display_get_config(void);",
+        "static const struct rtkit_live_state *dcp_live_rtkit_state(void);",
+        function(display_c, "display_live_rtkit_record"),
+    )) + "\n"
+
+
 def test_chainload_header_rejects_footprint_outside_file(tmp_path):
     source = (REPO / "src/chainload.c").read_text()
     harness = r'''
@@ -54,10 +83,10 @@ int main(void)
         CHAINLOAD_HDR_MAGIC, CHAINLOAD_HDR_VERSION, CHAINLOAD_HDR_F_RUN_BASE, 0x4000, 0
     };
     memcpy(image + CHAINLOAD_HDR_OFFSET, &hdr, sizeof(hdr));
-    assert(chainload_run_footprint(image, sizeof(image)) == sizeof(image));
+    assert(chainload_run_footprint(image, sizeof(image), NULL) == sizeof(image));
     /* Even a complete header cannot describe bytes beyond the supplied file. */
-    assert(chainload_run_footprint(image, sizeof(image) - 1) == 0);
-    assert(chainload_run_footprint(image, CHAINLOAD_HDR_OFFSET + sizeof(hdr) - 1) == 0);
+    assert(chainload_run_footprint(image, sizeof(image) - 1, NULL) == 0);
+    assert(chainload_run_footprint(image, CHAINLOAD_HDR_OFFSET + sizeof(hdr) - 1, NULL) == 0);
     return 0;
 }
 '''
@@ -67,7 +96,7 @@ int main(void)
 def test_chainload_places_images_around_t8140_firmware_ro(tmp_path):
     source = (REPO / "src/chainload.c").read_text()
     bodies = function(source, "chainload_run_footprint") + "\n" + \
-        function(source, "chainload_image")
+        function(source, "chainload_set_adt_range") + "\n" + function(source, "chainload_image")
     harness = r'''
 #define _GNU_SOURCE
 #include <assert.h>
@@ -94,6 +123,7 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define T8112 0x8112
 #define T8122 0x8122
 #define T8140 0x8140
+#define BIT(x) (1UL << (x))
 #define T6000 0x6000
 #define T6020 0x6020
 #define T6030 0x6030
@@ -103,6 +133,8 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 struct boot_args {
     u16 revision, version;
     u64 virt_base, phys_base, mem_size, top_of_kernel_data;
+    void *devtree;
+    u32 devtree_size;
     u8 rest[0x300];
 };
 _Static_assert(offsetof(struct boot_args, phys_base) == 16, "boot_args layout");
@@ -124,8 +156,13 @@ static struct boot_args cur_boot_args;
 static int chip_id, ro_status, adt_node = 1, setprop_ret;
 static u64 ram, home, ro_start, ro_end, live_heap, heap_next, sepfw[2];
 static u64 force_alloc, alloc_fail, allocs, frees, last_alloc;
-static char adt_dummy, message[256];
-static void *adt = &adt_dummy;
+static u8 adt_buf[128];
+#define TEST_SEPFW_OFF 64
+#define TEST_DEVTREE_OFF 80
+static char message[256];
+static void *adt = adt_buf;
+static bool handed_on, inherited_dcp;
+static u64 retained_heap_base;
 static u8 stub_code[STUB_SIZE];
 static struct {
     void *entry;
@@ -136,6 +173,31 @@ static struct {
 #define _chainload_stub_start stub_code
 #define _chainload_stub_end (stub_code + STUB_SIZE)
 
+struct adt_property { char name[32]; u32 size; u8 value[]; };
+struct adt_node_hdr { u32 property_count, child_count; };
+''' + live_rtkit_record() + r'''
+/* The DCP this stage handed on running; described unless rtkit_get_live_state() failed */
+static bool described;
+static const display_config_t display_config = {"dcpext"};
+static const struct rtkit_live_state live_session = {
+    2, {0x17, 0, 0, 0, 0, 0, 0, 0x80000000}, 2,
+    {{1, 0, 0x802424000, 0x9e5010000, 0x10000}, {2, 1, 0x810004000, 0x80696c000, 0x4000}}};
+static const display_config_t *display_get_config(void) { return &display_config; }
+static const struct rtkit_live_state *dcp_live_rtkit_state(void)
+{
+    return handed_on && described ? &live_session : NULL;
+}
+static int display_prepare_live_handoff(void) { return 0; }
+static bool display_handed_on_live(void) { return handed_on; }
+static bool display_needs_live_receiver(void) { return handed_on || inherited_dcp; }
+static bool display_inherited_live_heap(u64 *start)
+{
+    if (inherited_dcp)
+        *start = retained_heap_base;
+    return inherited_dcp;
+}
+static int adt_get_property_count(const void *dt, int node) { return 1; }
+static int adt_first_property_offset(const void *dt, int node) { return node + 8; }
 static u64 heapblock_high_water(void) { return live_heap; }
 static int memory_fw_ro_range(u64 *start, u64 *end)
 {
@@ -147,13 +209,21 @@ static int memory_fw_ro_range(u64 *start, u64 *end)
 }
 static int adt_path_offset(const void *dt, const char *path)
 {
-    assert(dt == adt && !strcmp(path, "/chosen/memory-map"));
+    assert(dt == adt);
+    if (!strcmp(path, "/chosen"))
+        return 0;
+    assert(!strcmp(path, "/chosen/memory-map"));
     return adt_node;
 }
 /* This ADT has no preoslog and no BootArgs entry: their handling must leave the layout alone. */
 static const void *adt_getprop(const void *dt, int node, const char *name, u32 *len)
 {
     assert(dt == adt && node == adt_node);
+    if (handed_on && (!strcmp(name, "SEPFW") || !strcmp(name, "DeviceTree"))) {
+        if (len)
+            *len = 2 * sizeof(u64);
+        return adt_buf + (!strcmp(name, "SEPFW") ? TEST_SEPFW_OFF : TEST_DEVTREE_OFF);
+    }
     assert(!strcmp(name, "preoslog") || !strcmp(name, "BootArgs"));
     return NULL;
 }
@@ -247,6 +317,9 @@ static void setup(int chip, u64 heap_used)
     heap_next = live_heap;
     force_alloc = alloc_fail = allocs = frees = last_alloc = 0;
     setprop_ret = 0;
+    handed_on = inherited_dcp = false;
+    described = true;
+    memset(adt_buf, 0, sizeof(adt_buf));
     message[0] = 0;
     sepfw_src = ram + SEPFW_OFF;
     sepfw[0] = sepfw_src;
@@ -668,6 +741,90 @@ static void composed_image_is_placed(void)
     free(image);
 }
 
+static void carries_live_display_in_chosen(void)
+{
+    setup(T8112, HEAP_USED);
+    handed_on = true;
+    struct adt_node_hdr *node = (void *)adt_buf;
+    node->property_count = 1;
+    struct adt_property *name = (void *)(node + 1);
+    memcpy(name->name, "name", sizeof("name"));
+    name->size = sizeof("chosen");
+    memcpy(name->value, "chosen", sizeof("chosen"));
+    cur_boot_args.devtree_size = sizeof(adt_buf);
+    memcpy(adt_buf + TEST_SEPFW_OFF, sepfw, sizeof(sepfw));
+    u64 original_tree_range[2] = {ram + ADT_OFF, sizeof(adt_buf)};
+    memcpy(adt_buf + TEST_DEVTREE_OFF, original_tree_range, sizeof(original_tree_range));
+
+    u8 image[SZ_16K] = {0};
+    struct chainload_header hdr = {
+        CHAINLOAD_HDR_MAGIC, CHAINLOAD_HDR_VERSION, CHAINLOAD_HDR_F_RUN_BASE, SZ_16K, 0
+    };
+    memcpy(image + CHAINLOAD_HDR_OFFSET, &hdr, sizeof(hdr));
+    assert(chainload_image(image, sizeof(image), NULL, 0) == -1);
+    assert(!next_stage.entry && strstr(message, "cannot inherit the running DCP"));
+    /* A receiver built before the RTKit record would boot the kernel without describing it */
+    hdr.flags |= CHAINLOAD_HDR_F_LIVE_DCP;
+    memcpy(image + CHAINLOAD_HDR_OFFSET, &hdr, sizeof(hdr));
+    message[0] = 0;
+    assert(chainload_image(image, sizeof(image), NULL, 0) == -1);
+    assert(!next_stage.entry && strstr(message, "cannot inherit the running DCP"));
+    hdr.flags |= CHAINLOAD_HDR_F_LIVE_RTKIT;
+    memcpy(image + CHAINLOAD_HDR_OFFSET, &hdr, sizeof(hdr));
+    /* A session this stage cannot describe is handed on to no one */
+    described = false;
+    assert(chainload_image(image, sizeof(image), NULL, 0) == -1);
+    assert(!next_stage.entry && strstr(message, "cannot describe the running DCP's RTKit session"));
+    assert(allocs == 0);
+    described = true;
+    assert(chainload_image(image, sizeof(image), NULL, 0) == 0);
+    struct boot_args *ba = (void *)staged_view(next_stage.args[0]);
+    u64 dst = (u64)ba->devtree - ba->virt_base + ba->phys_base;
+    assert(dst >= live_heap || dst + ba->devtree_size <= cur_boot_args.top_of_kernel_data);
+    assert(ba->top_of_kernel_data >= live_heap);
+    assert(ba->top_of_kernel_data >= dst + ba->devtree_size);
+    struct adt_node_hdr *next = (void *)staged_view(dst);
+    struct adt_property *prop = (void *)(next + 1);
+    u64 retained;
+    assert(next->property_count == 3 && node->property_count == 1);
+    assert(!strcmp(prop->name, DISPLAY_LIVE_ADT_PROP) && prop->size == sizeof(retained));
+    memcpy(&retained, prop->value, sizeof(retained));
+    assert(retained == cur_boot_args.top_of_kernel_data);
+    /* The RTKit record follows as a property of its own, then the tree's first property. */
+    struct display_live_rtkit_record rec;
+    prop = (void *)(prop->value + sizeof(retained));
+    assert(!strcmp(prop->name, DISPLAY_LIVE_RTKIT_ADT_PROP) && prop->size == sizeof(rec));
+    memcpy(&rec, prop->value, sizeof(rec));
+    assert(rec.version == DISPLAY_LIVE_RTKIT_VERSION && rec.size == sizeof(rec));
+    assert(!rec.reserved[0] && !rec.reserved[1] && !strcmp(rec.alias, "dcpext"));
+    assert(!memcmp(&rec.rtkit, &live_session, sizeof(live_session)));
+    assert(!memcmp(prop->value + sizeof(rec), name, sizeof(*name) + 8));
+    assert((u8 *)prop->value + sizeof(rec) == (u8 *)next + sizeof(*next) + LIVE_DCP_ADT_ENTRY_SIZE);
+    const u8 *copied = (const u8 *)next + LIVE_DCP_ADT_ENTRY_SIZE;
+    u64 tree_range[2];
+    memcpy(tree_range, copied + TEST_DEVTREE_OFF, sizeof(tree_range));
+    assert(tree_range[0] == dst && tree_range[1] == SZ_16K);
+    assert(!memcmp(adt_buf + TEST_DEVTREE_OFF, original_tree_range, sizeof(tree_range)));
+    assert(!memcmp(adt_buf + TEST_SEPFW_OFF, sepfw, sizeof(sepfw)));
+}
+
+/* A stage that inherited a running DCP passes its tree on as is: the next one needs both bits */
+static void inherited_dcp_needs_a_record_receiver(void)
+{
+    setup(T8112, HEAP_USED);
+    inherited_dcp = true;
+    retained_heap_base = cur_boot_args.top_of_kernel_data - SZ_16K;
+    u8 image[SZ_16K] = {0};
+    struct chainload_header hdr = {CHAINLOAD_HDR_MAGIC, CHAINLOAD_HDR_VERSION,
+                                   CHAINLOAD_HDR_F_RUN_BASE | CHAINLOAD_HDR_F_LIVE_DCP, SZ_16K, 0};
+    memcpy(image + CHAINLOAD_HDR_OFFSET, &hdr, sizeof(hdr));
+    assert(chainload_image(image, sizeof(image), NULL, 0) == -1);
+    assert(!next_stage.entry && strstr(message, "cannot inherit the running DCP"));
+    hdr.flags |= CHAINLOAD_HDR_F_LIVE_RTKIT;
+    memcpy(image + CHAINLOAD_HDR_OFFSET, &hdr, sizeof(hdr));
+    assert(chainload_image(image, sizeof(image), NULL, 0) == 0 && next_stage.entry);
+}
+
 int main(void)
 {
     /* The failing combined stage 2 (aura + 115 DTBs + U-Boot + variables) */
@@ -690,6 +847,8 @@ int main(void)
     t6000_stage1_before_larger_stage2(0x100088, 0x808000, 0x430000, true);  /* m1n1 1.5.2 size */
     t6000_stage1_before_larger_stage2(0x3b0000, 0x808000, 0x430000, false); /* m1n1 v2.0.0 size */
     t6000_stage1_before_larger_stage2(0x430000, 0x808000, 0x430000, false); /* aura 1.0.0b1 */
+    carries_live_display_in_chosen();
+    inherited_dcp_needs_a_record_receiver();
     composed_image_is_placed();
     puts("chainload run base matrix PASS");
     return 0;

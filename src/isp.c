@@ -318,6 +318,7 @@ int isp_init(void)
                     selected_top = 0x1800000;
                     break;
                 case V13_5:
+                case V27_2: /* legacy layout; segment end fits the 13.5 ceiling */
                     selected_top = 0x1000000;
                     break;
                 default:
@@ -354,6 +355,7 @@ int isp_init(void)
         case ISP_VER_T8122:
             switch (os_firmware.version) {
                 case V14_7:
+                case V27_2: /* T8122 and T603x alike; fits the 14.7 ceiling */
                     selected_top = 0x1000000;
                     break;
                 case V26_6_2:

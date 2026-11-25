@@ -557,7 +557,9 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
         case DPTX_APCALL_ACTIVATE:
             if (dptx_phy_activate(port->phy))
                 return 0xe00002bc; /* kIOReturnError */
-            port->link_rate = port->pending_link_rate = LINK_RATE_HBR;
+            port->link_rate = port->pending_link_rate =
+                dptx_phy_single_rate(port->phy) ? dptx_phy_max_link_rate(port->phy) / 270
+                                                : LINK_RATE_HBR;
             return 0;
         case DPTX_APCALL_DEACTIVATE:
             if (dptx_phy_deactivate(port->phy))
@@ -582,9 +584,9 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
             rate = ((const u8 *)data)[16];
             if (rate * 270 > dptx_phy_max_link_rate(port->phy))
                 return 0xe00002c7;
-            /* A phy qualified only at HBR keeps that single rate. */
-            if (dptx_phy_max_link_rate(port->phy) == 2700 &&
-                (rate != LINK_RATE_HBR || port->link_rate != LINK_RATE_HBR))
+            /* A phy qualified at a single rate keeps it. */
+            if (dptx_phy_single_rate(port->phy) &&
+                (rate * 270 != dptx_phy_max_link_rate(port->phy) || port->link_rate != rate))
                 return 0xe00002c7;
             if (dptx_phy_set_link_rate(port->phy, rate * 270))
                 return 0xe00002bc;
@@ -714,6 +716,11 @@ int dcp_dptx_disconnect(dcp_dptx_if_t *dptx, u32 port)
     if (ret)
         return ret;
     return dptxport_set_hpd(dptx->port[port].service, false);
+}
+
+bool dcp_dptx_is_afkv2(const dcp_dptx_if_t *dptx)
+{
+    return dptx && afk_epic_is_v2(dptx->epic);
 }
 
 dcp_dptx_if_t *dcp_dptx_init(dcp_dev_t *dcp, u32 num_dptxports)
