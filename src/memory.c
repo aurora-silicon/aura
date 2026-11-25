@@ -499,6 +499,7 @@ static bool mmu_holds_ctrr(u64 target, u64 size)
 int mmu_map(u64 from, u64 to, u64 size)
 {
     u64 chunk;
+    bool valid = !!(to & PTE_VALID);
     if (from & MASK(VADDR_L3_OFFSET_BITS) || size & MASK(VADDR_L3_OFFSET_BITS))
         return -1;
 
@@ -513,7 +514,8 @@ int mmu_map(u64 from, u64 to, u64 size)
     if (chunk) {
         mmu_pt_map_l3(from, to, chunk);
         from += chunk;
-        to += chunk;
+        if (valid)
+            to += chunk;
         size -= chunk;
     }
 
@@ -526,7 +528,8 @@ int mmu_map(u64 from, u64 to, u64 size)
         if (chunk) {
             mmu_pt_map_l2(from, to, chunk);
             from += chunk;
-            to += chunk;
+            if (valid)
+                to += chunk;
             size -= chunk;
         }
 
@@ -535,7 +538,8 @@ int mmu_map(u64 from, u64 to, u64 size)
         if (chunk && (to & VADDR_L1_ALIGN_MASK) == 0) {
             mmu_pt_map_l1(from, to, chunk);
             from += chunk;
-            to += chunk;
+            if (valid)
+                to += chunk;
             size -= chunk;
         }
     }
@@ -544,8 +548,8 @@ int mmu_map(u64 from, u64 to, u64 size)
     chunk = ALIGN_DOWN(size, MASK(VADDR_L2_OFFSET_BITS));
     if (!mmu_active() && chunk && (to & VADDR_L2_ALIGN_MASK) == 0) {
         u64 ro_start, ro_end;
-        bool split_ro = (to & PTE_VALID) && memory_fw_ro_range(&ro_start, &ro_end) > 0;
-        bool split_ctrr = (to & PTE_VALID) && mmu_ctrr_ranges() > 0;
+        bool split_ro = valid && memory_fw_ro_range(&ro_start, &ro_end) > 0;
+        bool split_ctrr = valid && mmu_ctrr_ranges() > 0;
         u64 block_size = BIT(VADDR_L2_OFFSET_BITS);
 
         if (!split_ro && !split_ctrr) {
@@ -564,7 +568,8 @@ int mmu_map(u64 from, u64 to, u64 size)
             }
         }
         from += chunk;
-        to += chunk;
+        if (valid)
+            to += chunk;
         size -= chunk;
     }
 
