@@ -9,9 +9,9 @@
 _chainload_stub_start:
     mov x7, x2
     mov x8, x3
-    /* A staged image is already in place: skip the copy, which runs uncached. */
+    /* A staged image is already in place (and mmu_shutdown() already cleaned D-cache). */
     cmp x1, x2
-    b.eq 2f
+    b.eq 3f
 1:
     ldp x5, x6, [x1], #16
     stp x5, x6, [x2]
@@ -26,15 +26,9 @@ _chainload_stub_start:
     add x2, x2, #64
     subs x3, x3, #64
     b.ne 2b
-    dsb sy
-
-    mov x2, x7
-    mov x3, x8
 3:
-    ic ivau, x2
-    add x2, x2, #64
-    subs x3, x3, #64
-    b.ne 3b
+    dsb sy
+    ic iallu
     dsb sy
     isb
 

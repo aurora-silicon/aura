@@ -111,6 +111,36 @@ _start:
     mov x19, x0
 
     /*
+     * Enable I-cache at entry (MMU/D-cache stay off until mmu_init()).
+     * With MMU off an enabled I-cache needs no page tables, and avoids
+     * uncached instruction fetches during relocation, apply_rela, and
+     * pre-MMU page-table setup.
+     */
+    ic iallu
+    dsb sy
+    isb
+    mrs x1, CurrentEL
+    cmp x1, #0xc
+    b.eq .Licache_el3
+    cmp x1, #0x8
+    b.eq .Licache_el2
+    mrs x2, sctlr_el1
+    orr x2, x2, #(1 << 12)
+    msr sctlr_el1, x2
+    b .Licache_done
+.Licache_el3:
+    mrs x2, sctlr_el3
+    orr x2, x2, #(1 << 12)
+    msr sctlr_el3, x2
+    b .Licache_done
+.Licache_el2:
+    mrs x2, sctlr_el2
+    orr x2, x2, #(1 << 12)
+    msr sctlr_el2, x2
+.Licache_done:
+    isb
+
+    /*
      * Run below the address stage 1 staged this image at (chainload.c). On
      * T8140, stage 1 copies a chainloaded image to its own base, where the
      * locked RVBAR of the secondary cores points, but iBoot ends its own
@@ -146,14 +176,23 @@ _start:
     mov x3, x22
 .Lrun_base_copy:
     ldp x4, x5, [x1], #16
+    ldp x6, x7, [x1], #16
+    ldp x8, x9, [x1], #16
+    ldp x10, x11, [x1], #16
     stp x4, x5, [x2], #16
-    subs x3, x3, #16
+    stp x6, x7, [x2], #16
+    stp x8, x9, [x2], #16
+    stp x10, x11, [x2], #16
+    subs x3, x3, #64
     b.ne .Lrun_base_copy
     adrp x1, relocated_from
     add x1, x1, :lo12:relocated_from
     sub x1, x1, x20
     str x20, [x1, x21]
-    /* Publish the copy as the chainload stub publishes an image */
+    /*
+     * Publish the copy with EL0-accessible cache maintenance so the block
+     * stays natively testable under Linux user space (test_start_run_base.py).
+     */
     mov x1, x21
 .Lrun_base_clean:
     dc cvac, x1
@@ -350,6 +389,31 @@ exc_unk:
 .globl cpu_reset
 .type cpu_reset, @function
 cpu_reset:
+    /* Enable I-cache on resetting cores so secondary bringup does not run uncached */
+    ic iallu
+    dsb sy
+    isb
+    mrs x1, CurrentEL
+    cmp x1, #0xc
+    b.eq .Lcpu_ic_el3
+    cmp x1, #0x8
+    b.eq .Lcpu_ic_el2
+    mrs x2, sctlr_el1
+    orr x2, x2, #(1 << 12)
+    msr sctlr_el1, x2
+    b .Lcpu_ic_done
+.Lcpu_ic_el3:
+    mrs x2, sctlr_el3
+    orr x2, x2, #(1 << 12)
+    msr sctlr_el3, x2
+    b .Lcpu_ic_done
+.Lcpu_ic_el2:
+    mrs x2, sctlr_el2
+    orr x2, x2, #(1 << 12)
+    msr sctlr_el2, x2
+.Lcpu_ic_done:
+    isb
+
     mov w0, 'O'
     bl debug_putc
 
