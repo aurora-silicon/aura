@@ -426,7 +426,10 @@ static int dt_set_t8140_wfx_args(int node)
 /*
  * M3 graphics on by default, with no boot.bin config line. The M3 Airs (J613, J615), the M3 Pros
  * (J514S, J516S) and the 16-inch M3 Max with the 40-core GPU (J516C) hand the internal display and
- * the GPU to the OS on every boot, as M1 and M2 Macs do. Each switch below
+ * the GPU to the OS on every boot, as M1 and M2 Macs do. The J504, the 14-inch M3 Max with the
+ * 40-core GPU (J514C) and the T6034 Maxes (J514M, J516M) get the display default only: their GPU
+ * power inputs are stand-ins taken from other machines, not read from this one, so the GPU stays
+ * off unless the owner turns it on with their own line. Each switch below
  * is put in /chosen as "1" unless a config line set it
  * already, so chosen.<switch>=0 in /etc/m1n1.conf (update-m1n1 copies it into boot.bin) still
  * turns that one off, and chosen.asahi,m3-defaults=0 adds none of them (an owner's own lines,
@@ -438,20 +441,23 @@ static int dt_set_t8140_wfx_args(int node)
  * changes: every check behind it (board, firmware, identity, reservations, PMP values, resources)
  * still runs, and a failed check still leaves the boot framebuffer and a disabled GPU node.
  *
- * The Air switches are the recipe the boot package wrote on these Macs: the display handoff
- * (which also passes the PMP values), the GPU, and the stand-in power model with this Mac's
- * leakage fuse. It wrote the GPU lines only beside a display line of 1, so an owner's
+ * The Air switches are the recipe the boot package wrote on these Macs: the display
+ * handoff (which also passes the PMP values), the GPU, and the stand-in power model with this
+ * Mac's leakage fuse. It wrote the GPU lines only beside a display line of 1, so an owner's
  * chosen.asahi,t8122-dcp=0 keeps the default GPU switches off as well; an owner's own GPU line
  * still counts. chosen.asahi,t8122-dcpext gets no default here (dt_t8122_dcpext_armed() decides).
+ * The J504 (the 14" M3 MacBook Pro, the same T8122 and the same 14.x DCP and GPU images) gets
+ * the Air's display switch only; an owner who wants its GPU writes the GPU lines themselves.
  * The Pro switches are its display handoff and GPU; its external display handoffs (t6030-dcpext,
  * t6030-dispext) keep their own lines.
  *
  * The J516C switches are its display handoff and GPU, each on its own as on the Pro: an owner's
  * chosen.asahi,t6031-gpu=0 keeps the GPU off and the display default still goes in, and
  * chosen.asahi,t6031-dcp=0 the other way round. The kernel decides whether it takes the display
- * over; one that does not leaves it on the boot framebuffer. The J514C (a T6031 board the
- * kernel's GPU driver refuses) and the T6034 Maxes (J514M, J516M) are not touched, nor is any
- * other board.
+ * over; one that does not leaves it on the boot framebuffer. J514C gets the display default
+ * only. The T6034 Maxes (J514M, J516M) get the display default only; their external displays
+ * (t6034-dcpext, t6034-dispext) stay off. On these three an owner's chosen.asahi,t6031-gpu=1 or
+ * chosen.asahi,t6034-gpu=1 still turns the GPU on. Other boards are untouched.
  */
 struct m3_default_board {
     const char *soc;
@@ -463,22 +469,36 @@ struct m3_default_board {
     const char *const *graphics;
 };
 
+/* The M3 MacBook Airs (J613, J615): one T8122 recipe. */
 static const char *const m3_air_boards[] = {"apple,j613", "apple,j615", NULL};
 static const char *const m3_air_switches[] = {"asahi,t8122-dcp", "asahi,t8122-gpu",
                                               "asahi,t8122-gpu-power-standin",
                                               "asahi,t8122-gpu-fuse-leakage", NULL};
+/* The J504: the Air's display default only; its GPU power inputs are the J613's stand-ins */
+static const char *const m3_j504_boards[] = {"apple,j504", NULL};
+static const char *const m3_t8122_display_switches[] = {"asahi,t8122-dcp", NULL};
 static const char *const m3_pro_boards[] = {"apple,j514s", "apple,j516s", NULL};
 static const char *const m3_pro_switches[] = {"asahi,t6030-dcp", "asahi,t6030-gpu", NULL};
 static const char *const m3_max_boards[] = {"apple,j516c", NULL};
 static const char *const m3_max_switches[] = {"asahi,t6031-dcp", "asahi,t6031-gpu", NULL};
+/* The J514C: the display default only; its GPU power inputs are stand-ins */
+static const char *const m3_max_j514c_boards[] = {"apple,j514c", NULL};
+static const char *const m3_max_display_switches[] = {"asahi,t6031-dcp", NULL};
+/* The T6034 Maxes: the display default only; their GPU power inputs are stand-ins */
+static const char *const m3_max14_boards[] = {"apple,j514m", "apple,j516m", NULL};
+static const char *const m3_max14_switches[] = {"asahi,t6034-dcp", NULL};
 static const char *const m3_air_graphics[] = {"asahi,t8122-", "asahi,j613-", "asahi,j615-", NULL};
 static const char *const m3_pro_graphics[] = {"asahi,t6030-", NULL};
 static const char *const m3_max_graphics[] = {"asahi,t6031-", NULL};
+static const char *const m3_max14_graphics[] = {"asahi,t6034-", NULL};
 
 static const struct m3_default_board m3_default_boards[] = {
     {"apple,t8122", m3_air_boards, m3_air_switches, true, m3_air_graphics},
+    {"apple,t8122", m3_j504_boards, m3_t8122_display_switches, true, m3_air_graphics},
     {"apple,t6030", m3_pro_boards, m3_pro_switches, false, m3_pro_graphics},
     {"apple,t6031", m3_max_boards, m3_max_switches, false, m3_max_graphics},
+    {"apple,t6031", m3_max_j514c_boards, m3_max_display_switches, false, m3_max_graphics},
+    {"apple,t6034", m3_max14_boards, m3_max14_switches, false, m3_max14_graphics},
 };
 
 #define M3_DEFAULTS_SWITCH "asahi,m3-defaults"
@@ -6304,9 +6324,9 @@ static bool dt_t8122_dcpext_shares_image(const char *alias)
  * With the boot.bin config line chosen.asahi,t8122-dcpext=1 it is armed; any other value turns it
  * off. Without a line it is on by default where the external processor runs the image the
  * internal handoff pinned (dt_t8122_dcpext_shares_image()), unless a config line was lost (an
- * owner's =0 may be among them). Otherwise it stays off without the line: on an M3 Air with 14.x
- * firmware a published marker lets the kernel enable dcpext, and the internal DCP then crashes
- * after disp0 DART faults, leaving the panel dark.
+ * owner's =0 may be among them). Otherwise it stays off without the line: an external DCP that
+ * does not run the image the internal handoff pinned is not known to work. (Pre-aurora15 kernels
+ * crashed the internal DCP after disp0 DART faults with dcpext enabled.)
  */
 static bool dt_t8122_dcpext_armed(const char *alias)
 {
@@ -9456,15 +9476,17 @@ static int dt_set_display(void)
         return 0;
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6030") ||
                !fdt_node_check_compatible(dt, 0, "apple,t8122") ||
-               !fdt_node_check_compatible(dt, 0, "apple,t6031")) {
+               !fdt_node_check_compatible(dt, 0, "apple,t6031") ||
+               (t6034_board(dt) || j516m_board(dt))) {
         /*
          * Fail-soft handoff (kboot_display_handoff.c): it always returns 0, never uses the
          * helpers above (they bail out of kboot or enable nodes) and never enables a node.
          * On T8122 it does nothing unless chosen.asahi,t8122-dcp=1; the external DCP firmware is
          * reserved only after that handoff (dt_t8122_dcpext_armed()). On T6031 it does nothing
          * unless the board is a J514C or J516C, and reserves only __OS_LOG unless
-         * chosen.asahi,t6031-dcp=1 (on a J516C, dt_set_m3_defaults() sets it unless a config line
-         * set it).
+         * chosen.asahi,t6031-dcp=1. dt_set_m3_defaults() supplies it on J514C and J516C;
+         * an owner's explicit value always wins. The T6034 Maxes (J514M, J516M) use their own
+         * handoffs and defaults with the same independent owner choices.
          */
         ret = dt_set_display_handoff(dt);
         if (!fdt_node_check_compatible(dt, 0, "apple,t8122"))
@@ -10094,6 +10116,25 @@ static int dt_set_pmp_t6031(void)
     return 0;
 }
 
+/* Fresh J514M ADT: the same PMP interrupt/DART layout, with a separate handoff. */
+static const struct pmp_values_soc pmp_values_t6034 = {
+    "apple,t6034", "asahi,t6034-pmp", "T6034", {1181, 1180, 1183, 1182}, 0x290300000, 0x4000,
+};
+
+/* J516M uses the same measured layout and its established T6031 namespace. */
+static const struct pmp_values_soc pmp_values_j516m = {
+    "apple,t6034", "asahi,t6031-pmp", "T6034", {1181, 1180, 1183, 1182}, 0x290300000, 0x4000,
+};
+
+static int dt_set_pmp_t6034(void)
+{
+    if (t6034_board(dt))
+        dt_pass_pmp(&pmp_values_t6034);
+    else if (j516m_board(dt))
+        dt_pass_pmp(&pmp_values_j516m);
+    return 0;
+}
+
 /*
  * T8122: pass this Mac's PMP values on either M3 Air with the display
  * handoff switch, chosen.asahi,t8122-dcp=1.
@@ -10106,7 +10147,8 @@ static int dt_set_pmp_t8122(void)
 
     if (!opt || len != 2 || opt[0] != '1' || opt[1] != '\0' ||
         (fdt_node_check_compatible(dt, 0, "apple,j613") &&
-         fdt_node_check_compatible(dt, 0, "apple,j615")))
+         fdt_node_check_compatible(dt, 0, "apple,j615") &&
+         fdt_node_check_compatible(dt, 0, "apple,j504")))
         return 0;
     dt_pass_pmp(&pmp_values_t8122);
     return 0;
@@ -13654,6 +13696,11 @@ int kboot_prepare_dt(void *fdt)
     if (chip_id == T6040 || chip_id == T6041)
         set32(0x50282c040, BIT(31));
 
+    /*
+     * A config line lost before the defaults run also covers the T6034: dt_set_m3_defaults()
+     * dropped its graphics lines, so dt_set_gpu_t6034() finds no opt-in and disables the GPU
+     * node before any measurement.
+     */
     if (dt_set_gpu(dt))
         return -1;
     if (dt_set_multitouch())
@@ -13755,6 +13802,10 @@ int kboot_prepare_dt(void *fdt)
      */
     if (chip_id == T6031) {
         dt_set_pmp_t6031();
+        dt_t6031_fw_uuids(dt);
+        dt_t6031_facts(dt);
+    } else if (chip_id == T6034) {
+        dt_set_pmp_t6034();
         dt_t6031_fw_uuids(dt);
         dt_t6031_facts(dt);
     } else if (chip_id == T6032) {
