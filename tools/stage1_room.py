@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 """How much a Stage 1 image can still grow before it reaches the DCP log buffer.
 
 aura-raw.ld puts the code (.init and .text), .rodata + .rela.dyn and .data on page boundaries, and

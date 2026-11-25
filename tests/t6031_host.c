@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 /*
  * Host test of the T6031 (M3 Max J514C/J516C) handoff on one Mac's ADT: the __OS_LOG reservations
  * and display handoff (kboot_display_handoff.c), the GPU firmware facts, the bounded powered
@@ -81,6 +81,10 @@ int debug_printf(const char *fmt, ...)
  */
 static u64 ram_min = 0x1000223c000UL, ram_len = 0x10bca4b0000UL - 0x1000223c000UL;
 static u64 fb_base = 0x10bd1485c00UL;
+bool kboot_config_lost(void)
+{
+    return false;
+}
 u64 kboot_ram_base(void)
 {
     return ram_min;

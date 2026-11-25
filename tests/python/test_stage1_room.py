@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 """tools/stage1_room.py: the room a Stage 1 link has left, with and without a 64 KiB step
 between .init and .text."""
 

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 """Link a small image with the real linker scripts and check where relocation sections land.
 
 start.S's load header stores _image_footprint with .quad. GNU ld keeps the dynamic relocation for

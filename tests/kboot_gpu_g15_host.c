@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 /*
  * Host test of the G15 GPU setup in kboot_gpu.c (T6030 and T8122), with a synthetic ADT, a
  * simulated bus and real libfdt. run-kboot-gpu-g15.sh copies kboot_gpu.c next to this file and
