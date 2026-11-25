@@ -173,11 +173,29 @@ int main(void)
     assert(regs[WDT_WD2_BARK/4] == 4272000000U && regs[WDT_WD2_CTL/4] == 1);
     assert((reconfig_value & 0x30u) == 0x10u && secondary_value == 0);
 
-    /* wdt_s2r_guard_supported preserves simple-reconfig channel on v2 if ADT advertises it */
+    /*
+     * wdt-version 2 WITH simple-reconfig-wdog-support (e.g. T6040): must stay on legacy WD1
+     * RESET_EN and leave Linux DT untouched so pre-#3029 kernels that pet WD1 keep working.
+     */
     adt_version = 2;
     has_simple_reconfig = true;
     wdt_reconfig = 0;
-    assert(wdt_s2r_guard_supported() && wdt_reconfig == 0x3000);
+    reconfig_value = 0x000000a5u;
+    regs[WDT_WD2_CTL/4] = 0;
+    secondary_value = 0;
+    writes = 0;
+    assert(!wdt_simple_reconfig_reg(&out_pri, &out_rec));
+    assert(wdt_s2r_guard_supported() && wdt_reconfig == 0);
+    assert(wdt_arm_seconds(30) == 0);
+    assert(regs[WDT_ALARM/4] == 720000000u && regs[WDT_CTL/4] == 4 && regs[WDT_COUNT/4] == 0);
+    assert(regs[WDT_WD2_CTL/4] == 0 && reconfig_value == 0x000000a5u && wdt_reconfig == 0);
+    assert(wdt_arm_trial() == 0);
+    assert(regs[WDT_ALARM/4] == 4272000000U && regs[WDT_CTL/4] == 4);
+    assert(regs[WDT_WD2_CTL/4] == 0 && reconfig_value == 0x000000a5u && wdt_reconfig == 0);
+    wdt_base = 0;
+    wdt_reboot();
+    assert(regs[WDT_ALARM/4] == 0x100000u && regs[WDT_CTL/4] == 4);
+    assert(regs[WDT_WD2_CTL/4] == 0 && reconfig_value == 0x000000a5u && wdt_reconfig == 0);
     has_simple_reconfig = false;
     assert(wdt_s2r_guard_supported() && wdt_reconfig == 0);
 

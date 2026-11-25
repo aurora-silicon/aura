@@ -133,6 +133,18 @@ def test_boot_watchdog_arms_on_any_v2_chip_and_a_host_disarms_it(tmp_path):
     assert(wdt_arm_seconds(30) == 0);
     wdt_host_attached();
     assert(disables == 1 && regs[WDT_CTL/4] == 4);
+    /* T6040 shape: wdt-version 2 with simple-reconfig-wdog-support stays on WD1 */
+    chip_id = T6040;
+    adt_version = 2;
+    has_simple_reconfig = true;
+    regs[WDT_WD2_CTL/4] = 0;
+    reconfig_value = 0x55u;
+    assert(wdt_arm_boot() == 0);
+    assert(regs[WDT_ALARM/4] == 4272000000U && regs[WDT_CTL/4] == 4);
+    assert(regs[WDT_WD2_CTL/4] == 0 && reconfig_value == 0x55u);
+    disables = 0;
+    wdt_host_attached();
+    assert(disables == 1 && regs[WDT_CTL/4] == 0);
 ''')
 
 

@@ -37,8 +37,10 @@ static void wdt_set_addrs(u64 primary, u64 reconfig)
 static bool wdt_has_simple_reconfig(int node, int *path, u64 primary_size, u64 *reconfig)
 {
     u64 addr, size;
+    u32 version;
 
-    if (primary_size < 0x30 || !adt_getprop(adt, node, "simple-reconfig-wdog-support", NULL) ||
+    if (primary_size < 0x30 || ADT_GETPROP(adt, node, "wdt-version", &version) < 0 || version < 3 ||
+        !adt_getprop(adt, node, "simple-reconfig-wdog-support", NULL) ||
         adt_get_reg(adt, path, "reg", 3, &addr, &size) || (addr & 3) || size != 4)
         return false;
 
@@ -249,9 +251,11 @@ static int wdt_arm(unsigned seconds)
     u32 alarm = seconds * 24000000u;
 
     /*
-     * On machines reporting simple-reconfig-wdog-support with a 4-byte reg[3], arm WD2 in
-     * bark-IRQ mode with reg[3] bits 5:4 = 01 so expiry takes the simple-reconfig cold-reset
-     * path instead of stalling on RESET_EN.
+     * On wdt-version >= 3 machines reporting simple-reconfig-wdog-support with a 4-byte reg[3],
+     * arm WD2 in bark-IRQ mode with reg[3] bits 5:4 = 01 so expiry takes the simple-reconfig
+     * cold-reset path instead of stalling on RESET_EN. Machines with wdt-version 2 stay on WD1
+     * RESET_EN so existing kernels (which pet WD1) keep working even when the ADT also lists
+     * simple-reconfig-wdog-support.
      */
     if (wdt_has_simple_reconfig(node, path, primary_size, &reconfig)) {
         u32 prev_r3 = wdt_arm_wd2(primary, reconfig, alarm);
@@ -286,8 +290,8 @@ static int wdt_arm(unsigned seconds)
 
 /*
  * A host's request (P_WDT_ARM). wdt_arm() selects the channel from the ADT (WD2 bark-IRQ +
- * simple-reconfig when simple-reconfig-wdog-support and reg[3] are present, otherwise WD1
- * RESET_EN on wdt-version 2) and reads back what it wrote; other layouts refuse.
+ * simple-reconfig when wdt-version >= 3 with simple-reconfig-wdog-support and reg[3], otherwise
+ * WD1 RESET_EN on wdt-version 2) and reads back what it wrote; other layouts refuse.
  */
 int wdt_arm_seconds(unsigned seconds)
 {

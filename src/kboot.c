@@ -1077,9 +1077,10 @@ static bool dt_ranges_identity_covers(int parent, u64 addr, u64 size)
 
 /*
  * Publish the ADT's simple-reconfig routing register (reg[3]) onto the Linux watchdog DT node
- * whenever the ADT reports simple-reconfig-wdog-support and the DT node lacks a "reconfig"
- * entry. Keeps the ADT as the single source so Linux's apple_wdt adopts WD2 on every
- * simple-reconfig SoC (including T8142 whose static DTS lists only the primary window).
+ * whenever the ADT selects the WD2 simple-reconfig path (wdt-version >= 3 with
+ * simple-reconfig-wdog-support) and the DT node lacks a "reconfig" entry. Keeps the ADT as the
+ * single source so Linux's apple_wdt adopts WD2 on every v3+ simple-reconfig SoC (including T8142
+ * if its static DTS lists only the primary window), while leaving wdt-version 2 SoCs on WD1.
  */
 static void dt_set_wdt_reconfig(void)
 {
