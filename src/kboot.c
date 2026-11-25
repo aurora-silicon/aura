@@ -4676,14 +4676,12 @@ static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits)
 }
 
 /*
- * The M3 MTP firmware gets RTKit buffers through its own mapper. Give the
- * OS and any intervening boot stage the DMA window iBoot described for it.
+ * MTP firmware gets RTKit buffers through its own mapper. Give the OS and any
+ * intervening boot stage the DMA window iBoot described for it when the MTP
+ * node is enabled, uses a matching T8110 DART, and has no explicit DT range.
  */
 static int dt_set_mtp_dma_window(void)
 {
-    if (chip_id != T8122 && chip_id != T6030 && chip_id != T6031 && chip_id != T6034)
-        return 0;
-
     int mtp = fdt_node_offset_by_compatible(dt, -1, "apple,mtp");
     if (mtp < 0)
         return 0;
@@ -4692,7 +4690,8 @@ static int dt_set_mtp_dma_window(void)
         return 0;
 
     int dart = dt_get_iommu_node(mtp, 0);
-    if (dart < 0 || fdt_getprop(dt, dart, "apple,dma-range", NULL))
+    if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart") ||
+        fdt_getprop(dt, dart, "apple,dma-range", NULL))
         return 0;
 
     int asc = adt_path_offset(adt, "/arm-io/mtp");

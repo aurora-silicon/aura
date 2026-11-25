@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""Exercise production dt_set_mtp_dma_window() across M3-family and refusal cases."""
+# SPDX-License-Identifier: GPL-2.0-only
+"""Exercise production dt_set_mtp_dma_window() across capability-matched and refusal cases."""
 
 from pathlib import Path
 import subprocess
@@ -143,9 +143,8 @@ static u32 read32(u64 addr)
 
 static unsigned char blob[8192];
 
-static void setup(u32 chip, const char *status, bool add_mtp, bool pre_existing)
+static void setup(const char *status, const char *dart_compat, bool add_mtp, bool pre_existing)
 {
-    chip_id = chip;
     mock_asc_off = 1;
     mock_adart_off = 2;
     mock_has_vm_base = true;
@@ -169,6 +168,8 @@ static void setup(u32 chip, const char *status, bool add_mtp, bool pre_existing)
 
     int dart = fdt_add_subnode(dt, soc, "iommu@39b000000");
     assert(dart >= 0);
+    if (dart_compat)
+        assert(fdt_setprop_string(dt, dart, "compatible", dart_compat) == 0);
     assert(fdt_setprop_u32(dt, dart, "phandle", 7) == 0);
     if (pre_existing) {
         fdt64_t existing[] = {cpu_to_fdt64(0x20000000ULL), cpu_to_fdt64(0x10000000ULL)};
@@ -204,11 +205,12 @@ int main(void)
 {
     u64 base = 0, size = 0;
 
-    /* Positive cases across the M3 family and valid status forms. */
-    const u32 m3_chips[] = {T8122, T6030, T6031, T6034};
-    const char *statuses[] = {NULL, "okay", "ok", "okay"};
-    for (unsigned i = 0; i < 4; i++) {
-        setup(m3_chips[i], statuses[i], true, false);
+    /* Positive cases across valid status forms and unlisted chip IDs with matching capabilities. */
+    const u32 chips[] = {T8122, T6030, T6031, T6034, T8132, 0x9999};
+    const char *statuses[] = {NULL, "okay", "ok", "okay", "okay", "okay"};
+    for (unsigned i = 0; i < 6; i++) {
+        chip_id = chips[i];
+        setup(statuses[i], "apple,t8110-dart", true, false);
         assert(dt_set_mtp_dma_window() == 0);
         assert(get_dma_range(&base, &size));
         assert(base == 0x10000004000ULL && size == 0xffff0000ULL);
@@ -216,90 +218,87 @@ int main(void)
         assert(mock_last_read_addr == mock_dart_mmio + DART_T8110_PARAMS3);
     }
 
-    /* Non-M3 SoCs are untouched. */
-    setup(T6020, "okay", true, false);
-    assert(dt_set_mtp_dma_window() == 0);
-    assert(!get_dma_range(&base, &size) && mock_read32_calls == 0);
-
-    setup(T8132, "okay", true, false);
+    /* Non-t8110 DART provider is skipped before MMIO access. */
+    chip_id = T6030;
+    setup("okay", "apple,t6000-dart", true, false);
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 0);
 
     /* Missing or disabled MTP node is skipped. */
-    setup(T6030, NULL, false, false);
+    setup(NULL, "apple,t8110-dart", false, false);
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 0);
 
-    setup(T6030, "disabled", true, false);
+    setup("disabled", "apple,t8110-dart", true, false);
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 0);
 
     /* Explicit apple,dma-range is preserved. */
-    setup(T6030, "okay", true, true);
+    setup("okay", "apple,t8110-dart", true, true);
     assert(dt_set_mtp_dma_window() == 0);
     assert(get_dma_range(&base, &size));
     assert(base == 0x20000000ULL && size == 0x10000000ULL && mock_read32_calls == 0);
 
     /* Missing ADT nodes are skipped. */
-    setup(T6030, "okay", true, false);
+    setup("okay", "apple,t8110-dart", true, false);
     mock_asc_off = -1;
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 0);
 
-    setup(T6030, "okay", true, false);
+    setup("okay", "apple,t8110-dart", true, false);
     mock_adart_off = -1;
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 0);
 
     /* Zero size or non-16KiB-aligned base/size is rejected before MMIO access. */
-    setup(T6030, "okay", true, false);
+    setup("okay", "apple,t8110-dart", true, false);
     mock_vm_size = 0;
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 0);
 
-    setup(T6030, "okay", true, false);
+    setup("okay", "apple,t8110-dart", true, false);
     mock_vm_base += 0x1000;
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 0);
 
-    setup(T6030, "okay", true, false);
+    setup("okay", "apple,t8110-dart", true, false);
     mock_vm_size += 0x1000;
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 0);
 
     /* Provider MMIO mismatch, powered-down DART, or short MMIO window skips register read. */
-    setup(T6030, "okay", true, false);
+    setup("okay", "apple,t8110-dart", true, false);
     mock_dart_mmio = 0x39b004000ULL;
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 0);
 
-    setup(T6030, "okay", true, false);
+    setup("okay", "apple,t8110-dart", true, false);
     mock_dart_mmio_rc = -1;
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 0);
 
-    setup(T6030, "okay", true, false);
+    setup("okay", "apple,t8110-dart", true, false);
     mock_dart_mmio_size = DART_T8110_PARAMS3;
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 0);
 
     /* Out-of-range VA width or window past 1<<bits is rejected. */
-    setup(T6030, "okay", true, false);
+    setup("okay", "apple,t8110-dart", true, false);
     mock_va_bits = 31;
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 1);
 
-    setup(T6030, "okay", true, false);
+    setup("okay", "apple,t8110-dart", true, false);
     mock_va_bits = 45;
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 1);
 
-    setup(T6030, "okay", true, false);
+    setup("okay", "apple,t8110-dart", true, false);
     mock_va_bits = 40;
     assert(dt_set_mtp_dma_window() == 0);
     assert(!get_dma_range(&base, &size) && mock_read32_calls == 1);
 
-    setup(T6030, "okay", true, false);
+    setup("okay", "apple,t8110-dart", true, false);
     mock_va_bits = 41;
     mock_vm_base = 0x1ffff000000ULL;
     mock_vm_size = 0x20000000ULL;
