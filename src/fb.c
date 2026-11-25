@@ -133,6 +133,20 @@ void fb_update(void)
     memcpy128(fb.hwptr, fb.ptr, fb.size);
 }
 
+static void fb_update_rows(u32 y, u32 h)
+{
+    if (y >= fb.height || !h)
+        return;
+    if (h > fb.height - y)
+        h = fb.height - y;
+    size_t off = (size_t)y * fb.stride;
+    size_t bytes = (size_t)h * fb.stride * sizeof(u32);
+    if ((fb.stride & 3) == 0)
+        memcpy128(fb.hwptr + off, fb.ptr + off, bytes);
+    else
+        memcpy(fb.hwptr + off, fb.ptr + off, bytes);
+}
+
 static void fb_clear_font_row(u32 row)
 {
     const u32 row_size = (console.margin.cols + console.cursor.max_col) * console.font.width * 4;
@@ -228,7 +242,7 @@ void fb_blit(u32 x, u32 y, u32 w, u32 h, void *data, u32 stride, pix_fmt_t pix_f
             fb_set_pixel(x + j, y + i, color);
         }
     }
-    fb_update();
+    fb_update_rows(y, h);
 }
 
 void fb_unblit(u32 x, u32 y, u32 w, u32 h, void *data, u32 stride)
@@ -257,7 +271,7 @@ void fb_fill(u32 x, u32 y, u32 w, u32 h, rgb_t color)
     u32 c = rgb2pixel(color);
     for (u32 i = 0; i < h; i++)
         memset32(&fb.ptr[x + (y + i) * fb.stride], c, w * 4);
-    fb_update();
+    fb_update_rows(y, h);
 }
 
 void fb_clear(rgb_t color)
