@@ -102,3 +102,78 @@ def test_same_release_selects_exact_kernel(offset, instruction, selected, hidden
     release, quirks = tool.xnu_quirks(b"xnu-13432.41.4~")
     assert (release == "xnu-13432.41.4") == selected
     assert ("/arm-io/centauri" in quirks["hide"]) == hidden_radio
+
+
+@pytest.mark.parametrize(("env_val", "expected_write"), [
+    (None, False),
+    ("0", False),
+    ("1", True),
+])
+def test_gpu_stop_reboot_configure(env_val, expected_write, monkeypatch):
+    monkeypatch.syspath_prepend(str(REPO / "proxyclient"))
+    path = REPO / "proxyclient/tools/run_guest_sptm.py"
+    spec = importlib.util.spec_from_file_location("run_guest_sptm", path)
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+
+    assert "AURA_GPU_STOP_REBOOT" in tool.KNOWN_ENV
+    for k in list(os.environ):
+        if k.startswith("AURA_"):
+            monkeypatch.delenv(k, raising=False)
+    if env_val is not None:
+        monkeypatch.setenv("AURA_GPU_STOP_REBOOT", env_val)
+
+    proxy = MagicMock()
+    sym = {
+        "sptm_virt_diag_pa": 0x1000,
+        "sptm_virt_config": 0x2000,
+        "sptm_virt_gpu_stop_reboot": 0x3000,
+    }
+    plan = SimpleNamespace(diag_pa=0)
+    tool.configure(proxy, sym, plan, b"")
+
+    writes = [call.args for call in proxy.write32.call_args_list]
+    if expected_write:
+        assert (0x3000, 1) in writes
+    else:
+        assert all(addr != 0x3000 for addr, _ in writes)
+
+
+def test_tail_console_does_not_overread_before_disconnect(monkeypatch, capsys):
+    monkeypatch.syspath_prepend(str(REPO / "proxyclient"))
+    path = REPO / "proxyclient/tools/run_guest_sptm.py"
+    spec = importlib.util.spec_from_file_location("run_guest_sptm", path)
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+
+    line = b"SPTM-virt[gpu]: the deadline the host asked for: rebooting via watchdog\n"
+
+    class FakeSerial:
+        def __init__(self, data):
+            self._buf = bytearray(data)
+            self._closed = False
+
+        @property
+        def in_waiting(self):
+            return len(self._buf)
+
+        def read(self, size=1):
+            # Model pyserial: requesting more bytes than remain before EOF raises and drops them.
+            if size > len(self._buf):
+                self._buf.clear()
+                raise OSError("disconnected")
+            out = bytes(self._buf[:size])
+            del self._buf[:size]
+            return out
+
+        def close(self):
+            self._closed = True
+
+        def open(self):
+            raise OSError("gone")
+
+    monkeypatch.setattr(tool.time, "sleep", lambda _: None)
+    tool.tail_console(SimpleNamespace(dev=FakeSerial(line)), secs=5, idle=1)
+    out = capsys.readouterr().out
+    assert "TTY> SPTM-virt[gpu]: the deadline the host asked for: rebooting via watchdog" in out
+    assert "--- tail: device gone ---" in out

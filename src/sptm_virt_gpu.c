@@ -19,8 +19,10 @@
 #include "memory.h"
 #include "sptm_virt_priv.h"
 #include "string.h"
+#include "uart.h"
 #include "uartproxy.h"
 #include "utils.h"
+#include "wdt.h"
 
 #define GPU_RING_BYTES (16UL << 20)
 #define GPU_SEEN_MAX   2048
@@ -42,6 +44,7 @@ volatile u64 sptm_virt_gpu_head;
 u32 sptm_virt_gpu_stop_secs;      /* park this long after the first GPU access; 0 = never */
 u32 sptm_virt_gpu_stop_boot_secs; /* park this long after the guest's entry, GPU or not; 0 = never
                                    */
+u32 sptm_virt_gpu_stop_reboot;    /* reboot via watchdog on park instead of entering the proxy */
 u64 sptm_virt_gpu_stop_msg; /* park after a write of this value (a mailbox message); 0 = never */
 u32 sptm_virt_gpu_print_max = 20000;
 
@@ -107,6 +110,15 @@ static void gpu_park(struct exc_info *ctx, const char *why)
     /* First: of several cores that reach here at once, one owns the console and the proxy. */
     sptm_virt_park_others();
     gpu_parked = true;
+    if (sptm_virt_gpu_stop_reboot) {
+        printf("SPTM-virt[gpu]: %s: rebooting via watchdog from cpu%d at XNU pc 0x%lx\n", why,
+               smp_id(), ctx->elr);
+        iodev_console_flush();
+        uart_flush();
+        wdt_reboot();
+        while (1)
+            sysop("wfe");
+    }
     printf("SPTM-virt[gpu]: %s: parking cpu%d in the proxy at XNU pc "
            "0x%lx; ring 0x%lx, %lu records of %lu written (head 0x%lx at 0x%lx)\n",
            why, smp_id(), ctx->elr, (u64)sptm_virt_gpu_ring,
@@ -245,7 +257,8 @@ void sptm_virt_gpu_setup(void)
     /* The deadline park is offered from every GL trap (sptm_virt_gl_sync), GPU trace or not. */
     if (sptm_virt_gpu_stop_boot_secs) {
         gpu_boot_stop_t = mrs(CNTPCT_EL0) + (u64)sptm_virt_gpu_stop_boot_secs * mrs(CNTFRQ_EL0);
-        printf("SPTM-virt[park]: the guest parks in the proxy at its first GL trap after %u s\n",
+        printf("SPTM-virt[park]: the guest %s at its first GL trap after %u s\n",
+               sptm_virt_gpu_stop_reboot ? "reboots via watchdog" : "parks in the proxy",
                sptm_virt_gpu_stop_boot_secs);
     }
     if (!(sptm_virt_flags & SPTM_VIRT_GPU))
