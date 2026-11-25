@@ -20,8 +20,9 @@
 #define SMC_MSG_TYPE GENMASK(7, 0)
 #define SMC_MSG_ID   GENMASK(15, 12)
 
-#define SMC_WRITE_KEY_SIZE GENMASK(23, 16)
-#define SMC_WRITE_KEY_KEY  GENMASK(63, 32)
+#define SMC_WRITE_KEY_WSIZE GENMASK(31, 24)
+#define SMC_WRITE_KEY_SIZE  GENMASK(23, 16)
+#define SMC_WRITE_KEY_KEY   GENMASK(63, 32)
 
 #define SMC_RESULT_RESULT GENMASK(7, 0)
 #define SMC_RESULT_ID     GENMASK(15, 12)
@@ -90,7 +91,7 @@ static void smc_send(smc_dev_t *smc, u64 message)
     rtkit_send(smc->rtkit, &msg);
 }
 
-static int smc_cmd(smc_dev_t *smc, u64 message)
+static int smc_cmd(smc_dev_t *smc, u64 message, u64 *reply)
 {
     u8 id = smc->msgid++ & 0xF;
     assert(!smc->outstanding[id]);
@@ -105,6 +106,8 @@ static int smc_cmd(smc_dev_t *smc, u64 message)
     }
 
     u64 result = smc->ret[id];
+    if (reply)
+        *reply = result;
     u32 ret = FIELD_GET(SMC_RESULT_RESULT, result);
     if (ret) {
         printf("SMC: smc_cmd[0x%x] failed: %u\n", id, ret);
@@ -183,6 +186,30 @@ out_free:
     return NULL;
 }
 
+/*
+ * Write @wvalue to @key and read four bytes back in one exchange. On an SMC GPIO key, a write of
+ * the output command (SMC_GPIO_CMD_OUTPUT) with no level returns the pin's output latch without
+ * changing it.
+ */
+int smc_rw_u32(smc_dev_t *smc, u32 key, u32 wvalue, u32 *value)
+{
+    u64 reply;
+    memcpy(smc->shmem, &wvalue, sizeof(wvalue));
+    u64 msg = FIELD_PREP(SMC_MSG_TYPE, SMC_RW_KEY);
+    msg |= FIELD_PREP(SMC_WRITE_KEY_WSIZE, sizeof(wvalue));
+    msg |= FIELD_PREP(SMC_WRITE_KEY_SIZE, sizeof(*value));
+    msg |= FIELD_PREP(SMC_WRITE_KEY_KEY, key);
+
+    int ret = smc_cmd(smc, msg, &reply);
+    if (ret)
+        return ret;
+    /* A value of up to four bytes comes back in the reply itself */
+    if (FIELD_GET(SMC_RESULT_SIZE, reply) != sizeof(*value))
+        return -1;
+    *value = FIELD_GET(SMC_RESULT_VALUE, reply);
+    return 0;
+}
+
 int smc_write_u32(smc_dev_t *smc, u32 key, u32 value)
 {
     memcpy(smc->shmem, &value, sizeof(value));
@@ -190,7 +217,7 @@ int smc_write_u32(smc_dev_t *smc, u32 key, u32 value)
     msg |= FIELD_PREP(SMC_WRITE_KEY_SIZE, sizeof(value));
     msg |= FIELD_PREP(SMC_WRITE_KEY_KEY, key);
 
-    return smc_cmd(smc, msg);
+    return smc_cmd(smc, msg, NULL);
 }
 
 int smc_write_u64(smc_dev_t *smc, u32 key, u64 value)
@@ -200,7 +227,7 @@ int smc_write_u64(smc_dev_t *smc, u32 key, u64 value)
     msg |= FIELD_PREP(SMC_WRITE_KEY_SIZE, sizeof(value));
     msg |= FIELD_PREP(SMC_WRITE_KEY_KEY, key);
 
-    return smc_cmd(smc, msg);
+    return smc_cmd(smc, msg, NULL);
 }
 
 /* ADT function-reset = pKW4/pKW8: the SMC node's phandle, the function name, then its arguments */

@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
-"""The M4, M4 Pro, M5 Pro and A18 Pro ANE preload handoff: reservations, memory regions and
+"""The M3, M4, M4 Pro, M5 Pro and A18 Pro ANE preload handoff: reservations, memory regions and
 firmware IOVAs.
 
 Runs kboot.c's dt_set_ane_firmware(), dt_set_ane_node(), dt_ane_fill_region() and
 dt_get_or_add_reserved_mem() as they are, on real FDTs built with aura's libfdt, against a
-fake ADT. Segment values are the J616s 26.6.2 /arm-io/ane0, the Neo (J700) 26.6.2 /arm-io/ane,
-the J713 26.6.2 /arm-io/ane and the J714s 27.0 /arm-io/ane0 segment-ranges. The J714s DT also has a soc@200000000 ahead of
-the /soc that holds the ANE, which libfdt resolves "/soc" to.
+fake ADT. Segment values are the J615 27.2 /arm-io/ane, J616s 26.6.2 /arm-io/ane0, the Neo (J700)
+26.6.2 /arm-io/ane, the J713 26.6.2 /arm-io/ane and the J714s 27.0 /arm-io/ane0 segment-ranges.
+The J714s DT also has a soc@200000000 ahead of the /soc that holds the ANE, which libfdt resolves
+"/soc" to.
 """
 
 from pathlib import Path
@@ -18,15 +19,22 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 BOARDS = {
+    "j615": dict(compat="apple,t8122-ane", node="ane@310000000", adt="/arm-io/ane",
+                 text=0x100009C4000, data=0x100015D0000, text_sz=0xC8000, data_sz=0x2A4000,
+                 data_iova=0x100000C8000, phys_base=0x10002000000, sibling=0, nub_preload=1),
     "j616s": dict(compat="apple,t6041-ane", node="ane@484000000", adt="/arm-io/ane0",
-                  text=0x100009D8000, data=0x1000196C000, phys_base=0x10002000000, sibling=0),
+                  text=0x100009D8000, data=0x1000196C000, text_sz=0xC0000, data_sz=0x2AC000,
+                  data_iova=0x100000C0000, phys_base=0x10002000000, sibling=0, nub_preload=0),
     "j700": dict(compat="apple,t8140-ane", node="ane@400000000", adt="/arm-io/ane",
-                 text=0x10000768000, data=0x100019A0000, phys_base=0x10002000000, sibling=0),
+                 text=0x10000768000, data=0x100019A0000, text_sz=0xC0000, data_sz=0x2AC000,
+                 data_iova=0x100000C0000, phys_base=0x10002000000, sibling=0, nub_preload=0),
     "j713": dict(compat="apple,t8132-ane", node="ane@500000000", adt="/arm-io/ane",
-                 text=0x10000AC8000, data=0x10001A2C000, phys_base=0x10002000000, sibling=0),
+                 text=0x10000AC8000, data=0x10001A2C000, text_sz=0xC0000, data_sz=0x2AC000,
+                 data_iova=0x100000C0000, phys_base=0x10002000000, sibling=0, nub_preload=0),
     "j714s": dict(compat="apple,t6050-ane", node="neural-processor@508000000",
-                  adt="/arm-io/ane0", text=0x10000DC0000, data=0x10002114000,
-                  phys_base=0x10003B40000, sibling=1),
+                  adt="/arm-io/ane0", text=0x10000DC0000, data=0x10002114000, text_sz=0xC0000,
+                  data_sz=0x2AC000, data_iova=0x100000C0000, phys_base=0x10003B40000,
+                  sibling=1, nub_preload=0),
 }
 
 
@@ -67,8 +75,8 @@ static struct { u64 phys_base; } cur_boot_args = { @PHYS_BASE@UL };
 ''' + layout + r'''
 static struct adt_segment_ranges segments[2];
 static const char *segment_names;
-static u32 names_len, segments_len, preloaded;
-static bool have_ane0;
+static u32 names_len, segments_len, preloaded, nub_preloaded;
+static bool have_ane0, have_parent_preloaded, have_nub, have_nub_preloaded;
 static u64 dram_base;
 
 static int adt_path_offset(void *tree, const char *path)
@@ -78,6 +86,13 @@ static int adt_path_offset(void *tree, const char *path)
         return have_ane0 ? 1 : -1;
     if (!strcmp(path, "/chosen"))
         return 2;
+    return -1;
+}
+static int adt_subnode_offset(void *tree, int parent, const char *name)
+{
+    (void)tree;
+    if (parent == 1 && !strcmp(name, "iop-ane-nub"))
+        return have_nub ? 3 : -1;
     return -1;
 }
 static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
@@ -96,7 +111,15 @@ static int adt_getprop_copy(void *tree, int node, const char *name, void *out, s
 {
     (void)tree;
     if (node == 1 && !strcmp(name, "pre-loaded") && len == 4) {
+        if (!have_parent_preloaded)
+            return -1;
         memcpy(out, &preloaded, 4);
+        return 4;
+    }
+    if (node == 3 && !strcmp(name, "pre-loaded") && len == 4) {
+        if (!have_nub_preloaded)
+            return -1;
+        memcpy(out, &nub_preloaded, 4);
         return 4;
     }
     if (node == 2 && !strcmp(name, "dram-base") && len == 8) {
@@ -113,11 +136,15 @@ static void reset_adt(void)
 {
     el2 = true;
     have_ane0 = true;
-    preloaded = 1;
+    have_parent_preloaded = !@NUB_PRELOAD@;
+    preloaded = have_parent_preloaded ? 1 : 0;
+    have_nub = @NUB_PRELOAD@;
+    have_nub_preloaded = @NUB_PRELOAD@;
+    nub_preloaded = @NUB_PRELOAD@ ? 1 : 0;
     dram_base = 0x10000000000UL;
-    segments[0] = (struct adt_segment_ranges){@TEXT@UL, 0, 0x10000000000UL, 0xc0000, 1};
-    segments[1] = (struct adt_segment_ranges){@DATA@UL, 0xc0000, 0x100000c0000UL,
-                                              0x2ac000, 0};
+    segments[0] = (struct adt_segment_ranges){@TEXT@UL, 0, 0x10000000000UL, @TEXT_SZ@, 1};
+    segments[1] = (struct adt_segment_ranges){@DATA@UL, @TEXT_SZ@, @DATA_IOVA@UL,
+                                              @DATA_SZ@, 0};
     segments_len = sizeof(segments);
     segment_names = "__TEXT;__DATA";
     names_len = 14;
@@ -207,13 +234,13 @@ static void check_handoff(const char *want_status)
     assert(!strcmp(status(), want_status));
     const fdt32_t *regions = fdt_getprop(dt, ane, "memory-region", &len);
     assert(regions && len == 8);
-    check_region(regions, 0, "ane-firmware-text@@TEXTN@", @TEXT@UL, 0xc0000);
-    check_region(regions, 1, "ane-firmware-data@@DATAN@", @DATA@UL, 0x2ac000);
+    check_region(regions, 0, "ane-firmware-text@@TEXTN@", @TEXT@UL, @TEXT_SZ@);
+    check_region(regions, 1, "ane-firmware-data@@DATAN@", @DATA@UL, @DATA_SZ@);
     const char *names = fdt_getprop(dt, ane, "memory-region-names", &len);
     assert(names && len == 28 && !memcmp(names, "firmware-text\0firmware-data", 28));
     const fdt64_t *iovas = fdt_getprop(dt, ane, "apple,firmware-iovas", &len);
     assert(iovas && len == 16);
-    assert(fdt64_ld(&iovas[0]) == 0x10000000000UL && fdt64_ld(&iovas[1]) == 0x100000c0000UL);
+    assert(fdt64_ld(&iovas[0]) == 0x10000000000UL && fdt64_ld(&iovas[1]) == @DATA_IOVA@UL);
 }
 
 /* A refused handoff disables the node and never reserves anything. */
@@ -240,7 +267,8 @@ static void check_refused(void (*fault)(void), const char *what)
 }
 
 static void no_ane0(void) { have_ane0 = false; }
-static void not_preloaded(void) { preloaded = 0; }
+static void not_preloaded(void) { preloaded = 0; nub_preloaded = 0; }
+static void missing_preloaded(void) { have_parent_preloaded = false; have_nub = false; }
 static void three_segments(void) { segments_len = sizeof(segments) + 32; }
 static void wrong_names(void) { segment_names = "__DATA;__TEXT"; }
 static void unterminated_names(void) { segment_names = "__TEXT;__DATAX"; names_len = 14; }
@@ -302,6 +330,7 @@ int main(void)
 
     check_refused(no_ane0, "no ADT node");
     check_refused(not_preloaded, "not preloaded");
+    check_refused(missing_preloaded, "pre-loaded absent on parent and nub");
     check_refused(three_segments, "three segments");
     check_refused(wrong_names, "segment order");
     check_refused(unterminated_names, "segment names");
@@ -330,6 +359,9 @@ int main(void)
     for key, value in (("@ADT@", b["adt"]), ("@COMPAT@", b["compat"]), ("@NODE@", b["node"]),
                        ("@TEXTN@", "%x" % b["text"]), ("@DATAN@", "%x" % b["data"]),
                        ("@TEXT@", "0x%x" % b["text"]), ("@DATA@", "0x%x" % b["data"]),
-                       ("@PHYS_BASE@", "0x%x" % b["phys_base"]), ("@SIBLING@", str(b["sibling"]))):
+                       ("@TEXT_SZ@", "0x%x" % b["text_sz"]), ("@DATA_SZ@", "0x%x" % b["data_sz"]),
+                       ("@DATA_IOVA@", "0x%x" % b["data_iova"]),
+                       ("@PHYS_BASE@", "0x%x" % b["phys_base"]), ("@SIBLING@", str(b["sibling"])),
+                       ("@NUB_PRELOAD@", str(b["nub_preload"]))):
         program = program.replace(key, value)
     run_c(tmp_path, "ane-preload-" + board, program)

@@ -56,6 +56,7 @@ typedef uint8_t u8;
 #define FIELD_GET(mask, v) (((v) & (mask)) >> __builtin_ctz(mask))
 #define T8132_DCPEXT_READY "apple,t8132-dcpext-firmware-ready"
 #define bail(...) do { return -1; } while (0)
+static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits) { (void)fdt_node; (void)adt_node; (void)bits; return -1; }
 ''' + pmgr_bits + r'''
 static void *dt, *adt;
 static bool chosen_lost;
@@ -190,6 +191,8 @@ __attribute__((unused)) static u32 clear32(uintptr_t addr, u32 clear) { return p
         # The native26 path is T8122-only; J713 must never reach it.
         "static int dt_ext26_snapshot(const char *alias) { assert(0); return -1; }\n"
         "static int dt_ext26_reserve(const char *alias) { assert(0); return -1; }\n"
+        "static int dt_dcpext_inherited_darts(const char *alias) { assert(0); return -1; }\n"
+        "static int dt_t8122_dcpext_reserve(const char *nub, const char *alias) { assert(0); return -1; }\n"
         "static void dt_ext26_step(const char *step) { assert(0); }\n"
         "static int dt_ext26_retain_cpu(const char *alias) { assert(0); return -1; }\n" +
         function(kboot, "dt_reserve_dcpext_ready") +

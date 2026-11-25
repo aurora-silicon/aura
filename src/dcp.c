@@ -3,6 +3,7 @@
 #include "../config.h"
 
 #include "adt.h"
+#include "adt_gpio.h"
 #include "afk.h"
 #include "dcp.h"
 #include "firmware.h"
@@ -83,6 +84,44 @@ bool dcp_left_running(void)
     return dcp_running;
 }
 
+/* Set when the last dcp_init() booted the DCP's RTKit, failed a later step and
+ * quiesced it again. */
+static bool dcp_init_quiesced;
+
+bool dcp_init_left_quiesced(void)
+{
+    return dcp_init_quiesced;
+}
+
+/*
+ * The level of the converter's HPD pin (ADT function-hdmi_hpd): 1 when a sink asserts it, 0 when
+ * it does not, -1 when that cannot be told. The pin belongs to its controller's owner (it is an
+ * interrupt input there), so it is only read, never reconfigured.
+ *
+ * A sink raises HPD only after it sees the connector's +5 V, and a slow one (a TV in standby, a
+ * monitor waking its scaler) takes a while to. So a low pin means "no sink" only when the 5 V
+ * was already on before this stage switched it on; when this stage has just turned it on, or its
+ * state could not be read, the level says nothing yet.
+ */
+int dcp_hdmi_hpd_level(dcp_dev_t *dcp)
+{
+    u32 cfg;
+
+    if (!dcp->hpd_pin.reg)
+        return -1;
+
+    int level = adt_gpio_pin_sample(&dcp->hpd_pin, &cfg);
+    if (level < 0) {
+        printf("dcp: HPD pin is not a readable input (0x%08x), level unknown\n", cfg);
+        return -1;
+    }
+    printf("dcp: HPD pin 0x%08x: %s, HDMI 5 V %s\n", cfg, level ? "asserted" : "not asserted",
+           dcp->hdmi_5v_was_on ? "on before this stage" : "switched on by this stage");
+    if (!level && !dcp->hdmi_5v_was_on)
+        return -1;
+    return level;
+}
+
 static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
 {
     int node = adt_path_offset(adt, cfg->dp2hdmi_gpio);
@@ -90,6 +129,13 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         printf("dcp: failed to find dp2hdmi-gpio node '%s'\n", cfg->dp2hdmi_gpio);
         return -1;
     }
+    int hpd = adt_gpio_function_pin(adt, node, "function-hdmi_hpd", &dcp->hpd_pin);
+    dcp->hpd_on_ap = hpd <= 0;
+    if (hpd)
+        dcp->hpd_pin.reg = 0;
+    if (hpd < 0)
+        printf("dcp: function-hdmi_hpd is not an AP gpio pin, its level stays unread\n");
+    dcp->hdmi_5v_was_on = false;
     struct adt_function_smc_gpio dp2hdmi_pwr, hdmi_pwr;
     u32 pw8_size;
     const struct adt_function_smc_pw8 *pw8_dp2hdmi =
@@ -129,6 +175,15 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         if (dcp->dp2hdmi_pwr_gpio && dcp->hdmi_pwr_gpio) {
             smc_dev_t *smc = smc_init();
             if (smc) {
+                /* Whether the connector's 5 V was already on decides what the HPD pin means: its
+                 * SMC gpio's output latch, queried without changing it */
+                u32 was;
+                int r = smc_rw_u32(smc, dcp->hdmi_pwr_gpio, SMC_GPIO_CMD_OUTPUT, &was);
+                dcp->hdmi_5v_was_on = !r && (was & 1);
+                if (r)
+                    printf("dcp: HDMI 5 V state unknown (%d)\n", r);
+                else
+                    printf("dcp: HDMI 5 V before this stage: 0x%x\n", was);
                 smc_write_u32(smc, dcp->dp2hdmi_pwr_gpio, 0x800001);
                 smc_write_u32(smc, dcp->hdmi_pwr_gpio, 0x800001);
                 smc_shutdown(smc);
@@ -157,6 +212,18 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         return -1;
     }
 
+    /*
+     * The firmware announces which message format its dptx-port service speaks. The AFKv2
+     * format is the same on every firmware that has it. The older format's layouts were only
+     * checked against the 13.5 firmware, so other firmware with that format is not driven.
+     */
+    if (!dcp_dptx_is_afkv2(dcp->dptx_ep) && os_firmware.version != V13_5) {
+        printf("dcp: dptx-port uses the pre-AFKv2 format, checked on 13.5 firmware only\n");
+        dcp_dptx_shutdown(dcp->dptx_ep);
+        dcp_dpav_shutdown(dcp->dpav_ep);
+        return -1;
+    }
+
 #ifdef RTKIT_SYSLOG
     // start system endpoint when extended logging is requested
     dcp->system_ep = dcp_system_init(dcp);
@@ -171,6 +238,16 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
 #endif
 
     return 0;
+}
+
+/*
+ * Whether the firmware has to be told about HPD. When the converter's HPD reaches an AP gpio
+ * (function-hdmi_hpd on its dp2hdmi-gpio node) instead of the phy, a dptx-port service that speaks
+ * AFKv2 brings the port up only once the AP reports HPD. The older format never needed it.
+ */
+bool dcp_dptx_needs_ap_hpd(dcp_dev_t *dcp)
+{
+    return dcp->hpd_on_ap && dcp_dptx_is_afkv2(dcp->dptx_ep);
 }
 
 int dcp_connect_dptx(dcp_dev_t *dcp)
@@ -259,15 +336,9 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
 {
     u32 sid;
 
-    if (cfg && cfg->dptx_phy[0]) {
-        /* J873g reports mBoot-20457.1.29, which is not in the OS firmware
-         * table, and the same dptx-port endpoint works on its USB-C route.
-         * Keep the V13_5 restriction for the machines it was written for. */
-        if (os_firmware.version != V13_5 && chip_id != T8152) {
-            printf("dcp: dtpx-port is only supported with V13_5 OS firmware.\n");
-            return NULL;
-        }
+    dcp_init_quiesced = false;
 
+    if (cfg && cfg->dptx_phy[0]) {
         strncpy(dcp_pmgr_dev, cfg->pmgr_dev, sizeof(dcp_pmgr_dev));
         dcp_die = cfg->die;
         pmgr_adt_power_enable(cfg->dcp);
@@ -379,6 +450,7 @@ out_afk:
 out_rtkit:
     if (!rtkit_quiesce(dcp->rtkit))
         goto out_running;
+    dcp_init_quiesced = true;
     rtkit_free(dcp->rtkit);
 out_iovad:
     iovad_shutdown(dcp->iovad_dcp, dcp->dart_dcp);
@@ -391,6 +463,67 @@ out_free:
 out_running:
     dcp_mark_running();
     return NULL;
+}
+
+/*
+ * Stop every AFK endpoint but leave RTKit running, with its buffers and DART mappings: the next
+ * owner adopts the running core and starts the endpoints again. An interface whose endpoint
+ * stopped is freed; one that did not stays allocated and keeps its AFK endpoint, so
+ * afk_epic_live_endpoints() still reports it. The AFK context goes once every endpoint has
+ * stopped (afk_epic_shutdown() frees it), and is then no longer referenced. -1 if any did not
+ * stop.
+ */
+int dcp_handoff(dcp_dev_t *dcp)
+{
+    int ret = 0;
+    if (dcp_system_shutdown(dcp->system_ep) < 0)
+        ret = -1;
+    else
+        dcp->system_ep = NULL;
+    if (dcp_dptx_shutdown(dcp->dptx_ep) < 0)
+        ret = -1;
+    else
+        dcp->dptx_ep = NULL;
+    if (dcp_dpav_shutdown(dcp->dpav_ep) < 0)
+        ret = -1;
+    else
+        dcp->dpav_ep = NULL;
+    if (afk_epic_shutdown(dcp->afk) < 0)
+        ret = -1;
+    else
+        dcp->afk = NULL;
+    return ret;
+}
+
+static bool dcp_handed_on;
+
+/*
+ * Hand a running DCP on to the next stage: its endpoints stopped (dcp_handoff()), RTKit, its
+ * buffers and DART mappings and the scanout left running. It counts as running from here on, so
+ * it is not started again and the next stage keeps its memory (kboot reserves the heap).
+ */
+static struct rtkit_live_state dcp_live_state;
+static bool dcp_live_state_valid;
+
+int dcp_hand_on(dcp_dev_t *dcp)
+{
+    /* Stopping the endpoints changes neither the endpoint map nor the system buffers. */
+    dcp_live_state_valid = rtkit_get_live_state(dcp->rtkit, &dcp_live_state);
+    int ret = dcp_handoff(dcp);
+    dcp_running = true;
+    dcp_handed_on = !ret;
+    return ret;
+}
+
+bool dcp_handed_on_live(void)
+{
+    return dcp_handed_on;
+}
+
+/* The RTKit session of the DCP handed on running, if this stage negotiated it. */
+const struct rtkit_live_state *dcp_live_rtkit_state(void)
+{
+    return dcp_handed_on && dcp_live_state_valid ? &dcp_live_state : NULL;
 }
 
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep)

@@ -3,6 +3,7 @@
 #ifndef DCP_H
 #define DCP_H
 
+#include "adt_gpio.h"
 #include "afk.h"
 #include "asc.h"
 #include "dart.h"
@@ -39,15 +40,25 @@ typedef struct dcp_dev {
     u32 die;
     u32 dp2hdmi_pwr_gpio;
     u32 hdmi_pwr_gpio;
+    bool hpd_on_ap; /* the converter's HPD reaches an AP gpio (ADT function-hdmi_hpd) */
+    struct adt_gpio_pin hpd_pin; /* that gpio, reg 0 when it is not an AP-visible pin */
+    bool hdmi_5v_was_on;         /* the connector's 5 V was on before this stage switched it */
 } dcp_dev_t;
 
 int dcp_connect_dptx(dcp_dev_t *dcp);
+bool dcp_dptx_needs_ap_hpd(dcp_dev_t *dcp);
+int dcp_hdmi_hpd_level(dcp_dev_t *dcp);
 int dcp_work(dcp_dev_t *dcp);
 
 dcp_dev_t *dcp_init(const display_config_t *config);
 
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep);
+int dcp_handoff(dcp_dev_t *dcp);
+int dcp_hand_on(dcp_dev_t *dcp);
+bool dcp_handed_on_live(void);
+const struct rtkit_live_state *dcp_live_rtkit_state(void);
 bool dcp_left_running(void);
 u32 t8152_psd_state(u32 service);
+bool dcp_init_left_quiesced(void);
 
 #endif

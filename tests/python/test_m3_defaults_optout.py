@@ -269,7 +269,12 @@ static bool nvme_post_m4_passed_off(void)
 }
 static int display_configure(const char *s) { printf("DISPLAY %s\n", s); return 0; }
 static int display_configure_second(const char *s) { printf("DISPLAY2 %s\n", s); return 0; }
+static bool display_set_afk_live(const char *s) { printf("AFKLIVE %s\n", s); return true; }
 #define T8132 0x8132
+#define T8152 0x8152
+/* display.c: the T8152 display hand-off before kboot_prepare_dt(); not this chip. */
+typedef enum { DCP_HANDOFF = 3 } dcp_shutdown_mode;
+static int display_shutdown(dcp_shutdown_mode mode) { (void)mode; return 0; }
 static void mitigations_configure(const char *s) {}
 static int boot_storage_load(const char *spec, struct kernel_header **k, void **f) { return -1; }
 /* A stage 1 configured with its target (stage1_config.c), or not (NULL) */

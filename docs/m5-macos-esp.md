@@ -37,6 +37,13 @@ The manifest's trace and S2R flags are explicit capture settings. Instrumentatio
 can affect the guest; successful plain boots do not qualify every hook set.
 `tests/python/test_esp_macos.py` contains the C/Python planner comparison.
 
+On a Mac whose Stage 1 lives in a separate stub volume group, pass `--root-from <file>`
+with the target volume group's `/chosen` root properties (`boot-uuid`,
+`apfs-preboot-uuid`, `boot-objects-path`, `root-snapshot-name`, `boot-manifest-hash`, and
+optional `asmb/lp-spih`). On a Mac without ExclaveOS, or when the stub's boot credentials
+do not cover the target's exclave image, pass `--no-exclave` (which omits cL4 and hides
+exclave ADT nodes discovered from the supplied ADT).
+
 ## Select and boot
 
 Installation is separate from selection. On the target Linux system, the

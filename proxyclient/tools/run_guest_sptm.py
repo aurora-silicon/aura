@@ -47,6 +47,8 @@ Environment (all optional; 1 enables a switch):
   AURA_XNU_BT              sample XNU backtraces every few seconds per core
   AURA_GPU_TRACE           hook the GPU (sgx reg 0) and PMP registers, record every access
   AURA_GPU_STOP_SECS=<n>   park in the proxy n s after the first GPU access (read the ring)
+  AURA_GPU_STOP_BOOT_SECS=<n>  park n s after guest entry (GPU trace or not)
+  AURA_GPU_STOP_REBOOT     reboot via watchdog on a stop park instead of entering the proxy
   AURA_GPU_STOP_MSG=<v>    park right after the guest writes v to the GPU (a mailbox message)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
@@ -149,6 +151,7 @@ KNOWN_ENV = {
     "AURA_TAIL_IDLE",
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_STOP_BOOT_SECS",
+    "AURA_GPU_STOP_REBOOT",
     "AURA_GPU_STOP_MSG",
     "AURA_GPU_PRINT_MAX",
     "AURA_SAMPLE_HZ",
@@ -275,6 +278,28 @@ XNU_QUIRKS = (
                    ("task PAC key reprogramming (3)", "BootKC-rx", 0x3148614, 0x540001e0,
                     0x1400000f),
                    ("task PAC key reprogramming (4)", "BootKC-rx", 0x31488c4, 0x540001e0,
+                    0x1400000f))),
+    # T8112's xnu-13432.41.4 (macOS 27.2, 26B123, kernelcache.release.mac14g).
+    # Keeps PCIe/Wi-Fi/Ethernet visible (hide=()) so networking and SSH stay up;
+    # patches NVRAM writes (nvram_ro), rorgn, Image4 mix-and-match, and EL1 PAC keys.
+    dict(release=b"xnu-13432.41.4~", fingerprint=("__TEXT_EXEC", 0x1ca30c, 0xaa0003e8),
+         hide=(),
+         ro_relax=(("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3a69d80, 0x540002a9,
+                    0x14000015),),
+         rorgn=(("rorgn register read", "BootKC-rx", 0x32be540, 0x370001a8, 0x1400000d),),
+         rorgn_globals=(0xec8020, 0xec8028),
+         nvram_mutable=(("Image4 storageInit mix-and-match question", "BootKC-rx",
+                         0x2b64db4, 0x34000080, 0x14000022),),
+         nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1ca30c, 0xaa0003e8, 0x52800000),
+                   ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1ca310, 0x52805840,
+                    0xd65f03c0)),
+         pac_keys=(("task PAC key reprogramming (switch)", "BootKC-rx", 0x30dbd10, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (2)", "BootKC-rx", 0x30dbdd4, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (3)", "BootKC-rx", 0x30dbfdc, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (4)", "BootKC-rx", 0x30dc288, 0x540001e0,
                     0x1400000f))),
     # T6041's xnu-13432.41.4 (macOS 27.2.1, 26B131, kernelcache.release.mac16j). Its guest needs
     # only nvram_ro: about 27 s in, while APFS mounts the volumes, AppleARMNORNVRAM sends the NOR a
@@ -668,10 +693,16 @@ def debug_port(adt, proxy_phy=0, port=None):
         walk(kid, "", None)
     by_ph = {_u32(pr["AAPL,phandle"]): h for h, pr in nodes.items() if "AAPL,phandle" in pr}
 
-    def device(h):  # the /arm-io device, or the device on an I2C or SPMI bus, a node belongs to
-        # A port controller can sit on an SPMI bus with the PMU; the bus itself stays.
-        bus_child = h.startswith(("/arm-io/i2c", "/arm-io/nub-spmi", "/arm-io/aop-spmi"))
-        while h.count("/") > (3 if bus_child else 2):
+    def device(h):  # the /arm-io device, or the device on an I2C/SPMI bus (or HPM bus manager), a node belongs to
+        # A port controller can sit on an SPMI/I2C bus (or under an i2c/hpmBusManager shared
+        # across ports); the bus and shared manager stay so sibling ports keep working.
+        if "/hpmBusManager/" in h:
+            limit = 4
+        elif h.startswith(("/arm-io/i2c", "/arm-io/nub-spmi", "/arm-io/aop-spmi")):
+            limit = 3
+        else:
+            limit = 2
+        while h.count("/") > limit:
             h = parent[h]
         return h
 
@@ -729,6 +760,8 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
         p.write32(sym["sptm_virt_gpu_stop_secs"], env_int("AURA_GPU_STOP_SECS"))
     if os.environ.get("AURA_GPU_STOP_BOOT_SECS"):
         p.write32(sym["sptm_virt_gpu_stop_boot_secs"], env_int("AURA_GPU_STOP_BOOT_SECS"))
+    if env_on("AURA_GPU_STOP_REBOOT"):
+        p.write32(sym["sptm_virt_gpu_stop_reboot"], 1)
     if os.environ.get("AURA_GPU_STOP_MSG"):
         p.write64(sym["sptm_virt_gpu_stop_msg"], env_int("AURA_GPU_STOP_MSG"))
     if os.environ.get("AURA_GPU_PRINT_MAX"):
@@ -799,7 +832,9 @@ def tail_console(iface, secs, idle):
             print(f"--- tail: console silent for {idle:g}s ---", flush=True)
             break
         try:
-            chunk = dev.read(4096)
+            # Read only what is already buffered (or wait for 1 byte): pyserial's read(4096)
+            # loops until full or timeout and discards buffered bytes if the link resets mid-read.
+            chunk = dev.read(max(1, min(4096, dev.in_waiting)))
         except (serial.serialutil.SerialException, OSError) as e:
             print(f"--- tail: read error ({e}); reopening ---", flush=True)
             try:

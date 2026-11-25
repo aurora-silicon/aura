@@ -246,8 +246,8 @@ static bool config_seen = false;
 static bool config_lost_passed = false;
 
 static const char *const config_names[] = {
-    "chosen.", "chainload=",        "boot=", "nvme.sart=", "display=", "mitigations=",
-    "tso=",    "m1n1.config-lost=", "hib=",
+    "chosen.", "chainload=",        "boot=", "nvme.sart=",    "display=", "mitigations=",
+    "tso=",    "m1n1.config-lost=", "hib=",  "dcp.afk-live=",
 #ifdef SPTM_VIRT_ESP
     "macos=",
 #endif
@@ -314,6 +314,10 @@ static bool check_var(u8 **p)
         /* Started by an earlier aura stage, which has had its host window already. */
         if (nvme_set_sart_var(val))
             stage1_chained = true;
+    } else if (IS_VAR("dcp.afk-live=")) {
+        /* An earlier aura stage's display, adopted here with its live endpoints. */
+        if (!display_set_afk_live(val))
+            printf("Payload: malformed dcp.afk-live=%s\n", val);
     } else if (IS_VAR("nvme.adopt=")) {
         /* An older Stage 1 hands its session on running; nvme_init() finds it by itself. */
         stage1_chained = true;
@@ -620,16 +624,19 @@ int payload_run(void)
             secboot_measure("dtb", fdt, fdt_totalsize(fdt), SECBOOT_MEASURED);
             secboot_measure("kernel", kernel, kernel_payload_size, SECBOOT_MEASURED);
         }
-#ifdef SPTM_VIRT_ESP
+#ifdef SPTM_VIRT
         /*
-         * A macOS-only ESP stage 2 (SPTM_VIRT_ESP) boots via the macos= line above and never
-         * prepares a Linux devicetree or hands off to a kernel. The whole kboot/DT/display/GPU-
-         * initdata/PCIe tree is gated out of this build so the vital region fits below the DCP
-         * __OS_LOG buffer (aura-raw.ld _file_limit). Reaching here means a boot=/chainload= path
-         * produced a kernel+fdt, which this image deliberately does not support: fail loudly.
+         * An SPTM-virt image hosts a macOS guest (via run_guest_sptm.py or the ESP macos= path)
+         * and never prepares a Linux devicetree or hands off to a Linux kernel. Gating out the
+         * Linux kboot/DT/display/GPU-initdata/PCIe tree keeps both _file_vital_end below the DCP
+         * __OS_LOG buffer (aura-raw.ld _file_limit) and the full in-place image below it.
          */
-        panic("payload: Linux kboot path is gated out of SPTM_VIRT_ESP builds\n");
+        panic("payload: Linux kboot path is gated out of SPTM_VIRT builds\n");
 #else
+        /* T8152: hand the display controllers this stage started to Linux powered off, with
+         * their endpoints stopped and RTKit running, before the device tree reports them. */
+        if (chip_id == T8152 && display_shutdown(DCP_HANDOFF) < 0)
+            printf("display: a DCP endpoint did not stop; Linux is told which\n");
         if (kboot_prepare_dt(fdt)) {
             printf("Failed to prepare FDT!\n");
             goto boot_failed;

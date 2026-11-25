@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: MIT
-"""Run kboot_gpu.c's T6041 GPU fill on real FDTs with a modelled ADT.
+"""Run kboot_gpu.c's T6041 GPU fill on real FDTs with a modelled ADT and SGX.
 
-The accepted cases use the operating points, CS/AFR tables and regions of one J616C (32-core
-M4 Max) ADT on 26.6.2 (two gfx-asc segments: __TEXT and __DATA) and on 27.2 / 26B123 (three
-gfx-asc segments: __TEXT, __DATA and a contiguous __DATA_SHARED_RO tail merged into
-gpu-fw-data).
+The accepted cases use the operating points, CS/AFR tables, AON PTD rows, active MCC mask and
+regions of one J616C (32-core M4 Max) ADT on 26.6.2 (two gfx-asc segments: __TEXT and __DATA) and
+on 27.2 / 26B123 (three gfx-asc segments: __TEXT, __DATA and a contiguous __DATA_SHARED_RO tail
+merged into gpu-fw-data), plus a 40-core (8-MCC) topology check.
 
-Failure model for 3-segment 27.2 framing recorded before implementation:
+Failure model for 3-segment 27.2 framing and v1 handoff recorded before implementation:
 - segment-ranges counts other than 2 or 3 must be refused.
 - A 3-segment gfx-asc must match /arm-io/sgx gfx-data-shared-ro-{base,size} on physical base,
   identity remap and non-zero 16 KiB-aligned size, sit immediately after gfx-data with no gap
   or wrap, and have zero (or absent) gfx-data-shared-rw-{base,size}.
 - Extending gpu-fw-data by gfx-data-shared-ro-size must still satisfy 42-bit OAS bounds and
   pairwise non-overlap against every other UAT and firmware reservation (including gpu-fw-text).
+- SGX power is enabled only around the SGX register reads and restored before returning; every
+  ADT/DT refusal happens before SGX is powered.
+- Handoff v1 emits only verified ADT and SGX properties (active-mcc-bit-vector, aon-table,
+  perf-map-a/b, perf-relative-b, perf-base-pstate, 40-bit core-mask, t6041-handoff-version = 1)
+  and never emits unverified efuse-derived leakage/power properties.
 - Every refusal leaves the GPU node and all six reserved-memory nodes disabled.
 """
 
@@ -45,6 +50,10 @@ typedef unsigned long u64;
 _Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define SZ_16K 0x4000
+#define MASK(x) ((1UL << (x)) - 1)
+#define sysop(op) ((void)0)
+enum { GUARD_OFF = 0, GUARD_MARK = 2, GUARD_SILENT = 0x100 };
+static int exc_guard, exc_count;
 
 static void *adt = (void *)1;
 static unsigned char blob[65536];
@@ -59,9 +68,29 @@ static int firmware_set_fdt(void *tree, int node, const char *prop,
         cells[i] = cpu_to_fdt32(version->num[i]);
     return fdt_setprop(tree, node, prop, cells, version->num_length * sizeof(u32));
 }
+
+/* SGX power: the fill must power it only around the register reads and restore it after. */
+struct pmgr_saved_modes { int count; };
+static bool sgx_on;
+static int enables, restores;
+static int pmgr_adt_power_enable_traced_saved(const char *path, struct pmgr_saved_modes *saved)
+{
+    assert(!strcmp(path, "/arm-io/sgx"));
+    enables++;
+    sgx_on = true;
+    saved->count = 1;
+    return 0;
+}
+static void pmgr_restore_modes(struct pmgr_saved_modes *saved)
+{
+    assert(saved->count == 1);
+    restores++;
+    sgx_on = false;
+}
 '''
 
 ADT = r'''
+#define SGX_BASE 0x288000000UL
 static struct perf_state states[64];
 static struct {
     u64 dies, count;
@@ -71,8 +100,12 @@ struct adt_segment_ranges { u64 phys, iova, remap; u32 size, unk; };
 static struct adt_segment_ranges segments[4];
 static u32 segments_len;
 static u64 region[6][2], shared_ro[2], shared_rw[2];
-static u32 raw_count, raw_tables, raw_max_state;
-static bool missing_sgx, missing_asc, has_shared_ro, has_shared_rw, bad_shared_rw_len;
+static u32 raw_count, raw_tables, raw_max_state, active_mcc;
+static u32 base_pstate, base_length;
+static u32 ptd_table[18], ptd_len;
+static u32 sgx_masks[3], map_a[16], map_b[16];
+static bool missing_sgx, missing_asc, missing_aon, missing_mcc;
+static bool have_base_pstate, has_shared_ro, has_shared_rw, bad_shared_rw_len, sgx_fault;
 static const char *const region_names[5] = {
     "gfx-handoff", "gfx-shared-l2-region", "gfx-shared-region", "gpu-region", "gfx-data",
 };
@@ -84,7 +117,24 @@ static int adt_path_offset(void *tree, const char *path)
         return missing_sgx ? -1 : 1;
     if (!strcmp(path, "/arm-io/gfx-asc"))
         return missing_asc ? -1 : 2;
+    if (!strcmp(path, "/arm-io/aon-ptd"))
+        return missing_aon ? -1 : 3;
     return -1;
+}
+static int adt_path_offset_trace(void *tree, const char *path, int *trace)
+{
+    (void)tree;
+    if (!strcmp(path, "/arm-io/sgx") && !missing_sgx) {
+        trace[0] = 1;
+        return 1;
+    }
+    return -1;
+}
+static int adt_get_reg(void *tree, int *path, const char *prop, int index, u64 *base, u64 *size)
+{
+    (void)tree; (void)path; (void)prop; (void)index; (void)size;
+    *base = SGX_BASE;
+    return 0;
 }
 static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
 {
@@ -92,10 +142,12 @@ static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
     if (!len) len = &dummy;
     (void)tree;
     if (node == 2 && !strcmp(name, "segment-ranges")) { *len = segments_len; return segments; }
+    if (node == 3 && !strcmp(name, "ptd_data_table")) { *len = ptd_len; return ptd_table; }
     if (node != 1) return NULL;
     if (!strcmp(name, "perf-states")) { *len = raw_count * raw_tables * sizeof(states[0]); return states; }
     if (!strcmp(name, "cs-perf-states")) { *len = sizeof(cs); return &cs; }
     if (!strcmp(name, "afr-perf-states")) { *len = sizeof(afr); return &afr; }
+    if (have_base_pstate && !strcmp(name, "gpu-perf-base-pstate")) { *len = base_length; return &base_pstate; }
     if (has_shared_ro && !strcmp(name, "gfx-data-shared-ro-base")) { *len = sizeof(u64); return &shared_ro[0]; }
     if (has_shared_ro && !strcmp(name, "gfx-data-shared-ro-size")) { *len = sizeof(u64); return &shared_ro[1]; }
     if (has_shared_rw && !strcmp(name, "gfx-data-shared-rw-base")) {
@@ -114,6 +166,7 @@ static int adt_copy(const char *name, void *out, size_t size)
     if (!strcmp(name, "perf-state-count")) value = raw_count;
     else if (!strcmp(name, "perf-state-table-count")) value = raw_tables;
     else if (!strcmp(name, "gpu-num-perf-states")) value = raw_max_state;
+    else if (!missing_mcc && !strcmp(name, "active-mcc-bit-vector")) value = active_mcc;
     else if (has_shared_ro && (!strcmp(name, "gfx-data-shared-ro-base") ||
                                !strcmp(name, "gfx-data-shared-ro-size"))) {
         if (size != sizeof(u64)) return -1;
@@ -141,6 +194,27 @@ static int adt_copy(const char *name, void *out, size_t size)
     return sizeof(value);
 }
 #define ADT_GETPROP(a, n, name, ptr) adt_copy(name, (ptr), sizeof(*(ptr)))
+
+static u32 read32(u64 addr)
+{
+    if (!sgx_on || sgx_fault) {
+        exc_count++;
+        return 0;
+    }
+    for (int i = 0; i < 3; i++)
+        if (addr == SGX_BASE + 0xe01500 + 4 * i)
+            return sgx_masks[i];
+    for (int bank = 0; bank < 2; bank++) {
+        u64 base = SGX_BASE + (bank ? 0xe01480 : 0xe01400);
+        const u32 *map = bank ? map_b : map_a;
+        if (addr >= base && addr < base + 32 && !(addr & 3)) {
+            u32 i = (addr - base) / 2;
+            return map[i] | (map[i + 1] << 16);
+        }
+    }
+    exc_count++;
+    return 0;
+}
 '''
 
 MAIN = r'''
@@ -156,6 +230,16 @@ static const u32 j616c_mv[4][16] = {
 static const u32 j616c_aux_mhz[8] = {24, 338, 618, 796, 992, 1188, 1380, 1470};
 static const u32 j616c_aux_uv[8] = {585000, 585000, 630000, 680000,
                                     720000, 770000, 865000, 900000};
+static const u32 j616c_aon_want[15] = {
+    0x67305452, 0x00c20001, 0x00001401,
+    0x67315452, 0x00970001, 0x00001401,
+    0x67325452, 0x00920001, 0x00001401,
+    0x67335452, 0x00c70001, 0x00001401,
+    0x72305452, 0x012c0001, 0x00001401,
+};
+static const u32 good_a[16] = {0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 15};
+static const u32 good_b[16] = {0, 1, 2, 3, 4, 6, 7, 9, 11, 13, 15};
+static const u32 want_rel_b[16] = {0, 0, 22, 36, 47, 57, 68, 78, 84, 91, 100};
 static const char *const region_paths[6] = {
     "/reserved-memory/uat-handoff", "/reserved-memory/uat-l2-pagetables",
     "/reserved-memory/uat-pagetables", "/reserved-memory/uat-ttbs",
@@ -227,9 +311,21 @@ static void world_with(const char *compatible, int gpu_opps, int gpu_cells, int 
                                               .remap = region[4][0], .size = region[4][1]};
     segments_len = 2 * sizeof(segments[0]);
     os_firmware = (struct fw_version_info){"26.6.2", {26, 6, 2}, 3};
-    raw_count = 16; raw_tables = 4; raw_max_state = 15;
-    missing_sgx = missing_asc = has_shared_ro = has_shared_rw = bad_shared_rw_len = false;
+    raw_count = 16; raw_tables = 4; raw_max_state = 15; active_mcc = 0x3f;
+    base_pstate = 1; base_length = sizeof(u32);
+    have_base_pstate = false;
+    /* Include one unrelated PTD row alongside the five GPU/SoC rows to verify filtering. */
+    ptd_table[0] = 0x73305452; ptd_table[1] = 0x00f20001; ptd_table[2] = 0x00001601;
+    memcpy(&ptd_table[3], j616c_aon_want, sizeof(j616c_aon_want));
+    ptd_len = 18 * sizeof(u32);
+    sgx_masks[0] = 0xfdbf6fdb; sgx_masks[1] = 0xf6; sgx_masks[2] = 0;
+    memcpy(map_a, good_a, sizeof(map_a));
+    memcpy(map_b, good_b, sizeof(map_b));
+    missing_sgx = missing_asc = missing_aon = missing_mcc = false;
+    has_shared_ro = has_shared_rw = bad_shared_rw_len = sgx_fault = false;
     shared_ro[0] = shared_ro[1] = shared_rw[0] = shared_rw[1] = 0;
+    sgx_on = false;
+    enables = restores = exc_count = 0;
 }
 
 static void world(void) { world_with("apple,agx-t6041", 16, 4, 8); }
@@ -262,7 +358,7 @@ static const char *status(const char *path)
     return s ? s : "okay";
 }
 
-static void expect_refused(const char *what)
+static void expect_refused(const char *what, int expected_enables)
 {
     assert(dt_set_gpu_t6041(dt) == 0);
     if (strcmp(status("gpu"), "disabled")) {
@@ -274,7 +370,14 @@ static void expect_refused(const char *what)
             fprintf(stderr, "%s: %s left published\n", what, region_paths[i]);
             exit(1);
         }
-    assert(!fdt_getprop(dt, fdt_path_offset(dt, "gpu"), "apple,firmware-version", NULL));
+    if (sgx_on || enables != expected_enables || restores != enables) {
+        fprintf(stderr, "%s: SGX power enables %d restores %d on %d\n", what, enables, restores,
+                sgx_on);
+        exit(1);
+    }
+    int gpu = fdt_path_offset(dt, "gpu");
+    assert(!fdt_getprop(dt, gpu, "apple,firmware-version", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,t6041-handoff-version", NULL));
     printf("PASS refused: %s\n", what);
 }
 
@@ -282,18 +385,22 @@ static void expect_untouched(const char *what, const char *gpu_status)
 {
     assert(dt_set_gpu_t6041(dt) == 0);
     assert(!strcmp(status("gpu"), gpu_status));
+    assert(enables == 0 && restores == 0 && !sgx_on);
     for (int i = 0; i < 6; i++)
         assert(!strcmp(status(region_paths[i]), "disabled"));
-    assert(!fdt_getprop(dt, fdt_path_offset(dt, "gpu"), "apple,firmware-version", NULL));
+    int gpu = fdt_path_offset(dt, "gpu");
+    assert(!fdt_getprop(dt, gpu, "apple,firmware-version", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,t6041-handoff-version", NULL));
     printf("PASS untouched: %s\n", what);
 }
 
 int main(void)
 {
-    /* The accepted case publishes the unit's tables and the boot's regions. */
+    /* The accepted case publishes verified ADT/SGX handoff v1 and restores SGX power. */
     world();
     assert(dt_set_gpu_t6041(dt) == 0);
     assert(!strcmp(status("gpu"), "okay"));
+    assert(enables == 1 && restores == 1 && !sgx_on);
     for (int i = 0; i < 6; i++) {
         assert(!strcmp(status(region_paths[i]), "okay"));
         int len;
@@ -322,11 +429,54 @@ int main(void)
         n++;
     }
     assert(n == 8);
-    const fdt32_t *version =
-        fdt_getprop(dt, fdt_path_offset(dt, "gpu"), "apple,firmware-version", &len);
+    int gpu = fdt_path_offset(dt, "gpu");
+    const fdt32_t *version = fdt_getprop(dt, gpu, "apple,firmware-version", &len);
     assert(version && len == 12 && fdt32_ld(&version[0]) == 26 && fdt32_ld(&version[1]) == 6 &&
            fdt32_ld(&version[2]) == 2);
-    puts("PASS accepted: J616C tables and regions");
+    const fdt32_t *hver = fdt_getprop(dt, gpu, "apple,t6041-handoff-version", &len);
+    assert(hver && len == 4 && fdt32_ld(hver) == 1);
+    const fdt32_t *mcc = fdt_getprop(dt, gpu, "apple,active-mcc-bit-vector", &len);
+    assert(mcc && len == 4 && fdt32_ld(mcc) == 0x3f);
+    const fdt64_t *cmask = fdt_getprop(dt, gpu, "apple,core-mask", &len);
+    assert(cmask && len == 8 && fdt64_ld(cmask) == 0xf6fdbf6fdbULL);
+    const fdt32_t *bp = fdt_getprop(dt, gpu, "apple,perf-base-pstate", &len);
+    assert(bp && len == 4 && fdt32_ld(bp) == 1);
+    const fdt32_t *aon = fdt_getprop(dt, gpu, "apple,aon-table", &len);
+    assert(aon && len == 15 * 4);
+    for (int i = 0; i < 15; i++)
+        assert(fdt32_ld(&aon[i]) == j616c_aon_want[i]);
+    const fdt32_t *ma = fdt_getprop(dt, gpu, "apple,perf-map-a", &len);
+    assert(ma && len == 16 * 4);
+    const fdt32_t *mb = fdt_getprop(dt, gpu, "apple,perf-map-b", &len);
+    assert(mb && len == 16 * 4);
+    const fdt32_t *rb = fdt_getprop(dt, gpu, "apple,perf-relative-b", &len);
+    assert(rb && len == 16 * 4);
+    for (int i = 0; i < 16; i++) {
+        assert(fdt32_ld(&ma[i]) == good_a[i]);
+        assert(fdt32_ld(&mb[i]) == good_b[i]);
+        assert(fdt32_ld(&rb[i]) == want_rel_b[i]);
+    }
+    /* Efuse-dependent v2 properties must NOT be emitted until live efuse offsets are verified. */
+    assert(!fdt_getprop(dt, gpu, "apple,core-leak-coef", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,sram-leak-coef", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,cs-leak-coef", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,afr-leak-coef", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,max-power-mw", NULL));
+    assert(!fdt_getprop(dt, gpu, "apple,perf-relative-a", NULL));
+    puts("PASS accepted: J616C v1 handoff, tables and regions");
+
+    /* 40-core (8-MCC) topology also accepted cleanly. */
+    world();
+    active_mcc = 0xff;
+    sgx_masks[0] = 0xffffffff; sgx_masks[1] = 0xff; sgx_masks[2] = 0;
+    have_base_pstate = true; base_pstate = 1;
+    assert(dt_set_gpu_t6041(dt) == 0 && !strcmp(status("gpu"), "okay"));
+    gpu = fdt_path_offset(dt, "gpu");
+    cmask = fdt_getprop(dt, gpu, "apple,core-mask", &len);
+    assert(cmask && len == 8 && fdt64_ld(cmask) == 0xffffffffffULL);
+    mcc = fdt_getprop(dt, gpu, "apple,active-mcc-bit-vector", &len);
+    assert(mcc && len == 4 && fdt32_ld(mcc) == 0xff);
+    puts("PASS accepted: 40-core 8-MCC T6041 topology");
 
     world_with("apple,agx-t6040", 16, 2, 8);
     expect_untouched("T6040 GPU node", "okay");
@@ -334,56 +484,93 @@ int main(void)
     expect_untouched("GPU disabled in the device tree", "disabled");
 
     world_with("apple,agx-t6041", 16, 2, 8);
-    expect_refused("two-cell OPP table");
+    expect_refused("two-cell OPP table", 0);
     world_with("apple,agx-t6041", 15, 4, 8);
-    expect_refused("OPP table one entry short");
+    expect_refused("OPP table one entry short", 0);
     world_with("apple,agx-t6041", 16, 4, 6);
-    expect_refused("CS/AFR tables shorter than the ADT's");
+    expect_refused("CS/AFR tables shorter than the ADT's", 0);
     world(); raw_tables = 2;
-    expect_refused("two cluster tables");
+    expect_refused("two cluster tables", 0);
     world(); raw_count = 15;
-    expect_refused("wrong raw OPP count");
+    expect_refused("wrong raw OPP count", 0);
     world(); raw_max_state = 10;
-    expect_refused("logical count in the raw ADT count");
+    expect_refused("logical count in the raw ADT count", 0);
+    world(); missing_mcc = true;
+    expect_refused("missing active-mcc-bit-vector", 0);
+    world(); active_mcc = 0;
+    expect_refused("zero active-mcc-bit-vector", 0);
+    world(); active_mcc = 0x1ff;
+    expect_refused("out-of-range active-mcc-bit-vector", 0);
     world(); missing_sgx = true;
-    expect_refused("missing SGX");
+    expect_refused("missing SGX", 0);
     world(); missing_asc = true;
-    expect_refused("missing GFX ASC");
+    expect_refused("missing GFX ASC", 0);
+    world(); missing_aon = true;
+    expect_refused("missing /arm-io/aon-ptd", 0);
+    world(); ptd_len = 14;
+    expect_refused("unaligned ptd_data_table", 0);
+    world(); ptd_table[15] = 0xdeadbeef;
+    expect_refused("missing r0TR in ptd_data_table", 0);
+    world(); ptd_table[0] = ptd_table[3];
+    expect_refused("duplicate g0TR in ptd_data_table", 0);
+    world(); have_base_pstate = true; base_length = 0;
+    expect_refused("empty present base property", 0);
+    world(); have_base_pstate = true; base_pstate = 2;
+    expect_refused("base state differs from supported policy", 0);
     world(); states[0].freq = 100000000;
-    expect_refused("off operating point has a clock");
+    expect_refused("off operating point has a clock", 0);
     world(); states[2 * 16 + 5].freq += 1000000;
-    expect_refused("a cluster runs a different clock");
+    expect_refused("a cluster runs a different clock", 0);
     world(); states[3 * 16 + 9].volt = 1400;
-    expect_refused("voltage out of range");
+    expect_refused("voltage out of range", 0);
     world(); cs.dies = 2;
-    expect_refused("two-die CS table");
+    expect_refused("two-die CS table", 0);
     world(); afr.states[3].freq = 0;
-    expect_refused("AFR state without a clock");
+    expect_refused("AFR state without a clock", 0);
     world(); cs.count = 9;
-    expect_refused("CS count beyond the property");
+    expect_refused("CS count beyond the property", 0);
     world(); segments[1].phys += 0x4000;
-    expect_refused("DATA segment disagrees with gfx-data");
+    expect_refused("DATA segment disagrees with gfx-data", 0);
     world(); segments[0].phys = region[0][0];
-    expect_refused("TEXT overlaps handoff");
+    expect_refused("TEXT overlaps handoff", 0);
     world(); region[4][1] = 0x4100;
-    expect_refused("unaligned region");
+    expect_refused("unaligned region", 0);
     world(); region[2][0] = region[1][0];
-    expect_refused("overlapping regions");
+    expect_refused("overlapping regions", 0);
     world(); region[0][0] = 1UL << 42;
-    expect_refused("region outside physical address width");
+    expect_refused("region outside physical address width", 0);
     world(); region[3][0] = ~0UL & ~(SZ_16K - 1);
-    expect_refused("region wraps");
+    expect_refused("region wraps", 0);
     world(); assert(!fdt_del_node(dt, fdt_path_offset(dt, "/reserved-memory/gpu-fw-data")));
-    assert(dt_set_gpu_t6041(dt) == 0 && !strcmp(status("gpu"), "disabled"));
+    assert(dt_set_gpu_t6041(dt) == 0 && !strcmp(status("gpu"), "disabled") && !enables);
     for (int i = 0; i < 4; i++)
         assert(!strcmp(status(region_paths[i]), "disabled"));
     puts("PASS refused: missing reserved-memory node");
+
+    /* SGX read / mask / perf-map refusal checks (must power off SGX cleanly). */
+    world(); sgx_fault = true;
+    expect_refused("SGX read faults", 1);
+    world(); sgx_masks[2] = 1;
+    expect_refused("leftover core mask word 2", 1);
+    world(); sgx_masks[1] = 0x1ff;
+    expect_refused("leftover core mask above 40 bits", 1);
+    world(); sgx_masks[1] = 0; sgx_masks[0] &= ~(3U << 30);
+    expect_refused("cluster 3 has zero active cores", 1);
+    world(); map_a[15] = 3;
+    expect_refused("nonzero unused perf map tail", 1);
+    world(); map_b[10] = 14;
+    expect_refused("B map does not reach top OPP", 1);
+    world(); map_a[5] = 4;
+    expect_refused("A map does not climb", 1);
+    world(); states[6].freq = states[16 + 6].freq = states[32 + 6].freq = states[48 + 6].freq = states[4].freq;
+    expect_refused("ADT frequency does not climb along A map", 1);
 
     /* 27.2 (26B123) 3-segment framing: __DATA + contiguous __DATA_SHARED_RO in gpu-fw-data. */
     world_27_2();
     has_shared_rw = true;
     assert(dt_set_gpu_t6041(dt) == 0);
     assert(!strcmp(status("gpu"), "okay"));
+    assert(enables == 1 && restores == 1 && !sgx_on);
     for (int i = 0; i < 6; i++) {
         assert(!strcmp(status(region_paths[i]), "okay"));
         const fdt64_t *reg = fdt_getprop(dt, fdt_path_offset(dt, region_paths[i]), "reg", &len);
@@ -394,36 +581,38 @@ int main(void)
     version = fdt_getprop(dt, fdt_path_offset(dt, "gpu"), "apple,firmware-version", &len);
     assert(version && len == 12 && fdt32_ld(&version[0]) == 27 && fdt32_ld(&version[1]) == 2 &&
            fdt32_ld(&version[2]) == 0);
+    hver = fdt_getprop(dt, fdt_path_offset(dt, "gpu"), "apple,t6041-handoff-version", &len);
+    assert(hver && len == 4 && fdt32_ld(hver) == 1);
     puts("PASS accepted: J616C 27.2 3-segment regions");
 
     world_27_2(); segments_len = sizeof(segments[0]);
-    expect_refused("1-segment gfx-asc");
+    expect_refused("1-segment gfx-asc", 0);
     world_27_2(); segments_len = 4 * sizeof(segments[0]);
-    expect_refused("4-segment gfx-asc");
+    expect_refused("4-segment gfx-asc", 0);
     world_27_2(); has_shared_ro = false;
-    expect_refused("missing gfx-data-shared-ro");
+    expect_refused("missing gfx-data-shared-ro", 0);
     world_27_2(); segments[2].phys += 0x4000;
-    expect_refused("SHARED_RO segment base disagrees with sgx");
+    expect_refused("SHARED_RO segment base disagrees with sgx", 0);
     world_27_2(); segments[2].remap += 0x4000;
-    expect_refused("SHARED_RO segment remap is not identity");
+    expect_refused("SHARED_RO segment remap is not identity", 0);
     world_27_2(); segments[2].size += 0x4000;
-    expect_refused("SHARED_RO segment size disagrees with sgx");
+    expect_refused("SHARED_RO segment size disagrees with sgx", 0);
     world_27_2(); shared_ro[0] += 0x4000; segments[2].phys = segments[2].remap = shared_ro[0];
-    expect_refused("SHARED_RO not contiguous with DATA");
+    expect_refused("SHARED_RO not contiguous with DATA", 0);
     world_27_2(); shared_ro[1] = 0x2000; segments[2].size = 0x2000;
-    expect_refused("unaligned SHARED_RO size");
+    expect_refused("unaligned SHARED_RO size", 0);
     world_27_2(); has_shared_rw = true; shared_rw[1] = 0x4000;
-    expect_refused("non-zero gfx-data-shared-rw");
+    expect_refused("non-zero gfx-data-shared-rw", 0);
     world_27_2(); has_shared_rw = true; bad_shared_rw_len = true;
-    expect_refused("malformed gfx-data-shared-rw");
+    expect_refused("malformed gfx-data-shared-rw", 0);
     world_27_2(); segments[0].phys = segments[0].remap = shared_ro[0];
-    expect_refused("TEXT overlaps SHARED_RO tail");
+    expect_refused("TEXT overlaps SHARED_RO tail", 0);
     world_27_2();
     region[4][0] = (1UL << 42) - region[4][1];
     shared_ro[0] = region[4][0] + region[4][1];
     segments[1].phys = segments[1].remap = region[4][0];
     segments[2].phys = segments[2].remap = shared_ro[0];
-    expect_refused("extended fw-data exceeds 42-bit OAS");
+    expect_refused("extended fw-data exceeds 42-bit OAS", 0);
     return 0;
 }
 '''
@@ -433,17 +622,28 @@ def test_t6041_gpu_fill(tmp_path):
     source = (ROOT / "src/kboot_gpu.c").read_text()
     defs = source[source.index("#define MAX_PSTATES"):source.index("int32_t rust_gpu_initdata_size(")]
     t6040 = source[source.index("/*\n * T6040 (M4 Pro)."):]
-    opps = t6040[t6040.index("#define T6040_OPPS"):].split("\n", 1)[0] + "\n"
+    macros = "\n".join(
+        line for line in t6040.splitlines()
+        if line.startswith(("#define T6040_OPPS", "#define T6040_CORES", "#define T6040_MAP_STATES"))
+    ) + "\n"
     regions = t6040[t6040.index("static const struct {\n    const char *name;"):]
     regions = regions[:regions.index("};\n") + 3]
-    fw = source[source.index("struct t604x_gpu_fw {"):]
-    fw = fw[:fw.index("\n}\n", fw.index("static int t604x_gpu_fw_segments(")) + 3]
-    clusters = next(line for line in source.splitlines()
-                    if line.startswith("#define T6041_CLUSTERS ")) + "\n"
-    t6041 = clusters + function(source, "static int dt_set_gpu_t6041(")
+    header = (ROOT / "src/kboot.h").read_text()
+    fw = header[header.index("struct gpu_fw_layout {"):]
+    fw = fw[:fw.index("};\n") + 3] + function(source, "int gpu_fw_layout(")
+    t6041_macros = "\n".join(
+        line for line in source.splitlines()
+        if line.startswith(("#define T6041_CLUSTERS ", "#define T6041_AON_ROWS "))
+    ) + "\n"
+    t6041 = (t6041_macros + function(source, "static int t6041_aon_table(") +
+             function(source, "static int dt_set_gpu_t6041("))
     bail = '#define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)\n'
-    code = (HARNESS + bail + defs + ADT + opps + function(source, "static int dt_set_resvmem(") +
+    code = (HARNESS + bail + defs + ADT + macros +
+            function(source, "static int dt_set_resvmem(") +
             function(source, "static int fdt_set_aux_opp(") +
+            function(source, "static int t6040_read32(") +
+            function(source, "static int t6040_perf_map(") +
+            function(source, "static int t6040_set_u32s(") +
             function(source, "static int t6040_opp_table(") + regions + fw + t6041 + MAIN)
     cfile = tmp_path / "t6041-gpu-fill.c"
     cfile.write_text(code)
@@ -458,4 +658,4 @@ def test_t6041_gpu_fill(tmp_path):
                     str(cfile), *sources, "-o", str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 37, result.stdout
+    assert result.stdout.count("PASS") == 55, result.stdout

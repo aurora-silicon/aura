@@ -4,6 +4,11 @@
 
 ringbuffer_t *ringbuffer_alloc(size_t len)
 {
+    /* One slot always stays empty (see ringbuffer_get_free()), and the
+     * indices wrap modulo len. */
+    if (len < 2)
+        return NULL;
+
     ringbuffer_t *bfr = calloc(1, sizeof(*bfr));
     if (!bfr)
         return NULL;
@@ -77,5 +82,8 @@ size_t ringbuffer_get_used(ringbuffer_t *bfr)
 
 size_t ringbuffer_get_free(ringbuffer_t *bfr)
 {
-    return bfr->len - ringbuffer_get_used(bfr);
+    /* read == write means empty, so one slot always stays unused: the
+     * buffer holds len - 1 bytes, and a write of get_free() bytes must
+     * fit in full. */
+    return bfr->len - 1 - ringbuffer_get_used(bfr);
 }

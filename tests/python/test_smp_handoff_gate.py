@@ -52,6 +52,9 @@ static jmp_buf refused;
 static _Noreturn void panic(const char *format, ...) { longjmp(refused, 1); }
 /* The T8152 handoff has its own path and is not modelled here. */
 static int kboot_boot_t8152(void *kernel) { return -1; }
+static bool dt_retained_live_dcp;
+static int display_prepare_live_handoff(void) { return 0; }
+static bool display_needs_live_receiver(void) { return false; }
 static int mcc_enable_cache(void) { hardware_calls++; return 0; }
 static void tunables_apply_static(void) {}
 static void clk_init(void) { if (mode == 2) spin_table[1].target = 0x1234; }
@@ -70,6 +73,7 @@ static int fdt_pack(void *p) { return 0; }
 static u32 fdt_totalsize(void *p) { return 0x8000; }
 static int dapf_init_fdt(void *p) { return 0; }
 static int dapf_init_all(void) { return 0; }
+static int dt_set_ave_dapf(void) { return 0; }
 static void pcie_shutdown(void) {}
 static void smp_set_wfe_mode(bool value) {}
 /* The J614s AOP/ISP handoff is gated on the board; no modelled chip is a J614s. */
