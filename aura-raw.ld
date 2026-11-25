@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
+
 ENTRY(_start)
 
 _stack_size = 0x20000;
