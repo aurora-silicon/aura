@@ -15,14 +15,24 @@
 #define WDT_WD2_BARK  0x28
 #define WDT_WD2_CTL   0x2c
 
-#define WDT_CTL_IRQ_EN   BIT(0)
-#define WDT_CTL_RESET_EN BIT(2)
+#define WDT_CTL_IRQ_EN     BIT(0)
+#define WDT_CTL_IRQ_STATUS BIT(1)
+#define WDT_CTL_RESET_EN   BIT(2)
 
 #define WDT_RECONFIG_MASK (3u << 4)
 #define WDT_RECONFIG_WD2  (1u << 4)
 
 static u64 wdt_base = 0;
 static u64 wdt_reconfig = 0;
+
+static void wdt_set_addrs(u64 primary, u64 reconfig)
+{
+    wdt_reconfig = reconfig;
+    dc_cvac_range(&wdt_reconfig, sizeof(wdt_reconfig));
+    sysop("dmb ishst");
+    wdt_base = primary;
+    dc_cvac_range(&wdt_base, sizeof(wdt_base));
+}
 
 static bool wdt_has_simple_reconfig(int node, int *path, u64 primary_size, u64 *reconfig)
 {
@@ -36,18 +46,41 @@ static bool wdt_has_simple_reconfig(int node, int *path, u64 primary_size, u64 *
     return true;
 }
 
-static void wdt_arm_wd2(u64 primary, u64 reconfig, u32 ticks)
+bool wdt_simple_reconfig_reg(u64 *primary_out, u64 *reconfig_out)
+{
+    int path[8];
+    u64 primary = 0, primary_size = 0, reconfig = 0;
+    int node;
+
+    if (!adt)
+        return false;
+    node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
+    if (node < 0 || adt_get_reg(adt, path, "reg", 0, &primary, &primary_size) || (primary & 3) ||
+        !wdt_has_simple_reconfig(node, path, primary_size, &reconfig))
+        return false;
+
+    if (primary_out)
+        *primary_out = primary;
+    if (reconfig_out)
+        *reconfig_out = reconfig;
+    return true;
+}
+
+static u32 wdt_arm_wd2(u64 primary, u64 reconfig, u32 ticks)
 {
     u32 r3 = read32(reconfig);
+    write32(primary + WDT_WD2_CTL, 0);
+    write32(primary + WDT_WD2_BITE, 0xffffffffu);
+    write32(primary + WDT_WD2_COUNT, 0);
+    write32(primary + WDT_WD2_BARK, ticks);
+    write32(primary + WDT_WD2_CTL, WDT_CTL_IRQ_STATUS);
+    sysop("dsb sy");
     write32(reconfig, (r3 & ~WDT_RECONFIG_MASK) | WDT_RECONFIG_WD2);
     sysop("dsb sy");
-    write32(primary + WDT_WD2_CTL, 0);
-    write32(primary + WDT_WD2_COUNT, 0);
-    write32(primary + WDT_WD2_BITE, 0xffffffffu);
-    write32(primary + WDT_WD2_BARK, ticks);
     write32(primary + WDT_WD2_CTL, WDT_CTL_IRQ_EN);
     write32(primary + WDT_WD2_COUNT, 0);
     sysop("dsb sy");
+    return r3;
 }
 
 void wdt_disable(void)
@@ -60,20 +93,20 @@ void wdt_disable(void)
         return;
     }
 
-    u64 primary_size = 0;
-    if (adt_get_reg(adt, path, "reg", 0, &wdt_base, &primary_size)) {
+    u64 primary = 0, primary_size = 0;
+    if (adt_get_reg(adt, path, "reg", 0, &primary, &primary_size)) {
         printf("Failed to get WDT reg property!\n");
         return;
     }
 
-    printf("Primary WDT register @ 0x%lx\n", wdt_base);
-    write32(wdt_base + WDT_CTL, 0);
+    printf("Primary WDT register @ 0x%lx\n", primary);
+    write32(primary + WDT_CTL, 0);
     u64 reconfig = 0;
     if (wdt_has_simple_reconfig(node, path, primary_size, &reconfig)) {
-        write32(wdt_base + WDT_WD2_CTL, 0);
-        wdt_reconfig = reconfig;
+        write32(primary + WDT_WD2_CTL, 0);
+        wdt_set_addrs(primary, reconfig);
     } else {
-        wdt_reconfig = 0;
+        wdt_set_addrs(primary, 0);
     }
     printf("Primary WDT disabled\n");
 
@@ -103,8 +136,8 @@ void wdt_reboot(void)
         u64 base = 0, size = 0, reconfig = 0;
         int node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
         if (node >= 0 && !adt_get_reg(adt, path, "reg", 0, &base, &size)) {
-            wdt_base = base;
-            wdt_reconfig = wdt_has_simple_reconfig(node, path, size, &reconfig) ? reconfig : 0;
+            wdt_set_addrs(base,
+                          wdt_has_simple_reconfig(node, path, size, &reconfig) ? reconfig : 0);
         }
     }
     if (!wdt_base)
@@ -129,7 +162,7 @@ bool wdt_s2r_guard_supported(void)
 {
     int path[8];
     int node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
-    u64 primary, primary_size, secondary, secondary_size;
+    u64 primary, primary_size, secondary, secondary_size, reconfig = 0;
     u32 version;
 
     if (node < 0 || ADT_GETPROP(adt, node, "wdt-version", &version) < 0 || version != 2 ||
@@ -137,10 +170,8 @@ bool wdt_s2r_guard_supported(void)
         primary_size < WDT_WD2_CTL + 4 ||
         adt_get_reg(adt, path, "reg", 2, &secondary, &secondary_size) || secondary_size != 4)
         return false;
-    wdt_base = primary;
-    wdt_reconfig = 0;
-    dc_cvac_range(&wdt_base, sizeof(wdt_base));
-    dc_cvac_range(&wdt_reconfig, sizeof(wdt_reconfig));
+    wdt_set_addrs(primary,
+                  wdt_has_simple_reconfig(node, path, primary_size, &reconfig) ? reconfig : 0);
     return true;
 }
 
@@ -223,16 +254,16 @@ static int wdt_arm(unsigned seconds)
      * path instead of stalling on RESET_EN.
      */
     if (wdt_has_simple_reconfig(node, path, primary_size, &reconfig)) {
-        wdt_arm_wd2(primary, reconfig, alarm);
+        u32 prev_r3 = wdt_arm_wd2(primary, reconfig, alarm);
         if (read32(primary + WDT_WD2_BARK) != alarm ||
             !(read32(primary + WDT_WD2_CTL) & WDT_CTL_IRQ_EN) ||
             (read32(reconfig) & WDT_RECONFIG_MASK) != WDT_RECONFIG_WD2) {
             write32(primary + WDT_WD2_CTL, 0);
+            write32(reconfig, prev_r3);
             sysop("dsb sy");
             return -1;
         }
-        wdt_base = primary;
-        wdt_reconfig = reconfig;
+        wdt_set_addrs(primary, reconfig);
         return 0;
     }
 
@@ -249,8 +280,7 @@ static int wdt_arm(unsigned seconds)
         sysop("dsb sy");
         return -1;
     }
-    wdt_base = primary;
-    wdt_reconfig = 0;
+    wdt_set_addrs(primary, 0);
     return 0;
 }
 

@@ -1048,6 +1048,102 @@ static void dt_set_trial_watchdog(void)
     }
 }
 
+static bool dt_ranges_identity_covers(int parent, u64 addr, u64 size)
+{
+    int ranges_len = 0;
+    const u8 *ranges = fdt_getprop(dt, parent, "ranges", &ranges_len);
+    if (!ranges || ranges_len == 0)
+        return true;
+
+    int grand = fdt_parent_offset(dt, parent);
+    if (grand < 0 || fdt_address_cells(dt, grand) != 2)
+        return false;
+
+    const int stride = 3 * (int)sizeof(fdt64_t);
+    if (ranges_len % stride != 0)
+        return false;
+
+    for (int off = 0; off < ranges_len; off += stride) {
+        fdt64_t triple[3];
+        memcpy(triple, ranges + off, sizeof(triple));
+        u64 child = fdt64_to_cpu(triple[0]);
+        u64 paddr = fdt64_to_cpu(triple[1]);
+        u64 len = fdt64_to_cpu(triple[2]);
+        if (child == paddr && addr >= child && size <= len && addr - child <= len - size)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Publish the ADT's simple-reconfig routing register (reg[3]) onto the Linux watchdog DT node
+ * whenever the ADT reports simple-reconfig-wdog-support and the DT node lacks a "reconfig"
+ * entry. Keeps the ADT as the single source so Linux's apple_wdt adopts WD2 on every
+ * simple-reconfig SoC (including T8142 whose static DTS lists only the primary window).
+ */
+static void dt_set_wdt_reconfig(void)
+{
+    u64 primary = 0, reconfig = 0;
+    if (!wdt_simple_reconfig_reg(&primary, &reconfig))
+        return;
+
+    static const char *const compat[] = {"apple,t8103-wdt", "apple,wdt"};
+    for (size_t i = 0; i < ARRAY_SIZE(compat); i++) {
+        int node = -1;
+        while ((node = fdt_node_offset_by_compatible(dt, node, compat[i])) >= 0) {
+            if (fdt_stringlist_search(dt, node, "reg-names", "reconfig") >= 0)
+                continue;
+            int parent = fdt_parent_offset(dt, node);
+            if (parent < 0 || fdt_address_cells(dt, parent) != 2 || fdt_size_cells(dt, parent) != 2)
+                continue;
+            int reg_len = 0;
+            const void *reg = fdt_getprop(dt, node, "reg", &reg_len);
+            if (!reg || reg_len < 2 * (int)sizeof(fdt64_t))
+                continue;
+            fdt64_t orig_reg[2];
+            memcpy(orig_reg, reg, sizeof(orig_reg));
+            if (fdt64_to_cpu(orig_reg[0]) != primary)
+                continue;
+            if (reg_len != 2 * (int)sizeof(fdt64_t) || fdt64_to_cpu(orig_reg[1]) < 0x30) {
+                printf("FDT: watchdog @ 0x%lx skipped: unexpected reg shape (len=%d)\n", primary,
+                       reg_len);
+                continue;
+            }
+            if (!dt_ranges_identity_covers(parent, primary, 0x30) ||
+                !dt_ranges_identity_covers(parent, reconfig, 4)) {
+                printf("FDT: watchdog @ 0x%lx skipped: parent ranges does not cover reconfig\n",
+                       primary);
+                continue;
+            }
+            bool has_names = fdt_getprop(dt, node, "reg-names", NULL) != NULL;
+            if (has_names && fdt_stringlist_count(dt, node, "reg-names") != 1) {
+                printf("FDT: watchdog @ 0x%lx skipped: unexpected reg-names count\n", primary);
+                continue;
+            }
+            fdt64_t cells[2];
+            fdt64_st(&cells[0], reconfig);
+            fdt64_st(&cells[1], 4);
+            if (fdt_appendprop(dt, node, "reg", cells, sizeof(cells)) < 0) {
+                printf("FDT: couldn't append watchdog reconfig reg\n");
+                continue;
+            }
+            int ret;
+            if (has_names) {
+                ret = fdt_appendprop_string(dt, node, "reg-names", "reconfig");
+            } else {
+                static const char names[] = "wdt\0reconfig";
+                ret = fdt_setprop(dt, node, "reg-names", names, sizeof(names));
+            }
+            if (ret < 0) {
+                fdt_setprop(dt, node, "reg", orig_reg, sizeof(orig_reg));
+                printf("FDT: couldn't publish watchdog reg-names\n");
+            } else {
+                printf("FDT: published watchdog reconfig reg @ 0x%lx\n", reconfig);
+            }
+        }
+    }
+}
+
 /*
  * An aura-try trial must boot the install its Stage 1 names. U-Boot picks the ESP from
  * /chosen/asahi,efi-system-partition; without it, it takes the first ESP with an EFI loader, which
@@ -14012,6 +14108,7 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_chosen())
         return -1;
     dt_set_trial_watchdog();
+    dt_set_wdt_reconfig();
     if (dt_check_trial_esp())
         return -1;
     secboot_export_fdt(dt);
