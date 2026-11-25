@@ -3549,7 +3549,32 @@ static T6050_TEXT bool t6050_pick_image(const char *uuid, u32 len)
     return false;
 }
 
-/* The ADT side: firmware, VRAM and segments, bandwidth agent, clocks, panel */
+/*
+ * The scratch offset of the PMGR bandwidth requester that `disp`'s bw_req interrupt names (ADT
+ * /arm-io/pmgr bwr-agent), or 0; if `die` is non-NULL, *die is that interrupt's die.
+ */
+static T6050_TEXT u32 t6050_bw_agent(const char *disp, u32 *die)
+{
+    u32 len = 0, val = 0, fn[3];
+    int node = adt_path_offset(adt, disp), pmgr = adt_path_offset(adt, "/arm-io/pmgr");
+    const u8 *agents = pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "bwr-agent", &len);
+    if (!agents || node < 0 || dcp6_adt_u32(pmgr, "AAPL,phandle", &val) ||
+        adt_getprop_copy(adt, node, "function-bw_req_interrupt0", fn, sizeof(fn)) != sizeof(fn) ||
+        fn[0] != val)
+        return 0;
+    for (u32 off = 0; off + 24 <= len; off += 24) {
+        u32 birq;
+        memcpy(&birq, agents + off + 4, sizeof(birq));
+        if (agents[off] == 1 && birq == fn[2]) {
+            if (die)
+                *die = birq >> 28;
+            return T6050_BW_BASE + agents[off + 2] * T6050_BW_STRIDE;
+        }
+    }
+    return 0;
+}
+
+/* The ADT side: firmware, VRAM and segments, bandwidth scratch, clocks, panel */
 static T6050_INIT int t6050_check_adt(void)
 {
     u32 len = 0, val = 0;
@@ -3583,24 +3608,13 @@ static T6050_INIT int t6050_check_adt(void)
     if (!vram_seg)
         bail("/vram is not a DCP segment\n");
 
-    /* The scratch of the PMGR bandwidth agent disp0's bw_req interrupt names */
-    u32 fn[3];
-    int pmgr = adt_path_offset(adt, "/arm-io/pmgr");
-    const u8 *agents = pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "bwr-agent", &len);
+    /* The scratch of the PMGR bandwidth requester disp0's bw_req interrupt names */
     if (t6050_adt_reg("/arm-io/dcp", 0, &t6050.coproc, NULL) ||
-        t6050_adt_reg("/arm-io/disp0", 4, &t6050.pmc, &t6050.pmc_size) || t6050.pmc_size < 4 ||
-        !agents || dcp6_adt_u32(pmgr, "AAPL,phandle", &val) ||
-        adt_getprop_copy(adt, disp0, "function-bw_req_interrupt0", fn, sizeof(fn)) != sizeof(fn) ||
-        fn[0] != val)
-        bail("no dcp registers, PMC metadata or PMGR bandwidth interrupt\n");
-    for (u32 off = 0; off + 24 <= len && !t6050.bw_offset; off += 24) {
-        u32 birq;
-        memcpy(&birq, agents + off + 4, sizeof(birq));
-        if (agents[off] == 1 && birq == fn[2])
-            t6050.bw_offset = T6050_BW_BASE + agents[off + 2] * T6050_BW_STRIDE;
-    }
+        t6050_adt_reg("/arm-io/disp0", 4, &t6050.pmc, &t6050.pmc_size) || t6050.pmc_size < 4)
+        bail("no dcp registers or PMC metadata\n");
+    t6050.bw_offset = t6050_bw_agent("/arm-io/disp0", NULL);
     if (!t6050_bw_valid(t6050.bw_offset, t6050.pmc_size))
-        bail("no bandwidth agent scratch for BIRQ 0x%x\n", fn[2]);
+        bail("no bandwidth scratch for disp0\n");
 
     /* The firmware's clocks: clock-ids index /arm-io clock-frequencies from 256 */
     int arm = adt_path_offset(adt, "/arm-io");
@@ -3920,7 +3934,7 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
 {
     char a[40], b[40];
     u64 coproc, base[2], l1, cnt, vm_base, vm_size;
-    u32 len = 0, val = 0, fn[3];
+    u32 len = 0, val = 0;
     int node = -1, dart[2];
 
     snprintf(a, sizeof(a), "/arm-io/dcpext%d/iop-dcpext%d-nub", n, n);
@@ -3984,11 +3998,16 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
 
     /* Its bandwidth agent: the one dispextN's bw_req interrupt names */
     snprintf(b, sizeof(b), "/arm-io/dispext%d", n);
-    u32 bw = 0;
+    u32 die = 0, bw = 0, agent = t6050_bw_agent(b, &die);
     int pmc = -1;
     fdt32_t v[4] = {0};
     if (t6050.headless) {
-        /* No panel's PMC node: the scratch the node names, in the PMC metadata of dispextN */
+        /*
+         * No panel's PMC node: the scratch the node names, in the PMC metadata of dispextN, at
+         * the ADT's bandwidth agent. Agents are numbered across both dies; how a die-1 agent's
+         * number maps into its die's PMC metadata is not known yet, so a die-1 engine keeps
+         * the offset its node names.
+         */
         u64 meta, meta_size;
         const fdt32_t *s = fdt_getprop(dt, node, "apple,bw-scratch", (int *)&len);
         if (s && len == sizeof(v)) {
@@ -3997,22 +4016,20 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
         }
         const fdt64_t *r = pmc < 0 ? NULL : fdt_getprop(dt, pmc, "reg", (int *)&len);
         bw = fdt32_ld(&v[3]);
+        if (agent && !die) {
+            if (bw && bw != agent)
+                dlog("dcpext%d: apple,bw-scratch names 0x%x, the ADT's agent is at 0x%x: the "
+                     "ADT's is used\n",
+                     n, bw, agent);
+            bw = agent;
+            v[3] = cpu_to_fdt32(bw);
+        }
         if (!r || len != 16 || t6050_adt_reg(b, 4, &meta, &meta_size) || fdt64_ld(&r[0]) != meta ||
             fdt64_ld(&r[1]) != meta_size || fdt32_ld(&v[1]) || fdt32_ld(&v[2]) != T6050_NDISP ||
             !t6050_bw_valid(bw, meta_size))
             bail("dcpext%d: apple,bw-scratch is not in %s's PMC metadata\n", n, b);
     } else {
-        int disp = adt_path_offset(adt, b), pmgr = adt_path_offset(adt, "/arm-io/pmgr");
-        const u8 *agents = pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "bwr-agent", &len);
-        if (!agents || disp < 0 ||
-            adt_getprop_copy(adt, disp, "function-bw_req_interrupt0", fn, sizeof(fn)) != sizeof(fn))
-            bail("dcpext%d: no bandwidth interrupt\n", n);
-        for (u32 off = 0; off + 24 <= len && !bw; off += 24) {
-            u32 birq;
-            memcpy(&birq, agents + off + 4, sizeof(birq));
-            if (agents[off] == 1 && birq == fn[2])
-                bw = T6050_BW_BASE + agents[off + 2] * T6050_BW_STRIDE;
-        }
+        bw = agent;
         v[0] = cpu_to_fdt32(t6050.pmc_ph);
         v[1] = 0;
         v[2] = cpu_to_fdt32(T6050_NDISP);
