@@ -898,9 +898,14 @@ void mmu_shutdown(void)
 {
     fb_console_reserve_lines(3);
     printf("MMU: shutting down...\n");
-    write_sctlr(read_sctlr() & ~(SCTLR_I | SCTLR_C | SCTLR_M));
+    u64 sctlr = read_sctlr() & ~(SCTLR_C | SCTLR_M);
+    write_sctlr(sctlr);
     printf("MMU: shutdown successful, clearing caches\n");
     dcsw_op_all(DCSW_OP_DCCISW);
+    write_sctlr(sctlr & ~SCTLR_I);
+    sysop("ic iallu");
+    sysop("dsb sy");
+    sysop("isb");
 }
 
 u64 mmu_disable(void)
@@ -909,8 +914,13 @@ u64 mmu_disable(void)
     if (!(sctlr_old & SCTLR_M))
         return sctlr_old;
 
-    write_sctlr(sctlr_old & ~(SCTLR_I | SCTLR_C | SCTLR_M));
+    u64 sctlr = sctlr_old & ~(SCTLR_C | SCTLR_M);
+    write_sctlr(sctlr);
     dcsw_op_all(DCSW_OP_DCCISW);
+    write_sctlr(sctlr & ~SCTLR_I);
+    sysop("ic iallu");
+    sysop("dsb sy");
+    sysop("isb");
 
     return sctlr_old;
 }
