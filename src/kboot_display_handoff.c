@@ -104,6 +104,7 @@
 #include "adt.h"
 #include "exception.h"
 #include "firmware.h"
+#include "kboot_display_routes.h"
 #include "malloc.h"
 #include "mcc.h"
 #include "pmgr.h"
@@ -3815,40 +3816,7 @@ static T6050_TEXT int t6050_publish(void *dt)
  * power domains, and the GPIO controllers of the converter's hotplug input and power enables.
  * The walk finds the first of them still disabled, or with `all` checks the whole route.
  */
-enum { T6050_ROUTE_DONE = -1, T6050_ROUTE_BAD = -2 };
-
-static T6050_TEXT int t6050_route_refs(void *dt, int node, const char *prop, const char *cells,
-                                       int depth, bool all);
-
-/* `target`, then its power domains */
-static T6050_TEXT int t6050_route_node(void *dt, int target, int depth, bool all)
-{
-    const char *status = target < 0 ? NULL : fdt_getprop(dt, target, "status", NULL);
-    if (target < 0 || depth > 4)
-        return T6050_ROUTE_BAD;
-    if (!all && status && !strcmp(status, "disabled"))
-        return target;
-    return t6050_route_refs(dt, target, "power-domains", "#power-domain-cells", depth + 1, all);
-}
-
-/* Each target of a phandle list, its arguments counted by the target's `cells` property */
-static T6050_TEXT int t6050_route_refs(void *dt, int node, const char *prop, const char *cells,
-                                       int depth, bool all)
-{
-    int len;
-    const fdt32_t *v = fdt_getprop(dt, node, prop, &len);
-    for (int i = 0; v && i < len / 4;) {
-        int target = fdt_node_offset_by_phandle(dt, fdt32_ld(&v[i]));
-        const fdt32_t *n = target < 0 ? NULL : fdt_getprop(dt, target, cells, NULL);
-        int r = t6050_route_node(dt, target, depth, all);
-        if (r != T6050_ROUTE_DONE)
-            return r;
-        i += 1 + (n ? fdt32_ld(n) : 0);
-        if (i > len / 4)
-            return T6050_ROUTE_BAD;
-    }
-    return T6050_ROUTE_DONE;
-}
+enum { T6050_ROUTE_DONE = DCP_TYPEC_ROUTE_DONE, T6050_ROUTE_BAD = DCP_TYPEC_ROUTE_BAD };
 
 static T6050_TEXT int t6050_route_next(void *dt, int node, bool all)
 {
@@ -3859,16 +3827,17 @@ static T6050_TEXT int t6050_route_next(void *dt, int node, bool all)
 
     if (!phys)
         return T6050_ROUTE_DONE;
-    r = t6050_route_refs(dt, node, "phys", "#phy-cells", 0, all);
+    r = dcp_typec_route_refs(dt, node, "phys", "#phy-cells", 0, all);
     for (size_t i = 0; ep < 0 && r == T6050_ROUTE_DONE && i < ARRAY_SIZE(gpios); i++)
-        r = t6050_route_refs(dt, node, gpios[i], "#gpio-cells", 0, all);
+        r = dcp_typec_route_refs(dt, node, gpios[i], "#gpio-cells", 0, all);
     if (ep < 0 || r != T6050_ROUTE_DONE)
         return r;
-    r = t6050_route_refs(dt, node, "mux-controls", "#mux-control-cells", 0, all);
+    r = dcp_typec_route_refs(dt, node, "mux-controls", "#mux-control-cells", 0, all);
     for (int i = 0; r == T6050_ROUTE_DONE && i < len / 4; i++) {
         int phy = fdt_node_offset_by_phandle(dt, fdt32_ld(&phys[i]));
         const fdt32_t *n = phy < 0 ? NULL : fdt_getprop(dt, phy, "#phy-cells", NULL);
-        r = phy < 0 ? T6050_ROUTE_BAD : t6050_route_refs(dt, phy, "mboxes", "#mbox-cells", 0, all);
+        r = phy < 0 ? T6050_ROUTE_BAD
+                    : dcp_typec_route_refs(dt, phy, "mboxes", "#mbox-cells", 0, all);
         i += n ? fdt32_ld(n) : 0;
     }
     if (r != T6050_ROUTE_DONE)
@@ -3884,15 +3853,13 @@ static T6050_TEXT int t6050_route_next(void *dt, int node, bool all)
         int e = fdt_subnode_offset(dt, rt, "port");
         e = e < 0 ? e : fdt_subnode_offset(dt, e, "endpoint");
         const fdt32_t *remote = e < 0 ? NULL : fdt_getprop(dt, e, "remote-endpoint", NULL);
-        int hpm = remote ? fdt_node_offset_by_phandle(dt, fdt32_ld(remote)) : -1;
-        for (int up = 0;
-             hpm >= 0 && up < 5 && fdt_node_check_compatible(dt, hpm, "apple,sn201202x"); up++)
-            hpm = fdt_parent_offset(dt, hpm);
-        if (hpm < 0 || fdt_node_check_compatible(dt, hpm, "apple,sn201202x"))
+        int rnode = remote ? fdt_node_offset_by_phandle(dt, fdt32_ld(remote)) : -1;
+        int hpm = dcp_typec_route_controller(dt, rnode);
+        if (hpm < 0)
             return T6050_ROUTE_BAD;
-        r = t6050_route_node(dt, hpm, 0, all);
+        r = dcp_typec_route_node(dt, hpm, 0, all);
         if (r == T6050_ROUTE_DONE)
-            r = t6050_route_node(dt, fdt_parent_offset(dt, hpm), 0, all);
+            r = dcp_typec_route_node(dt, fdt_parent_offset(dt, hpm), 0, all);
         if (r != T6050_ROUTE_DONE)
             return r;
         routes++;
@@ -4093,7 +4060,11 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
     for (int i = 0; i < ntargets; i++)
         if (fdt_setprop_string(dt, kboot_fdt_path_exact(dt, path[i]), "status", "okay"))
             return -1;
-    if (t6050.headless && t6050_route(dt, path[0], n))
+    /* The Type-C display routes the tree asks for (an empty typec-routes), from the ADT */
+    int routes = kboot_dcp_typec_routes(dt, path[0], a);
+    if (routes < 0)
+        return -1;
+    if ((t6050.headless || routes) && t6050_route(dt, path[0], n))
         return -1;
     dlog("dcpext%d handed off: bw-scratch 0x%x\n", n, bw);
     return 0;

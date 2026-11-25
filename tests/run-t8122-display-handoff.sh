@@ -15,8 +15,15 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 mkdir -p "$tmp/src"
-cp "$root/src/kboot_display_handoff.c" "$root/tests/t8122_display_host.c" \
-    "$root"/tests/t8122_display_host/*.h "$tmp/src/"
+handoff_srcs=""
+while IFS= read -r f; do
+    case "$f" in ""|"#"*) continue ;; esac
+    cp "$root/src/$f" "$tmp/src/"
+    h="${f%.c}.h"
+    [ -f "$root/src/$h" ] && cp "$root/src/$h" "$tmp/src/"
+    handoff_srcs="$handoff_srcs $tmp/src/$f"
+done < "$root/tests/display-handoff-sources.txt"
+cp "$root/tests/t8122_display_host.c" "$root"/tests/t8122_display_host/*.h "$tmp/src/"
 if [ "$(uname -s)" = Darwin ]; then
     # This host fixture links as Mach-O, without aura's ELF linker script.
     sed 's/section("\.init\.t6050")/section("__TEXT,__t6050_init")/g' \
@@ -26,11 +33,12 @@ cc=${CC:-cc}
 if [ -z "${CC:-}" ] && [ "${USE_CLANG:-0}" = 1 ]; then
     cc=clang
 fi
+# shellcheck disable=SC2086
 $cc -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-function \
     -Wno-unused-parameter -Wno-sign-compare -Wno-format-truncation \
     -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
     -I"$tmp/src" -I"$root/src" \
-    "$tmp/src/t8122_display_host.c" "$tmp/src/kboot_display_handoff.c" \
+    "$tmp/src/t8122_display_host.c" $handoff_srcs \
     "$root"/src/libfdt/fdt.c "$root"/src/libfdt/fdt_ro.c "$root"/src/libfdt/fdt_rw.c \
     "$root"/src/libfdt/fdt_wip.c "$root"/src/libfdt/fdt_sw.c \
     "$root"/src/libfdt/fdt_empty_tree.c "$root"/src/libfdt/fdt_strerror.c \

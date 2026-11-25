@@ -22,7 +22,7 @@ import sys
 
 import pytest
 
-from host_compiler import host_cc
+from host_compiler import display_handoff_sources, host_cc
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = Path(os.environ.get("AURA_T6050_SOURCE", ROOT / "src/kboot_display_handoff.c"))
@@ -184,6 +184,34 @@ int adt_get_property_count(const void *a, int n)
 {
     UNUSED(a);
     return n < 1 || n > nnodes ? -1 : nodes[n - 1].nprops;
+}
+
+int adt_get_child_count(const void *a, int n)
+{
+    UNUSED(a);
+    UNUSED(n);
+    return 0;
+}
+
+int adt_first_child_offset(const void *a, int n)
+{
+    UNUSED(a);
+    UNUSED(n);
+    return -1;
+}
+
+int adt_next_sibling_offset(const void *a, int n)
+{
+    UNUSED(a);
+    UNUSED(n);
+    return -1;
+}
+
+const char *adt_get_name(const void *a, int n)
+{
+    UNUSED(a);
+    UNUSED(n);
+    return "";
 }
 
 int host_adt_nprops(int n)
@@ -598,6 +626,13 @@ def host(tmp_path_factory):
         # The host fixture has no aura ELF linker script; retain a dedicated Mach-O section.
         code = code.replace('section(".init.t6050")', 'section("__TEXT,__t6050_init")')
     (src / "kboot_display_handoff.c").write_text(code)
+    extra_srcs = [name for name in display_handoff_sources(ROOT)
+                  if name != "kboot_display_handoff.c"]
+    for name in extra_srcs:
+        shutil.copy(ROOT / "src" / name, src)
+        hdr = ROOT / "src" / name.replace(".c", ".h")
+        if hdr.exists():
+            shutil.copy(hdr, src)
     (src / "t6050_bounds_host.c").write_text(HOST)
     for header in (ROOT / "tests/t8122_display_host").glob("*.h"):
         shutil.copy(header, src)
@@ -607,7 +642,7 @@ def host(tmp_path_factory):
          "-Wno-unused-parameter", "-Wno-format", "-Wno-format-truncation",
          "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
          "-fno-sanitize-recover=undefined", "-I", str(src), "-I", str(ROOT / "src"),
-         str(src / "t6050_bounds_host.c"),
+         str(src / "t6050_bounds_host.c"), *(str(src / name) for name in extra_srcs),
          *(str(ROOT / "src/libfdt" / f) for f in LIBFDT), "-o", str(binary)],
         check=True,
     )
