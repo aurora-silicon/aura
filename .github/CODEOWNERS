@@ -1,0 +1,6 @@
+# Reviews go to the teams that review and merge here; any one approval from a listed
+# owner satisfies code-owner review (https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/access-tiers.md).
+* @aurora-silicon/core @aurora-silicon/omarchy-m
+
+# Workflows and repository configuration need an Owner's review.
+/.github/ @RyanTheTide @DjDeveloperr

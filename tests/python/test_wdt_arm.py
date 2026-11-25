@@ -22,6 +22,13 @@ typedef uint64_t u64;
 #define WDT_BOOT_SECONDS 178
 #define ADT_GETPROP(a,n,k,v) (*(v)=adt_version,0)
 #define sysop(x) ((void)0)
+struct wdt_guard {
+    bool borrowed;
+    u64 base;
+    u32 ctl, count, alarm;
+};
+static void dc_cvac_range(const void *p, size_t n)
+{ (void)p; (void)n; }
 static u32 chip_id = T6040, adt_version = 2, regs[12], secondary_value, reconfig_value;
 static u64 primary = 0x1000, primary_size = 0x4000, secondary_size = 4, reconfig_size = 4;
 static bool has_simple_reconfig, has_reg3 = true;
