@@ -622,13 +622,19 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
      * them the guest's HPM driver misses DisplayPort status events, and a USB-C monitor that
      * lights at a low mode goes dark when macOS sets a faster one. The proxy's port is still in
      * use and keeps its masks.
+     *
+     * With the proxy on USB, the guest's ports are also cold reset first (usb_hpm_fresh_attach), so
+     * macOS finds them as at power-on rather than in the DisplayPort mode the previous OS left: a
+     * USB-C monitor then attaches with its full mode list. With the proxy on the DockChannel the
+     * debug carrier may ride one of these ports, which a cold reset would cut, so they keep their
+     * state there.
      */
     if (uartproxy_iodev == IODEV_DOCKCHANNEL_UART) {
         usb_iodev_shutdown();
         usb_hpm_restore_irqs(false);
     } else if (uartproxy_iodev >= IODEV_USB0 && uartproxy_iodev < IODEV_MAX) {
         usb_iodev_shutdown_except(uartproxy_iodev);
-        usb_hpm_restore_irqs(false);
+        usb_hpm_fresh_attach();
     }
 
     /* The proxy flow never passes through kboot's nv2_prepare. */
