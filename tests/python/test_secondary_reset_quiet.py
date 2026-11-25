@@ -22,4 +22,4 @@ def test_secondary_entry_does_not_print_by_chip():
     entry = entry[:entry.index("\n}\n")]
     assert "printf(" not in entry
     start = source[source.index("Starting CPU %d"):]
-    assert "Started, MPIDR 0x%lx" in start[:start.index("return i >= 100")]
+    assert "Started, MPIDR 0x%lx" in start[:start.index("return i >= 2000")]

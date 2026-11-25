@@ -571,6 +571,13 @@ void smp_s2r_return_to_os(void)
     s2r_mailbox.resumes++;
     sysop("dsb sy");
 
+    /* cpu_reset enabled I-cache; restore MMU+caches-off handoff state for the OS. */
+    if (in_el2())
+        msr(SCTLR_EL2, mrs(SCTLR_EL2) & ~(SCTLR_M | SCTLR_C | SCTLR_I));
+    else
+        msr(SCTLR_EL1, mrs(SCTLR_EL1) & ~(SCTLR_M | SCTLR_C | SCTLR_I));
+    sysop("isb");
+
     ((void (*)(void))entry)();
     reboot();
 }
@@ -742,14 +749,14 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
     // Actually start the core
     write32(start_base + 0x8 + 4 * cpu->cluster, 1 << cpu->core);
 
-    for (i = 0; i < 100; i++) {
+    for (i = 0; i < 2000; i++) {
         sysop("dmb ld");
         if (spin_table[index].flag)
             break;
-        udelay(1000);
+        udelay(50);
     }
 
-    if (i >= 100) {
+    if (i >= 2000) {
         printf("Failed!\n");
     } else {
         sysop("dmb ld");
@@ -758,7 +765,7 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
 
     _reset_stack = dummy_stack + DUMMY_STACK_SIZE;
     _reset_stack_el1 = dummy_stack_el1 + DUMMY_STACK_SIZE;
-    return i >= 100 ? -1 : 0;
+    return i >= 2000 ? -1 : 0;
 }
 
 static int smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
