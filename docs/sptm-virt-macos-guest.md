@@ -204,6 +204,10 @@ systemctl --failed
   (`XNU_QUIRKS`), including `nvram_ro` (NOR writes return success in memory
   only) and shared EL1 PAC keys (`pac_keys`). Newer macOS builds whose
   kernelcache layout changes need a matching `XNU_QUIRKS` entry.
+- **USB-C monitors above 60 Hz:** with the proxy on a USB CDC port, a monitor
+  on another USB-C port can flicker and go dark at modes above 60 Hz, because
+  `aura` still masks that port's USB-C controller interrupts. Pick a 60 Hz mode
+  for it in System Settings > Displays. HDMI is not affected.
 - **T8112 (M2) specifics:** macOS 27.2 on T8112 runs SPTM, TXM, and XNU without
   exclaves. External monitors over HDMI and USB-C (including HDR) work with
   discrete refresh rates; MCDP29xx/2900 HDMI bridges report no VRR support.
