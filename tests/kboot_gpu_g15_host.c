@@ -901,6 +901,10 @@ static const struct {
 static void prepare_j613_setup(u32 core_mask, int standin)
 {
     prepare(&t8122_fx);
+    static const char compat[] = "apple,j613\0apple,t8122";
+    CHK(fdt_setprop(dtbuf, 0, "compatible", compat, sizeof(compat)));
+    mmio_set(T8122_LEAK_FUSE_WORD0, 0xa0000000, 0);
+    mmio_set(T8122_LEAK_FUSE_WORD1, 0x000aaaaa, 0);
 
     hset_u32("/arm-io", "chip-revision", 0x20);
     static const struct perf_state ps[14] = {
@@ -973,7 +977,7 @@ static void t8122_j613_switch_off(void)
     run();
     expect_gpu_off(dtbuf);
     assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "disabled"));
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("the G15G leakage fuse and power model are not known yet"));
     assert(log_has("FW: GFX: image uuid df697f05-f6b5-33ef-a137-61c4a73d666a"));
     assert(log_has("FW: GFX: unknown GPU firmware image, not identified"));
@@ -1323,10 +1327,9 @@ static void expect_standin_handoff(const u32 *max_pwr)
     assert(log_has("FW: GFX: identified image g15g build c0, firmware 14.8.3"));
     assert(log_has("FDT: GPU: T8122 power model: stand-in (not measured; does not limit clocks)"));
     assert(!log_has("perf-states-sram present but unused"));
-    /* Not a J613 root here: no fuse read, and the stand-in leakage */
-    assert(log_has("FDT: GPU: T8122 leakage: the stand-in\n"));
-    assert(!strstr(trace_buf, "0x2e42c812"));
-    assert(prop_len(dtbuf, "/chosen", "asahi,t8122-gpu-leak-fuse") < 0);
+    /* The J613 exports its fuse, but the stand-in uses the default leakage. */
+    assert(log_has("FDT: GPU: T8122 leakage: the stand-in (the fuse values are exported only)\n"));
+    assert(prop_len(dtbuf, "/chosen", "asahi,t8122-gpu-leak-fuse") == 8);
     assert(log_has("FDT: GPU: Leakage: 6412.000"));
     assert(log_has("FDT: GPU: T8122 GPU enabled (firmware 14.8.3)"));
     assert(log_has("ADT: GPU: 39 power-management values, fast-die sensor mask 0x2, SRAM floor "
@@ -1431,11 +1434,14 @@ static void t8122_j613_standin_only(void)
     /* The stand-in switch alone arms nothing: logged, and the boot is the default one */
     prepare_j613_setup(0x3ff, 1);
     fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu");
-    static u8 before[sizeof(dtbuf)];
-    memcpy(before, dtbuf, sizeof(dtbuf));
+    char *before = dump_path(dtbuf, "/");
     run();
-    assert(!memcmp(before, dtbuf, sizeof(dtbuf)));
-    assert(!trace_len && !pmgr_enables && !mmio_reads);
+    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), T8122_LEAK_FUSE_PROP));
+    char *after = dump_path(dtbuf, "/");
+    assert(!strcmp(before, after));
+    free(before);
+    free(after);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("asahi,t8122-gpu-power-standin ignored: it needs chosen.asahi,t8122-gpu=1"));
 }
 
@@ -1447,7 +1453,7 @@ static void t8122_j613_standin_missing_value(void)
     run();
     expect_gpu_off(dtbuf);
     assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "disabled"));
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("ADT: GPU: missing or invalid gpu-se-tgt"));
     assert(log_has("T8122 GPU setup failed"));
     assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,se-ki") < 0);
@@ -1461,7 +1467,7 @@ static void t8122_j613_standin_bad_mask_size(void)
     hset("/arm-io/sgx", "gpu-fast-die0-sensor-mask", &mask, sizeof(mask));
     run();
     expect_gpu_off(dtbuf);
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("missing or invalid gpu-fast-die0-sensor-mask"));
 }
 
@@ -1473,7 +1479,7 @@ static void t8122_j613_standin_bad_sram(void)
     hset("/arm-io/sgx", "perf-states-sram", sram, sizeof(sram));
     run();
     expect_gpu_off(dtbuf);
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("invalid or missing perf-states-sram"));
 }
 
@@ -1485,7 +1491,7 @@ static void t8122_j613_standin_idleoff_malformed(void)
     hset("/arm-io/sgx", "gpu-idleoff-standby-timer", &timer, sizeof(timer));
     run();
     expect_gpu_off(dtbuf);
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("ADT: GPU: malformed gpu-idleoff-standby-timer (len 8)"));
     assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,idleoff-standby-timer") < 0);
 }
@@ -1510,7 +1516,7 @@ static void t8122_j613_standin_sram_above(void)
     run();
     expect_gpu_off(dtbuf);
     assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "disabled"));
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("ADT: GPU: perf state 0/13 SRAM 960 mV is above max(core 935 mV, floor 790 mV); "
                    "not supported"));
     assert(log_has("T8122 GPU setup failed"));
@@ -1524,7 +1530,7 @@ static void t8122_j613_standin_sram_above_floor(void)
     set_j613_sram(1, 800);
     run();
     expect_gpu_off(dtbuf);
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("ADT: GPU: perf state 0/1 SRAM 800 mV is above max(core 630 mV, floor 790 mV); "
                    "not supported"));
 }
@@ -1560,7 +1566,7 @@ static void t8122_j613_standin_g15s_image(void)
     fw_hdr[13] = 0x5c000;
     run();
     expect_gpu_off(dtbuf);
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("FW: GFX: unknown GPU firmware image, not identified"));
     assert(log_has("loaded GPU firmware is not a known ABI"));
 }
@@ -1590,7 +1596,7 @@ static void t8122_j613_standin_wrong_id(void)
     run();
     expect_gpu_off(dtbuf);
     assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1);
-    assert(log_has("not a G15G"));
+    assert(log_has("full-start T8122 powered identity rejected"));
 }
 
 /*
@@ -1704,9 +1710,7 @@ static void t8122_j613_fuse_fault(void)
 static void prepare_j613_standin_fuse(int use, int fault)
 {
     prepare_j613_setup(0x3ff, 1);
-    CHK(fdt_setprop_string(dtbuf, 0, "compatible", "apple,j613"));
     mmio_set(T8122_LEAK_FUSE_WORD0, 0xa0000000, fault);
-    mmio_set(T8122_LEAK_FUSE_WORD1, 0x000aaaaa, 0);
     if (use)
         CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"),
                                "asahi,t8122-gpu-fuse-leakage", "1"));
@@ -1777,14 +1781,15 @@ static void t8122_j613_standin_fuse_on_fault(void)
 
 static void t8122_j613_standin_fuse_not_j613(void)
 {
-    /* The switch on another T8122 root: no fuse values, so the setup refuses */
+    /* A root without an Air board compatible cannot publish the identity witness. */
     prepare_j613_setup(0x3ff, 1);
+    CHK(fdt_setprop_string(dtbuf, 0, "compatible", "apple,t8122"));
     CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-fuse-leakage",
                            "1"));
     run();
     expect_gpu_off(dtbuf);
-    assert(!strstr(trace_buf, "0x2e42c812"));
-    assert(log_has("but this boot has no T8122 leakage fuse values"));
+    assert(!pmgr_enables && !mmio_reads && !unguarded_faults);
+    assert(log_has("full-start T8122 identity node unavailable"));
 }
 
 /* Each Air hands over its own fuse, clock and power values. */
