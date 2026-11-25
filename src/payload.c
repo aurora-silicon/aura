@@ -624,15 +624,14 @@ int payload_run(void)
             secboot_measure("dtb", fdt, fdt_totalsize(fdt), SECBOOT_MEASURED);
             secboot_measure("kernel", kernel, kernel_payload_size, SECBOOT_MEASURED);
         }
-#ifdef SPTM_VIRT_ESP
+#ifdef SPTM_VIRT
         /*
-         * A macOS-only ESP stage 2 (SPTM_VIRT_ESP) boots via the macos= line above and never
-         * prepares a Linux devicetree or hands off to a kernel. The whole kboot/DT/display/GPU-
-         * initdata/PCIe tree is gated out of this build so the vital region fits below the DCP
-         * __OS_LOG buffer (aura-raw.ld _file_limit). Reaching here means a boot=/chainload= path
-         * produced a kernel+fdt, which this image deliberately does not support: fail loudly.
+         * An SPTM-virt image hosts a macOS guest (via run_guest_sptm.py or the ESP macos= path)
+         * and never prepares a Linux devicetree or hands off to a Linux kernel. Gating out the
+         * Linux kboot/DT/display/GPU-initdata/PCIe tree keeps both _file_vital_end below the DCP
+         * __OS_LOG buffer (aura-raw.ld _file_limit) and the full in-place image below it.
          */
-        panic("payload: Linux kboot path is gated out of SPTM_VIRT_ESP builds\n");
+        panic("payload: Linux kboot path is gated out of SPTM_VIRT builds\n");
 #else
         /* T8152: hand the display controllers this stage started to Linux powered off, with
          * their endpoints stopped and RTKit running, before the device tree reports them. */
