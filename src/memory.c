@@ -264,7 +264,7 @@ static void mmu_write_descriptor(u64 *entry, u64 value, u64 from)
     msr(DAIF, daif);
 }
 
-static u64 *mmu_pt_get_l1(u64 from)
+static u64 *mmu_pt_get_l1(u64 from, bool alloc)
 {
     u64 l0idx = from >> VADDR_L0_OFFSET_BITS;
     assert(l0idx < ENTRIES_PER_L0_TABLE);
@@ -272,6 +272,9 @@ static u64 *mmu_pt_get_l1(u64 from)
 
     if (L0_IS_TABLE(l0d))
         return (u64 *)(l0d & PTE_TARGET_MASK);
+
+    if (!alloc)
+        return NULL;
 
     u64 *l1 = (u64 *)memalign(PAGE_SIZE, ENTRIES_PER_L1_TABLE * sizeof(u64));
     assert(!IS_PTE(l0d));
@@ -288,30 +291,44 @@ static void mmu_pt_map_l1(u64 from, u64 to, u64 size)
     assert((to & PTE_TARGET_MASK & MASK(VADDR_L1_OFFSET_BITS)) == 0);
     assert((size & MASK(VADDR_L1_OFFSET_BITS)) == 0);
 
-    to |= FIELD_PREP(PTE_TYPE, PTE_BLOCK);
+    bool valid = !!(to & PTE_VALID);
+    if (valid)
+        to |= FIELD_PREP(PTE_TYPE, PTE_BLOCK);
 
     for (; size; size -= BIT(VADDR_L1_OFFSET_BITS)) {
         u64 idx = (from >> VADDR_L1_OFFSET_BITS) & MASK(VADDR_L1_INDEX_BITS);
-        u64 *l1 = mmu_pt_get_l1(from);
+        u64 *l1 = mmu_pt_get_l1(from, valid);
+        if (!l1) {
+            from += BIT(VADDR_L1_OFFSET_BITS);
+            if (valid)
+                to += BIT(VADDR_L1_OFFSET_BITS);
+            continue;
+        }
 
         if (L1_IS_TABLE(l1[idx]))
             free((void *)(l1[idx] & PTE_TARGET_MASK));
 
         l1[idx] = to;
         from += BIT(VADDR_L1_OFFSET_BITS);
-        to += BIT(VADDR_L1_OFFSET_BITS);
+        if (valid)
+            to += BIT(VADDR_L1_OFFSET_BITS);
     }
 }
 
-static u64 *mmu_pt_get_l2(u64 from)
+static u64 *mmu_pt_get_l2(u64 from, bool alloc)
 {
-    u64 *l1 = mmu_pt_get_l1(from);
+    u64 *l1 = mmu_pt_get_l1(from, alloc);
+    if (!l1)
+        return NULL;
     u64 l1idx = (from >> VADDR_L1_OFFSET_BITS) & MASK(VADDR_L1_INDEX_BITS);
     assert(l1idx < ENTRIES_PER_L1_TABLE);
     u64 l1d = l1[l1idx];
 
     if (L1_IS_TABLE(l1d))
         return (u64 *)(l1d & PTE_TARGET_MASK);
+
+    if (!alloc && !IS_PTE(l1d))
+        return NULL;
 
     u64 *l2 = (u64 *)memalign(PAGE_SIZE, ENTRIES_PER_L2_TABLE * sizeof(u64));
     if (IS_PTE(l1d)) {
@@ -335,33 +352,50 @@ static void mmu_pt_map_l2(u64 from, u64 to, u64 size)
     assert((to & PTE_TARGET_MASK & MASK(VADDR_L2_OFFSET_BITS)) == 0);
     assert((size & MASK(VADDR_L2_OFFSET_BITS)) == 0);
 
-    to |= FIELD_PREP(PTE_TYPE, PTE_BLOCK);
+    bool valid = !!(to & PTE_VALID);
+    if (valid)
+        to |= FIELD_PREP(PTE_TYPE, PTE_BLOCK);
 
     /* As for L3: one table lookup per L1 block, not per entry. */
     u64 *l2 = NULL;
-    for (; size; size -= BIT(VADDR_L2_OFFSET_BITS)) {
+    while (size) {
         u64 idx = (from >> VADDR_L2_OFFSET_BITS) & MASK(VADDR_L2_INDEX_BITS);
-        if (!l2 || !idx)
-            l2 = mmu_pt_get_l2(from);
+        if (!l2 || !idx) {
+            l2 = mmu_pt_get_l2(from, valid);
+            if (!l2) {
+                u64 skip =
+                    min(size, BIT(VADDR_L1_OFFSET_BITS) - (from & MASK(VADDR_L1_OFFSET_BITS)));
+                from += skip;
+                size -= skip;
+                continue;
+            }
+        }
 
         if (L2_IS_TABLE(l2[idx]))
             free((void *)(l2[idx] & PTE_TARGET_MASK));
 
         l2[idx] = to;
         from += BIT(VADDR_L2_OFFSET_BITS);
-        to += BIT(VADDR_L2_OFFSET_BITS);
+        if (valid)
+            to += BIT(VADDR_L2_OFFSET_BITS);
+        size -= BIT(VADDR_L2_OFFSET_BITS);
     }
 }
 
-static u64 *mmu_pt_get_l3(u64 from)
+static u64 *mmu_pt_get_l3(u64 from, bool alloc)
 {
-    u64 *l2 = mmu_pt_get_l2(from);
+    u64 *l2 = mmu_pt_get_l2(from, alloc);
+    if (!l2)
+        return NULL;
     u64 l2idx = (from >> VADDR_L2_OFFSET_BITS) & MASK(VADDR_L2_INDEX_BITS);
     assert(l2idx < ENTRIES_PER_L2_TABLE);
     u64 l2d = l2[l2idx];
 
     if (L2_IS_TABLE(l2d))
         return (u64 *)(l2d & PTE_TARGET_MASK);
+
+    if (!alloc && !IS_PTE(l2d))
+        return NULL;
 
     u64 *l3 = (u64 *)memalign(PAGE_SIZE, ENTRIES_PER_L3_TABLE * sizeof(u64));
     if (IS_PTE(l2d)) {
@@ -385,21 +419,37 @@ static void mmu_pt_map_l3(u64 from, u64 to, u64 size)
     assert((to & PTE_TARGET_MASK & MASK(VADDR_L3_OFFSET_BITS)) == 0);
     assert((size & MASK(VADDR_L3_OFFSET_BITS)) == 0);
 
-    to |= FIELD_PREP(PTE_TYPE, PTE_PAGE);
+    bool valid = !!(to & PTE_VALID);
+    bool active = mmu_active();
+    if (valid)
+        to |= FIELD_PREP(PTE_TYPE, PTE_PAGE);
 
     /*
      * Look the L3 table up once per L2 block rather than once per page: before the MMU is on
      * every table access is uncached, and the walk costs three reads per entry.
      */
     u64 *l3 = NULL;
-    for (; size; size -= BIT(VADDR_L3_OFFSET_BITS)) {
+    while (size) {
         u64 idx = (from >> VADDR_L3_OFFSET_BITS) & MASK(VADDR_L3_INDEX_BITS);
-        if (!l3 || !idx)
-            l3 = mmu_pt_get_l3(from);
+        if (!l3 || !idx) {
+            l3 = mmu_pt_get_l3(from, valid);
+            if (!l3) {
+                u64 skip =
+                    min(size, BIT(VADDR_L2_OFFSET_BITS) - (from & MASK(VADDR_L2_OFFSET_BITS)));
+                from += skip;
+                size -= skip;
+                continue;
+            }
+        }
 
-        mmu_write_descriptor(&l3[idx], to, from);
+        if (active)
+            mmu_write_descriptor(&l3[idx], to, from);
+        else
+            l3[idx] = to;
         from += BIT(VADDR_L3_OFFSET_BITS);
-        to += BIT(VADDR_L3_OFFSET_BITS);
+        if (valid)
+            to += BIT(VADDR_L3_OFFSET_BITS);
+        size -= BIT(VADDR_L3_OFFSET_BITS);
     }
 }
 
@@ -540,10 +590,12 @@ void mmu_add_mapping(u64 from, u64 to, size_t size, u8 attribute_index, u64 perm
                 size) < 0)
         panic("Failed to add MMU mapping 0x%lx -> 0x%lx (0x%lx)\n", from, to, size);
 
-    sysop("dsb ishst");
-    sysop("tlbi vmalle1is");
-    sysop("dsb ish");
-    sysop("isb");
+    if (mmu_active()) {
+        sysop("dsb ishst");
+        sysop("tlbi vmalle1is");
+        sysop("dsb ish");
+        sysop("isb");
+    }
 }
 
 void mmu_rm_mapping(u64 from, size_t size)
