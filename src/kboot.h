@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
 #ifndef KBOOT_H
 #define KBOOT_H
@@ -27,6 +27,7 @@ void kboot_request_hibernate_layout(bool on);
 int kboot_set_chosen(const char *name, const char *value);
 void kboot_delete_chosen(const char *name);
 void kboot_set_config_lost(void);
+bool kboot_config_lost(void);
 int kboot_set_uboot(const char *name, const char *value);
 int dt_gpu_t8122_26_calibrate(void *dt);
 #define T8122_27_VALUES 2

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 /*
  * Internal display handoff, for SoCs whose internal DCP iBoot leaves running.
  *
@@ -551,7 +551,7 @@ static struct {
     bool vm_ok;
     int nnubs;
     const char *nubs[DCP6_NUBS_MAX];
-    int nsegs, seg_oslog, seg_vram;
+    int nsegs, seg_text, seg_oslog, seg_vram;
     struct dcp6_seg_def derived[DCP6_SEGS_MAX];
     char derived_names[DCP6_SEGS_MAX][2][DCP6_DEF_LEN]; /* heap segments' names */
     bool mmio_ok;     /* display domain on and the register reads below did not fault */
@@ -1816,6 +1816,7 @@ static int dcp6_derive_segs(const struct adt_segment_ranges *seg, int n, const c
         bail("dcp segments lack text, __DATA, __OS_LOG or /vram\n");
 
     dcp6.nsegs = n;
+    dcp6.seg_text = text;
     dcp6.seg_oslog = oslog;
     dcp6.seg_vram = vram_seg;
     for (int i = 0; i < n; i++) {
@@ -2207,7 +2208,7 @@ static int dcp6_check_dt(void *dt, struct dcp6_dt *n)
 {
     const struct dcp_soc *soc = dcp6.soc;
 
-    if (!dcp6_board_ok(dt))
+    if ((!dcp6.fw || dcp6.fw->os_fw != V27_2) && !dcp6_board_ok(dt))
         bail("not a %s device tree\n", soc->boards_desc);
     if (soc->fw25 && !t8122_25g83_board(dt))
         bail(
@@ -2574,6 +2575,14 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
     return 0;
 }
 
+static bool dcp6_optout(void *dt, const char *name)
+{
+    int chosen = fdt_path_offset(dt, "/chosen");
+    int len = 0;
+    const char *val = chosen >= 0 ? fdt_getprop(dt, chosen, name, &len) : NULL;
+    return val && (len != 2 || strcmp(val, "1"));
+}
+
 static bool dcp6_armed(void *dt)
 {
     if (!dcp6.soc->optin)
@@ -2581,7 +2590,11 @@ static bool dcp6_armed(void *dt)
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
     const char *optin = chosen >= 0 ? fdt_getprop(dt, chosen, dcp6.soc->optin, &len) : NULL;
-    return optin && len == 2 && !strcmp(optin, "1");
+    if (optin)
+        return !kboot_config_lost() && len == 2 && !strcmp(optin, "1");
+    if (dcp6.fw && dcp6.fw->os_fw == V27_2)
+        return !kboot_config_lost() && !dcp6_optout(dt, "asahi,m3-defaults");
+    return false;
 }
 
 /* The segments' reservations: __OS_LOG's is in place, the others do not collide with anything */
@@ -2811,8 +2824,10 @@ static int dcpext6_publish(void *dt, const struct dcpext6_inst *inst)
         }
     }
     /* Only the immutable text may alias the panel's firmware allocation. */
-    if (segs[0].phys != dcp6.segs[0].phys || segs[0].size != dcp6.segs[0].size ||
-        segs[0].remap != dcp6.segs[0].remap)
+    if (dcp6.seg_text < 0 || dcp6.seg_text >= dcp6.nsegs ||
+        segs[0].phys != dcp6.segs[dcp6.seg_text].phys ||
+        segs[0].size != dcp6.segs[dcp6.seg_text].size ||
+        segs[0].remap != dcp6.segs[dcp6.seg_text].remap)
         return -1;
 
     u32 owner = dcp6_phandle(dt, path);
@@ -3224,13 +3239,16 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
                 return -1;
     }
     /* The two external processors and the panel share immutable TEXT. */
-    const struct dcp6_seg *shared_text = &dcp6.segs[SEG_TEXT];
+    const struct dcp6_seg *shared_text = NULL;
     if (t6041_headless(dt)) {
         if (!t6041_headless_text.phys)
             t6041_headless_text = segs[SEG_TEXT];
         shared_text = &t6041_headless_text;
+    } else if (dcp6.seg_text >= 0 && dcp6.seg_text < dcp6.nsegs) {
+        shared_text = &dcp6.segs[dcp6.seg_text];
     }
-    if (segs[SEG_TEXT].phys != shared_text->phys || segs[SEG_TEXT].size != shared_text->size)
+    if (!shared_text || segs[SEG_TEXT].phys != shared_text->phys ||
+        segs[SEG_TEXT].size != shared_text->size)
         return -1;
 
     u32 owner = dcp6_phandle(dt, ext->dt_path);
@@ -4213,12 +4231,13 @@ int dt_set_display_handoff(void *dt)
         return 0;
     }
 
-    if (dcp6.soc->board_gate && (chip_id != dcp6.soc->chip || !dcp6_board_ok(dt))) {
+    dcp6.fw = dcp6_select_fw(dcp6.soc);
+
+    if (dcp6.soc->board_gate && (chip_id != dcp6.soc->chip ||
+                                 ((!dcp6.fw || dcp6.fw->os_fw != V27_2) && !dcp6_board_ok(dt)))) {
         dlog("not a %s (chip 0x%x): nothing done\n", dcp6.soc->boards_desc, chip_id);
         return 0;
     }
-
-    dcp6.fw = dcp6_select_fw(dcp6.soc);
 
     /* Reject unsupported firmware before reserving __OS_LOG or touching registers. */
     if (!dcp6.soc->optin && !dcp6.fw) {
