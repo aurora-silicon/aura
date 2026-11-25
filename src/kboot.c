@@ -87,6 +87,7 @@ extern u64 relocated_from;
 
 int dt_set_gpu(void *dt);
 int dt_set_display_handoff(void *dt);
+bool dt_t8132_external_display(void);
 
 u64 kboot_ram_base(void)
 {
@@ -9394,6 +9395,8 @@ static int dt_set_display(void)
         disp0_piodma_alias = compat_piodma_alias;
 
     if (chip_id == T8132) {
+        if (dt_t8132_external_display())
+            return dt_set_display_handoff(dt);
         if (dt_set_m4_dcp_handoff())
             printf("FDT: M4 DCP handoff refused; keeping the boot framebuffer\n");
         else

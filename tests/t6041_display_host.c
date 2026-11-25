@@ -726,6 +726,7 @@ static const char OTHER[] = "apple,j999s\0apple,t6040\0apple,arm-platform";
 static const char J614S[] = "apple,j614s\0apple,t6040\0apple,arm-platform";
 static const char J616C[] = "apple,j616c\0apple,t6041\0apple,arm-platform";
 static const char J614C[] = "apple,j614c\0apple,t6041\0apple,arm-platform";
+static const char J575C[] = "apple,j575c\0apple,t6041\0apple,arm-platform";
 
 /* ---- checks ---- */
 
@@ -989,9 +990,10 @@ static void refusal_check(const void *in, const void *dt, bool oslog)
 
 enum kind {
     PUBLISH,
-    NOTHING, /* refused by the chip, board, firmware or DT gate: no access at all, the DT
-                byte-identical */
-    REFUSE,  /* refused after the gates, __OS_LOG reserved */
+    HEADLESS, /* no internal panel (ADT disp0 external): external processors + display enabled */
+    NOTHING,  /* refused by the chip, board, firmware or DT gate: no access at all, the DT
+                 byte-identical */
+    REFUSE,   /* refused after the gates, __OS_LOG reserved */
     REFUSE_NO_OSLOG,
 };
 
@@ -1022,6 +1024,7 @@ static const struct scenario scenarios[] = {
     {"j614c", PUBLISH, "a J614C (chip T6041) boot publishes"},
     {"j614c-external", PUBLISH, "J614C external firmware memories come from the ADT"},
     {"j614c-on-t6040", NOTHING, "chip T6040 with a J614C device tree"},
+    {"j575c-headless", HEADLESS, "J575C headless (disp0 external): external processors only"},
     {"no-display-dt", NOTHING, "a J616s device tree without the display block"},
     {"no-dcp-alias", NOTHING, "a J616s device tree without the dcp alias"},
     {"wrong-dcp-compat", NOTHING, "dcp is not apple,t6041-dcp"},
@@ -1095,17 +1098,20 @@ int main(int argc, char **argv)
     world_j616s(&o);
 
     static u8 dt[DT_SIZE], in[DT_SIZE];
-    bool j616c = !strncmp(s, "j616c", 5), j614c = !strncmp(s, "j614c", 5);
+    bool j616c = !strncmp(s, "j616c", 5), j614c = !strncmp(s, "j614c", 5),
+         j575c = !strncmp(s, "j575c", 5);
     _Static_assert(sizeof(J616C) == sizeof(J616S), "root compatibles of equal length");
     _Static_assert(sizeof(J614C) == sizeof(J616S), "root compatibles of equal length");
+    _Static_assert(sizeof(J575C) == sizeof(J616S), "root compatibles of equal length");
     const char *board = is(s, "wrong-board")                              ? OTHER
                         : (is(s, "j614-no-optin") || is(s, "j614-optin")) ? J614S
                         : j616c                                           ? J616C
                         : j614c                                           ? J614C
+                        : j575c                                           ? J575C
                                                                           : J616S;
     build_dt(dt, board, sizeof(J616S));
     if (is(s, "external") || is(s, "external-refuse") || is(s, "j616c-external") ||
-        is(s, "j614c-external")) {
+        is(s, "j614c-external") || is(s, "j575c-headless")) {
         for (int i = 0; i < 2; i++) {
             build_ext(dt, i);
             world_ext(i);
@@ -1116,8 +1122,14 @@ int main(int argc, char **argv)
 
     /* ADT side */
     if (is(s, "wrong-chip") || (j616c && !is(s, "j616c-on-t6040")) ||
-        (j614c && !is(s, "j614c-on-t6040")))
+        (j614c && !is(s, "j614c-on-t6040")) || j575c)
         chip_id = T6041;
+    if (is(s, "j575c-headless")) {
+        prop_set("/arm-io/disp0", "external", "", 0);
+        fb_base = TB + 0x2a0000000ULL;
+        cur_boot_args.video.stride = 0x4000;
+        cur_boot_args.video.height = 0x200000 / 0x4000;
+    }
     if (is(s, "no-adt-nub"))
         node_drop("/arm-io/dcp/iop-dcp-nub");
     if (is(s, "no-adt-dart-dcp"))
@@ -1212,7 +1224,7 @@ int main(int argc, char **argv)
     check(exc_count == 0, "no MMIO access faulted");
 
     if (is(s, "external") || is(s, "external-refuse") || is(s, "j616c-external") ||
-        is(s, "j614c-external")) {
+        is(s, "j614c-external") || is(s, "j575c-headless")) {
         for (int i = 0; i < 2; i++) {
             char path[40];
             snprintf(path, sizeof(path), "/dcp@%llx", (unsigned long long)(i ? EXT1 : EXT0));
@@ -1295,6 +1307,24 @@ int main(int argc, char **argv)
             check(mmio_writes == 1 && last_write == DART_DCP + 0x200,
                   "the only MMIO write is the dart-dcp lock");
             break;
+        case HEADLESS: {
+            int dcp_n = alias_node(dt, "dcp"), disp_n = alias_node(dt, "disp0");
+            int dart_disp = fdt_node_offset_by_phandle(dt, PH_DART_DISP);
+            int fb_idx = fdt_stringlist_search(dt, disp_n, "memory-region-names", "framebuffer");
+            int fb_reg = fb_idx >= 0 ? region_at(dt, disp_n, fb_idx) : -1;
+            u64 b = 0, sz = 0;
+            check(dcp_n >= 0 && !marker_set(dt, dcp_n) && status_is(dt, dcp_n, "disabled"),
+                  "headless: internal DCP untouched without handoff marker");
+            check(disp_n >= 0 && status_is(dt, disp_n, "okay") && dart_disp >= 0 &&
+                      status_is(dt, dart_disp, "okay"),
+                  "headless: display subsystem and its DART enabled");
+            check(fb_reg >= 0 && !fdt_node_check_compatible(dt, fb_reg, "framebuffer") &&
+                      reg_of(dt, fb_reg, &b, &sz) && b == fb_base && sz == 0x200000,
+                  "headless: display framebuffer region uses iBoot boot framebuffer");
+            oslog_check(dt, true);
+            check(mmio_writes == 0, "headless: no MMIO write (dart-dcp not locked)");
+            break;
+        }
         case NOTHING:
             check(fdt_totalsize(dt) == fdt_totalsize(in) && !memcmp(in, dt, fdt_totalsize(in)),
                   "nothing done: the device tree is byte for byte unchanged");
