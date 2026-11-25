@@ -175,7 +175,6 @@
 #define DART_DVA_MASK    ((1UL << 36) - 1)
 #define DART_PT_MAX_SIZE SZ_1M
 
-#define DCP6_SEGS         8 /* T6030 */
 #define DCP6_SEGS_MAX     12
 #define DCP6_SEG_MAX_SIZE (256 * SZ_1M)
 #define DCP6_OSLOG_MAX    SZ_1M
@@ -197,30 +196,14 @@
 #define SEG_FLAGS_HEAP  2
 #define SEG_FLAGS_OSLOG 0xa
 
-/* Segment indices of the T6030 dcp layout, and of the T6030 dcpext0 layout (its first four) */
-enum { SEG_TEXT, SEG_DATA, SEG_OSLOG, SEG_3, SEG_4, SEG_5, SEG_VRAM, SEG_7 };
+/* Segment indices used by the external display handoffs. */
+enum { SEG_TEXT, SEG_DATA, SEG_OSLOG, SEG_3 };
 
 struct dcp6_seg_def {
-    u32 flags;
     int region_id;
     const char *node;   /* /reserved-memory node name, before the unit address */
     const char *name;   /* memory-region-names entry */
     const char *compat; /* compatible of the reserved-memory node, or NULL */
-};
-
-/*
- * T6030 iop-dcp-nub segment-ranges, in ADT order. Every segment except __OS_LOG is also a carveout
- * from /chosen/carveout-memory-map (region-id-14 is /vram, the boot framebuffer).
- */
-static const struct dcp6_seg_def dcp6_seg_defs_t6030[DCP6_SEGS] = {
-    {SEG_FLAGS_TEXT, 49, "dcp-text", "asc-firmware", "apple,asc-mem"},
-    {SEG_FLAGS_DATA, 50, "dcp-data", "dcp_data", "apple,asc-mem"},
-    {SEG_FLAGS_OSLOG, -1, "dcp-oslog", "os_log", NULL},
-    {SEG_FLAGS_HEAP, 57, "dcp-seg3", "region57", "apple,asc-mem"},
-    {SEG_FLAGS_HEAP, 94, "dcp-seg4", "region94", "apple,asc-mem"},
-    {SEG_FLAGS_HEAP, 95, "dcp-seg5", "region95", "apple,asc-mem"},
-    {SEG_FLAGS_HEAP, 14, "framebuffer", "framebuffer", "framebuffer"},
-    {SEG_FLAGS_HEAP, 157, "dcp-seg7", "region157", "apple,asc-mem"},
 };
 
 #define DCP6_OSLOG_NODE "dcp-oslog"
@@ -272,10 +255,8 @@ struct dcp_soc {
     int nfws;
     /* Nonzero: the ADT must say the same. Zero: taken from the ADT. */
     u64 coproc, dart_dcp, dart_disp;
-    u64 vm_base, vm_size; /* both DARTs' DVA window (vm-base, vm-size, apple,dma-range) */
-    u64 pmgr_disp_cpu;    /* display CPU power state register (with adt_psreg: compared only) */
-    const struct dcp6_seg_def *segs; /* fixed iop-dcp-nub layout, or NULL: derived from the ADT */
-    int nsegs;
+    u64 vm_base, vm_size;    /* both DARTs' DVA window (vm-base, vm-size, apple,dma-range) */
+    u64 pmgr_disp_cpu;       /* display CPU power state register (with adt_psreg: compared only) */
     const char *const *nubs; /* owners whose __OS_LOG is reserved, or NULL: every dcp/dcpextN */
     int nnubs;
 };
@@ -310,8 +291,6 @@ static const struct dcp_soc dcp_soc_t6030 = {
     .vm_base = DCP6_DART_VM_BASE,
     .vm_size = DCP6_DART_VM_SIZE,
     .pmgr_disp_cpu = 0x350710000UL,
-    .segs = dcp6_seg_defs_t6030,
-    .nsegs = DCP6_SEGS,
     .nubs = dcp6_nubs_t6030,
     .nnubs = ARRAY_SIZE(dcp6_nubs_t6030),
 };
@@ -573,7 +552,6 @@ static struct {
     int nnubs;
     const char *nubs[DCP6_NUBS_MAX];
     int nsegs, seg_oslog, seg_vram;
-    const struct dcp6_seg_def *defs; /* the SoC's layout, or derived[] */
     struct dcp6_seg_def derived[DCP6_SEGS_MAX];
     char derived_names[DCP6_SEGS_MAX][2][DCP6_DEF_LEN]; /* heap segments' names */
     bool mmio_ok;     /* display domain on and the register reads below did not fault */
@@ -1765,9 +1743,9 @@ static int dcp6_find_carveout(int cmap, u64 base, u64 size)
 }
 
 /*
- * A layout for an SoC without a fixed one: exactly one text, one __DATA and one __OS_LOG segment,
- * every other one a heap segment, the one at /vram the framebuffer. Each segment except __OS_LOG
- * must be exactly one carveout, whose region id names it as on T6030.
+ * The panel layout has exactly one text, one __DATA and one __OS_LOG segment and uses heap
+ * segments for everything else, including the framebuffer at /vram. Every segment except
+ * __OS_LOG must match exactly one carveout. The carveout ID names each ordinary heap.
  */
 static int dcp6_derive_segs(const struct adt_segment_ranges *seg, int n, const char *names,
                             u32 names_len, int cmap)
@@ -1783,7 +1761,6 @@ static int dcp6_derive_segs(const struct adt_segment_ranges *seg, int n, const c
         struct dcp6_seg_def *d = &dcp6.derived[i];
 
         memcpy(&r, &seg[i], sizeof(r));
-        d->flags = r.unk;
         d->region_id = -1;
         d->compat = "apple,asc-mem";
         switch (r.unk) {
@@ -1841,7 +1818,6 @@ static int dcp6_derive_segs(const struct adt_segment_ranges *seg, int n, const c
     dcp6.nsegs = n;
     dcp6.seg_oslog = oslog;
     dcp6.seg_vram = vram_seg;
-    dcp6.defs = dcp6.derived;
     for (int i = 0; i < n; i++) {
         if (i == oslog)
             dlog_debug("dcp segment %d: %s, physical buffer\n", i, dcp6.derived[i].name);
@@ -1886,7 +1862,6 @@ static int dcp6_get_vm(void)
 
 static int dcp6_get_segs(void)
 {
-    const struct dcp_soc *soc = dcp6.soc;
     int nub = adt_path_offset(adt, DCP6_NUB);
     if (nub < 0)
         bail("no %s\n", DCP6_NUB);
@@ -1894,16 +1869,8 @@ static int dcp6_get_segs(void)
     u32 len = 0, names_len = 0;
     const struct adt_segment_ranges *seg = adt_getprop(adt, nub, "segment-ranges", &len);
     const char *names = adt_getprop(adt, nub, "segment-names", &names_len);
-    if (soc->segs) {
-        if (!seg || len != soc->nsegs * sizeof(*seg) || !names)
-            bail("dcp segment-ranges missing or not %d entries (len %u)\n", soc->nsegs, len);
-        /* Segment 0 (text) is checked by its flags below */
-        if (!dcp6_seg_name_is(names, names_len, SEG_DATA, "__DATA") ||
-            !dcp6_seg_name_is(names, names_len, SEG_OSLOG, "__OS_LOG"))
-            bail("dcp segments 1 and 2 are not named __DATA and __OS_LOG\n");
-    } else if (!seg || !len || len % sizeof(*seg) || len > DCP6_SEGS_MAX * sizeof(*seg) || !names) {
+    if (!seg || !len || len % sizeof(*seg) || len > DCP6_SEGS_MAX * sizeof(*seg) || !names)
         bail("dcp segment-ranges missing or not 1 to %d entries (len %u)\n", DCP6_SEGS_MAX, len);
-    }
 
     u64 dram_base, dram_size;
     if (dcp6_dram(&dram_base, &dram_size))
@@ -1915,21 +1882,14 @@ static int dcp6_get_segs(void)
     if (cmap < 0)
         bail("no /chosen/carveout-memory-map\n");
 
-    if (soc->segs) {
-        dcp6.nsegs = soc->nsegs;
-        dcp6.seg_oslog = SEG_OSLOG;
-        dcp6.seg_vram = SEG_VRAM;
-        dcp6.defs = soc->segs;
-    } else if (dcp6_derive_segs(seg, len / sizeof(*seg), names, names_len, cmap)) {
+    if (dcp6_derive_segs(seg, len / sizeof(*seg), names, names_len, cmap))
         return -1;
-    }
     if (!dcp6.vm_ok && dcp6_get_vm())
         return -1;
 
     for (int i = 0; i < dcp6.nsegs; i++) {
         struct adt_segment_ranges r;
         struct dcp6_seg *s = &dcp6.segs[i];
-        const struct dcp6_seg_def *d = &dcp6.defs[i];
 
         memcpy(&r, &seg[i], sizeof(r));
         s->phys = r.phys;
@@ -1937,8 +1897,6 @@ static int dcp6_get_segs(void)
         s->remap = r.remap;
         s->flags = r.unk;
 
-        if (s->flags != d->flags)
-            bail("dcp segment %d flags 0x%x, expected 0x%x\n", i, s->flags, d->flags);
         if (!r.size || s->size > DCP6_SEG_MAX_SIZE || (s->phys & (SZ_16K - 1)) ||
             s->phys < dram_base || s->phys + s->size < s->phys ||
             s->phys + s->size > dram_base + dram_size)
@@ -1959,14 +1917,6 @@ static int dcp6_get_segs(void)
                 bail("dcp segment %d 0x%lx+0x%lx is in usable RAM\n", i, s->phys, s->size);
             if (dcp6_carveout_conflict(s->phys, s->size, "dcp segment"))
                 return -1;
-
-            /* The matching carveout: same base, same (16K rounded) size */
-            char prop[32];
-            u64 cbase, csize;
-            snprintf(prop, sizeof(prop), "region-id-%d", d->region_id);
-            if (dcp6_adt_u64_pair(cmap, prop, &cbase, &csize) || cbase != s->phys ||
-                csize != s->size)
-                bail("dcp segment %d does not match carveout %s\n", i, prop);
         }
 
         for (int j = 0; j < i; j++) {
@@ -2553,7 +2503,7 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
                                dcp6_alias(VM_DISP, 0)};
 
     for (int i = 0; i < dcp6.nsegs; i++) {
-        const struct dcp6_seg_def *d = &dcp6.defs[i];
+        const struct dcp6_seg_def *d = &dcp6.derived[i];
         const struct dcp6_seg *s = &dcp6.segs[i];
         char name[DCP6_NAME_LEN];
         u32 ph;
@@ -2641,7 +2591,7 @@ static int dcp6_check_resv(void *dt)
         const struct dcp6_seg *s = &dcp6.segs[i];
         char name[DCP6_NAME_LEN];
 
-        snprintf(name, sizeof(name), "%s@%lx", dcp6.defs[i].node, s->phys);
+        snprintf(name, sizeof(name), "%s@%lx", dcp6.derived[i].node, s->phys);
         int node = dcp6_find_resv(dt, name, s->phys, s->size);
         if (i == dcp6.seg_oslog) {
             if (node < 0 || !fdt_get_phandle(dt, node) ||
