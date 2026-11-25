@@ -276,6 +276,28 @@ XNU_QUIRKS = (
                     0x1400000f),
                    ("task PAC key reprogramming (4)", "BootKC-rx", 0x31488c4, 0x540001e0,
                     0x1400000f))),
+    # T8112's xnu-13432.41.4 (macOS 27.2, 26B123, kernelcache.release.mac14g).
+    # Keeps PCIe/Wi-Fi/Ethernet visible (hide=()) so networking and SSH stay up;
+    # patches NVRAM writes (nvram_ro), rorgn, Image4 mix-and-match, and EL1 PAC keys.
+    dict(release=b"xnu-13432.41.4~", fingerprint=("__TEXT_EXEC", 0x1ca30c, 0xaa0003e8),
+         hide=(),
+         ro_relax=(("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3a69d80, 0x540002a9,
+                    0x14000015),),
+         rorgn=(("rorgn register read", "BootKC-rx", 0x32be540, 0x370001a8, 0x1400000d),),
+         rorgn_globals=(0xec8020, 0xec8028),
+         nvram_mutable=(("Image4 storageInit mix-and-match question", "BootKC-rx",
+                         0x2b64db4, 0x34000080, 0x14000022),),
+         nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1ca30c, 0xaa0003e8, 0x52800000),
+                   ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1ca310, 0x52805840,
+                    0xd65f03c0)),
+         pac_keys=(("task PAC key reprogramming (switch)", "BootKC-rx", 0x30dbd10, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (2)", "BootKC-rx", 0x30dbdd4, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (3)", "BootKC-rx", 0x30dbfdc, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (4)", "BootKC-rx", 0x30dc288, 0x540001e0,
+                    0x1400000f))),
     # T6041's xnu-13432.41.4 (macOS 27.2.1, 26B131, kernelcache.release.mac16j). Its guest needs
     # only nvram_ro: about 27 s in, while APFS mounts the volumes, AppleARMNORNVRAM sends the NOR a
     # write enable. The same two words as the J813's, at this kernelcache's offsets; the first is

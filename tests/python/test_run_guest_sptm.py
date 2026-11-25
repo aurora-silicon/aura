@@ -88,6 +88,7 @@ def test_aura_heap_reservation_before_proxy_limit(chip, model, override, expecte
 
 
 @pytest.mark.parametrize(("offset", "instruction", "selected", "hidden_radio"), [
+    (0x1CA30C, 0xAA0003E8, True, False),   # T8112 keeps networking visible with its quirks.
     (0x1BDF0C, 0xAA0003E8, True, False),   # T6041 uses only the NVRAM write quirk.
     (0x3B53C20, 0x540002A9, True, True),   # T8142 keeps its distinct fingerprint.
     (0x3B53C20, 0xD503201F, False, False), # The release string alone is insufficient.
