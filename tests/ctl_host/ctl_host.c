@@ -607,15 +607,18 @@ static void test_hooks(void)
     /* List: everything comes back, the missing blocks marked */
     CHECK(call(AURACTL_LIST, 0, 0, 0, VA_BUF, BUF_PAGES * PG) == 0);
     u64 total = req_ptr()->ret0;
-    CHECK(total == 9 + 2 + 4 + 12 + 4); /* PMGR blocks, PMS pages, AMCC planes, mailboxes, rest */
+    CHECK(total ==
+          9 + 2 + 4 + 12 + 4 + 4); /* PMGR blocks, PMS pages, AMCC planes, mailboxes, rest, APR */
     CHECK(req_ptr()->buf_used == total * sizeof(struct auractl_range));
     const struct auractl_range *e = (void *)gptr(PA_BUF);
     int absent = 0;
     for (u64 i = 0; i < total; i++)
         if (!strcmp(e[i].name, "gfx-mbox") || !strcmp(e[i].name, "gfx1-mbox") ||
-            !strcmp(e[i].name, "pmgr-pwrgate"))
+            !strcmp(e[i].name, "pmgr-pwrgate") || !strcmp(e[i].name, "apr-core") ||
+            !strcmp(e[i].name, "apr-wrapper") || !strcmp(e[i].name, "dart-apr") ||
+            !strcmp(e[i].name, "dart-apr-aux"))
             absent += !(e[i].flags & AURACTL_RANGE_FOUND) && !e[i].size && !e[i].base;
-    CHECK(absent == 3);
+    CHECK(absent == 7);
     CHECK(call(AURACTL_LIST, 0, 0, 0, VA_BUF, sizeof(*e) * 3) == 0 && req_ptr()->ret0 == total);
     CHECK(req_ptr()->buf_used == 3 * sizeof(*e));
     /* By name: two ranges of one name, then the same again (nothing changes) */
