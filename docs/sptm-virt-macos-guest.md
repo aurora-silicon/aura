@@ -57,6 +57,13 @@ True recoveryOS (1TR):
 
 Leave your Aurora Linux volume as the persistent default startup disk.
 
+After enrollment that macOS volume always starts `aura`, never XNU directly. A
+plain one-shot boot of it (for example `aurora-bless --set-boot-macos --next`)
+with no tether host attached leaves the Mac in `aura`'s USB proxy: the screen
+stays dark, the Mac does not join the network, and after a few minutes `aura`
+reboots into the default startup disk. Booting that volume natively again needs
+its original boot object restored from paired 1TR.
+
 ## 3. Start the host-side tether and `vuart` console
 
 On the Linux host connected to the target Mac's DFU port, start
@@ -121,6 +128,33 @@ osascript -e 'set volume output volume 0 output muted true'
 caffeinate -dimsu &
 ```
 
+### Check the displays
+
+`WindowServer` takes a little longer than SSH to light the monitors. Wait about
+a minute after SSH comes up, then check from the guest:
+
+```sh
+system_profiler SPDisplaysDataType
+```
+
+Each attached monitor should be listed with `Online: Yes` and its mode under
+`UI Looks like`. Right after SSH the list can still be empty.
+
+macOS shows the login window and the menu bar on its main display, which is not
+always the monitor you are looking at. A monitor that is cabled to the Mac but
+set to another input still counts. Pick the main display in System Settings >
+Displays (drag the menu bar), or from a script with the public CoreGraphics
+call `CGConfigureDisplayOrigin` (the display at origin 0,0 is the main display).
+macOS stores the choice on the guest's disk, so later guest boots keep it.
+
+### Saving NVRAM changes
+
+`nvram_ro` drops every NVRAM write, including the ones macOS makes when you pair
+a Bluetooth device. macOS keeps such a pairing on its own disk, but Linux tools
+that read the pairing from NVRAM do not see it. For a session whose NVRAM writes
+must persist, add `AURA_SHARE_NVRAM=1`. Back up the NVRAM partition first: if
+that guest boot fails, XNU can write recovery or panic state into the real NVRAM.
+
 ## 5. Return cleanly to Linux
 
 From inside the macOS guest:
@@ -170,6 +204,10 @@ systemctl --failed
   (`XNU_QUIRKS`), including `nvram_ro` (NOR writes return success in memory
   only) and shared EL1 PAC keys (`pac_keys`). Newer macOS builds whose
   kernelcache layout changes need a matching `XNU_QUIRKS` entry.
+- **USB-C monitors above 60 Hz:** with the proxy on a USB CDC port, a monitor
+  on another USB-C port can flicker and go dark at modes above 60 Hz, because
+  `aura` still masks that port's USB-C controller interrupts. Pick a 60 Hz mode
+  for it in System Settings > Displays. HDMI is not affected.
 - **T8112 (M2) specifics:** macOS 27.2 on T8112 runs SPTM, TXM, and XNU without
   exclaves. External monitors over HDMI and USB-C (including HDR) work with
   discrete refresh rates; MCDP29xx/2900 HDMI bridges report no VRR support.
