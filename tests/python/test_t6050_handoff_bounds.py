@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 """The T6050 display handoff refuses an empty, overflowing or out-of-/vram boot framebuffer and a
 zero, unaligned or out-of-range bandwidth scratch, and the T6041 headless handoff refuses an empty
 or overflowing boot framebuffer.
@@ -266,6 +266,11 @@ int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *gate)
 int pmgr_adt_is_powered(const char *path)
 {
     DIE("pmgr_adt_is_powered(%s)\n", path);
+}
+
+bool kboot_config_lost(void)
+{
+    return false;
 }
 
 u64 kboot_ram_base(void)
