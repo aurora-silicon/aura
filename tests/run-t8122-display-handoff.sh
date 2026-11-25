@@ -57,5 +57,13 @@ for dtb in $dtbs; do
         fi
     done
 done
+sed -e 's/t8122/t6030/g' -e 's/j613/j516s/g' tests/t8122-j613-display.dts |
+    ${DTC:-dtc} -q -I dts -O dtb -o "$tmp/j516s.dtb" -
+if ! "$tmp/t8122-display-host" "$tmp/j516s.dtb" t6030-publish-27_2 > "$tmp/t6030-27_2.log" 2>&1; then
+    fail=1
+    cat "$tmp/t6030-27_2.log"
+else
+    grep -E '^(ok|FAIL) ' "$tmp/t6030-27_2.log" | sed 's/^/t6030-publish-27_2: /'
+fi
 [ $fail = 0 ] && echo "T8122 display handoff: every scenario passes"
 exit $fail

@@ -418,7 +418,7 @@ static u32 ttbr_of(u64 l1)
 
 #define TB         0x10000000000ULL
 static bool fw25;
-static bool fw27; /* the generalised T8122 profile admitting the 27.2 image */
+static bool fw27;
 #define J613_UUID                                                                                  \
     (fw25   ? "C042E95C-B9D8-3F0E-94B3-582A08AA6FDD"                                                \
      : fw27 ? "93FA4B31-BB97-3B2A-8673-49EA489EE9C1"                                                \
@@ -568,6 +568,7 @@ static const struct seg segs6[8] = {
     {TB + 0x280200000ULL, ~0ULL, TB + 0x1b60000, 0x4000, 2},
 };
 static const int region_ids6[8] = {49, 50, -1, 57, 94, 95, 14, 157};
+#define T6030_UUID_27_2 "94D7C96F-63F6-3D8A-B208-B3D8E2D3621E"
 
 static void world_t6030(const struct opts *o)
 {
@@ -583,6 +584,7 @@ static void world_t6030(const struct opts *o)
              "__TEXT;__DATA;__OS_LOG;unknown;unknown;unknown;unknown;unknown");
     prop_str("/arm-io/dcp/iop-dcp-nub", "uuid",
              o->wrong_uuid ? "11111111-2222-3333-4444-555555555555"
+             : fw27        ? T6030_UUID_27_2
                            : "DDF38191-93B3-324A-BC8F-643006F5AC82");
     prop_u32("/arm-io/dcp/iop-dcp-nub", "pre-loaded", 1);
     prop_u32("/arm-io/dcp/iop-dcp-nub", "running", 1);
@@ -604,7 +606,8 @@ static void world_t6030(const struct opts *o)
         if (region_ids6[i] < 0)
             continue;
         char p[32];
-        snprintf(p, sizeof(p), "region-id-%d", region_ids6[i]);
+        /* A different carveout ID for a heap segment, with the same valid DART mappings. */
+        snprintf(p, sizeof(p), "region-id-%d", fw27 && i == SEG_HEAP3 ? 123 : region_ids6[i]);
         prop_pair("/chosen/carveout-memory-map", p, segs6[i].phys,
                   ALIGN_UP((u64)segs6[i].size, SZ_16K));
     }
@@ -1002,11 +1005,11 @@ int main(int argc, char **argv)
         return 2;
     }
     const char *sc = argv[2];
-    /* t6030-<scenario>: the same scenario in the T6030 world, run and kept, not checked */
+    /* t6030-<scenario>: run the same scenario in the T6030 world. */
     bool t6030 = !strncmp(sc, "t6030-", 6);
     if (t6030)
         sc += 6;
-    fw27 = !t6030 && !strcmp(sc, "publish-27_2");
+    fw27 = !strcmp(sc, "publish-27_2");
     fw25 = !t6030 && !fw27 && getenv("J613_25G83") != NULL;
     struct opts o = {0};
     bool publish = true;
@@ -1100,7 +1103,17 @@ int main(int argc, char **argv)
         check(mmio_writes == 0, "unarmed: no MMIO write");
 
     if (t6030) {
-        /* Compared with another tree's output by tests/run-t6031-unchanged.sh */
+        /* The 14.7 output is compared separately by tests/run-t6031-unchanged.sh. */
+        if (fw27) {
+            int dcp = fdt_path_offset(dt, "dcp"), len;
+            const fdt32_t *marker = fdt_getprop(dt, dcp, "apple,t6030-handoff", &len);
+            check(marker && len == 4 && fdt32_ld(marker) == 1, "T6030 27.2 handoff published");
+            int i = fdt_stringlist_search(dt, dcp, "memory-region-names", "region123");
+            u64 base, size;
+            check(i >= 0 && reg_of(dt, region_at(dt, dcp, i), &base, &size) &&
+                      base == segs6[SEG_HEAP3].phys && size == segs6[SEG_HEAP3].size,
+                  "T6030 heap uses the live carveout ID and range");
+        }
     } else if (publish) {
         contract_check(dt);
         if (fw25) {

@@ -10,7 +10,7 @@
 #     with both (some T8122 stand-in scenarios fail on <base-ref> already; they are listed).
 #  2. tests/t8122_display_host.c, the internal display handoff: every J613 scenario, its 25G83
 #     ones, and the same scenarios in its T6030 world: the output device tree, byte for byte, and
-#     the log.
+#     the log, allowing the T6030 ADT segment summaries.
 set -eu
 cd "$(dirname "$0")/.."
 root=$(pwd)
@@ -114,8 +114,14 @@ for mode in j613 j613-25g83 t6030; do
     esac
     for s in $list; do
         for b in base new; do
-            run "$tmp/disp-$b/$mode-$s.out" env $env "$tmp/disp-$b/display-host" "$dtb" "$pre$s" \
+            out="$tmp/disp-$b/$mode-$s.out"
+            run "$out" env $env "$tmp/disp-$b/display-host" "$dtb" "$pre$s" \
                 "$tmp/disp-$b/$mode-$s.dtb"
+            if [ "$mode" = t6030 ]; then
+                sed -E '/^DCP: T6030: dcp segment [0-9]+: .+, (region-id-[0-9]+|physical buffer)$/d' \
+                    "$out" > "$out.filtered"
+                mv "$out.filtered" "$out"
+            fi
         done
         if ! cmp -s "$tmp/disp-base/$mode-$s.out" "$tmp/disp-new/$mode-$s.out" ||
             ! cmp -s "$tmp/disp-base/$mode-$s.dtb" "$tmp/disp-new/$mode-$s.dtb"; then
