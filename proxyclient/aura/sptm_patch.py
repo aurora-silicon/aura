@@ -109,13 +109,46 @@ def _b(src, dst):
     return 0x14000000 | ((dst - src) & 0x3FFFFFF)
 
 
+def _find_apsts_polls(words):
+    """Find the APSTS readiness-poll CBZ instructions in any SPTM build.
+
+    Each poll spins on bit 0 of S3_6_C15_C12_4 before setting bit 0 of S3_4_C15_C0_4:
+        mrs xA, S3_6_C15_C12_4
+        and xB, xA, #1
+        cbz xB, .-8
+        mrs xA, S3_4_C15_C0_4
+        orr xA, xA, #1
+    The register pair (xA, xB) differs across builds and across primary/secondary entry
+    paths in the same image, so match the 5-instruction architectural sequence structurally.
+    """
+    hits = []
+    for i in range(len(words) - 4):
+        w0 = words[i]
+        if (w0 & 0xFFFFFFE0) != 0xD53EFC80:
+            continue
+        reg_a = w0 & 0x1F
+        if reg_a == 31:
+            continue
+        w1 = words[i + 1]
+        if (w1 & 0xFFFFFC00) != 0x92400000 or ((w1 >> 5) & 0x1F) != reg_a:
+            continue
+        reg_b = w1 & 0x1F
+        if reg_b == 31:
+            continue
+        if (words[i + 2] == (0xB4FFFFC0 | reg_b) and
+                words[i + 3] == (0xD53CF080 | reg_a) and
+                words[i + 4] == (0xB2400000 | (reg_a << 5) | reg_a)):
+            hits.append(i + 2)
+    return hits
+
+
 def plan(image, entry_off):
     """The patches for one SPTM image: a dict with
     patches: [(what, offset from entry, mask, expected, replacement)],
     ctrr_stash_off: SPTM's CTRR stash offset (aura's sptm_virt_ctrr_stash_off; 0 if it has no
         CTXR checks),
     mte: (offset from entry, expected words, replacement words) or None.
-    Raises SptmPatchError if a site is missing or not unique."""
+    Raises SptmPatchError if a site is missing or outside its expected count."""
     words = _words(image)
     e = entry_off // 4
     out = []
@@ -123,8 +156,12 @@ def plan(image, entry_off):
     def patch(what, i, new):
         out.append((what, 4 * (i - e), 0xFFFFFFFF, words[i], new))
 
-    i = _one(words, APSTS, "APSTS poll") + 5
-    patch("APSTS poll", i, NOP)
+    apsts = _find_apsts_polls(words)
+    if not 1 <= len(apsts) <= 2:
+        raise SptmPatchError(
+            f"APSTS poll: {len(apsts)} matches in this SPTM, need one or two")
+    for i in apsts:
+        patch("APSTS poll", i, NOP)
     stash = 0
     if CTXR_MARKER in image:
         c = _one(words, CTRR, "CTRR check") + 6

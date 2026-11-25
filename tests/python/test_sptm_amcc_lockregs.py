@@ -38,8 +38,8 @@ typedef uint16_t u16;
 static const void *adt = (const void *)1;
 
 /* A modeled ADT: node 1 is /chosen/lock-regs/amcc, nodes 2.. its children. */
-struct prop { int node; const char *name; u32 len; unsigned char data[32]; };
-static struct prop props[64];
+struct prop { int node; const char *name; u32 len; unsigned char data[72]; };
+static struct prop props[128];
 static int nprops, nchildren, have_node;
 static int adt_path_offset(const void *t, const char *path)
 {
@@ -65,7 +65,7 @@ static int adt_next_sibling_offset(const void *t, int node) { (void)t; return no
         for (node = adt_first_child_offset(adt, node); _child_count--;                   \
              node = adt_next_sibling_offset(adt, node))
 
-static u64 mcc_base[4], mcc_stride;
+static u64 mcc_base[9], mcc_stride;
 static int mcc_n, mcc_planes;
 static int mcc_plane_info(int mcc, u64 *base, u64 *stride, int *count)
 {
@@ -164,6 +164,59 @@ int main(void)
         amcc_lr = lr;
         assert(amcc_lr_is_shadow(0x300008000ULL + 0x70c));
         assert(!amcc_lr_is_shadow(0x300008000ULL + 0x614));
+    }
+
+    /* Empty sibling children (no *-reg-offset properties) are skipped, as on
+     * live ADTs with unpopulated secondary CTRR banks; partial banks still fail. */
+    {
+        geometry_a();
+        nchildren = 4; /* node 2 is populated; nodes 3, 4, 5 have no bank props */
+        set32(3, "lock-reg-mask", 1); /* unrelated property on an empty bank */
+        assert(amcc_lockregs_parse(&lr));
+        assert(lr.nbanks == 1);
+        /* A single bank property on node 3 makes it a partial bank -> refused. */
+        set32(3, "lower-limit-reg-offset", 0x700);
+        assert(!amcc_lockregs_parse(&lr));
+    }
+
+    /* Multi-aperture 4-bank geometries up to 8 apertures x 4 planes x 4 banks (640 regs). */
+    {
+        const struct { u32 naps; u32 nplanes; } cases[] = {
+            {2, 2}, /* 80 shadow regs */
+            {4, 4}, /* 320 shadow regs */
+            {8, 2}, /* 320 shadow regs */
+            {8, 4}, /* 640 shadow regs (max capacity) */
+        };
+        for (unsigned c = 0; c < ARRAY_SIZE(cases); c++) {
+            u64 ap[8];
+            geometry_a();
+            for (u32 i = 0; i < cases[c].naps; i++) {
+                ap[i] = 0x200000000ULL + (u64)i * 0x4000000ULL;
+                mcc_base[i] = ap[i];
+            }
+            set(1, "aperture-phys-addr", ap, cases[c].naps * sizeof(u64));
+            set32(1, "aperture-count", cases[c].naps);
+            set32(1, "plane-count", cases[c].nplanes);
+            nchildren = 4;
+            for (int b = 0; b < 4; b++)
+                bank(2 + b, 0x600 + 0x40 * b);
+            mcc_n = (int)cases[c].naps;
+            mcc_planes = (int)cases[c].nplanes;
+            assert(amcc_lockregs_parse(&lr));
+            assert(lr.napertures == cases[c].naps && lr.nplanes == cases[c].nplanes &&
+                   lr.nbanks == 4);
+        }
+        /* 9 apertures exceeds AMCC_LR_MAX_APERTURES -> refused. */
+        u64 ap9[9];
+        geometry_a();
+        for (u32 i = 0; i < 9; i++) {
+            ap9[i] = 0x200000000ULL + (u64)i * 0x4000000ULL;
+            mcc_base[i] = ap9[i];
+        }
+        set(1, "aperture-phys-addr", ap9, sizeof(ap9));
+        set32(1, "aperture-count", 9);
+        mcc_n = 9;
+        assert(!amcc_lockregs_parse(&lr));
     }
 
     /* Refusals. Each starts from the admitted geometry A. */

@@ -374,7 +374,7 @@ static void sptm_virt_reset_guard_setup(void)
  * wrote, the hardware keeps them open. On by default; AURA_AMCC_NOLOCK=0 lets SPTM lock them.
  */
 u32 sptm_virt_amcc_nolock = 1;
-static u64 amcc_lock_shadow[64][2]; /* {pa, value} */
+static u64 amcc_lock_shadow[640][2]; /* {pa, value} */
 
 /*
  * Where stock SPTM finds the AMCC protection registers: /chosen/lock-regs/amcc. Its properties
@@ -387,7 +387,7 @@ static u64 amcc_lock_shadow[64][2]; /* {pa, value} */
  * A missing or malformed node, or one that disagrees with the MCC driver's planes, is refused
  * before any page is hooked.
  */
-#define AMCC_LR_MAX_APERTURES 4
+#define AMCC_LR_MAX_APERTURES 8
 #define AMCC_LR_MAX_BANKS     4
 #define AMCC_LR_BANK_REGS     5
 #define AMCC_LR_PAGE          0x4000UL
@@ -476,11 +476,17 @@ static bool amcc_lockregs_parse(struct amcc_lockregs *lr)
         goto malformed;
     }
 
-    /* Every child is a bank, and every bank names all of its registers. */
+    /* Every populated child is a bank naming all of its registers; empty sibling children
+     * (no *-reg-offset properties) are skipped, while partial banks are refused. */
     bank = node;
     ADT_FOREACH_CHILD(adt, bank)
     {
-        if (lr->nbanks == AMCC_LR_MAX_BANKS)
+        u32 bank_has = 0;
+        for (int r = 0; r < AMCC_LR_BANK_REGS; r++)
+            bank_has += !!adt_getprop(adt, bank, amcc_lr_bank_props[r], NULL);
+        if (!bank_has)
+            continue;
+        if (bank_has != AMCC_LR_BANK_REGS || lr->nbanks == AMCC_LR_MAX_BANKS)
             goto malformed;
         for (int r = 0; r < AMCC_LR_BANK_REGS; r++) {
             u32 off;

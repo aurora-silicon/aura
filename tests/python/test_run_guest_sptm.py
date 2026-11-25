@@ -264,3 +264,29 @@ def test_tail_console_does_not_overread_before_disconnect(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "TTY> SPTM-virt[gpu]: the deadline the host asked for: rebooting via watchdog" in out
     assert "--- tail: device gone ---" in out
+
+
+@pytest.mark.parametrize(("stash_off", "expect_write"), [
+    (0x120, True),
+    (0, True),
+    (None, False),
+])
+def test_patch_sptm_handles_optional_ctrr_stash_off(stash_off, expect_write):
+    runner = load_runner()
+    proxy = MagicMock()
+    proxy.read32.return_value = 0xB4FFFFC1
+    sym = {
+        "sptm_virt_flush": 0x1000,
+        "sptm_virt_ctrr_stash_off": 0x2000,
+    }
+    sp = {
+        "patches": [("APSTS poll", 0x10, 0xFFFFFFFF, 0xB4FFFFC1, 0xD503201F)],
+        "mte": None,
+        "ctrr_stash_off": stash_off,
+    }
+    runner.patch_sptm(proxy, sym, 0x80000000, sp)
+    stash_writes = [c.args for c in proxy.write32.call_args_list if c.args[0] == 0x2000]
+    if expect_write:
+        assert stash_writes == [(0x2000, stash_off)]
+    else:
+        assert stash_writes == []
