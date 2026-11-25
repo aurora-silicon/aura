@@ -319,6 +319,23 @@ const char *adt_get_name(const void *a, int node)
     return n;
 }
 
+bool adt_is_compatible(const void *a, int node, const char *compat)
+{
+    u32 len = 0;
+    const char *c = adt_getprop(a, node, "compatible", &len);
+
+    while (c && len) {
+        size_t n = strnlen(c, len);
+        if (n == strlen(compat) && !memcmp(c, compat, n))
+            return true;
+        if (n + 1 > len)
+            break;
+        c += n + 1;
+        len -= n + 1;
+    }
+    return false;
+}
+
 bool adt_is_compatible_at(const void *a, int node, const char *compat, size_t index)
 {
     u32 len = 0;
