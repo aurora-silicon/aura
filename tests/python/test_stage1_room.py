@@ -55,6 +55,15 @@ def test_data_room_of_a_step_or_more_wins():
     assert headroom == r["data"] == 0x20000
 
 
+def test_file_section_alignment_from_linker():
+    r, headroom = stage1_room.room(
+        syms(_text_content_start=0x1E000, _text_content_end=0xB3F00,
+             _rodata_content_end=0xFBA00, _file_section_align=0x4000, _file_vital_end=0x11B000)
+    )
+    assert r == {"text": 0x100, "rodata": 0x600, "data": 0x5000}
+    assert headroom == 0x4100
+
+
 def test_built_stage1():
     elf = ROOT / "build/aura-raw.elf"
     nm = next((n for n in ("llvm-nm", "aarch64-linux-gnu-nm", "nm") if shutil.which(n)), None)
