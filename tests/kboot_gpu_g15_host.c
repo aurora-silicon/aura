@@ -2275,6 +2275,16 @@ static void check_t6030_27_reserve_only(void)
     assert(!unguarded_faults);
 }
 
+static void t6030_27_missing_alias(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "gpu"), "status", "okay"));
+    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/aliases"), "gpu"));
+    assert(run() == 0);
+    check_t6030_27_reserve_only();
+    assert(!pmgr_enables && !pmgr_disables);
+}
+
 static void t6030_27_unknown_image(void)
 {
     prepare_t6030_27(t6030_27_unknown);
@@ -2641,6 +2651,19 @@ static void t8122_27_start_identity_mismatch(void)
     t27_start_refused();
     assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1);
 }
+static void t8122_27_restore_failure(void)
+{
+    prepare_27_start();
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-power-diag",
+                           "1"));
+    pmgr_off_after_release = 0;
+    assert(run() == GPU26_ERR_FATAL);
+    assert(pmgr_enables == 1 && pmgr_disables == 1);
+    assert(!log_has("skipping probe"));
+    assert(fdt_path_offset(dtbuf, "/chosen/asahi,t8122-gpu-powered-identity") < 0);
+    assert(!gpu_prop("apple,m3-handoff-version", NULL));
+}
+
 static void t8122_27_start_refused_diag(void)
 {
     /* A refused start keeps chosen.asahi,t8122-gpu-power-diag=1 as before. */
@@ -3115,6 +3138,7 @@ static const struct {
     {"t6030-27-handoff", t6030_27_handoff},
     {"t6030-27-handoff-a000", t6030_27_handoff_a000},
     {"t6030-27-afr-already-on", t6030_27_afr_already_on},
+    {"t6030-27-missing-alias", t6030_27_missing_alias},
     {"t6030-27-unknown-image", t6030_27_unknown_image},
     {"t6030-27-identity-failure", t6030_27_identity_failure},
     {"t6030-27-unlisted-board-default", t6030_27_unlisted_board_default},
@@ -3157,6 +3181,7 @@ static const struct {
     {"t8122-27-start-other-mailbox", t8122_27_start_other_mailbox},
     {"t8122-27-start-owner-off", t8122_27_start_owner_off},
     {"t8122-27-start-identity-mismatch", t8122_27_start_identity_mismatch},
+    {"t8122-27-restore-failure", t8122_27_restore_failure},
     {"t8122-27-start-refused-diag", t8122_27_start_refused_diag},
 #endif
     {"t6030-dry", t6030_dry},

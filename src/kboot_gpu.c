@@ -2486,7 +2486,7 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
     return 0;
 }
 
-/* Never fails: on any problem the gpu node is left disabled and the boot continues. */
+/* Continue with graphics disabled only if the fallback can safely hand memory to Linux. */
 static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
 {
     /* Per-kboot state: nothing of the firmware segment description is in this DT yet */
@@ -2496,7 +2496,7 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
     int gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0) {
         printf("FDT: GPU: gpu alias not found in device tree\n");
-        return 0;
+        return soc->handoff ? soc->handoff(dt, NULL) : 0;
     }
 
     if (fdt_node_check_compatible(dt, gpu, soc->compatible)) {

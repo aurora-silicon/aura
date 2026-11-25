@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 """Exercise production dt_set_mtp_dma_window() across capability-matched and refusal cases."""
 
 from pathlib import Path

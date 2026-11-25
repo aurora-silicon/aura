@@ -573,7 +573,8 @@ static int gpu26_enable(void *dt, void *arg)
  * switch, and this Mac's ADT has both 27.2 start values. Then the GPU node gets them
  * through gpu26_enable(), the mailbox is enabled, the GPU's power domain gets
  * apple,no-auto-pm (the 27.2 start takes no PMP link), and the GPU node is enabled; the kernel
- * admits and starts the loaded firmware. Any failure leaves the GPU node and the mailbox disabled,
+ * admits and starts the loaded firmware. A failed power restore aborts DT preparation. Other
+ * failures leave the GPU node and the mailbox disabled,
  * as before; then only with chosen.asahi,t8122-gpu-power-diag=1 the bounded powered identity probe
  * runs, with the SGX power voted off again before Linux starts; without it nothing more powers
  * the GPU.
@@ -585,7 +586,10 @@ static int t8122_gpu_publish_27(void *dt, const struct t8122_gpu_fw *fw)
     int gpu = t8122_gpu_node(dt);
     if (gpu < 0 || fdt_setprop_string(dt, gpu, "status", "disabled"))
         bail("FDT: GPU: T8122 cannot set GPU status\n");
-    if (!t8122_fdt_transaction(dt, gpu26_enable, (void *)fw->t)) {
+    int ret = t8122_fdt_transaction(dt, gpu26_enable, (void *)fw->t);
+    if (ret == GPU26_ERR_FATAL)
+        return ret;
+    if (!ret) {
         t8122_gpu_log(fw, "enabled (27.2 firmware, calibrated from this Mac's ADT)");
         return 0;
     }
@@ -825,8 +829,11 @@ int dt_set_gpu_t8122_26(void *dt)
     struct t8122_gpu_fw fw;
 
     printf("FDT: GPU: T8122 firmware handoff\n");
-    if (!gpu26_read_adt(&t8122_target, &fw) && !t8122_fdt_transaction(dt, t8122_gpu_publish, &fw))
-        return 0;
+    if (!gpu26_read_adt(&t8122_target, &fw)) {
+        int ret = t8122_fdt_transaction(dt, t8122_gpu_publish, &fw);
+        if (!ret || ret == GPU26_ERR_FATAL)
+            return ret;
+    }
 
     printf("FDT: GPU: T8122 handoff not published; reserving the GPU firmware memory only\n");
     if (t8122_fdt_transaction(dt, gpu26_disable, (void *)&t8122_target))

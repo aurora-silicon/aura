@@ -7,7 +7,7 @@
 # Runs every scenario of tests/kboot_gpu_g15_host.c against this tree. With BASE_REF (a git ref
 # of this repository, e.g. aurora7), the T6030 scenarios are also built against that ref's
 # kboot_gpu.c and firmware.c, and their DT, bus/PMGR traces and logs must be identical.
-# An unknown T6030 image now reserves its memory, so that scenario only runs against this tree.
+# An unknown T6030 image or a missing GPU alias now requires the reservation fallback.
 # If that
 # ref has the T8122 setup (e.g. aurora12), so are the T8122 scenarios without the stand-in switch.
 # If that ref also has the T8122 stand-in experiment's own test (aurora12-air-gpu and later), its
@@ -92,7 +92,7 @@ if [ -n "$base" ]; then
     scenarios=$("$tmp/base/kboot-gpu-g15" list) || fail "baseline scenario discovery ($base)"
     same=0
     for s in $scenarios; do
-        [ "$s" != t6030-unknown-fw ] || continue
+        case "$s" in t6030-unknown-fw|t6030-no-alias) continue ;; esac
         "$tmp/base/kboot-gpu-g15" "$s" > "$tmp/base/$s.out" 2>&1 || {
             cat "$tmp/base/$s.out"
             echo "FAIL: $s on $base"
