@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 #include "kboot.h"
 #include "adt.h"
 #include "firmware.h"
@@ -70,12 +70,17 @@ static const char *const t8122_gpu_nodes[T8122_GPU_UAT] = {
     "uat-handoff",
     "uat-pagetables-l2",
 };
-static const char *const t8122_gpu_adt_regions[T8122_GPU_UAT] = {
-    "gpu-region",
-    "gfx-shared-region",
-    "gfx-handoff",
-    "gfx-shared-l2-region",
+/* Keep the ADT property names together for publication and reservation fallback. */
+#define UAT_REGION(name) {name, name "-base", name "-size"}
+static const struct {
+    const char *name, *base, *size;
+} gpu26_uat[T8122_GPU_UAT] = {
+    UAT_REGION("gpu-region"),
+    UAT_REGION("gfx-shared-region"),
+    UAT_REGION("gfx-handoff"),
+    UAT_REGION("gfx-shared-l2-region"),
 };
+#undef UAT_REGION
 
 /*
  * Which GPU the handoff is for: the name in the log, the /arm-io/sgx compatible to require (NULL:
@@ -87,13 +92,34 @@ struct gpu26_target {
     const char *sgx_compat;
     const char *gpu_compat;
     u64 fw_va;
+    const char *mbox_compat, *mbox_fallback;
+    const char *handoff_version;
+    int (*calibrate)(void *dt);
+    bool fast_die;
+    bool exact_regions;
 };
 
 static const struct gpu26_target t8122_target = {
-    "T8122",
-    "gpu,t8122",
-    "apple,agx-t8122",
-    T8122_GPU_FW_VA,
+    .tag = "T8122",
+    .sgx_compat = "gpu,t8122",
+    .gpu_compat = "apple,agx-t8122",
+    .fw_va = T8122_GPU_FW_VA,
+    .mbox_compat = "apple,t8122-agx-asc-mailbox",
+    .mbox_fallback = "apple,asc-mailbox-v4",
+    .handoff_version = "apple,m3-handoff-version",
+    .calibrate = dt_gpu_t8122_26_calibrate,
+    .fast_die = true,
+};
+
+static const struct gpu26_target t6030_target = {
+    .tag = "T6030",
+    .sgx_compat = "gpu,t6030",
+    .gpu_compat = "apple,agx-t6030",
+    .fw_va = T8122_GPU_FW_VA,
+    .mbox_compat = "apple,t6030-agx-asc-mailbox",
+    .handoff_version = "apple,g16-handoff-version",
+    .calibrate = dt_gpu_t6030_27_calibrate,
+    .exact_regions = true,
 };
 
 struct t8122_gpu_fw {
@@ -115,12 +141,7 @@ static const struct {
 
 static int t8122_adt_u64(int node, const char *name, u64 *val)
 {
-    u32 len;
-    const void *p = adt_getprop(adt, node, name, &len);
-    if (!p || len != sizeof(*val))
-        return -1;
-    memcpy(val, p, sizeof(*val));
-    return 0;
+    return ADT_GETPROP(adt, node, name, val) == sizeof(*val) ? 0 : -1;
 }
 
 static bool t8122_adt_compatible(int node, const char *compat)
@@ -136,13 +157,13 @@ static bool t8122_adt_compatible(int node, const char *compat)
     return false;
 }
 
-static int t8122_gpu_dram(u64 *start, u64 *end)
+static int gpu26_dram(const char *tag, u64 *start, u64 *end)
 {
     int chosen = adt_path_offset(adt, "/chosen");
     u64 size;
     if (chosen < 0 || t8122_adt_u64(chosen, "dram-base", start) ||
         t8122_adt_u64(chosen, "dram-size", &size) || !size || *start + size <= *start)
-        bail("ADT: GPU: T8122 DRAM bounds missing\n");
+        bail("ADT: GPU: %s DRAM bounds missing\n", tag);
     *end = *start + size;
     return 0;
 }
@@ -163,13 +184,10 @@ static int gpu26_read_adt(const struct gpu26_target *t, struct t8122_gpu_fw *fw)
              t->sgx_compat ? t->sgx_compat : "present");
 
     for (int i = 0; i < T8122_GPU_UAT; i++) {
-        char prop[64];
-        snprintf(prop, sizeof(prop), "%s-base", t8122_gpu_adt_regions[i]);
-        if (t8122_adt_u64(sgx, prop, &fw->base[i]))
-            bail("ADT: GPU: %s sgx %s missing\n", t->tag, prop);
-        snprintf(prop, sizeof(prop), "%s-size", t8122_gpu_adt_regions[i]);
-        if (t8122_adt_u64(sgx, prop, &fw->size[i]))
-            bail("ADT: GPU: %s sgx %s missing\n", t->tag, prop);
+        if (t8122_adt_u64(sgx, gpu26_uat[i].base, &fw->base[i]))
+            bail("ADT: GPU: %s sgx %s missing\n", t->tag, gpu26_uat[i].base);
+        if (t8122_adt_u64(sgx, gpu26_uat[i].size, &fw->size[i]))
+            bail("ADT: GPU: %s sgx %s missing\n", t->tag, gpu26_uat[i].size);
     }
 
     int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
@@ -188,11 +206,7 @@ static int gpu26_read_adt(const struct gpu26_target *t, struct t8122_gpu_fw *fw)
     const char *names = adt_getprop(adt, asc, "segment-names", &len);
     if (!names || len < strlen(layout) + 1 || memcmp(names, layout, strlen(layout) + 1))
         bail("ADT: GPU: %s gfx-asc segment-names is not %s\n", t->tag, layout);
-    const void *pre = adt_getprop(adt, nub, "pre-loaded", &len);
-    if (!pre || len != sizeof(preloaded))
-        bail("ADT: GPU: %s GPU firmware is not pre-loaded\n", t->tag);
-    memcpy(&preloaded, pre, sizeof(preloaded));
-    if (preloaded != 1)
+    if (ADT_GETPROP(adt, nub, "pre-loaded", &preloaded) != sizeof(preloaded) || preloaded != 1)
         bail("ADT: GPU: %s GPU firmware is not pre-loaded\n", t->tag);
 
     u64 next_va = t->fw_va;
@@ -232,7 +246,7 @@ static int gpu26_read_adt(const struct gpu26_target *t, struct t8122_gpu_fw *fw)
     fw->segments = segments;
 
     u64 dram_start, dram_end;
-    if (t8122_gpu_dram(&dram_start, &dram_end))
+    if (gpu26_dram(t->tag, &dram_start, &dram_end))
         return -1;
     for (int i = 0; i < T8122_GPU_REGIONS; i++) {
         if (!t8122_gpu_range_ok(fw->base[i], fw->size[i], dram_start, dram_end))
@@ -312,6 +326,7 @@ static int t8122_resv_overlap(void *dt, const char *tag, const char *self, bool 
     *covered = false;
     if (resv < 0)
         return -1;
+    int self_node = fdt_subnode_offset(dt, resv, self);
     fdt_for_each_subnode(node, dt, resv)
     {
         const char *name = fdt_get_name(dt, node, NULL);
@@ -321,7 +336,7 @@ static int t8122_resv_overlap(void *dt, const char *tag, const char *self, bool 
         bool disabled = status && strcmp(status, "okay") && strcmp(status, "ok");
         if (disabled || !reg)
             continue;
-        if (name && !strcmp(name, self) &&
+        if (node == self_node &&
             (self_any || (len == 16 && fdt64_ld(reg) == base && fdt64_ld(reg + 1) == size)))
             continue;
         for (int i = 0; i + 16 <= len; i += 16, reg += 2) {
@@ -377,7 +392,8 @@ static u32 t8122_gpu_reserve(void *dt, const char *name, bool asc_mem, u64 base,
 /*
  * Set memory-region/memory-region-names on the GPU node: entries the DT
  * already has under other names stay first, in order; the six handoff regions
- * replace any of the same name.
+ * replace any of the same name. The G16 ABI takes exactly the six handoff
+ * regions, so drop the disabled G15 initdata placeholders on that path.
  */
 static int gpu26_link(void *dt, const struct gpu26_target *t, int gpu, const u32 *phandles)
 {
@@ -405,6 +421,15 @@ static int gpu26_link(void *dt, const struct gpu26_target *t, int gpu, const u32
             ours |= !strcmp(name, t8122_gpu_names[j]);
         if (ours)
             continue;
+        if (t->exact_regions) {
+            int node = fdt_node_offset_by_phandle(dt, fdt32_ld(old + i));
+            const char *status = node < 0 ? NULL : fdt_getprop(dt, node, "status", NULL);
+            if (status && !strcmp(status, "disabled") &&
+                (!strcmp(name, "hw-cal-a") || !strcmp(name, "hw-cal-b") ||
+                 !strcmp(name, "globals")))
+                continue;
+            bail("FDT: GPU: %s unexpected GPU memory region %s\n", t->tag, name);
+        }
         if (count >= T8122_GPU_MAX_MR - T8122_GPU_REGIONS || used + n > (int)sizeof(names) - 64)
             bail("FDT: GPU: %s GPU node has too many memory regions\n", t->tag);
         regions[count++] = old[i];
@@ -443,9 +468,9 @@ static void t8122_gpu_log(const struct t8122_gpu_fw *fw, const char *state)
 }
 
 /* The node a single-phandle property of the GPU node points at, or -1 */
-static int t8122_gpu_phandle_node(void *dt, const char *prop)
+static int gpu26_phandle_node(void *dt, const struct gpu26_target *t, const char *prop)
 {
-    int gpu = t8122_gpu_node(dt), len = 0;
+    int gpu = gpu26_node(dt, t), len = 0;
     const fdt32_t *ref = gpu < 0 ? NULL : fdt_getprop(dt, gpu, prop, &len);
     if (!ref || len != sizeof(*ref))
         return -1;
@@ -453,54 +478,81 @@ static int t8122_gpu_phandle_node(void *dt, const char *prop)
     return node < 0 ? -1 : node;
 }
 
-/*
- * Hand the GPU to Linux on 27.2, on the copy t8122_gpu_publish_27() passes: everything is
- * checked in the DT and both start values are read from the ADT first (nothing is powered for a
- * refusal), then the 26.6.2 path's calibration runs (OPPs and SRAM voltages from
- * this Mac's ADT, the bounded powered identity, every power vote released), and only then are
- * the mailbox and the GPU node enabled. Any failure discards the copy.
- */
-static int t8122_gpu_enable_27(void *dt, void *arg)
+static int gpu26_publish_version(void *dt, const struct gpu26_target *t,
+                                 const struct fw_version_info *image)
 {
-    UNUSED(arg);
-    /* The firmware's own mailbox: an AGX ASC mailbox, as the 25G83 path takes. */
-    int mailbox = t8122_gpu_phandle_node(dt, "mboxes");
-    if (mailbox < 0 || (fdt_node_check_compatible(dt, mailbox, "apple,asc-mailbox-v4") &&
-                        fdt_node_check_compatible(dt, mailbox, "apple,t8122-agx-asc-mailbox")))
-        bail("FDT: GPU: T8122 27.2: GPU mailbox is not an AGX ASC mailbox\n");
-    if (t8122_gpu_phandle_node(dt, "power-domains") < 0)
-        bail("FDT: GPU: T8122 27.2: GPU node has no single power domain\n");
+    int gpu = gpu26_node(dt, t);
+    if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-compat", image) ||
+        firmware_set_fdt(dt, gpu, "apple,firmware-version", image))
+        bail("FDT: GPU: %s cannot set the 27.2 firmware version\n", t->tag);
+    return 0;
+}
 
-    /* Both start values from this Mac's ADT, read before anything is powered. */
-    u32 values[T8122_27_VALUES];
-    if (dt_gpu_t8122_27_machine_values_read(values))
-        return -1;
+/* The ADT cells Linux needs for its 27.2 start. FastDie is only supplied on T8122. */
+static const struct {
+    const char *path, *adt, *dt;
+} gpu26_values[] = {
+    {"/arm-io/sgx", "gpu-fast-die0-target", "apple,fast-die0-target"},
+    {"/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer", "apple,coredump-copy-buffer"},
+};
 
-    if (dt_gpu_t8122_26_calibrate(dt))
-        bail("FDT: GPU: T8122 27.2: calibration from this Mac's ADT failed\n");
-    for (size_t i = 0; i < T8122_27_VALUES; i++) {
-        int gpu = t8122_gpu_node(dt);
-        if (gpu < 0 || fdt_setprop_u32(dt, gpu, t8122_27_values[i].dt, values[i]))
-            bail("FDT: GPU: T8122 27.2: cannot set %s\n", t8122_27_values[i].dt);
+/*
+ * Enable only after the mailbox, power domain and start values are validated
+ * and any bounded calibration has released its power vote. The caller owns the
+ * FDT transaction.
+ */
+static int gpu26_enable(void *dt, void *arg)
+{
+    const struct gpu26_target *t = arg;
+    int mailbox = gpu26_phandle_node(dt, t, "mboxes");
+    if (mailbox < 0 ||
+        (fdt_node_check_compatible(dt, mailbox, t->mbox_compat) &&
+         (!t->mbox_fallback || fdt_node_check_compatible(dt, mailbox, t->mbox_fallback))))
+        bail("FDT: GPU: %s 27.2: GPU mailbox is not an AGX ASC mailbox\n", t->tag);
+    if (gpu26_phandle_node(dt, t, "power-domains") < 0)
+        bail("FDT: GPU: %s 27.2: GPU node has no single power domain\n", t->tag);
+
+    u32 values[ARRAY_SIZE(gpu26_values)];
+    size_t first = t->fast_die ? 0 : 1;
+    for (size_t i = first; i < ARRAY_SIZE(gpu26_values); i++) {
+        int node = adt_path_offset(adt, gpu26_values[i].path);
+        u32 len = 0;
+        const void *value = node < 0 ? NULL : adt_getprop(adt, node, gpu26_values[i].adt, &len);
+        if (!value)
+            bail("ADT: GPU: %s 27.2: %s absent, GPU left disabled\n", t->tag, gpu26_values[i].adt);
+        values[i] = 0;
+        if (len == sizeof(values[i]))
+            memcpy(&values[i], value, sizeof(values[i]));
+        if (!values[i])
+            bail("ADT: GPU: %s malformed %s (len %u)\n", t->tag, gpu26_values[i].adt, len);
     }
-    printf("FDT: GPU: T8122 27.2 machine values: fast-die0 target %u C, coredump copy buffer "
-           "0x%x bytes\n",
-           values[0], values[1]);
+    if (t->calibrate) {
+        int cal_ret = t->calibrate(dt);
+        if (cal_ret) {
+            printf("FDT: GPU: %s 27.2: calibration from this Mac's ADT failed\n", t->tag);
+            return cal_ret == GPU26_ERR_FATAL ? GPU26_ERR_FATAL : -1;
+        }
+    }
+    for (size_t i = first; i < ARRAY_SIZE(gpu26_values); i++) {
+        int gpu = gpu26_node(dt, t);
+        if (gpu < 0 || fdt_setprop_u32(dt, gpu, gpu26_values[i].dt, values[i]))
+            bail("FDT: GPU: %s 27.2: cannot set %s\n", t->tag, gpu26_values[i].dt);
+    }
+    if (t->fast_die)
+        printf("FDT: GPU: %s 27.2 machine values: fast-die0 target %u C, coredump copy buffer "
+               "0x%x bytes\n",
+               t->tag, values[0], values[1]);
 
-    mailbox = t8122_gpu_phandle_node(dt, "mboxes");
+    mailbox = gpu26_phandle_node(dt, t, "mboxes");
     if (mailbox < 0 || fdt_setprop_string(dt, mailbox, "status", "okay"))
-        bail("FDT: GPU: T8122 27.2: cannot enable the GPU mailbox\n");
-    /*
-     * The 27.2 start takes no PMP link or vote (GPU power through its power domain), so the GPU
-     * node gets no apple,pmp. Linux's pmgr must not arm hardware auto power-gating of GFX under a
-     * running firmware.
-     */
-    int domain = t8122_gpu_phandle_node(dt, "power-domains");
+        bail("FDT: GPU: %s 27.2: cannot enable the GPU mailbox\n", t->tag);
+    /* Firmware idles GFX itself. Do not let pmgr auto-gate it under the firmware. */
+    int domain = gpu26_phandle_node(dt, t, "power-domains");
     if (domain < 0 || fdt_setprop_empty(dt, domain, "apple,no-auto-pm"))
-        bail("FDT: GPU: T8122 27.2: cannot mark the GPU power domain apple,no-auto-pm\n");
-    int gpu = t8122_gpu_node(dt);
+        bail("FDT: GPU: %s 27.2: cannot mark the GPU power domain apple,no-auto-pm\n", t->tag);
+    int gpu = gpu26_node(dt, t);
     if (gpu < 0 || fdt_setprop_string(dt, gpu, "status", "okay"))
-        bail("FDT: GPU: T8122 27.2: cannot enable the GPU\n");
+        bail("FDT: GPU: %s 27.2: cannot enable the GPU\n", t->tag);
     return 0;
 }
 
@@ -512,29 +564,34 @@ static int t8122_gpu_enable_27(void *dt, void *arg)
  * voltages from this Mac's ADT, the bounded powered identity the kernel's admission checks, every
  * power vote released before Linux starts) succeeds under the M3 Air's chosen.asahi,t8122-gpu
  * switch, and this Mac's ADT has both 27.2 start values. Then the GPU node gets them
- * (dt_gpu_t8122_27_machine_values_read()), the mailbox is enabled, the GPU's power domain gets
+ * through gpu26_enable(), the mailbox is enabled, the GPU's power domain gets
  * apple,no-auto-pm (the 27.2 start takes no PMP link), and the GPU node is enabled; the kernel
- * admits and starts the loaded firmware. Any failure leaves the GPU node and the mailbox disabled,
+ * admits and starts the loaded firmware. A failed power restore aborts DT preparation. Other
+ * failures leave the GPU node and the mailbox disabled,
  * as before; then only with chosen.asahi,t8122-gpu-power-diag=1 the bounded powered identity probe
  * runs, with the SGX power voted off again before Linux starts; without it nothing more powers
  * the GPU.
  */
 static int t8122_gpu_publish_27(void *dt, const struct t8122_gpu_fw *fw)
 {
+    if (gpu26_publish_version(dt, fw->t, &os_firmware))
+        return -1;
     int gpu = t8122_gpu_node(dt);
-    if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-compat", &os_firmware) ||
-        firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware))
-        bail("FDT: GPU: T8122 cannot set the 27.2 firmware version\n");
-    gpu = t8122_gpu_node(dt);
     if (gpu < 0 || fdt_setprop_string(dt, gpu, "status", "disabled"))
         bail("FDT: GPU: T8122 cannot set GPU status\n");
-    if (!t8122_fdt_transaction(dt, t8122_gpu_enable_27, NULL)) {
+    int ret = t8122_fdt_transaction(dt, gpu26_enable, (void *)fw->t);
+    if (ret == GPU26_ERR_FATAL)
+        return ret;
+    if (!ret) {
         t8122_gpu_log(fw, "enabled (27.2 firmware, calibrated from this Mac's ADT)");
         return 0;
     }
     gpu = t8122_gpu_node(dt);
-    if (gpu >= 0)
-        t8122_read_powered_identity(dt, gpu);
+    if (gpu >= 0) {
+        ret = t8122_read_powered_identity(dt, gpu);
+        if (ret)
+            return ret;
+    }
     t8122_gpu_log(fw, "left disabled (27.2 firmware: the GPU start is not fully described)");
     return 0;
 }
@@ -577,26 +634,30 @@ static int gpu26_publish_regions(void *dt, const struct t8122_gpu_fw *fw)
     return 0;
 }
 
-static int t8122_gpu_publish(void *dt, void *arg)
+static int gpu26_publish_segments(void *dt, const struct t8122_gpu_fw *fw)
 {
-    const struct t8122_gpu_fw *fw = arg;
-
-    if (gpu26_publish_regions(dt, fw))
-        return -1;
-    int gpu;
-
+    const struct gpu26_target *t = fw->t;
     fdt64_t vas[T8122_GPU_MAX_SEGS];
     fdt32_t flags[T8122_GPU_MAX_SEGS];
     for (int i = 0; i < fw->segments; i++) {
         fdt64_st(&vas[i], fw->vas[i]);
         flags[i] = cpu_to_fdt32(fw->flags[i]);
     }
-    gpu = t8122_gpu_node(dt);
-    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,m3-handoff-version", fw->segments - 1) ||
+    int gpu = gpu26_node(dt, t);
+    if (gpu < 0 || fdt_setprop_u32(dt, gpu, t->handoff_version, fw->segments - 1) ||
         fdt_setprop(dt, gpu, "apple,firmware-segment-vas", vas, fw->segments * sizeof(vas[0])) ||
         fdt_setprop(dt, gpu, "apple,firmware-segment-flags", flags,
                     fw->segments * sizeof(flags[0])))
-        bail("FDT: GPU: T8122 cannot set the firmware segment description\n");
+        bail("FDT: GPU: %s cannot set the firmware segment description\n", t->tag);
+    return 0;
+}
+
+static int t8122_gpu_publish(void *dt, void *arg)
+{
+    const struct t8122_gpu_fw *fw = arg;
+
+    if (gpu26_publish_regions(dt, fw) || gpu26_publish_segments(dt, fw))
+        return -1;
 
     if (os_firmware.version == V27_2)
         return t8122_gpu_publish_27(dt, fw);
@@ -622,6 +683,7 @@ static int t8122_gpu_publish(void *dt, void *arg)
         return -1;
     if (fdt_node_check_compatible(dt, 0, "apple,j615") == 0)
         printf("FDT: GPU: J615 25G83 handoff (EXPERIMENTAL, J613 firmware profile)\n");
+    int gpu = t8122_gpu_node(dt);
     int mailbox = -1;
     if (enable) {
         const fdt32_t *mbox = fdt_getprop(dt, gpu, "mboxes", &len);
@@ -660,51 +722,58 @@ static int t8122_gpu_reserve_one(void *dt, void *arg)
     return t8122_gpu_reserve(dt, name, r->index >= T8122_GPU_UAT, r->base, r->size) ? 0 : -1;
 }
 
-static void t8122_gpu_reserve_range(void *dt, const struct t8122_gpu_range *r, u64 dram_start,
-                                    u64 dram_end)
+static int gpu26_reserve_range(void *dt, const struct gpu26_target *t,
+                               const struct t8122_gpu_range *r, u64 dram_start, u64 dram_end)
 {
     bool covered;
     char name[64];
     t8122_gpu_node_name(name, sizeof(name), r->index, r->base);
     if (!t8122_gpu_range_ok(r->base, r->size, dram_start, dram_end)) {
-        printf("FDT: GPU: T8122 %s 0x%lx+0x%lx is unusable, not reserved\n", r->what, r->base,
+        printf("FDT: GPU: %s %s 0x%lx+0x%lx is unusable, not reserved\n", t->tag, r->what, r->base,
                r->size);
-        return;
+        return -1;
     }
     int overlap =
-        t8122_resv_overlap(dt, "T8122", name, r->index < T8122_GPU_UAT, r->base, r->size, &covered);
+        t8122_resv_overlap(dt, t->tag, name, r->index < T8122_GPU_UAT, r->base, r->size, &covered);
     if (overlap) {
-        printf("FDT: GPU: T8122 %s 0x%lx+0x%lx %s\n", r->what, r->base, r->size,
+        printf("FDT: GPU: %s %s 0x%lx+0x%lx %s\n", t->tag, r->what, r->base, r->size,
                overlap < 0 ? "not reserved (no /reserved-memory)"
                : covered   ? "is already reserved"
                            : "partially overlaps another reservation; not reserved");
-        return;
+        return overlap > 0 && covered ? 0 : -1;
     }
-    if (t8122_fdt_transaction(dt, t8122_gpu_reserve_one, (void *)r))
-        printf("FDT: GPU: T8122 failed to reserve %s 0x%lx+0x%lx\n", r->what, r->base, r->size);
-    else
-        printf("FDT: GPU: T8122 reserved %s 0x%lx+0x%lx (unlinked)\n", r->what, r->base, r->size);
+    if (t8122_fdt_transaction(dt, t8122_gpu_reserve_one, (void *)r)) {
+        printf("FDT: GPU: %s failed to reserve %s 0x%lx+0x%lx\n", t->tag, r->what, r->base,
+               r->size);
+        return -1;
+    }
+    printf("FDT: GPU: %s reserved %s 0x%lx+0x%lx (unlinked)\n", t->tag, r->what, r->base, r->size);
+    return 0;
 }
 
 /* Fallback: reserve whatever the ADT describes, one range at a time. */
-static void t8122_gpu_reserve_all(void *dt)
+static int gpu26_reserve_all(void *dt, const struct gpu26_target *t)
 {
     u64 dram_start = 0, dram_end = T8122_GPU_PA_MAX;
-    if (t8122_gpu_dram(&dram_start, &dram_end))
-        printf("ADT: GPU: T8122 reserving without DRAM bounds\n");
+    int err = 0;
+    if (gpu26_dram(t->tag, &dram_start, &dram_end)) {
+        printf("ADT: GPU: %s reserving without DRAM bounds\n", t->tag);
+        err = -1;
+    }
 
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    if (sgx < 0)
+        err = -1;
     for (int i = 0; sgx >= 0 && i < T8122_GPU_UAT; i++) {
-        char prop[64];
         struct t8122_gpu_range r = {t8122_gpu_names[i], i, 0, 0};
-        snprintf(prop, sizeof(prop), "%s-base", t8122_gpu_adt_regions[i]);
-        int missing = t8122_adt_u64(sgx, prop, &r.base);
-        snprintf(prop, sizeof(prop), "%s-size", t8122_gpu_adt_regions[i]);
-        missing |= t8122_adt_u64(sgx, prop, &r.size);
-        if (missing)
-            printf("ADT: GPU: T8122 sgx has no %s region\n", t8122_gpu_adt_regions[i]);
-        else
-            t8122_gpu_reserve_range(dt, &r, dram_start, dram_end);
+        int missing = t8122_adt_u64(sgx, gpu26_uat[i].base, &r.base);
+        missing |= t8122_adt_u64(sgx, gpu26_uat[i].size, &r.size);
+        if (missing) {
+            printf("ADT: GPU: %s sgx has no %s region\n", t->tag, gpu26_uat[i].name);
+            err = -1;
+        } else if (gpu26_reserve_range(dt, t, &r, dram_start, dram_end)) {
+            err = -1;
+        }
     }
 
     /* Both copies of the segment list, in case they disagree. */
@@ -717,7 +786,8 @@ static void t8122_gpu_reserve_all(void *dt)
         const struct adt_segment_ranges *seg =
             node < 0 ? NULL : adt_getprop(adt, node, "segment-ranges", &len);
         if (!seg || !len || len % sizeof(*seg) || len > 8 * sizeof(*seg)) {
-            printf("ADT: GPU: T8122 %s has no usable segment-ranges\n", paths[p]);
+            printf("ADT: GPU: %s %s has no usable segment-ranges\n", t->tag, paths[p]);
+            err = -1;
             continue;
         }
         if (first && len == first_len && !memcmp(seg, first, len))
@@ -729,15 +799,17 @@ static void t8122_gpu_reserve_all(void *dt)
             memcpy(&s, &seg[i], sizeof(s));
             struct t8122_gpu_range r = {"firmware segment", T8122_GPU_UAT + (i ? 1 : 0), s.phys,
                                         ALIGN_UP((u64)s.size, SZ_16K)};
-            t8122_gpu_reserve_range(dt, &r, dram_start, dram_end);
+            if (gpu26_reserve_range(dt, t, &r, dram_start, dram_end))
+                err = -1;
         }
     }
+    return err;
 }
 
-static int t8122_gpu_disable(void *dt, void *arg)
+static int gpu26_disable(void *dt, void *arg)
 {
-    UNUSED(arg);
-    int gpu = t8122_gpu_node(dt);
+    const struct gpu26_target *t = arg;
+    int gpu = gpu26_node(dt, t);
     return gpu < 0 ? 0 : fdt_setprop_string(dt, gpu, "status", "disabled");
 }
 
@@ -746,13 +818,62 @@ int dt_set_gpu_t8122_26(void *dt)
     struct t8122_gpu_fw fw;
 
     printf("FDT: GPU: T8122 firmware handoff\n");
-    if (!gpu26_read_adt(&t8122_target, &fw) && !t8122_fdt_transaction(dt, t8122_gpu_publish, &fw))
-        return 0;
+    if (!gpu26_read_adt(&t8122_target, &fw)) {
+        int ret = t8122_fdt_transaction(dt, t8122_gpu_publish, &fw);
+        if (!ret || ret == GPU26_ERR_FATAL)
+            return ret;
+    }
 
     printf("FDT: GPU: T8122 handoff not published; reserving the GPU firmware memory only\n");
-    if (t8122_fdt_transaction(dt, t8122_gpu_disable, NULL))
+    if (t8122_fdt_transaction(dt, gpu26_disable, (void *)&t8122_target))
         printf("FDT: GPU: T8122 cannot mark the GPU node disabled\n");
-    t8122_gpu_reserve_all(dt);
+    return gpu26_reserve_all(dt, &t8122_target);
+}
+
+struct t6030_handoff {
+    struct t8122_gpu_fw fw;
+    const struct fw_version_info *image;
+};
+
+static int t6030_gpu_publish_27(void *dt, void *arg)
+{
+    const struct t6030_handoff *h = arg;
+    const struct gpu26_target *t = h->fw.t;
+    if (gpu26_publish_regions(dt, &h->fw) || gpu26_publish_segments(dt, &h->fw) ||
+        gpu26_publish_version(dt, t, h->image))
+        return -1;
+
+    /* G16 reads its performance and CLPC data from kboot's original-ADT phram export. */
+    int gpu = gpu26_node(dt, t);
+    int ret = fdt_delprop(dt, gpu, "apple,pmp");
+    if (ret && ret != -FDT_ERR_NOTFOUND)
+        return ret;
+    return gpu26_enable(dt, (void *)t);
+}
+
+int dt_set_gpu_t6030_27(void *dt, const struct fw_version_info *image)
+{
+    struct t6030_handoff h = {.image = image};
+    int pub_ret = -1;
+    if (image && image->version == V27_2 && !gpu26_read_adt(&t6030_target, &h.fw) &&
+        h.fw.segments == 3) {
+        pub_ret = t8122_fdt_transaction(dt, t6030_gpu_publish_27, &h);
+        if (!pub_ret) {
+            printf("FDT: GPU: T6030 firmware %s handoff published, GPU enabled\n", image->string);
+            return 0;
+        }
+    }
+
+    printf("FDT: GPU: T6030 handoff not published; reserving the GPU firmware memory only\n");
+    int dis_ret = t8122_fdt_transaction(dt, gpu26_disable, (void *)&t6030_target);
+    if (dis_ret)
+        printf("FDT: GPU: T6030 cannot mark the GPU node disabled\n");
+    int resv_ret = gpu26_reserve_all(dt, &t6030_target);
+    if (pub_ret == GPU26_ERR_FATAL || dis_ret || resv_ret) {
+        printf("FDT: GPU: T6030 handoff fallback failed (power=%d disable=%d reserve=%d)\n",
+               pub_ret == GPU26_ERR_FATAL ? -1 : 0, dis_ret, resv_ret);
+        return GPU26_ERR_FATAL;
+    }
     return 0;
 }
 
@@ -765,16 +886,15 @@ int dt_set_gpu_t8122_26(void *dt)
  * firmware VAs are not fixed here: they must follow on from the first segment's.
  */
 static const struct gpu26_target g14g_target = {
-    "G14G",
-    "gpu,t8112",
-    "apple,agx-g14g",
-    0,
+    .tag = "G14G",
+    .sgx_compat = "gpu,t8112",
+    .gpu_compat = "apple,agx-g14g",
+    .mbox_compat = "apple,asc-mailbox-v4",
 };
 
 struct g14g_handoff {
     struct t8122_gpu_fw fw;
     const struct fw_version_info *image;
-    u32 copy_bytes;
     const void *sram;
     u32 sram_len;
 };
@@ -800,26 +920,8 @@ static int g14g_gpu_publish(void *dt, void *arg)
     if (sgx < 0 || fdt_setprop(dt, sgx, "adt-perf-states-sram", h->sram, h->sram_len))
         bail("FDT: GPU: G14G cannot publish /chosen/aurora-gpu-resources/sgx\n");
 
-    int gpu = gpu26_node(dt, h->fw.t);
-    if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-compat", h->image) ||
-        firmware_set_fdt(dt, gpu, "apple,firmware-version", h->image))
-        bail("FDT: GPU: G14G cannot set the firmware version\n");
-    gpu = gpu26_node(dt, h->fw.t);
-    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,coredump-copy-buffer", h->copy_bytes))
-        bail("FDT: GPU: G14G cannot set apple,coredump-copy-buffer\n");
-    /*
-     * As on T8122 27.2 (t8122_gpu_enable_27()): the kernel starts this firmware with no PMP link,
-     * so Linux's pmgr must not arm hardware auto power-gating of the GPU's domain under it.
-     */
-    gpu = gpu26_node(dt, h->fw.t);
-    int len = 0;
-    const fdt32_t *pd = gpu < 0 ? NULL : fdt_getprop(dt, gpu, "power-domains", &len);
-    int domain = pd && len == sizeof(*pd) ? fdt_node_offset_by_phandle(dt, fdt32_ld(pd)) : -1;
-    if (domain < 0 || fdt_setprop_empty(dt, domain, "apple,no-auto-pm"))
-        bail("FDT: GPU: G14G cannot mark the GPU power domain apple,no-auto-pm\n");
-    gpu = gpu26_node(dt, h->fw.t);
-    if (gpu < 0 || fdt_setprop_string(dt, gpu, "status", "okay"))
-        bail("FDT: GPU: G14G cannot set GPU status\n");
+    if (gpu26_publish_version(dt, h->fw.t, h->image) || gpu26_enable(dt, (void *)h->fw.t))
+        return -1;
 
     for (int i = 0; i < T8122_GPU_REGIONS; i++)
         printf("FDT: GPU: G14G %s: 0x%lx+0x%lx (no-map)\n", t8122_gpu_names[i], h->fw.base[i],
@@ -834,10 +936,6 @@ int dt_set_gpu_g14g_handoff(void *dt, const struct fw_version_info *image)
 
     if (gpu26_read_adt(&g14g_target, &h.fw))
         return -1;
-    int nub = adt_path_offset(adt, "/arm-io/gfx-asc/iop-gfx-nub");
-    if (nub < 0 || ADT_GETPROP(adt, nub, "coredump-copy-buffer", &h.copy_bytes) < 0 ||
-        !h.copy_bytes)
-        bail("ADT: GPU: G14G iop-gfx-nub coredump-copy-buffer missing\n");
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
     h.sram = sgx < 0 ? NULL : adt_getprop(adt, sgx, "perf-states-sram", &h.sram_len);
     if (!h.sram || !h.sram_len)
