@@ -576,6 +576,8 @@ struct g15_soc {
      * it recursively and checks that it is off again.
      */
     bool power_closure;
+    /* Firmware admission requires a /chosen witness from the powered GPU identity read. */
+    bool publish_powered_identity;
     /* Also accept the firmware images firmware.c lists as experimental */
     bool fw_experimental;
     /* A kernel-owned handoff (or memory reservation when the image is unknown). */
@@ -2003,6 +2005,7 @@ static const struct g15_soc g15_soc_t8122 = {
     .dies = 1,
     .mask2_bits = 32,
     .power_closure = true,
+    .publish_powered_identity = true,
 };
 
 /*
@@ -2022,6 +2025,7 @@ static const struct g15_soc g15_soc_t8122_standin = {
     .dies = 1,
     .mask2_bits = 32,
     .power_closure = true,
+    .publish_powered_identity = true,
     .fw_experimental = true,
     .power_props = true,
     .read_leak = g15g_standin_read_leak,
@@ -2135,10 +2139,8 @@ static int dt_gpu_g15_calibrate(void *dt, const struct g15_soc *soc)
     u32 count, tables, clusters, enabled, cores[G15_MAX_CLUSTERS], power[MAX_PSTATES];
     const struct perf_state *ps;
     struct g15_power_values pv;
-    bool t8122 = soc->chip == T8122;
     struct t8122_powered_identity identity = {.result = T8122_ID_NOT_RUN};
-    if (gpu < 0 || sgx < 0 || (t8122 && !t8122_fuse_valid) ||
-        g15_get_pstates(soc, sgx, &count, &tables, &ps) ||
+    if (gpu < 0 || sgx < 0 || g15_get_pstates(soc, sgx, &count, &tables, &ps) ||
         (soc->power_props && g15_get_power_props(sgx, count, tables, ps, &pv)))
         return -1;
     int len;
@@ -2147,7 +2149,7 @@ static int dt_gpu_g15_calibrate(void *dt, const struct g15_soc *soc)
         return -1;
     u32 opps = fdt32_ld(ref);
     /* Reserve the witness before power-on; never replace an input witness. */
-    if (t8122 && t8122_full_identity_prepare(dt) < 0) {
+    if (soc->publish_powered_identity && t8122_full_identity_prepare(dt) < 0) {
         printf("FDT: GPU: T8122 25G83 powered identity node unavailable; GPU stays disabled\n");
         return -1;
     }
@@ -2166,21 +2168,18 @@ static int dt_gpu_g15_calibrate(void *dt, const struct g15_soc *soc)
                soc->name);
         return -1;
     }
-    bool previous = t8122_fuse_use;
-    t8122_fuse_use |= t8122;
     g15_powered = false;
     float leak;
-    int ret =
-        g15_read_hw(dt, gpu, soc, cores, &clusters, &enabled, &leak, t8122 ? &identity : NULL);
-    t8122_fuse_use = previous;
+    int ret = g15_read_hw(dt, gpu, soc, cores, &clusters, &enabled, &leak,
+                          soc->publish_powered_identity ? &identity : NULL);
     bool restore_fail = false;
     if (g15_powered) {
         restore_fail = soc->power_closure ? (pmgr_adt_power_disable_recursive("/arm-io/sgx") ||
                                              pmgr_adt_power_is_off("/arm-io/sgx") != 1)
                                           : (t6031_closure_restore(&closure) != 0);
         if (restore_fail) {
-            printf("FDT: GPU: %s%s failed to release SGX power vote; GPU stays disabled\n",
-                   soc->name, t8122 ? " 25G83" : " 27.2");
+            printf("FDT: GPU: %s failed to release SGX power vote; GPU stays disabled\n",
+                   soc->name);
             ret = -1;
         }
     }
@@ -2189,7 +2188,7 @@ static int dt_gpu_g15_calibrate(void *dt, const struct g15_soc *soc)
         return GPU26_ERR_FATAL;
     if (ret || tables > clusters)
         return -1;
-    if (t8122) {
+    if (soc->publish_powered_identity) {
         /* Power is confirmed off: publish the real read, PASS last. */
         if (t8122_full_identity_publish(dt, &identity)) {
             printf(
@@ -2229,20 +2228,24 @@ static int dt_gpu_g15_calibrate(void *dt, const struct g15_soc *soc)
             return -1;
         i++;
     }
-    if (i != (int)count)
-        return -1;
-    if (!t8122)
-        return 0;
-    gpu = fdt_path_offset(dt, "gpu");
-    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,gpu-power-model", 1))
-        return -1;
-    return fdt_setprop_string(dt, gpu, "apple,j613-gpu-power-model",
-                              "g15s-fuse-scaled-experimental");
+    return i == (int)count ? 0 : -1;
 }
 
 int dt_gpu_t8122_26_calibrate(void *dt)
 {
-    return dt_gpu_g15_calibrate(dt, &g15_soc_t8122_standin);
+    if (!t8122_fuse_valid)
+        return -1;
+    bool previous = t8122_fuse_use;
+    t8122_fuse_use = true;
+    int ret = dt_gpu_g15_calibrate(dt, &g15_soc_t8122_standin);
+    t8122_fuse_use = previous;
+    if (ret)
+        return ret;
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,gpu-power-model", 1))
+        return -1;
+    return fdt_setprop_string(dt, gpu, "apple,j613-gpu-power-model",
+                              "g15s-fuse-scaled-experimental");
 }
 
 /* Whether /chosen has `name` = "1" */
@@ -2383,9 +2386,8 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
     }
 
     /* Reserve the full14 witness before power-on; GPU26 uses its separate path. */
-    bool publish_identity = soc->chip == T8122;
     struct t8122_powered_identity identity = {0};
-    if (publish_identity && t8122_full_identity_prepare(dt) < 0)
+    if (soc->publish_powered_identity && t8122_full_identity_prepare(dt) < 0)
         bail("FDT: GPU: full-start T8122 identity node unavailable\n");
     gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0)
@@ -2399,7 +2401,7 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
         if (g15_probed_hw(dt, gpu, soc, core_count, &clusters, &enabled_cores, &leak))
             return -1;
     } else if (g15_read_hw(dt, gpu, soc, core_count, &clusters, &enabled_cores, &leak,
-                           publish_identity ? &identity : NULL)) {
+                           soc->publish_powered_identity ? &identity : NULL)) {
         return -1;
     }
     if (perf_state_table_count > clusters)
@@ -2477,7 +2479,7 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
         if (g15_set_mbox_status(dt, mbox_ph, "okay"))
             return -1;
     }
-    if (publish_identity && t8122_full_identity_publish(dt, &identity))
+    if (soc->publish_powered_identity && t8122_full_identity_publish(dt, &identity))
         bail("FDT: GPU: full-start T8122 identity publication failed\n");
     if (g15_set_status(dt, "gpu", "okay"))
         return -1;
@@ -2531,7 +2533,7 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
     if (ret) {
         if (ret < 0)
             printf("FDT: GPU: %s GPU setup failed, leaving the gpu node disabled\n", soc->name);
-        if (soc->chip == T8122)
+        if (soc->publish_powered_identity)
             t8122_full_identity_invalidate(dt);
         g15_disable(dt);
         if (g15_powered) {

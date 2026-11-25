@@ -267,6 +267,7 @@ static const struct g15_soc soc = {
     .dies = 1,
     .mask2_bits = 32,
     .power_closure = true,
+    .publish_powered_identity = true,
     .fw_experimental = true,
     .power_props = true,
     .read_leak = leak,
@@ -442,6 +443,7 @@ int main(void)
     setup(dt, true);
     struct g15_soc pro = soc;
     pro.chip = 0x6030;
+    pro.publish_powered_identity = false;
     pro.id_variant = 3;
     pro.cores_per_cluster = 10;
     pro.clusters = 2;

@@ -1077,6 +1077,8 @@ static int run_t8122_test_soc(void)
 {
     test_soc = g15_soc_t8122;
     test_soc.chip = T6030; /* the G15S images stand in for the G15G ones */
+    /* The stand-in firmware exercises the pipeline without the G15G identity witness. */
+    test_soc.publish_powered_identity = false;
     test_soc.read_leak = test_read_leak;
     test_soc.calc_power = test_calc_power;
     return dt_set_gpu_g15(dtbuf, &test_soc);

@@ -171,7 +171,7 @@ static int stub_read_leak(const struct g15_soc *soc, float *leak)
     return 0;
 }
 static const struct g15_soc g15_soc_t8122_standin = {
-    .chip = T8122,
+    /* Calibration must work from the descriptor without a firmware lookup chip ID. */
     .name = "T8122",
     .gpu_name = "G15G",
     .compatible = "apple,agx-t8122",
@@ -181,6 +181,7 @@ static const struct g15_soc g15_soc_t8122_standin = {
     .dies = 1,
     .mask2_bits = 32,
     .power_closure = true,
+    .publish_powered_identity = true,
     .power_props = true,
     .read_leak = stub_read_leak,
     .calc_power = calc_power_t8122_standin,
