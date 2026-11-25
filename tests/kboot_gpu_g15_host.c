@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 /*
  * Host test of the G15 GPU setup in kboot_gpu.c (T6030 and T8122), with a synthetic ADT, a
  * simulated bus and real libfdt. run-kboot-gpu-g15.sh copies kboot_gpu.c next to this file and
@@ -109,6 +109,7 @@ static const u64 gfx_psreg = 0x350000008, afr_psreg = 0x350000010;
 static const u32 ps_active = (PMGR_PS_ACTIVE << 4) | PMGR_PS_ACTIVE;
 static const u32 ps_auto = BIT(28);
 static bool mock_pmgr_gates;
+static int mock_pmgr_set_mode_fail;
 static u32 gfx_ps, afr_ps;
 
 int pmgr_adt_power_enable(const char *path)
@@ -198,6 +199,8 @@ int pmgr_set_mode(uintptr_t addr, u8 target_mode)
 {
     if (mock_pmgr_gates && target_mode == 0 && (addr == gfx_psreg || addr == afr_psreg)) {
         trace("pmgr set-mode 0x%lx = %u\n", addr, target_mode);
+        if (mock_pmgr_set_mode_fail)
+            return -1;
         if (addr == gfx_psreg)
             gfx_ps = 0;
         else
@@ -2116,6 +2119,7 @@ static void prepare_t6030_27(const char *uuid)
     f.mbox_disabled = 1;
     prepare(&f);
     mock_pmgr_gates = true;
+    mock_pmgr_set_mode_fail = 0;
     /* Route by the loaded image even if the OS version differs. */
     os_firmware = fw_versions[V14_8_3];
     fw_text = t6030_27_ranges[4].base;
@@ -2268,7 +2272,7 @@ static void t6030_27_unknown_image(void)
 {
     prepare_t6030_27(t6030_27_unknown);
     os_firmware = fw_versions[V27_2];
-    run();
+    assert(run() == 0);
     check_t6030_27_reserve_only();
     assert(!pmgr_enables && !pmgr_disables);
 }
@@ -2277,9 +2281,65 @@ static void t6030_27_identity_failure(void)
 {
     prepare_t6030_27(t6030_27_b000);
     mmio_set(LEAK_FUSE, 0, 1);
-    run();
+    assert(run() == 0);
     check_t6030_27_reserve_only();
     assert(pmgr_enables == 1 && pmgr_disables == 0 && gfx_ps == 0 && afr_ps == 0);
+}
+
+static void t6030_27_unlisted_board_default(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    static const char compat[] = "apple,j999s\0apple,t6030";
+    CHK(fdt_setprop(dtbuf, 0, "compatible", compat, sizeof(compat)));
+    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t6030-gpu"));
+    assert(run() == 0);
+    check_t6030_27_handoff();
+}
+
+static void t6030_27_owner_disabled(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t6030-gpu", "0"));
+    assert(run() == 0);
+    check_t6030_27_reserve_only();
+    assert(!pmgr_enables && !pmgr_disables);
+}
+
+static void t6030_27_closure_restore_fail(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    mock_pmgr_set_mode_fail = 1;
+    assert(run() < 0);
+    check_t6030_27_reserve_only();
+    assert(log_has("failed to release SGX power vote"));
+    assert(log_has("T6030 handoff fallback failed"));
+}
+
+static void t6030_27_reserve_partial_overlap(void)
+{
+    prepare_t6030_27(t6030_27_unknown);
+    os_firmware = fw_versions[V27_2];
+    int resv = fdt_path_offset(dtbuf, "/reserved-memory");
+    int blocker = fdt_add_subnode(dtbuf, resv, "other-carveout@100009e8000");
+    CHK(blocker);
+    fdt64_t reg[2] = {cpu_to_fdt64(0x100009e8000), cpu_to_fdt64(0x10000)};
+    CHK(fdt_setprop(dtbuf, blocker, "reg", reg, sizeof(reg)));
+    CHK(fdt_setprop_empty(dtbuf, blocker, "no-map"));
+    assert(run() < 0);
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(log_has("partially overlaps another reservation; not reserved"));
+    assert(log_has("T6030 handoff fallback failed"));
+}
+
+static void t6030_27_reserve_failure(void)
+{
+    prepare_t6030_27(t6030_27_unknown);
+    os_firmware = fw_versions[V27_2];
+    CHK(fdt_del_node(dtbuf, fdt_path_offset(dtbuf, "/reserved-memory")));
+    assert(run() < 0);
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(log_has("not reserved (no /reserved-memory)"));
+    assert(log_has("T6030 handoff fallback failed"));
 }
 
 static void t8122_27_handoff(void)
@@ -3017,6 +3077,11 @@ static const struct {
     {"t6030-27-afr-already-on", t6030_27_afr_already_on},
     {"t6030-27-unknown-image", t6030_27_unknown_image},
     {"t6030-27-identity-failure", t6030_27_identity_failure},
+    {"t6030-27-unlisted-board-default", t6030_27_unlisted_board_default},
+    {"t6030-27-owner-disabled", t6030_27_owner_disabled},
+    {"t6030-27-closure-restore-fail", t6030_27_closure_restore_fail},
+    {"t6030-27-reserve-partial-overlap", t6030_27_reserve_partial_overlap},
+    {"t6030-27-reserve-failure", t6030_27_reserve_failure},
 #endif
     {"t8122-25-calibrated", t8122_25_calibrated},
     {"t8122-25-wrong-input-compat", t8122_25_wrong_input_compat},

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +15,7 @@
 #define G15_SGX_ID_COUNTS_1 0xd04010
 #define G15_SGX_ID_COUNTS_2 0xd04014
 #define T8122              0x8122
+#define GPU26_ERR_FATAL    (-2)
 #define bail(...)                                                                                  \
     do {                                                                                           \
         printf(__VA_ARGS__);                                                                       \

@@ -2173,17 +2173,20 @@ static int dt_gpu_g15_calibrate(void *dt, const struct g15_soc *soc)
     int ret =
         g15_read_hw(dt, gpu, soc, cores, &clusters, &enabled, &leak, t8122 ? &identity : NULL);
     t8122_fuse_use = previous;
+    bool restore_fail = false;
     if (g15_powered) {
-        bool release_fail = soc->power_closure ? (pmgr_adt_power_disable_recursive("/arm-io/sgx") ||
-                                                  pmgr_adt_power_is_off("/arm-io/sgx") != 1)
-                                               : (t6031_closure_restore(&closure) != 0);
-        if (release_fail) {
+        restore_fail = soc->power_closure ? (pmgr_adt_power_disable_recursive("/arm-io/sgx") ||
+                                             pmgr_adt_power_is_off("/arm-io/sgx") != 1)
+                                          : (t6031_closure_restore(&closure) != 0);
+        if (restore_fail) {
             printf("FDT: GPU: %s%s failed to release SGX power vote; GPU stays disabled\n",
                    soc->name, t8122 ? " 25G83" : " 27.2");
             ret = -1;
         }
     }
     g15_powered = false;
+    if (restore_fail)
+        return GPU26_ERR_FATAL;
     if (ret || tables > clusters)
         return -1;
     if (t8122) {
@@ -2251,10 +2254,20 @@ static bool g15_optin(void *dt, const char *name)
     return optin && len == 2 && !strcmp(optin, "1");
 }
 
+/* Whether /chosen explicitly disables `name` (any value other than "1") */
+static bool g15_optout(void *dt, const char *name)
+{
+    int chosen = fdt_path_offset(dt, "/chosen");
+    int len = 0;
+    const char *val = chosen >= 0 ? fdt_getprop(dt, chosen, name, &len) : NULL;
+    return val && (len != 2 || strcmp(val, "1"));
+}
+
 int dt_gpu_t6030_27_calibrate(void *dt)
 {
-    if (!g15_optin(dt, g15_soc_t6030.optin))
-        bail("FDT: GPU: T6030 27.2: set chosen.%s=1 to enable the GPU\n", g15_soc_t6030.optin);
+    if (g15_optout(dt, g15_soc_t6030.optin) ||
+        (!g15_optin(dt, g15_soc_t6030.optin) && g15_optout(dt, "asahi,m3-defaults")))
+        bail("FDT: GPU: T6030 27.2: GPU disabled by chosen config\n");
     return dt_gpu_g15_calibrate(dt, &g15_soc_t6030);
 }
 
@@ -2527,6 +2540,8 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
             if (!off)
                 printf("FDT: GPU: failed to power the GPU back off\n");
         }
+        if (ret == GPU26_ERR_FATAL)
+            return -1;
     }
 
     return 0;

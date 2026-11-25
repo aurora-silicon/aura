@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
 #ifndef KBOOT_H
 #define KBOOT_H
@@ -28,6 +28,7 @@ int kboot_set_chosen(const char *name, const char *value);
 void kboot_delete_chosen(const char *name);
 void kboot_set_config_lost(void);
 int kboot_set_uboot(const char *name, const char *value);
+#define GPU26_ERR_FATAL (-2)
 int dt_gpu_t8122_26_calibrate(void *dt);
 int dt_gpu_t6030_27_calibrate(void *dt);
 void t8122_read_powered_identity(void *dt, int gpu);

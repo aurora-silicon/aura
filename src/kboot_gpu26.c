@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 #include "kboot.h"
 #include "adt.h"
 #include "firmware.h"
@@ -533,8 +533,13 @@ static int gpu26_enable(void *dt, void *arg)
         if (!values[i])
             bail("ADT: GPU: %s malformed %s (len %u)\n", t->tag, gpu26_values[i].adt, len);
     }
-    if (t->calibrate && t->calibrate(dt))
-        bail("FDT: GPU: %s 27.2: calibration from this Mac's ADT failed\n", t->tag);
+    if (t->calibrate) {
+        int cal_ret = t->calibrate(dt);
+        if (cal_ret) {
+            printf("FDT: GPU: %s 27.2: calibration from this Mac's ADT failed\n", t->tag);
+            return cal_ret == GPU26_ERR_FATAL ? GPU26_ERR_FATAL : -1;
+        }
+    }
     for (size_t i = first; i < ARRAY_SIZE(gpu26_values); i++) {
         int gpu = gpu26_node(dt, t);
         if (gpu < 0 || fdt_setprop_u32(dt, gpu, gpu26_values[i].dt, values[i]))
@@ -717,8 +722,8 @@ static int t8122_gpu_reserve_one(void *dt, void *arg)
     return t8122_gpu_reserve(dt, name, r->index >= T8122_GPU_UAT, r->base, r->size) ? 0 : -1;
 }
 
-static void gpu26_reserve_range(void *dt, const struct gpu26_target *t,
-                                const struct t8122_gpu_range *r, u64 dram_start, u64 dram_end)
+static int gpu26_reserve_range(void *dt, const struct gpu26_target *t,
+                               const struct t8122_gpu_range *r, u64 dram_start, u64 dram_end)
 {
     bool covered;
     char name[64];
@@ -726,7 +731,7 @@ static void gpu26_reserve_range(void *dt, const struct gpu26_target *t,
     if (!t8122_gpu_range_ok(r->base, r->size, dram_start, dram_end)) {
         printf("FDT: GPU: %s %s 0x%lx+0x%lx is unusable, not reserved\n", t->tag, r->what, r->base,
                r->size);
-        return;
+        return -1;
     }
     int overlap =
         t8122_resv_overlap(dt, t->tag, name, r->index < T8122_GPU_UAT, r->base, r->size, &covered);
@@ -735,24 +740,30 @@ static void gpu26_reserve_range(void *dt, const struct gpu26_target *t,
                overlap < 0 ? "not reserved (no /reserved-memory)"
                : covered   ? "is already reserved"
                            : "partially overlaps another reservation; not reserved");
-        return;
+        return overlap > 0 && covered ? 0 : -1;
     }
-    if (t8122_fdt_transaction(dt, t8122_gpu_reserve_one, (void *)r))
+    if (t8122_fdt_transaction(dt, t8122_gpu_reserve_one, (void *)r)) {
         printf("FDT: GPU: %s failed to reserve %s 0x%lx+0x%lx\n", t->tag, r->what, r->base,
                r->size);
-    else
-        printf("FDT: GPU: %s reserved %s 0x%lx+0x%lx (unlinked)\n", t->tag, r->what, r->base,
-               r->size);
+        return -1;
+    }
+    printf("FDT: GPU: %s reserved %s 0x%lx+0x%lx (unlinked)\n", t->tag, r->what, r->base, r->size);
+    return 0;
 }
 
 /* Fallback: reserve whatever the ADT describes, one range at a time. */
-static void gpu26_reserve_all(void *dt, const struct gpu26_target *t)
+static int gpu26_reserve_all(void *dt, const struct gpu26_target *t)
 {
     u64 dram_start = 0, dram_end = T8122_GPU_PA_MAX;
-    if (gpu26_dram(t->tag, &dram_start, &dram_end))
+    int err = 0;
+    if (gpu26_dram(t->tag, &dram_start, &dram_end)) {
         printf("ADT: GPU: %s reserving without DRAM bounds\n", t->tag);
+        err = -1;
+    }
 
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    if (sgx < 0)
+        err = -1;
     for (int i = 0; sgx >= 0 && i < T8122_GPU_UAT; i++) {
         char prop[64];
         struct t8122_gpu_range r = {t8122_gpu_names[i], i, 0, 0};
@@ -760,16 +771,19 @@ static void gpu26_reserve_all(void *dt, const struct gpu26_target *t)
         int missing = t8122_adt_u64(sgx, prop, &r.base);
         snprintf(prop, sizeof(prop), "%s-size", t8122_gpu_adt_regions[i]);
         missing |= t8122_adt_u64(sgx, prop, &r.size);
-        if (missing)
+        if (missing) {
             printf("ADT: GPU: %s sgx has no %s region\n", t->tag, t8122_gpu_adt_regions[i]);
-        else
-            gpu26_reserve_range(dt, t, &r, dram_start, dram_end);
+            err = -1;
+        } else if (gpu26_reserve_range(dt, t, &r, dram_start, dram_end)) {
+            err = -1;
+        }
     }
 
     /* Both copies of the segment list, in case they disagree. */
     const char *paths[] = {"/arm-io/gfx-asc", "/arm-io/gfx-asc/iop-gfx-nub"};
     const void *first = NULL;
     u32 first_len = 0;
+    bool saw_segs = false;
     for (int p = 0; p < 2; p++) {
         int node = adt_path_offset(adt, paths[p]);
         u32 len = 0;
@@ -777,8 +791,10 @@ static void gpu26_reserve_all(void *dt, const struct gpu26_target *t)
             node < 0 ? NULL : adt_getprop(adt, node, "segment-ranges", &len);
         if (!seg || !len || len % sizeof(*seg) || len > 8 * sizeof(*seg)) {
             printf("ADT: GPU: %s %s has no usable segment-ranges\n", t->tag, paths[p]);
+            err = -1;
             continue;
         }
+        saw_segs = true;
         if (first && len == first_len && !memcmp(seg, first, len))
             continue;
         first = seg;
@@ -788,9 +804,13 @@ static void gpu26_reserve_all(void *dt, const struct gpu26_target *t)
             memcpy(&s, &seg[i], sizeof(s));
             struct t8122_gpu_range r = {"firmware segment", T8122_GPU_UAT + (i ? 1 : 0), s.phys,
                                         ALIGN_UP((u64)s.size, SZ_16K)};
-            gpu26_reserve_range(dt, t, &r, dram_start, dram_end);
+            if (gpu26_reserve_range(dt, t, &r, dram_start, dram_end))
+                err = -1;
         }
     }
+    if (!saw_segs)
+        err = -1;
+    return err;
 }
 
 static int gpu26_disable(void *dt, void *arg)
@@ -839,16 +859,26 @@ static int t6030_gpu_publish_27(void *dt, void *arg)
 int dt_set_gpu_t6030_27(void *dt, const struct fw_version_info *image)
 {
     struct t6030_handoff h = {.image = image};
+    int pub_ret = -1;
     if (image && image->version == V27_2 && !gpu26_read_adt(&t6030_target, &h.fw) &&
-        h.fw.segments == 3 && !t8122_fdt_transaction(dt, t6030_gpu_publish_27, &h)) {
-        printf("FDT: GPU: T6030 firmware %s handoff published, GPU enabled\n", image->string);
-        return 0;
+        h.fw.segments == 3) {
+        pub_ret = t8122_fdt_transaction(dt, t6030_gpu_publish_27, &h);
+        if (!pub_ret) {
+            printf("FDT: GPU: T6030 firmware %s handoff published, GPU enabled\n", image->string);
+            return 0;
+        }
     }
 
     printf("FDT: GPU: T6030 handoff not published; reserving the GPU firmware memory only\n");
-    if (gpu26_disable(dt, (void *)&t6030_target))
+    int dis_ret = t8122_fdt_transaction(dt, gpu26_disable, (void *)&t6030_target);
+    if (dis_ret)
         printf("FDT: GPU: T6030 cannot mark the GPU node disabled\n");
-    gpu26_reserve_all(dt, &t6030_target);
+    int resv_ret = gpu26_reserve_all(dt, &t6030_target);
+    if (pub_ret == GPU26_ERR_FATAL || dis_ret || resv_ret) {
+        printf("FDT: GPU: T6030 handoff fallback failed (power=%d disable=%d reserve=%d)\n",
+               pub_ret == GPU26_ERR_FATAL ? -1 : 0, dis_ret, resv_ret);
+        return GPU26_ERR_FATAL;
+    }
     return 0;
 }
 

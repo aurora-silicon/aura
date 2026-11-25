@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -19,6 +19,7 @@
 #define G15_ARRAY_CLUSTERS   4
 #define G15_AUX_MAX          16
 #define T8122                0x8122
+#define GPU26_ERR_FATAL      (-2)
 #define bail(...)                                                                                  \
     do {                                                                                           \
         printf(__VA_ARGS__);                                                                       \
