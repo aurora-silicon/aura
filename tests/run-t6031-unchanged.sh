@@ -111,7 +111,7 @@ for mode in j613 j613-25g83 t6030; do
     j613) dtb=$tmp/j613.dtb list="$plain contract-selftest" pre= env= ;;
     j613-25g83) dtb=$tmp/j613.dtb list="$plain missing-clock wrong-os missing-profile" pre= \
         env=J613_25G83=1 ;;
-    t6030) dtb=$tmp/j516s.dtb list=$plain pre=t6030- env= ;;
+    t6030) dtb=$tmp/j516s.dtb list="$plain 14_7-panel-dcpext" pre=t6030- env= ;;
     esac
     for s in $list; do
         for b in base new; do

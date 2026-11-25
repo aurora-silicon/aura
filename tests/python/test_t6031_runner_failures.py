@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 """Black-box runner control-flow checks with synthetic compiler/host outputs.
 
 These checks establish execution and comparison behavior, not hardware behavior
@@ -180,9 +180,11 @@ def test_unchanged_positive_control_executes_actual_comparisons(runner):
     assert scenario_calls(calls, "g15-base") == ["one", "two"]
     assert scenario_calls(calls, "g15-new") == ["one", "two"]
     for role in ("disp-base", "disp-new"):
-        assert len(scenario_calls(calls, role)) == 25
+        scenarios = scenario_calls(calls, role)
+        assert len(scenarios) == 26
+        assert "t6030-14_7-panel-dcpext" in scenarios
     assert "G15 GPU setup: 2 scenarios identical" in result.stdout
-    assert "Display handoff: 25 J613" in result.stdout
+    assert "Display handoff: 26 J613" in result.stdout
     assert "PASS: every other SoC's handoff results" in result.stdout
 
 

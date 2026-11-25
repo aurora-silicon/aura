@@ -1053,8 +1053,9 @@ int main(int argc, char **argv)
     } else if (lost_cfg) {
         o.armed = true;
         publish = false;
-    } else if (!strcmp(sc, "reordered-text-dcpext")) {
-        o.armed = o.reordered_text = o.dcpext = true;
+    } else if (!strcmp(sc, "14_7-panel-dcpext") || !strcmp(sc, "reordered-text-dcpext")) {
+        o.armed = o.dcpext = true;
+        o.reordered_text = !strcmp(sc, "reordered-text-dcpext");
     } else if (!strcmp(sc, "repeat")) {
         o.armed = o.twice = true;
     } else if (!strcmp(sc, "wrong-image")) {
@@ -1193,11 +1194,11 @@ int main(int argc, char **argv)
         } else if (o.dcpext) {
             int dcp = fdt_path_offset(dt, "dcp"), ext = fdt_path_offset(dt, "dcpext0"), len;
             const fdt32_t *pm = fdt_getprop(dt, dcp, "apple,t6030-handoff", &len);
-            check(pm && len == 4 && fdt32_ld(pm) == 1, "T6030 reordered panel handoff published");
+            check(pm && len == 4 && fdt32_ld(pm) == 1, "T6030 14.7 panel handoff published");
             const fdt32_t *em =
                 ext < 0 ? NULL : fdt_getprop(dt, ext, "apple,t6030-dcpext-memory-ready", &len);
             check(em && len == 4 && fdt32_ld(em) == 1,
-                  "T6030 dcpext0 matches reordered panel TEXT segment");
+                  "T6030 14.7 dcpext0 memory ready");
             int panel_ti = fdt_stringlist_search(dt, dcp, "memory-region-names", "asc-firmware");
             int ext_ti = fdt_stringlist_search(dt, ext, "memory-region-names", "asc-firmware");
             u64 base = 0, size = 0;
