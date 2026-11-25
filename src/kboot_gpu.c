@@ -2265,6 +2265,8 @@ static bool g15_optout(void *dt, const char *name)
 
 int dt_gpu_t6030_27_calibrate(void *dt)
 {
+    if (kboot_config_lost())
+        bail("FDT: GPU: T6030 27.2: config line lost; GPU stays disabled\n");
     if (g15_optout(dt, g15_soc_t6030.optin) ||
         (!g15_optin(dt, g15_soc_t6030.optin) && g15_optout(dt, "asahi,m3-defaults")))
         bail("FDT: GPU: T6030 27.2: GPU disabled by chosen config\n");
@@ -2507,6 +2509,8 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
         printf("FDT: GPU: cannot mark the gpu node disabled, not setting up the %s GPU\n",
                soc->name);
         g15_disable(dt);
+        if (soc->handoff && soc->handoff(dt, NULL) == GPU26_ERR_FATAL)
+            return -1;
         return 0;
     }
 

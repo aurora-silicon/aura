@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 /*
  * Host test of the T6030 display ADT facts (src/kboot_display_facts.c) and of the atc-phy3 lane
  * tunable rule (src/kboot_atc.c). Synthetic ADTs in the boot loader's binary layout, an ADT

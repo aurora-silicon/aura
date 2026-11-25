@@ -12854,6 +12854,11 @@ void kboot_set_config_lost(void)
     chosen_lost = true;
 }
 
+bool kboot_config_lost(void)
+{
+    return chosen_lost;
+}
+
 void kboot_delete_chosen(const char *name)
 {
     if (!name)

@@ -109,8 +109,14 @@ static const u64 gfx_psreg = 0x350000008, afr_psreg = 0x350000010;
 static const u32 ps_active = (PMGR_PS_ACTIVE << 4) | PMGR_PS_ACTIVE;
 static const u32 ps_auto = BIT(28);
 static bool mock_pmgr_gates;
+static bool mock_config_lost;
 static int mock_pmgr_set_mode_fail;
 static u32 gfx_ps, afr_ps;
+
+bool kboot_config_lost(void)
+{
+    return mock_config_lost;
+}
 
 int pmgr_adt_power_enable(const char *path)
 {
@@ -703,6 +709,7 @@ static void prepare(const struct fixture *f)
     pmgr_enable_ret = 0;
     pmgr_off = pmgr_off_after_release = 1;
     mock_pmgr_gates = false;
+    mock_config_lost = false;
     gfx_ps = afr_ps = 0;
     exc_guard = GUARD_OFF;
     exc_count = 0;
@@ -2305,6 +2312,39 @@ static void t6030_27_owner_disabled(void)
     assert(!pmgr_enables && !pmgr_disables);
 }
 
+static void t6030_27_config_lost(void)
+{
+    /* Listed board after dt_drop_m3_graphics(): switch absent and config lost keeps GPU off. */
+    prepare_t6030_27(t6030_27_b000);
+    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t6030-gpu"));
+    mock_config_lost = true;
+    assert(run() == 0);
+    check_t6030_27_reserve_only();
+    assert(!pmgr_enables && !pmgr_disables);
+    assert(log_has("config line lost; GPU stays disabled"));
+
+    /* Unlisted board with an earlier =1 still present: config lost still keeps GPU off. */
+    prepare_t6030_27(t6030_27_b000);
+    static const char compat[] = "apple,j999s\0apple,t6030";
+    CHK(fdt_setprop(dtbuf, 0, "compatible", compat, sizeof(compat)));
+    mock_config_lost = true;
+    assert(run() == 0);
+    check_t6030_27_reserve_only();
+    assert(!pmgr_enables && !pmgr_disables);
+    assert(log_has("config line lost; GPU stays disabled"));
+}
+
+static void t6030_27_full_fdt(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "gpu"), "status", "okay"));
+    CHK(fdt_pack(dtbuf));
+    assert(run() < 0);
+    assert(log_has("cannot mark the gpu node disabled"));
+    assert(log_has("T6030 handoff fallback failed"));
+    assert(!pmgr_enables && !pmgr_disables);
+}
+
 static void t6030_27_closure_restore_fail(void)
 {
     prepare_t6030_27(t6030_27_b000);
@@ -3079,6 +3119,8 @@ static const struct {
     {"t6030-27-identity-failure", t6030_27_identity_failure},
     {"t6030-27-unlisted-board-default", t6030_27_unlisted_board_default},
     {"t6030-27-owner-disabled", t6030_27_owner_disabled},
+    {"t6030-27-config-lost", t6030_27_config_lost},
+    {"t6030-27-full-fdt", t6030_27_full_fdt},
     {"t6030-27-closure-restore-fail", t6030_27_closure_restore_fail},
     {"t6030-27-reserve-partial-overlap", t6030_27_reserve_partial_overlap},
     {"t6030-27-reserve-failure", t6030_27_reserve_failure},
