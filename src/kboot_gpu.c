@@ -578,6 +578,8 @@ struct g15_soc {
     bool power_closure;
     /* Also accept the firmware images firmware.c lists as experimental */
     bool fw_experimental;
+    /* A kernel-owned handoff (or memory reservation when the image is unknown). */
+    int (*handoff)(void *dt, const struct fw_version_info *image);
     /* Add the ADT's power-management values to the gpu node, see g15_power_props[] */
     bool power_props;
     /*
@@ -1985,6 +1987,7 @@ static const struct g15_soc g15_soc_t6030 = {
     .cores_per_cluster = G15S_CORES_PER_CLUSTER,
     .clusters = T6030_MAX_CLUSTERS,
     .mask2_bits = 16,
+    .handoff = dt_set_gpu_t6030_27,
     .read_leak = g15s_read_leak,
     .calc_power = calc_power_t6030,
 };
@@ -2121,28 +2124,22 @@ static int g15_probed_hw(void *dt, int gpu, const struct g15_soc *soc, u32 *core
     return soc->read_leak(soc, leak);
 }
 
-/* 25G83 calibration on the scratch DT: this Mac's ADT and fuse, no unit tables.
- * The G15S-derived power model remains experimental. Release every power vote
- * after the bounded identity read; Linux owns firmware admission and startup.
- *
- * The kernel's T8122 admission requires the bounded powered-identity witness
- * in /chosen/asahi,t8122-gpu-powered-identity. Reserve it (probe-result
- * NOT_RUN) before power-on, retain g15_read_hw()'s genuine guarded read of
- * this boot's ID/core-mask registers, and publish it only after the SGX
- * power vote is confirmed released. The caller runs this on a scratch copy
- * of the DT, so any failure here discards the reserved node together with
- * the rest of the handoff and leaves the GPU disabled.
+/*
+ * Calibrate on the scratch DT before Linux starts the firmware. Take the OPPs
+ * and SRAM voltages from this Mac and release SGX after the bounded identity read.
+ * T8122 also requires the powered-identity witness for firmware admission.
  */
-int dt_gpu_t8122_26_calibrate(void *dt)
+static int dt_gpu_g15_calibrate(void *dt, const struct g15_soc *soc)
 {
     int gpu = fdt_path_offset(dt, "gpu"), sgx = adt_path_offset(adt, "/arm-io/sgx");
     u32 count, tables, clusters, enabled, cores[G15_MAX_CLUSTERS], power[MAX_PSTATES];
     const struct perf_state *ps;
     struct g15_power_values pv;
+    bool t8122 = soc->chip == T8122;
     struct t8122_powered_identity identity = {.result = T8122_ID_NOT_RUN};
-    if (gpu < 0 || sgx < 0 || !t8122_fuse_valid ||
-        g15_get_pstates(&g15_soc_t8122_standin, sgx, &count, &tables, &ps) ||
-        g15_get_power_props(sgx, count, tables, ps, &pv))
+    if (gpu < 0 || sgx < 0 || (t8122 && !t8122_fuse_valid) ||
+        g15_get_pstates(soc, sgx, &count, &tables, &ps) ||
+        (soc->power_props && g15_get_power_props(sgx, count, tables, ps, &pv)))
         return -1;
     int len;
     const fdt32_t *ref = fdt_getprop(dt, gpu, "operating-points-v2", &len);
@@ -2150,43 +2147,64 @@ int dt_gpu_t8122_26_calibrate(void *dt)
         return -1;
     u32 opps = fdt32_ld(ref);
     /* Reserve the witness before power-on; never replace an input witness. */
-    if (t8122_full_identity_prepare(dt) < 0) {
+    if (t8122 && t8122_full_identity_prepare(dt) < 0) {
         printf("FDT: GPU: T8122 25G83 powered identity node unavailable; GPU stays disabled\n");
         return -1;
     }
     gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0)
         return -1;
+
+    /*
+     * On T8122 (power_closure == true) SGX starts off and is verified off after release.
+     * On T6030 (power_closure == false) GFX's parent AFR is always on, so restore the
+     * closure registers to their pre-probe state instead of requiring the whole closure off.
+     */
+    struct t6031_closure closure;
+    if (!soc->power_closure && t6031_closure_get("/arm-io/sgx", &closure)) {
+        printf("FDT: GPU: %s 27.2: SGX power closure did not resolve; GPU stays disabled\n",
+               soc->name);
+        return -1;
+    }
     bool previous = t8122_fuse_use;
-    t8122_fuse_use = true;
+    t8122_fuse_use |= t8122;
     g15_powered = false;
     float leak;
     int ret =
-        g15_read_hw(dt, gpu, &g15_soc_t8122_standin, cores, &clusters, &enabled, &leak, &identity);
+        g15_read_hw(dt, gpu, soc, cores, &clusters, &enabled, &leak, t8122 ? &identity : NULL);
     t8122_fuse_use = previous;
-    if (g15_powered && (pmgr_adt_power_disable_recursive("/arm-io/sgx") ||
-                        pmgr_adt_power_is_off("/arm-io/sgx") != 1)) {
-        printf("FDT: GPU: T8122 25G83 failed to release SGX power vote; GPU stays disabled\n");
-        ret = -1;
+    if (g15_powered) {
+        bool release_fail = soc->power_closure ? (pmgr_adt_power_disable_recursive("/arm-io/sgx") ||
+                                                  pmgr_adt_power_is_off("/arm-io/sgx") != 1)
+                                               : (t6031_closure_restore(&closure) != 0);
+        if (release_fail) {
+            printf("FDT: GPU: %s%s failed to release SGX power vote; GPU stays disabled\n",
+                   soc->name, t8122 ? " 25G83" : " 27.2");
+            ret = -1;
+        }
     }
     g15_powered = false;
     if (ret || tables > clusters)
         return -1;
-    /* Power is confirmed off: publish the real read, PASS last. */
-    if (t8122_full_identity_publish(dt, &identity)) {
-        printf("FDT: GPU: T8122 25G83 powered identity publication failed; GPU stays disabled\n");
-        return -1;
+    if (t8122) {
+        /* Power is confirmed off: publish the real read, PASS last. */
+        if (t8122_full_identity_publish(dt, &identity)) {
+            printf(
+                "FDT: GPU: T8122 25G83 powered identity publication failed; GPU stays disabled\n");
+            return -1;
+        }
+        printf("FDT: GPU: T8122 25G83 powered identity result %u: ID_VERSION 0x%08x ID_COUNTS_1 "
+               "0x%08x core masks 0x%x 0x%x 0x%x\n",
+               identity.result, identity.id_version, identity.id_counts_1, identity.core_mask[0],
+               identity.core_mask[1], identity.core_mask[2]);
     }
-    printf("FDT: GPU: T8122 25G83 powered identity result %u: ID_VERSION 0x%08x ID_COUNTS_1 "
-           "0x%08x core masks 0x%x 0x%x 0x%x\n",
-           identity.result, identity.id_version, identity.id_counts_1, identity.core_mask[0],
-           identity.core_mask[1], identity.core_mask[2]);
-    calc_power_t8122_standin(count, ps, leak, enabled, power);
+    soc->calc_power(count, ps, leak, enabled, power);
     if (power[count - 1] < 1000 || g15_set_opps(dt, opps, count, tables, clusters, ps, power) ||
-        g15_set_power_props(dt, &pv) ||
+        (soc->power_props && g15_set_power_props(dt, &pv)) ||
         g15_set_float_array(dt, "apple,core-leak-coef", leak, clusters) ||
         g15_set_float_array(dt, "apple,sram-leak-coef", 0.0f, clusters))
         return -1;
+
     u32 sram_len;
     const struct perf_state *sram = adt_getprop(adt, sgx, "perf-states-sram", &sram_len);
     if (!sram || sram_len != sizeof(*sram) * count * tables)
@@ -2199,44 +2217,29 @@ int dt_gpu_t8122_26_calibrate(void *dt)
         fdt32_t voltage[G15_MAX_CLUSTERS];
         for (u32 t = 0; t < clusters; t++) {
             u32 mv = t < tables ? sram[t * count + i].volt : 0;
-            voltage[t] = cpu_to_fdt32((mv ? mv : sram[i].volt) * 1000);
+            mv = mv ? mv : sram[i].volt;
+            if (mv > G15_PS_MAX_MV)
+                return -1;
+            voltage[t] = cpu_to_fdt32(mv * 1000);
         }
         if (fdt_setprop(dt, node, "opp-microvolt-sram", voltage, clusters * sizeof(fdt32_t)))
             return -1;
         i++;
     }
+    if (i != (int)count)
+        return -1;
+    if (!t8122)
+        return 0;
     gpu = fdt_path_offset(dt, "gpu");
-    if (i != (int)count || gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,gpu-power-model", 1))
+    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,gpu-power-model", 1))
         return -1;
     return fdt_setprop_string(dt, gpu, "apple,j613-gpu-power-model",
                               "g15s-fuse-scaled-experimental");
 }
 
-/*
- * 27.2 start values the kernel takes from the GPU node rather than its own literals. Both are
- * required: without either one in this Mac's ADT the 27.2 GPU is not handed over.
- * - apple,fast-die0-target: /arm-io/sgx gpu-fast-die0-target (degrees C);
- * - apple,coredump-copy-buffer: /arm-io/gfx-asc/iop-gfx-nub coredump-copy-buffer (bytes, the
- *   host's firmware crash-copy buffer).
- * dt_gpu_t8122_27_machine_values_read() reads the ADT only, so the start can refuse before
- * anything is powered; t8122_gpu_enable_27() copies them to the GPU node as they are.
- */
-const struct t8122_27_value t8122_27_values[T8122_27_VALUES] = {
-    {"/arm-io/sgx", "gpu-fast-die0-target", "apple,fast-die0-target"},
-    {"/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer", "apple,coredump-copy-buffer"},
-};
-
-int dt_gpu_t8122_27_machine_values_read(u32 val[T8122_27_VALUES])
+int dt_gpu_t8122_26_calibrate(void *dt)
 {
-    for (size_t i = 0; i < T8122_27_VALUES; i++) {
-        int node = adt_path_offset(adt, t8122_27_values[i].path);
-        u32 len = 0;
-        if (node < 0 || !adt_getprop(adt, node, t8122_27_values[i].adt, &len))
-            bail("ADT: GPU: T8122 27.2: %s absent, GPU left disabled\n", t8122_27_values[i].adt);
-        if (g15_adt_u32(node, t8122_27_values[i].adt, &val[i]) || !val[i])
-            bail("ADT: GPU: T8122 malformed %s (len %u)\n", t8122_27_values[i].adt, len);
-    }
-    return 0;
+    return dt_gpu_g15_calibrate(dt, &g15_soc_t8122_standin);
 }
 
 /* Whether /chosen has `name` = "1" */
@@ -2246,6 +2249,13 @@ static bool g15_optin(void *dt, const char *name)
     int len = 0;
     const char *optin = chosen >= 0 ? fdt_getprop(dt, chosen, name, &len) : NULL;
     return optin && len == 2 && !strcmp(optin, "1");
+}
+
+int dt_gpu_t6030_27_calibrate(void *dt)
+{
+    if (!g15_optin(dt, g15_soc_t6030.optin))
+        bail("FDT: GPU: T6030 27.2: set chosen.%s=1 to enable the GPU\n", g15_soc_t6030.optin);
+    return dt_gpu_g15_calibrate(dt, &g15_soc_t6030);
 }
 
 /*
@@ -2275,6 +2285,9 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
      */
     const struct fw_version_info *gfx_fw =
         soc->family_fw ? g15_t6031_fw : firmware_gfx_version_ex(soc->chip, soc->fw_experimental);
+    if (soc->handoff && (!gfx_fw || gfx_fw->version != V14_8_3))
+        return soc->handoff(dt, gfx_fw);
+
     bool have_model = soc->read_leak && soc->calc_power;
     if (!have_model)
         printf("FDT: GPU: the %s leakage fuse and power model are not known yet\n", soc->gpu_name);

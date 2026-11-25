@@ -371,6 +371,9 @@ static const struct gfx_fw_image gfx_fw_images[] = {
     {T6030, V14_8_3, "g15s build b0", {0xdb, 0xf3, 0x7c, 0x40, 0xea, 0xd5, 0x37, 0x60,
                                        0x94, 0x41, 0x99, 0x50, 0x18, 0x78, 0x29, 0x55},
      0x58e88, 0x1e8, 0x5c000},
+    /* 27.2 (26B123) G15S images, identified by the loaded TEXT size and the nub UUID. */
+    {T6030, V27_2, "g15s 27.2 a000", {0}, 0, 0, 0x60000, false, "3FC79C19-5D8B-3EE9-80FF-0F49FC416C00"},
+    {T6030, V27_2, "g15s 27.2 b000", {0}, 0, 0, 0x60000, false, "A0EA5119-604D-3372-B38F-528F9E967970"},
     /*
      * T8122 (M3, G15G): the image iBoot loads on the M3 Air (J613, chip revision C0, RTKit
      * 2419.140.12). Experimental: its ABI is taken to be the 14.8.3 G15S one and is not validated,

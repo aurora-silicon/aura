@@ -104,12 +104,22 @@ int32_t rust_fill_gpu_initdata(struct initdata_inputs *a, void *b, void *c, void
 
 /* PMGR: the GPU power closure. pmgr_off is the state seen by pmgr_adt_power_is_off(). */
 static int pmgr_enable_ret, pmgr_off = 1, pmgr_off_after_release = 1;
+enum { GFX_GATE = 1, AFR_GATE };
+static const u64 gfx_psreg = 0x350000008, afr_psreg = 0x350000010;
+static const u32 ps_active = (PMGR_PS_ACTIVE << 4) | PMGR_PS_ACTIVE;
+static const u32 ps_auto = BIT(28);
+static bool mock_pmgr_gates;
+static u32 gfx_ps, afr_ps;
+
 int pmgr_adt_power_enable(const char *path)
 {
     trace("pmgr enable %s\n", path);
     pmgr_enables++;
-    if (!pmgr_enable_ret)
+    if (!pmgr_enable_ret) {
         pmgr_off = 0;
+        if (mock_pmgr_gates)
+            gfx_ps = afr_ps = ps_active;
+    }
     return pmgr_enable_ret;
 }
 int pmgr_adt_power_enable_traced_saved(const char *path, struct pmgr_saved_modes *saved)
@@ -132,39 +142,68 @@ int pmgr_adt_power_disable_recursive(const char *path)
     trace("pmgr disable-recursive %s\n", path);
     pmgr_disables++;
     pmgr_off = pmgr_off_after_release;
+    if (mock_pmgr_gates)
+        gfx_ps = afr_ps = 0;
     return 0;
 }
 int pmgr_adt_power_is_off(const char *path)
 {
-    trace("pmgr is-off %s = %d\n", path, pmgr_off);
-    return pmgr_off;
+    int off = mock_pmgr_gates ? !(gfx_ps || afr_ps) : pmgr_off;
+    trace("pmgr is-off %s = %d\n", path, off);
+    return off;
 }
 
-/*
- * The T6031 code (kboot_gpu_t6031.c, kboot_t6031.c) links in with kboot_gpu.c from trees that have
- * it. No T6030 or T8122 scenario reaches it: a register write or PMGR lookup here fails the run.
- */
 void host_write32(u64 addr, u32 val)
 {
+    if (mock_pmgr_gates && addr == afr_psreg) {
+        afr_ps = val;
+        return;
+    }
     trace("write32 0x%lx = 0x%x UNEXPECTED\n", addr, val);
     unguarded_faults++;
 }
 int pmgr_adt_gate(const char *path, const char *prop, u32 index, struct pmgr_gate *gate)
 {
-    (void)prop, (void)index, (void)gate;
+    if (mock_pmgr_gates && !strcmp(path, "/arm-io/sgx") && !strcmp(prop, "clock-gates")) {
+        if (index)
+            return -1;
+        return pmgr_device_gate(0, GFX_GATE, gate);
+    }
     trace("pmgr gate %s UNEXPECTED\n", path);
     unguarded_faults++;
     return -1;
 }
 int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *gate)
 {
-    (void)die, (void)id, (void)gate;
+    if (mock_pmgr_gates && die == 0) {
+        if (id == GFX_GATE) {
+            *gate = (struct pmgr_gate){
+                .id = id,
+                .found = true,
+                .name = "GFX",
+                .psreg = gfx_psreg,
+                .parent = {AFR_GATE},
+            };
+            return 0;
+        }
+        if (id == AFR_GATE) {
+            *gate = (struct pmgr_gate){.id = id, .found = true, .name = "AFR", .psreg = afr_psreg};
+            return 0;
+        }
+    }
     unguarded_faults++;
     return -1;
 }
 int pmgr_set_mode(uintptr_t addr, u8 target_mode)
 {
-    (void)addr, (void)target_mode;
+    if (mock_pmgr_gates && target_mode == 0 && (addr == gfx_psreg || addr == afr_psreg)) {
+        trace("pmgr set-mode 0x%lx = %u\n", addr, target_mode);
+        if (addr == gfx_psreg)
+            gfx_ps = 0;
+        else
+            afr_ps = 0;
+        return 0;
+    }
     unguarded_faults++;
     return -1;
 }
@@ -338,6 +377,10 @@ static u32 bus_fault(u64 addr)
 
 u32 host_read32(u64 addr)
 {
+    if (mock_pmgr_gates && addr == gfx_psreg)
+        return gfx_ps;
+    if (mock_pmgr_gates && addr == afr_psreg)
+        return afr_ps;
     if (addr >= fw_text + 0x4200 && addr < fw_text + 0x4200 + sizeof(fw_hdr)) {
         trace("read32 fw+0x%lx\n", addr - fw_text);
         return fw_hdr[(addr - fw_text - 0x4200) / 4];
@@ -656,6 +699,8 @@ static void prepare(const struct fixture *f)
     pmgr_enables = pmgr_disables = mmio_reads = unguarded_faults = 0;
     pmgr_enable_ret = 0;
     pmgr_off = pmgr_off_after_release = 1;
+    mock_pmgr_gates = false;
+    gfx_ps = afr_ps = 0;
     exc_guard = GUARD_OFF;
     exc_count = 0;
     os_firmware = fw_versions[V14_7];
@@ -690,6 +735,12 @@ static void t6030_unknown_fw(void)
     prepare(&t6030_fx);
     fw_hdr[5] ^= 1;
     run();
+#ifdef G15_NEW
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(prop_len(dtbuf, "/reserved-memory/uat-ttbs", "no-map") == 0);
+    assert(prop_len(dtbuf, "/reserved-memory/asc-firmware@101f8000000", "no-map") == 0);
+    assert(!pmgr_enables && !pmgr_disables);
+#endif
 }
 static void t6030_wrong_id(void)
 {
@@ -2041,6 +2092,196 @@ static void t27_refused(void)
     assert(log_has("handoff not published; reserving the GPU firmware memory only"));
     assert(!pmgr_enables);
 }
+/* J516s on 26B123. The ADT has one voltage table for both clusters and no
+ * FastDie target. Model the 14.x header location as empty for the 27.2 image.
+ */
+static const char t6030_27_b000[] = "A0EA5119-604D-3372-B38F-528F9E967970";
+static const char t6030_27_a000[] = "3FC79C19-5D8B-3EE9-80FF-0F49FC416C00";
+static const char t6030_27_unknown[] = "00000000-0000-0000-0000-000000000000";
+static const struct {
+    const char *name, *node, *adt_prefix;
+    u64 base, size;
+} t6030_27_ranges[] = {
+    {"ttbs", "uat-ttbs@10", "gpu-region", 0x1047ffb8000, 0x4000},
+    {"pagetables", "uat-pagetables@20", "gfx-shared-region", 0x1047ff78000, 0x40000},
+    {"handoff", "uat-handoff@30", "gfx-handoff", 0x1047ff70000, 0x4000},
+    {"shared-l2", "uat-pagetables-l2@40", "gfx-shared-l2-region", 0x1047ff74000, 0x4000},
+    {"fw-text", "asc-firmware@100009f0000", NULL, 0x100009f0000, 0x60000},
+    {"fw-data", "asc-firmware@10001918000", NULL, 0x10001918000, 0x134000},
+};
+
+static void prepare_t6030_27(const char *uuid)
+{
+    struct fixture f = t6030_fx;
+    f.mbox_disabled = 1;
+    prepare(&f);
+    mock_pmgr_gates = true;
+    /* Route by the loaded image even if the OS version differs. */
+    os_firmware = fw_versions[V14_8_3];
+    fw_text = t6030_27_ranges[4].base;
+    memset(fw_hdr, 0, sizeof(fw_hdr));
+    mem_size_actual = 0x480000000;
+    hset_u64("/chosen", "dram-size", mem_size_actual);
+    hset("/arm-io/sgx", "compatible", "gpu,t6030", sizeof("gpu,t6030"));
+    const u64 sgx_reg[] = {SGX_BASE, 0x32a4000, 0x290d00000, 0x16c000};
+    const u64 asc_reg[] = {ASC_BASE, 0x6c000, 0x292050000, 0x6c000};
+    hset("/arm-io/sgx", "reg", sgx_reg, sizeof(sgx_reg));
+    hset("/arm-io/gfx-asc", "reg", asc_reg, sizeof(asc_reg));
+    const struct perf_state core[] = {
+        {0, 125}, {338000000, 650}, {618000000, 690}, {796000000, 710}, {832000000, 750},
+        {924000000, 750}, {952000000, 825}, {1056000000, 825}, {1064000000, 875},
+        {1182000000, 875}, {1182000000, 940}, {1312000000, 940}, {1242000000, 975},
+        {1380000000, 975},
+    };
+    struct perf_state sram[ARRAY_SIZE(core)];
+    for (size_t i = 0; i < ARRAY_SIZE(core); i++)
+        sram[i] = (struct perf_state){core[i].freq, max(core[i].volt, 810)};
+    hset_u32("/arm-io/sgx", "perf-state-count", ARRAY_SIZE(core));
+    hset_u32("/arm-io/sgx", "gpu-num-perf-states", ARRAY_SIZE(core) - 1);
+    hset_u32("/arm-io/sgx", "perf-state-table-count", 1);
+    hset("/arm-io/sgx", "perf-states", core, sizeof(core));
+    hset("/arm-io/sgx", "perf-states-sram", sram, sizeof(sram));
+
+    /* hset keeps the property names by reference. */
+    static char props[4][2][40];
+    for (size_t i = 0; i < ARRAY_SIZE(props); i++) {
+        snprintf(props[i][0], sizeof(props[i][0]), "%s-base", t6030_27_ranges[i].adt_prefix);
+        snprintf(props[i][1], sizeof(props[i][1]), "%s-size", t6030_27_ranges[i].adt_prefix);
+        hset_u64("/arm-io/sgx", props[i][0], t6030_27_ranges[i].base);
+        hset_u64("/arm-io/sgx", props[i][1], t6030_27_ranges[i].size);
+        int resv = fdt_path_offset(dtbuf, "/reserved-memory");
+        char node[40];
+        snprintf(node, sizeof(node), "%s", t6030_27_ranges[i].node);
+        *strchr(node, '@') = 0;
+        CHK(fdt_set_name(dtbuf, fdt_subnode_offset(dtbuf, resv, node), t6030_27_ranges[i].node));
+    }
+
+    const struct adt_segment_ranges seg[] = {
+        {0x100009f0000, FW_VA, 0x100009f0000, 0x60000, 1},
+        {0x10001918000, FW_VA + 0x60000, 0x10001918000, 0x12c000, 0x10},
+        {0x10001a44000, FW_VA + 0x18c000, 0x10001a44000, 0x8000, 0},
+    };
+    static const char names[] = "__TEXT;__DATA;__DATA_SHARED_RO";
+    const char *nub = "/arm-io/gfx-asc/iop-gfx-nub";
+    hset("/arm-io/gfx-asc", "segment-names", names, sizeof(names));
+    hset("/arm-io/gfx-asc", "segment-ranges", seg, sizeof(seg));
+    hset(nub, "segment-ranges", seg, sizeof(seg));
+    hset(nub, "uuid", uuid, strlen(uuid) + 1);
+    hset_u32(nub, "coredump-copy-buffer", 0x8000);
+    hset_u64("/arm-io/sgx", "gfx-data-shared-ro-base", seg[2].phys);
+    hset_u64("/arm-io/sgx", "gfx-data-shared-ro-size", seg[2].size);
+    hset_u64("/arm-io/sgx", "gfx-data-shared-rw-size", 0);
+
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/soc/mbox@292408000"), "compatible",
+                           "apple,t6030-agx-asc-mailbox"));
+    int ps = fdt_add_subnode(dtbuf, fdt_path_offset(dtbuf, "/soc"), "power-controller@gfx");
+    CHK(ps);
+    CHK(fdt_setprop_u32(dtbuf, ps, "phandle", 41));
+    CHK(fdt_setprop_u32(dtbuf, fdt_path_offset(dtbuf, "gpu"), "power-domains", 41));
+}
+
+static void check_t6030_27_handoff(void)
+{
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "okay"));
+    assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "okay"));
+    assert(prop_len(dtbuf, "/soc/power-controller@gfx", "apple,no-auto-pm") == 0);
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,pmp") < 0);
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,fast-die0-target") < 0);
+    assert(gpu_u32("apple,g16-handoff-version") == 2);
+    assert(gpu_u32("apple,coredump-copy-buffer") == 0x8000);
+
+    int gpu = fdt_path_offset(dtbuf, "gpu"), len;
+    static const char names[] = "ttbs\0pagetables\0handoff\0shared-l2\0fw-text\0fw-data";
+    const char *actual = fdt_getprop(dtbuf, gpu, "memory-region-names", &len);
+    assert(actual && len == sizeof(names) && !memcmp(actual, names, sizeof(names)));
+    const fdt32_t *regions = gpu_prop("memory-region", &len);
+    assert(regions && len == sizeof(*regions) * ARRAY_SIZE(t6030_27_ranges));
+    for (size_t i = 0; i < ARRAY_SIZE(t6030_27_ranges); i++) {
+        int node = fdt_node_offset_by_phandle(dtbuf, fdt32_ld(regions + i));
+        CHK(node);
+        assert(fdt_getprop(dtbuf, node, "no-map", &len) && len == 0);
+        const fdt64_t *reg = fdt_getprop(dtbuf, node, "reg", &len);
+        assert(reg && len == 16 && fdt64_ld(reg) == t6030_27_ranges[i].base &&
+               fdt64_ld(reg + 1) == t6030_27_ranges[i].size);
+    }
+    const fdt64_t *vas = fdt_getprop(dtbuf, gpu, "apple,firmware-segment-vas", &len);
+    assert(vas && len == 24 && fdt64_ld(vas) == FW_VA && fdt64_ld(vas + 1) == FW_VA + 0x60000 &&
+           fdt64_ld(vas + 2) == FW_VA + 0x18c000);
+    const fdt32_t *flags = gpu_prop("apple,firmware-segment-flags", &len);
+    assert(flags && len == 12 && fdt32_ld(flags) == 1 && fdt32_ld(flags + 1) == 0x10 &&
+           fdt32_ld(flags + 2) == 0);
+    const char *const versions[] = {"apple,firmware-compat", "apple,firmware-version"};
+    for (size_t i = 0; i < ARRAY_SIZE(versions); i++) {
+        const fdt32_t *v = fdt_getprop(dtbuf, gpu, versions[i], &len);
+        assert(v && len == 12 && fdt32_ld(v) == 27 && fdt32_ld(v + 1) == 2 && !fdt32_ld(v + 2));
+    }
+    CHK(fdt_path_offset(dtbuf, "/opp-table-gpu/opp13"));
+    int opp = fdt_path_offset(dtbuf, "/opp-table-gpu/opp01");
+    const fdt32_t *sram = fdt_getprop(dtbuf, opp, "opp-microvolt-sram", &len);
+    assert(sram && len == 8 && fdt32_ld(sram) == 810000 && fdt32_ld(sram + 1) == 810000);
+    assert(pmgr_enables == 1 && pmgr_disables == 0 && gfx_ps == 0 && !unguarded_faults);
+}
+
+static void t6030_27_handoff(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    run();
+    check_t6030_27_handoff();
+    assert(afr_ps == 0);
+    assert(log_has("identified image g15s 27.2 b000"));
+}
+
+static void t6030_27_handoff_a000(void)
+{
+    prepare_t6030_27(t6030_27_a000);
+    run();
+    check_t6030_27_handoff();
+    assert(log_has("identified image g15s 27.2 a000"));
+}
+
+static void t6030_27_afr_already_on(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    /* The parent is active with automatic power management before the probe. */
+    afr_ps = ps_active | ps_auto;
+    run();
+    check_t6030_27_handoff();
+    assert(afr_ps == (ps_active | ps_auto));
+}
+
+static void check_t6030_27_reserve_only(void)
+{
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "disabled"));
+    assert(prop_len(dtbuf, "/soc/power-controller@gfx", "apple,no-auto-pm") < 0);
+    assert(!gpu_prop("apple,g16-handoff-version", NULL));
+    for (size_t i = 0; i < ARRAY_SIZE(t6030_27_ranges); i++) {
+        char path[80];
+        snprintf(path, sizeof(path), "/reserved-memory/%s", t6030_27_ranges[i].node);
+        assert(prop_len(dtbuf, path, "no-map") == 0);
+    }
+    assert(prop_len(dtbuf, "/reserved-memory/asc-firmware@10001a44000", "no-map") == 0);
+    assert(!unguarded_faults);
+}
+
+static void t6030_27_unknown_image(void)
+{
+    prepare_t6030_27(t6030_27_unknown);
+    os_firmware = fw_versions[V27_2];
+    run();
+    check_t6030_27_reserve_only();
+    assert(!pmgr_enables && !pmgr_disables);
+}
+
+static void t6030_27_identity_failure(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    mmio_set(LEAK_FUSE, 0, 1);
+    run();
+    check_t6030_27_reserve_only();
+    assert(pmgr_enables == 1 && pmgr_disables == 0 && gfx_ps == 0 && afr_ps == 0);
+}
+
 static void t8122_27_handoff(void)
 {
     prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
@@ -2770,6 +3011,13 @@ static const struct {
     void (*fn)(void);
 } scenarios[] = {
 #ifdef G15_FW26
+#ifdef G15_NEW
+    {"t6030-27-handoff", t6030_27_handoff},
+    {"t6030-27-handoff-a000", t6030_27_handoff_a000},
+    {"t6030-27-afr-already-on", t6030_27_afr_already_on},
+    {"t6030-27-unknown-image", t6030_27_unknown_image},
+    {"t6030-27-identity-failure", t6030_27_identity_failure},
+#endif
     {"t8122-25-calibrated", t8122_25_calibrated},
     {"t8122-25-wrong-input-compat", t8122_25_wrong_input_compat},
     {"t8122-25-short-calibration", t8122_25_short_calibration},

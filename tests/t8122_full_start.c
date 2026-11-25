@@ -25,17 +25,18 @@
         return -1;                                                                                 \
     } while (0)
 
-/* SOURCE STRUCTS */
-
-struct g15_power_values {
-    u32 unused;
-    u32 min_sram_uv;
-};
 struct fw_version_info {
     int version;
     const char *string;
     u32 num[3];
     int num_length;
+};
+
+/* SOURCE STRUCTS */
+
+struct g15_power_values {
+    u32 unused;
+    u32 min_sram_uv;
 };
 enum { V14_8_3 = 1 };
 static const struct fw_version_info firmware = {V14_8_3, "14.8.3", {14, 8, 3}, 3};
