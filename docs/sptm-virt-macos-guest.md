@@ -77,7 +77,7 @@ sudo proxyclient/tools/sptm_guest_session.sh \
     --stage2 /path/to/aura/build/aura.bin \
     --os-long-version 26.2.123.0.0,0 \
     -- \
-    AURA_S2R_TRACE=1 AURA_XNU_ENTRY=1 AURA_XNU_SERIAL=uart0 \
+    AURA_XNU_ENTRY=1 AURA_XNU_SERIAL=uart0 \
     AURA_HIDE_DOCKCHANNEL=1 AURA_WFI_WATCH=1 \
     AURA_TAIL_SECS=1700 AURA_TAIL_IDLE=0
 ```
@@ -204,10 +204,16 @@ systemctl --failed
   (`XNU_QUIRKS`), including `nvram_ro` (NOR writes return success in memory
   only) and shared EL1 PAC keys (`pac_keys`). Newer macOS builds whose
   kernelcache layout changes need a matching `XNU_QUIRKS` entry.
-- **USB-C monitors above 60 Hz:** with the proxy on a USB CDC port, a monitor
-  on another USB-C port can flicker and go dark at modes above 60 Hz, because
-  `aura` still masks that port's USB-C controller interrupts. Pick a 60 Hz mode
-  for it in System Settings > Displays. HDMI is not affected.
+- **USB-C monitors at boot:** with the proxy on a USB CDC port, a USB-C monitor
+  can be offered only its 60 Hz modes after the guest boots. Unplugging and
+  replugging it brings the full list back. HDMI is not affected. Tracked in
+  https://github.com/aurora-silicon/aura/issues/522.
+- **`AURA_S2R_TRACE` is a sleep-path debug tool:** leave it out when you only
+  want the desktop. On J473 it adds the trace ring and nothing the guest needs.
+  Two guest boots with it panicked in the GPU firmware (`GFX DATA ABORT ...
+  agx_interrupt(4)`) right after a USB-C display power or mode change. The same
+  unplugs without it did not panic. The sample is small (2 of 10 boots with it),
+  so treat a GPU panic under the tracer as unproven, and rerun without it first.
 - **T8112 (M2) specifics:** macOS 27.2 on T8112 runs SPTM, TXM, and XNU without
   exclaves. External monitors over HDMI and USB-C (including HDR) work with
   discrete refresh rates; MCDP29xx/2900 HDMI bridges report no VRR support.

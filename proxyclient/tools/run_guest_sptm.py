@@ -20,7 +20,7 @@ Environment (all optional; 1 enables a switch):
   AURA_HIDE_DOCKCHANNEL    hide the DockChannel that carries aura's console and proxy
   AURA_KEEP_ERRH           keep the platform error handler visible to XNU
   AURA_AMCC_CLEAR          clear the AMCC error latches stage 1 left, before entry
-  AURA_S2R_TRACE           sleep path: hooks on the power blocks and the trace ring
+  AURA_S2R_TRACE           sleep path: hooks on the power blocks and the trace ring (debug only)
   AURA_S2R_GO              let the sleep proceed (otherwise stop in the proxy before it)
   AURA_S2R_FULLTRACE       also hook the high-volume blocks
   AURA_S2R_COPROC          also hook the coprocessor and exclave mailboxes
