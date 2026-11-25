@@ -109,15 +109,12 @@ static int dt_amp_by_addr(const void *dt, u32 addr)
     return found;
 }
 
-/* Set @name on the DT amp at @addr to @val (remove it when @val is NULL) */
-static int dt_amp_setprop(void *dt, u32 addr, const char *name, const void *val, u32 len)
+/* Set @name on the DT amp node @node (at I2C @addr) to @val (remove when @val is NULL) */
+static int dt_amp_node_setprop(void *dt, int node, u32 addr, const char *name, const void *val,
+                               u32 len)
 {
-    /* Offsets move with every change to the tree: look the amp up each time */
-    int node = dt_amp_by_addr(dt, addr);
     int ret;
 
-    if (node < 0)
-        return -1;
     if (val)
         ret = fdt_setprop(dt, node, name, val, len);
     else
@@ -176,17 +173,14 @@ static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
         }
     }
 
+    const void *group_vals[ARRAY_SIZE(amp_group_props)];
+    u32 group_lens[ARRAY_SIZE(amp_group_props)];
     for (size_t p = 0; p < ARRAY_SIZE(amp_group_props); p++) {
-        u32 len = 0;
-        const void *val = adt_getprop(adt, group, amp_group_props[p].adt, &len);
-
-        for (int i = 0; i < n; i++) {
-            if (dt_amp_setprop(dt, addrs[i], amp_group_props[p].dt, val, len))
-                return -1;
-        }
+        group_lens[p] = 0;
+        group_vals[p] = adt_getprop(adt, group, amp_group_props[p].adt, &group_lens[p]);
     }
 
-    /* One row per amp, in the group's order */
+    const u8 *row_vals[ARRAY_SIZE(amp_row_props)];
     for (size_t p = 0; p < ARRAY_SIZE(amp_row_props); p++) {
         u32 len = 0;
         u32 row = amp_row_props[p].row;
@@ -197,9 +191,28 @@ static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
                    amp_row_props[p].adt, len, n);
             rows = NULL;
         }
-        for (int i = 0; i < n; i++) {
-            if (dt_amp_setprop(dt, addrs[i], amp_row_props[p].dt, rows ? rows + i * row : NULL,
-                               row))
+        row_vals[p] = rows;
+    }
+
+    /*
+     * Modifying properties of @node only shifts bytes after @node, so one
+     * lookup per amp suffices for all of its properties.
+     */
+    for (int i = 0; i < n; i++) {
+        int node = dt_amp_by_addr(dt, addrs[i]);
+
+        if (node < 0)
+            return -1;
+        for (size_t p = 0; p < ARRAY_SIZE(amp_group_props); p++) {
+            if (dt_amp_node_setprop(dt, node, addrs[i], amp_group_props[p].dt, group_vals[p],
+                                    group_lens[p]))
+                return -1;
+        }
+        for (size_t p = 0; p < ARRAY_SIZE(amp_row_props); p++) {
+            u32 row = amp_row_props[p].row;
+
+            if (dt_amp_node_setprop(dt, node, addrs[i], amp_row_props[p].dt,
+                                    row_vals[p] ? row_vals[p] + i * row : NULL, row))
                 return -1;
         }
     }
