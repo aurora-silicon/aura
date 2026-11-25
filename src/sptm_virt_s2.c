@@ -2,7 +2,8 @@
 
 /*
  * The stage 2 aura gives the OS at virtual EL2 under the virtualized SPTM: an identity map of the
- * low 2 TiB (all MMIO and DRAM on T8140) with a few pages trapped. uart0 becomes aura's vuart
+ * CPU's whole PA range up to 2 TiB (all MMIO and DRAM; 2 TiB on T8140, 64 GiB where
+ * ID_AA64MMFR0_EL1.PARange is 36 bits) with a few pages trapped. uart0 becomes aura's vuart
  * (XNU's console is moved there in the ADT, so its serial stack never binds the DockChannel that
  * carries the proxy), the SoC watchdogs are guarded so XNU cannot reset the Mac, and aura's own
  * memory is unmapped so a stray guest access stops in aura. SPTM's own bring-up runs without it:
@@ -527,10 +528,16 @@ static bool sptm_virt_aura_guard_fault(u64 *regs, bool gl)
         sysop("wfe");
 }
 
+extern uint64_t vaddr_bits; /* hv_vm.c: the stage 2's IPA bits */
+static u64 sptm_s2_ipa_end;
+
 void sptm_virt_s2_setup(void)
 {
     hv_pt_init(); /* programs this CPU's VTCR/VTTBR */
-    if (hv_map_hw(0, 0, 1UL << 41)) {
+    /* The stage 2's input range is the CPU's PA range (hv_pt_init); mapping past it would index
+     * beyond the top table. */
+    sptm_s2_ipa_end = 1UL << min(vaddr_bits, 41UL);
+    if (hv_map_hw(0, 0, sptm_s2_ipa_end)) {
         printf("SPTM-virt[s2]: identity map failed; stage 2 off\n");
         return;
     }
@@ -576,9 +583,9 @@ void sptm_virt_s2_setup(void)
     sptm_s2_ready = true;
     nv2_set_l1_stage2_deferred(vtcr, vttbr);
     msr(VTTBR_EL2, 0);
-    printf("SPTM-virt[s2]: stage 2 deferred to each CPU's XNU entry: identity [0, 2 TiB), vuart at "
+    printf("SPTM-virt[s2]: stage 2 deferred to each CPU's XNU entry: identity [0, 0x%lx), vuart at "
            "0x%lx irq %u -> iodev %d, %u tables at 0x%lx sum 0x%lx\n",
-           base, irqs[0], uartproxy_iodev, sptm_s2_tables, vttbr, sptm_s2_sum);
+           sptm_s2_ipa_end, base, irqs[0], uartproxy_iodev, sptm_s2_tables, vttbr, sptm_s2_sum);
 }
 
 void sptm_virt_s2_enter_xnu(int cpu)
@@ -643,6 +650,7 @@ static void sptm_virt_s2_activity(struct exc_info *ctx)
            n - n_last, (now - t_last) / f, n, ctx->far, ctx->esr, ctx->elr);
     n_last = n;
     t_last = now;
+    sptm_virt_usb_pump();
 }
 
 /* A stage-2 abort from the OS at virtual EL2: a trapped page, emulated by the HV's MMIO code. */

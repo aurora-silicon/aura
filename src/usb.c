@@ -9,6 +9,7 @@
 #include "i2c.h"
 #include "iodev.h"
 #include "malloc.h"
+#include "memory.h"
 #include "pmgr.h"
 #include "sptm_virt.h"
 #include "string.h"
@@ -437,6 +438,122 @@ dwc3_dev_t *usb_iodev_bringup(u32 idx)
     return usb_dwc3_init_mode(usb_reg.drd_regs, usb_dart, chip_id == T8140);
 }
 
+#ifdef SPTM_VIRT
+/*
+ * IODEV_USB0 (CDC pipe 0) and IODEV_USB_VUART (CDC pipe 1) share one dwc3_dev_t with separate
+ * iodev->locks. Under SMP SPTM-virt guests, serialize all DWC3 operations across both pipes once
+ * the MMU is up, and keep console prints inside DWC3 error paths off console_lock to avoid a
+ * cross-CPU ABBA with iodev_console_write() -> USB0.
+ */
+static DECLARE_SPINLOCK(usb_dwc3_lock);
+
+static __attribute__((noinline)) bool usb_dwc3_lock_enter(void)
+{
+    if (!mmu_active())
+        return false;
+    spin_lock(&usb_dwc3_lock);
+    iodev_console_enter_nolock();
+    return true;
+}
+
+static __attribute__((noinline)) void usb_dwc3_lock_leave(bool lk)
+{
+    if (!lk)
+        return;
+    iodev_console_leave_nolock();
+    spin_unlock(&usb_dwc3_lock);
+}
+
+static ssize_t usb_pipe_can_read(void *dev, cdc_acm_pipe_id_t pipe)
+{
+    bool lk = usb_dwc3_lock_enter();
+    ssize_t r = usb_dwc3_can_read(dev, pipe);
+    usb_dwc3_lock_leave(lk);
+    return r;
+}
+
+static bool usb_pipe_can_write(void *dev, cdc_acm_pipe_id_t pipe)
+{
+    bool lk = usb_dwc3_lock_enter();
+    bool r = usb_dwc3_can_write(dev, pipe);
+    usb_dwc3_lock_leave(lk);
+    return r;
+}
+
+static ssize_t usb_pipe_read(void *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t count)
+{
+    bool lk = usb_dwc3_lock_enter();
+    ssize_t r = usb_dwc3_read(dev, pipe, buf, count);
+    usb_dwc3_lock_leave(lk);
+    return r;
+}
+
+static ssize_t usb_pipe_write(void *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
+{
+    bool lk = usb_dwc3_lock_enter();
+    ssize_t r = usb_dwc3_write(dev, pipe, buf, count);
+    usb_dwc3_lock_leave(lk);
+    return r;
+}
+
+static ssize_t usb_pipe_queue(void *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
+{
+    bool lk = usb_dwc3_lock_enter();
+    ssize_t r = usb_dwc3_queue(dev, pipe, buf, count);
+    usb_dwc3_lock_leave(lk);
+    return r;
+}
+
+static void usb_pipe_handle_events(void *dev)
+{
+    bool lk = usb_dwc3_lock_enter();
+    usb_dwc3_handle_events(dev);
+    usb_dwc3_lock_leave(lk);
+}
+
+static void usb_pipe_flush(void *dev, cdc_acm_pipe_id_t pipe)
+{
+    bool lk = usb_dwc3_lock_enter();
+    usb_dwc3_flush(dev, pipe);
+    usb_dwc3_lock_leave(lk);
+}
+
+#define USB_IODEV_WRAPPER(name, pipe)                                                              \
+    static ssize_t usb_##name##_can_read(void *dev)                                                \
+    {                                                                                              \
+        return usb_pipe_can_read(dev, pipe);                                                       \
+    }                                                                                              \
+                                                                                                   \
+    static bool usb_##name##_can_write(void *dev)                                                  \
+    {                                                                                              \
+        return usb_pipe_can_write(dev, pipe);                                                      \
+    }                                                                                              \
+                                                                                                   \
+    static ssize_t usb_##name##_read(void *dev, void *buf, size_t count)                           \
+    {                                                                                              \
+        return usb_pipe_read(dev, pipe, buf, count);                                               \
+    }                                                                                              \
+                                                                                                   \
+    static ssize_t usb_##name##_write(void *dev, const void *buf, size_t count)                    \
+    {                                                                                              \
+        return usb_pipe_write(dev, pipe, buf, count);                                              \
+    }                                                                                              \
+                                                                                                   \
+    static ssize_t usb_##name##_queue(void *dev, const void *buf, size_t count)                    \
+    {                                                                                              \
+        return usb_pipe_queue(dev, pipe, buf, count);                                              \
+    }                                                                                              \
+                                                                                                   \
+    static void usb_##name##_handle_events(void *dev)                                              \
+    {                                                                                              \
+        usb_pipe_handle_events(dev);                                                               \
+    }                                                                                              \
+                                                                                                   \
+    static void usb_##name##_flush(void *dev)                                                      \
+    {                                                                                              \
+        usb_pipe_flush(dev, pipe);                                                                 \
+    }
+#else
 #define USB_IODEV_WRAPPER(name, pipe)                                                              \
     static ssize_t usb_##name##_can_read(void *dev)                                                \
     {                                                                                              \
@@ -472,6 +589,7 @@ dwc3_dev_t *usb_iodev_bringup(u32 idx)
     {                                                                                              \
         usb_dwc3_flush(dev, pipe);                                                                 \
     }
+#endif
 
 USB_IODEV_WRAPPER(0, CDC_ACM_PIPE_0)
 USB_IODEV_WRAPPER(1, CDC_ACM_PIPE_1)

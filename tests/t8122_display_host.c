@@ -251,8 +251,6 @@ int adt_get_property_count(const void *a, int node)
     return host_adt_nprops(node);
 }
 
-#include "adt_tree.h"
-
 /* ---- fake PMGR table: device id -> name, virtual or power state register, parents ---- */
 
 static struct fdev {

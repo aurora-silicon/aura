@@ -8820,42 +8820,20 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
 static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine);
 
 /*
- * Firmware 27 DCPs are given their firmware clocks by the OS: the one rule by which dcp's are
- * published (dt_set_dcp_fw27_clocks()) and the external processors' handoff is chosen.
- *
- * This is a release test because no ADT property separates the two interfaces: on the 26.5.1
- * J713 and 26.6.2 J773 ADTs the external processors already run dcp's uuid and share its __TEXT
- * (same address and size), as on 27.2, yet they take the firmware-ready path there. Any firmware
- * 27 boot takes this path and publishes each processor with its own uuid, firmware-version and
- * memory; the kernel decides which releases it drives, and such a boot never gets the 26.6.2
- * ready marker.
- */
-static bool dt_dcp_fw_clocks(void)
-{
-    return os_firmware.version >= V27_0;
-}
-
-/*
  * Publish the inherited DCP firmware mapping without starting a display driver, on any M4 Mac
  * whose ADT describes an internal panel on disp0, whatever its firmware. The kernel picks the
- * display backend from the firmware the DCP runs. *internal says what was done, for the
- * external display processors (dt_set_dcpext_handoff()).
+ * display backend from the firmware the DCP runs.
  */
-static int dt_set_m4_dcp_handoff(enum dcp_internal *internal)
+static int dt_set_m4_dcp_handoff(void)
 {
-    *internal = DCP_INTERNAL_NONE;
     int dcp_node = fdt_path_offset(dt, "dcp");
     if (dcp_node < 0)
         return 0; /* Older DT with simple-framebuffer only. */
-    /* A Mac mini's disp0 is external: its DCP drives a port, not a panel. */
-    int disp0 = adt_path_offset(adt, "/arm-io/disp0");
-    if (disp0 >= 0 && adt_getprop(adt, disp0, "external", NULL)) {
-        *internal = DCP_INTERNAL_NO_PANEL;
-        bail("FDT: no internal panel, no native DCP handoff\n");
-    }
     if (chip_id != T8132 || fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
         bail("FDT: unsupported native DCP handoff target\n");
-    if (disp0 < 0)
+    /* A Mac mini's disp0 is external: its DCP drives a port, not a panel. */
+    int disp0 = adt_path_offset(adt, "/arm-io/disp0");
+    if (disp0 < 0 || adt_getprop(adt, disp0, "external", NULL))
         bail("FDT: no internal panel, no native DCP handoff\n");
 
     int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
@@ -8925,12 +8903,6 @@ static int dt_set_m4_dcp_handoff(enum dcp_internal *internal)
     if (maps && dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
         printf("FDT: M4 DCP firmware clocks not published\n");
 
-    /* Complete: the maps, and the clocks firmware 27 needs (the kernel admits on them). */
-    dcp_node = fdt_path_offset(dt, "dcp");
-    if (maps && (!dt_dcp_fw_clocks() ||
-                 (dcp_node >= 0 && fdt_getprop(dt, dcp_node, "apple,clock-ids", NULL))))
-        *internal = DCP_INTERNAL_COMPLETE;
-
     printf("FDT: M4 DCP firmware mappings published; display device status unchanged\n");
     return 0;
 }
@@ -8950,7 +8922,7 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
         return 0;
     strcpy(path, alias_path);
     int node = fdt_path_offset(dt, path);
-    if (node < 0 || !dt_dcp_fw_clocks() || fdt_getprop(dt, node, "apple,clock-ids", NULL))
+    if (node < 0 || os_firmware.version < V27_0 || fdt_getprop(dt, node, "apple,clock-ids", NULL))
         return 0;
 
     int disp = adt_path_offset(adt, adt_engine);
@@ -8958,6 +8930,17 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
     u32 len = 0, flen = 0;
     const u8 *raw_ids = disp < 0 ? NULL : adt_getprop(adt, disp, "clock-ids", &len);
     const u8 *freq = arm < 0 ? NULL : adt_getprop(adt, arm, "clock-frequencies", &flen);
+    /*
+     * An empty list (every T602x disp0/dispext<n> on 27.2) says the firmware takes no provider
+     * clocks. Publish it as such: without apple,clock-ids the kernel refuses a firmware-27 DCP.
+     * The display clock the node already has stays its own.
+     */
+    if (raw_ids && !len) {
+        int ret = fdt_setprop_empty(dt, node, "apple,clock-ids");
+        if (!ret)
+            printf("FDT: %s: no firmware clocks in %s; empty apple,clock-ids\n", alias, adt_engine);
+        return ret;
+    }
     u32 nclk = raw_ids ? len / sizeof(u32) : 0;
     if (!nclk || len % sizeof(u32) || nclk > 8 || !freq || flen % sizeof(u32)) {
         printf("FDT: %s: no firmware clocks in the ADT; left unchanged\n", alias);
@@ -9028,6 +9011,22 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
     if (!ret)
         printf("FDT: %s: %u firmware clocks published from %s\n", alias, nclk, adt_engine);
     return ret;
+}
+
+/*
+ * Every display processor the tree names: dcp runs /arm-io/disp0 and dcpext<n> runs
+ * /arm-io/dispext<n>; a tree with one external processor calls it dcpext (dispext0).
+ */
+static void dt_set_dcp_fw27_clocks_all(void)
+{
+    if (dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
+        printf("FDT: dcp: publishing the firmware clocks failed\n");
+    for (size_t n = 0; n < ARRAY_SIZE(dcpext_aliases); n++) {
+        char engine[24];
+        snprintf(engine, sizeof(engine), "/arm-io/dispext%u", n ? (unsigned)(n - 1) : 0);
+        if (dt_set_dcp_fw27_clocks(dcpext_aliases[n], engine))
+            printf("FDT: %s: publishing the firmware clocks failed\n", dcpext_aliases[n]);
+    }
 }
 
 static bool fw_log_overlaps(u64 a, u64 size, u64 b, u64 bytes)
@@ -9395,16 +9394,9 @@ static int dt_set_display(void)
         disp0_piodma_alias = compat_piodma_alias;
 
     if (chip_id == T8132) {
-        enum dcp_internal internal;
-        int refused = dt_set_m4_dcp_handoff(&internal);
-        if (refused && internal != DCP_INTERNAL_NO_PANEL)
+        if (dt_set_m4_dcp_handoff())
             printf("FDT: M4 DCP handoff refused; keeping the boot framebuffer\n");
-        /*
-         * The external processors of firmware the OS gives clocks (firmware 27) are handed over
-         * from the ADT by kboot_display_handoff.c, beside a complete internal handoff or with no
-         * panel; those of older firmware keep the firmware-ready path.
-         */
-        if (!dt_set_dcpext_handoff(dt, internal, dt_dcp_fw_clocks()) && !refused)
+        else
             dt_reserve_j713_dcpext();
         return 0;
     }
@@ -9521,10 +9513,7 @@ static int dt_set_display(void)
         return ret;
 
     /* Without them the firmware-27 DCP does not start, but the rest of the boot does. */
-    if (dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
-        printf("FDT: dcp: publishing the firmware clocks failed\n");
-    if (dt_set_dcp_fw27_clocks("dcpext", "/arm-io/dispext0"))
-        printf("FDT: dcpext: publishing the firmware clocks failed\n");
+    dt_set_dcp_fw27_clocks_all();
 
     /*
      * Ignore errors for dcpext firmware reservation, nodes should be disabled
@@ -9820,6 +9809,41 @@ static bool skip_pmp_prop(const char *prop_name)
     return false;
 }
 
+/* The high bit of the ADT property size is a flag. */
+static u32 pmp_prop_size(const struct adt_property *prop)
+{
+    return prop->size & 0x7fffffff;
+}
+
+static const char *const pmp_bootargs[] = {"dram-channel-disable", "pmc-msg-disabled",
+                                           "soc-chip-variant"};
+
+/* Count each property as new, including its name in the string table. */
+static size_t pmp_fdt_prop_space(size_t name_len, size_t value_len)
+{
+    return sizeof(struct fdt_property) + ALIGN_UP(value_len, 4) + name_len + 1;
+}
+
+static size_t pmp_alias_space(int pmp_iop_anode)
+{
+    size_t need = pmp_fdt_prop_space(strlen("apple,board-id"), sizeof(u32)) +
+                  pmp_fdt_prop_space(strlen("apple,dram-vendor-id"), sizeof(u32)) +
+                  pmp_fdt_prop_space(strlen("apple,dram-capacity"), sizeof(u32)) +
+                  pmp_fdt_prop_space(strlen("status"), sizeof("okay"));
+
+    for (size_t i = 0; i < ARRAY_SIZE(pmp_bootargs); i++)
+        need += pmp_fdt_prop_space(strlen("apple,") + strlen(pmp_bootargs[i]), sizeof(u32));
+
+    ADT_FOREACH_PROPERTY(adt, pmp_iop_anode, prop)
+    {
+        if (skip_pmp_prop(prop->name))
+            continue;
+        need +=
+            pmp_fdt_prop_space(strlen("apple,tunable-") + strlen(prop->name), pmp_prop_size(prop));
+    }
+    return need;
+}
+
 /* Reads a u32 ADT property only if it is exactly four bytes long. */
 static int adt_get_u32_exact(int node, const char *name, u32 *val)
 {
@@ -9869,7 +9893,7 @@ static int dt_fill_pmp(int pmp_node)
             continue;
         char prop_name[128];
         snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
-        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
+        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, pmp_prop_size(prop)))
             bail("FDT: failed to transfer pmp tunable\n");
     }
     return 0;
@@ -9914,6 +9938,29 @@ static int dt_set_pmp(void)
         bail("ADT: failed to get dram vendor id\n");
     ADT_GETPROP(adt, pmp_iop_anode, "dram-capacity", &dram_capacity);
 
+    /* Check the whole alias handoff before writing any PMP data. */
+    size_t total = fdt_totalsize(dt);
+    size_t strings_offset = fdt_off_dt_strings(dt);
+    size_t strings_size = fdt_size_dt_strings(dt);
+    if (strings_offset > total || strings_size > total - strings_offset)
+        bail("FDT: invalid strings block while checking the PMP handoff\n");
+
+    size_t need = pmp_alias_space(pmp_iop_anode);
+    size_t free_space = total - strings_offset - strings_size;
+    if (need > free_space) {
+        int status_len;
+        const char *status = fdt_getprop(dt, pmp_node, "status", &status_len);
+
+        /* An absent status also enables the node. */
+        if ((!status || status_len != sizeof("disabled") ||
+             memcmp(status, "disabled", sizeof("disabled"))) &&
+            fdt_setprop_string(dt, pmp_node, "status", "disabled"))
+            bail("FDT: cannot disable pmp after handoff shortfall\n");
+        printf("FDT: pmp left disabled: handoff needs up to %zu bytes, %zu free\n", need,
+               free_space);
+        return 0;
+    }
+
     if (fdt_setprop_u32(dt, pmp_node, "apple,board-id", board_id))
         bail("FDT: failed to set board id\n");
     if (fdt_setprop_u32(dt, pmp_node, "apple,dram-vendor-id", dram_vendor_id))
@@ -9928,7 +9975,7 @@ static int dt_set_pmp(void)
             continue;
         char prop_name[128];
         snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
-        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
+        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, pmp_prop_size(prop)))
             bail("FDT: failed to transfer pmp tunable");
     }
 
@@ -9937,8 +9984,6 @@ static int dt_set_pmp(void)
      * apple,<name>; the firmware's default for each is 0. iBoot sets them where they
      * apply, e.g. a J616s has dram-channel-disable 0xffff0000.
      */
-    static const char *const pmp_bootargs[] = {"dram-channel-disable", "pmc-msg-disabled",
-                                               "soc-chip-variant"};
     for (size_t i = 0; i < ARRAY_SIZE(pmp_bootargs); i++) {
         u32 val;
         char arg_name[64];
@@ -9953,7 +9998,8 @@ static int dt_set_pmp(void)
     }
 
     pmp_node = fdt_path_offset(dt, "pmp");
-    fdt_setprop_string(dt, pmp_node, "status", "okay");
+    if (fdt_setprop_string(dt, pmp_node, "status", "okay"))
+        bail("FDT: failed to enable pmp after handoff\n");
     return 0;
 }
 
@@ -11239,7 +11285,7 @@ static int dt_set_isp(void)
 }
 
 /*
- * J713 and J604: iBoot loads the camera firmware, and the kernel starts it as iBoot left it. The
+ * T8132: iBoot loads the camera firmware, and the kernel starts it as iBoot left it. The
  * segments move with the boot firmware, so the device tree describes the ISP disabled, with empty
  * placeholders isp-firmware-text and isp-firmware-data and an isp-heap window for the
  * firmware's main memory. Fill the placeholders from this boot's ADT isp segment-ranges: reg,
@@ -11434,19 +11480,22 @@ static int dt_set_j713_isp_one(unsigned int unused)
 }
 
 /*
- * Only a disabled ISP with the placeholders is a handoff target. A tree without them (no camera,
- * or a kernel that reserves the firmware itself and enables the ISP) is left as it is. A refused
- * handoff leaves the camera disabled; the boot goes on.
+ * Only a disabled ISP with the placeholders is a handoff target, on any T8132 machine: the tree
+ * asks for the handoff by describing the ISP disabled with isp-firmware-text, isp-firmware-data
+ * and the isp-heap window, as t8132-isp.dtsi does for every T8132 laptop. A tree without them (no
+ * camera, or a kernel that reserves the firmware itself and enables the ISP) is left as it is. A
+ * refused handoff leaves the camera disabled; the boot goes on.
  */
 static void dt_set_j713_isp(void)
 {
-    if (chip_id != T8132 || (fdt_node_check_compatible(dt, 0, "apple,j713") &&
-                             fdt_node_check_compatible(dt, 0, "apple,j604")))
-        return; /* No other M4 board's camera handoff is qualified. */
+    if (chip_id != T8132)
+        return;
     int isp = fdt_node_offset_by_compatible(dt, -1, "apple,t8132-isp");
     const char *status = isp < 0 ? NULL : fdt_getprop(dt, isp, "status", NULL);
     if (!status || strcmp(status, "disabled") ||
-        fdt_path_offset(dt, "/reserved-memory/isp-firmware-text") < 0)
+        fdt_path_offset(dt, "/reserved-memory/isp-firmware-text") < 0 ||
+        fdt_path_offset(dt, "/reserved-memory/isp-firmware-data") < 0 ||
+        fdt_path_offset(dt, "/reserved-memory/isp-heap") < 0)
         return;
     if (dt_display_transaction(dt_set_j713_isp_one, 0))
         printf("FDT: J713 ISP handoff refused; keeping the camera disabled\n");
@@ -12699,304 +12748,6 @@ T6050_SLEEP_INIT static void dt_set_t6050_sleep(void)
     dt_set_t6050_sleep_prop(node, "apple,pinctrl-skip-pins", pins, npins);
 }
 
-/*
- * Single-die T6050 system cache handoff (apple,t6050-mcc).
- *
- * Single-die T6050 boards (M5 Pro and both 460 GB/s and 614 GB/s M5 Max SKUs) share a disabled
- * apple,t6050-mcc node because fused-off AMCC apertures cannot be probed safely from Linux.
- * Populate reg with one 16 KiB aperture per plane of every enabled AMCC from the live ADT
- * (/arm-io/mcc and /chosen/lock-regs/amcc), verified against the parent bus ranges, and set
- * status = "okay". Already-enabled nodes (such as two-die M5 Ultra) are left alone; any missing
- * or inconsistent ADT or DT property leaves the node disabled with its original reg intact.
- */
-#define T6050_MCC_PLANE_SIZE 0x4000ULL
-#define T6050_MCC_MAX_PLANES 64U
-
-/* Return 1 if present and decoded (4 or 8 bytes), 0 if absent, -1 on wrong width. */
-static int dt_adt_get_u64(int node, const char *name, u64 *out)
-{
-    u32 len = 0;
-    const void *p = adt_getprop(adt, node, name, &len);
-
-    if (!p)
-        return 0;
-    if (len == sizeof(u32)) {
-        u32 v;
-        memcpy(&v, p, sizeof(v));
-        *out = v;
-        return 1;
-    }
-    if (len == sizeof(u64)) {
-        memcpy(out, p, sizeof(*out));
-        return 1;
-    }
-    return -1;
-}
-
-static u64 dt_fdt_read_cells(const fdt32_t *cells, int count)
-{
-    u64 v = 0;
-
-    while (count--)
-        v = (v << 32) | fdt32_ld(cells++);
-    return v;
-}
-
-static int dt_explicit_cells(const void *fdt, int node, const char *name)
-{
-    int len = 0;
-    const fdt32_t *prop = fdt_getprop(fdt, node, name, &len);
-
-    if (!prop || len != (int)sizeof(*prop))
-        return -1;
-    u32 val = fdt32_ld(prop);
-    if (val < 1 || val > 2)
-        return -1;
-    return (int)val;
-}
-
-static int dt_ranges_step(const void *fdt, int bus, int parent, u64 *addr, u64 size, bool forward)
-{
-    int len = 0;
-    const fdt32_t *ranges = fdt_getprop(fdt, bus, "ranges", &len);
-    int child_ac = dt_explicit_cells(fdt, bus, "#address-cells");
-    int child_sc = dt_explicit_cells(fdt, bus, "#size-cells");
-    int parent_ac = dt_explicit_cells(fdt, parent, "#address-cells");
-
-    if (!ranges || child_ac < 0 || child_sc < 0 || parent_ac < 0)
-        return -1;
-    int src_ac = forward ? child_ac : parent_ac;
-    int dst_ac = forward ? parent_ac : child_ac;
-    if (src_ac == 1 && (*addr > UINT32_MAX || size - 1 > UINT32_MAX - *addr))
-        return -1;
-    if (!len) {
-        if (dst_ac == 1 && (*addr > UINT32_MAX || size - 1 > UINT32_MAX - *addr))
-            return -1;
-        return 0;
-    }
-
-    int stride = child_ac + parent_ac + child_sc;
-    if (len % (int)(stride * sizeof(*ranges)))
-        return -1;
-
-    int entries = len / (int)(stride * sizeof(*ranges));
-    for (int i = 0; i < entries; i++, ranges += stride) {
-        u64 rchild = dt_fdt_read_cells(ranges, child_ac);
-        u64 rparent = dt_fdt_read_cells(ranges + child_ac, parent_ac);
-        u64 rsize = dt_fdt_read_cells(ranges + child_ac + parent_ac, child_sc);
-
-        if (!rsize || rchild > UINT64_MAX - rsize || rparent > UINT64_MAX - rsize)
-            return -1;
-        u64 rsrc = forward ? rchild : rparent;
-        u64 rdst = forward ? rparent : rchild;
-        if (*addr < rsrc || *addr - rsrc >= rsize)
-            continue;
-        u64 off = *addr - rsrc;
-        if (size > rsize - off) {
-            if (forward)
-                return -1;
-            continue;
-        }
-        u64 mapped = rdst + off;
-        if (dst_ac == 1 && (mapped > UINT32_MAX || size - 1 > UINT32_MAX - mapped))
-            return -1;
-        *addr = mapped;
-        return 0;
-    }
-    return -1;
-}
-
-static int dt_untranslate_range(const void *fdt, int bus, u64 phys, u64 size, u64 *out)
-{
-    int chain[8];
-    int depth = 0;
-
-    if (!size || phys > UINT64_MAX - size)
-        return -1;
-
-    for (int cur = bus; cur > 0;) {
-        if (depth >= (int)ARRAY_SIZE(chain))
-            return -1;
-        chain[depth++] = cur;
-        cur = fdt_parent_offset(fdt, cur);
-        if (cur < 0)
-            return -1;
-    }
-
-    u64 addr = phys;
-    for (int d = depth - 1; d >= 0; d--) {
-        int p = d + 1 < depth ? chain[d + 1] : 0;
-        if (dt_ranges_step(fdt, chain[d], p, &addr, size, false))
-            return -1;
-    }
-
-    /* Confirm Linux's forward child-first ranges walk maps addr back to phys. */
-    u64 roundtrip = addr;
-    for (int d = 0; d < depth; d++) {
-        int p = d + 1 < depth ? chain[d + 1] : 0;
-        if (dt_ranges_step(fdt, chain[d], p, &roundtrip, size, true))
-            return -1;
-    }
-    if (roundtrip != phys)
-        return -1;
-
-    *out = addr;
-    return 0;
-}
-
-static void dt_set_t6050_mcc(void)
-{
-    int node = fdt_node_offset_by_compatible(dt, -1, "apple,t6050-mcc");
-    if (node < 0)
-        return;
-
-    const char *why = "DT";
-    u64 *buf = NULL;
-
-    if (fdt_node_offset_by_compatible(dt, node, "apple,t6050-mcc") >= 0)
-        goto err;
-
-    int slen = 0;
-    const char *status = fdt_getprop(dt, node, "status", &slen);
-    if (!status || slen != (int)sizeof("disabled") ||
-        memcmp(status, "disabled", sizeof("disabled")))
-        return;
-
-    int parent = fdt_parent_offset(dt, node);
-    if (parent < 0 || dt_explicit_cells(dt, parent, "#address-cells") != 2 ||
-        dt_explicit_cells(dt, parent, "#size-cells") != 2)
-        goto err;
-
-    why = "ADT";
-    int armio = adt_path_offset(adt, "/arm-io");
-    u64 dies = 0, die_mask = 0;
-    int r_dies = armio >= 0 ? dt_adt_get_u64(armio, "die-count", &dies) : 0;
-    int path[8];
-    int anode = adt_path_offset_trace(adt, "/arm-io/mcc", path);
-    if (r_dies < 0 || (r_dies > 0 && dies != 1) || anode < 0 ||
-        !adt_is_compatible(adt, anode, "mcc,t6050"))
-        goto err;
-
-    int r_dmask = dt_adt_get_u64(anode, "die-enable-mask", &die_mask);
-    if (r_dmask < 0 || (r_dmask > 0 && die_mask != 1) || (!r_dies && !r_dmask))
-        goto err;
-
-    u64 reg_idx = 0, amcc_count = 0, amcc_mask = 0;
-    if (dt_adt_get_u64(anode, "amcc-reg-idx", &reg_idx) <= 0 || reg_idx > INT32_MAX ||
-        dt_adt_get_u64(anode, "amcc-count", &amcc_count) <= 0 || !amcc_count || amcc_count > 64 ||
-        dt_adt_get_u64(anode, "amcc-enable-mask", &amcc_mask) <= 0)
-        goto err;
-
-    u64 all_amccs = amcc_count == 64 ? ~0ULL : (1ULL << amcc_count) - 1;
-    if (!amcc_mask || (amcc_mask & ~all_amccs))
-        goto err;
-
-    u64 ch_mask = 0, channels = 0;
-    int r = dt_adt_get_u64(anode, "dcs-channel-enable-mask", &ch_mask);
-    if (r < 0)
-        goto err;
-    if (r > 0) {
-        if (dt_adt_get_u64(anode, "dcs-count-per-amcc", &channels) <= 0 || !channels ||
-            channels > 64 / amcc_count)
-            goto err;
-        u64 all_ch = amcc_count * channels == 64 ? ~0ULL : (1ULL << (amcc_count * channels)) - 1;
-        if (!ch_mask || (ch_mask & ~all_ch))
-            goto err;
-        for (u64 b = 0; b < amcc_count * channels; b++) {
-            if ((ch_mask & (1ULL << b)) && !(amcc_mask & (1ULL << (b / channels))))
-                goto err;
-        }
-    }
-
-    why = "lock-regs";
-    int lnode = adt_path_offset(adt, "/chosen/lock-regs/amcc");
-    u64 planes = 0, stride = 0;
-    if (lnode < 0 || dt_adt_get_u64(lnode, "plane-count", &planes) <= 0 || !planes ||
-        planes > T6050_MCC_MAX_PLANES || dt_adt_get_u64(lnode, "plane-stride", &stride) <= 0 ||
-        stride < T6050_MCC_PLANE_SIZE || (stride & (T6050_MCC_PLANE_SIZE - 1)))
-        goto err;
-
-    u64 pmask = 0;
-    u64 expect = planes == 64 ? ~0ULL : (1ULL << planes) - 1;
-    r = dt_adt_get_u64(anode, "amcc-plane-enable-mask", &pmask);
-    if (r < 0 || (r > 0 && pmask != expect))
-        goto err;
-
-    unsigned int enabled_amccs = __builtin_popcountll(amcc_mask);
-    if (planes > T6050_MCC_MAX_PLANES / enabled_amccs ||
-        (planes - 1) > (UINT64_MAX - T6050_MCC_PLANE_SIZE) / stride)
-        goto err;
-    unsigned int total_planes = enabled_amccs * (unsigned int)planes;
-    u64 reach = (planes - 1) * stride + T6050_MCC_PLANE_SIZE;
-
-    u32 ap_len = 0;
-    const u8 *apertures = adt_getprop(adt, lnode, "aperture-phys-addr", &ap_len);
-    if (!apertures || !ap_len || (ap_len % sizeof(u64)))
-        goto err;
-    u32 ap_count = ap_len / sizeof(u64);
-    u64 listed_aps = 0, aperture_size = 0;
-    r = dt_adt_get_u64(lnode, "aperture-count", &listed_aps);
-    if (r < 0 || (r > 0 && listed_aps != ap_count))
-        goto err;
-    r = dt_adt_get_u64(lnode, "aperture-size", &aperture_size);
-    if (r < 0 || (r > 0 && aperture_size < reach))
-        goto err;
-
-    buf = malloc(total_planes * 3 * sizeof(*buf));
-    if (!buf) {
-        why = "OOM";
-        goto err;
-    }
-    fdt64_t *reg = (fdt64_t *)buf;
-    u64 *seen = buf + total_planes * 2;
-
-    why = "ranges";
-    unsigned int out_idx = 0;
-    for (u64 i = 0; i < amcc_count; i++) {
-        if (!(amcc_mask & (1ULL << i)))
-            continue;
-        u64 base = 0, size = 0;
-        if (reg_idx > (u64)INT32_MAX - i ||
-            adt_get_reg(adt, path, "reg", (int)(reg_idx + i), &base, &size) < 0 || !base ||
-            (base & (T6050_MCC_PLANE_SIZE - 1)) || size < reach || base > UINT64_MAX - size)
-            goto err;
-        bool listed = false;
-        for (u32 j = 0; j < ap_count && !listed; j++) {
-            u64 ap;
-            memcpy(&ap, apertures + j * sizeof(u64), sizeof(ap));
-            listed = ap == base;
-        }
-        if (!listed || (aperture_size && size != aperture_size))
-            goto err;
-        for (u64 p = 0; p < planes; p++) {
-            u64 phys = base + p * stride;
-            for (unsigned int k = 0; k < out_idx; k++)
-                if (phys < seen[k] + T6050_MCC_PLANE_SIZE && seen[k] < phys + T6050_MCC_PLANE_SIZE)
-                    goto err;
-            u64 bus_addr = 0;
-            if (dt_untranslate_range(dt, parent, phys, T6050_MCC_PLANE_SIZE, &bus_addr))
-                goto err;
-            seen[out_idx] = phys;
-            reg[out_idx * 2] = cpu_to_fdt64(bus_addr);
-            reg[out_idx * 2 + 1] = cpu_to_fdt64(T6050_MCC_PLANE_SIZE);
-            out_idx++;
-        }
-    }
-
-    why = "FDT write";
-    if (fdt_setprop(dt, node, "reg", reg, total_planes * 2 * sizeof(*reg)) ||
-        fdt_setprop_string(dt, node, "status", "okay"))
-        goto err;
-
-    free(buf);
-    printf("FDT: T6050 MCC: enabled (%u AMCCs, %u planes)\n", enabled_amccs, total_planes);
-    return;
-
-err:
-    free(buf);
-    printf("FDT: T6050 MCC: %s; leaving disabled\n", why);
-}
-
 void kboot_set_initrd(void *start, size_t size)
 {
     initrd_start = start;
@@ -13947,7 +13698,6 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_t6040_sleep_dcpext())
         return -1;
     dt_set_t6050_sleep();
-    dt_set_t6050_mcc();
 #ifndef RELEASE
     if (dt_transfer_virtios())
         return 1;
