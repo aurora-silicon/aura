@@ -340,8 +340,14 @@ bool firmware_sfw_in_range(enum fw_version lower_bound, enum fw_version upper_bo
  *
  * Only an exact match of the whole identifying part of the header (branch, magic, version, UUID,
  * patchbay offset/size, text size) against the table below counts as a positive identification.
- * Anything else (no header, unknown image, read fault, odd ADT) makes firmware_gfx_version() return
- * NULL, and the caller must then leave the GPU disabled.
+ *
+ * Images without that header (G14G on 27.2) are identified by the ADT instead: the uuid string
+ * iBoot publishes in /arm-io/gfx-asc/iop-gfx-nub for the image it loaded, together with the size
+ * of the image's __TEXT segment. Such rows have nub_uuid set and are matched only when no
+ * segment carries a header.
+ *
+ * Anything else (no header and no matching nub uuid, unknown image, read fault, odd ADT) makes
+ * firmware_gfx_version() return NULL, and the caller must then leave the GPU disabled.
  */
 // clang-format on
 struct gfx_fw_image {
@@ -352,7 +358,8 @@ struct gfx_fw_image {
     u32 patchbay_off;
     u32 patchbay_size;
     u32 text_size;
-    bool experimental; /* identified only by firmware_gfx_version_ex(chip, true) */
+    bool experimental;    /* identified only by firmware_gfx_version_ex(chip, true) */
+    const char *nub_uuid; /* headerless image: the iop-gfx-nub uuid; text_size is __TEXT's size */
 };
 
 // clang-format off
@@ -373,6 +380,11 @@ static const struct gfx_fw_image gfx_fw_images[] = {
     {T8122, V14_8_3, "g15g build c0", {0xdf, 0x69, 0x7f, 0x05, 0xf6, 0xb5, 0x33, 0xef,
                                        0xa1, 0x37, 0x61, 0xc4, 0xa7, 0x3d, 0x66, 0x6a},
      0x5d54a, 0x1e8, 0x64000, true},
+    /*
+     * T8112 (M2, G14G): the headerless image iBoot loads on macOS 27.2 (26B123), seen on the
+     * MacBook Air (J413). Linux's g14_v27_2 backend starts it.
+     */
+    {T8112, V27_2, "g14g 27.2", {0}, 0, 0, 0x60000, false, "EEFD8A47-3273-3387-868A-F1E0585A978E"},
 };
 // clang-format on
 
@@ -546,7 +558,7 @@ const struct fw_version_info *firmware_gfx_version_ex(u32 chip, bool experimenta
         for (size_t j = 0; j < ARRAY_SIZE(gfx_fw_images); j++) {
             const struct gfx_fw_image *img = &gfx_fw_images[j];
 
-            if (img->chip != chip || (img->experimental && !experimental))
+            if (img->chip != chip || img->nub_uuid || (img->experimental && !experimental))
                 continue;
             if (memcmp(uuid, img->uuid, sizeof(img->uuid)) || hdr[11] != img->patchbay_off ||
                 hdr[12] != img->patchbay_size || hdr[13] != img->text_size)
@@ -562,6 +574,25 @@ const struct fw_version_info *firmware_gfx_version_ex(u32 chip, bool experimenta
 
         printf("FW: GFX: unknown GPU firmware image, not identified\n");
         return NULL;
+    }
+
+    /* No header in any segment: a headerless image, named by the uuid in the ADT. */
+    int nub = adt_path_offset(adt, "/arm-io/gfx-asc/iop-gfx-nub");
+    u32 uuid_len = 0;
+    const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &uuid_len);
+    for (size_t j = 0; uuid && j < ARRAY_SIZE(gfx_fw_images); j++) {
+        const struct gfx_fw_image *img = &gfx_fw_images[j];
+
+        if (img->chip != chip || !img->nub_uuid || (img->experimental && !experimental))
+            continue;
+        if (uuid_len != strlen(img->nub_uuid) + 1 || memcmp(uuid, img->nub_uuid, uuid_len) ||
+            seg[0].size != img->text_size)
+            continue;
+
+        const struct fw_version_info *ver = &fw_versions[img->version];
+        printf("FW: GFX: identified image %s (iop-gfx-nub uuid %s), firmware %s\n", img->image,
+               img->nub_uuid, ver->string);
+        return ver;
     }
 
     printf("FW: GFX: no image-info header found, GPU firmware not identified\n");

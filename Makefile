@@ -257,6 +257,7 @@ OBJECTS := \
 	dockchannel_uart.o \
 	exception.o exception_asm.o \
 	fb.o font.o font_retina.o \
+	fdt_disable.o \
 	firmware.o \
 	gxf.o gxf_asm.o \
 	heapblock.o \
