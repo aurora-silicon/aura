@@ -1,0 +1,20 @@
+name: pr-text
+
+# 'Tested:' and 'Risk:' lines present, no AI attribution in the PR text.
+# Guide: https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/pr-structure.md
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review, converted_to_draft]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-text-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-text:
+    uses: aurora-silicon/.github/.github/workflows/pr-text.yml@main
