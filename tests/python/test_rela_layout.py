@@ -115,7 +115,8 @@ def test_rela_init_stays_inside_rela_dyn_padding(tmp_path, kind, script):
     sym, end, types, warnings = layout(tmp_path, linker, REPO / script, "fixed")
     assert "orphan" not in warnings, warnings
     assert types and all(t == R_AARCH64_RELATIVE for t in types), types
-    boundary = (sym["_rela_end"] + 0xFFFF) & ~0xFFFF
+    mask = (0x4000 if script == "aura-raw.ld" else 0x10000) - 1
+    boundary = (sym["_rela_end"] + mask) & ~mask
     assert end == boundary == sym["_rodata_end"], (hex(sym["_rela_end"]), hex(end), hex(sym["_rodata_end"]))
 
     if kind != "gnu":
@@ -127,4 +128,4 @@ def test_rela_init_stays_inside_rela_dyn_padding(tmp_path, kind, script):
     unlisted.write_text(text.replace(FIX_LINE, ""))
     sym, end, types, warnings = layout(tmp_path, linker, unlisted, "control")
     assert "orphan section `.rela.init'" in warnings, warnings
-    assert sym["_rodata_end"] == end > ((sym["_rela_end"] + 0xFFFF) & ~0xFFFF)
+    assert sym["_rodata_end"] == end > ((sym["_rela_end"] + mask) & ~mask)
