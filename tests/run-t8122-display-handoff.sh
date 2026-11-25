@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 # Host test of the T8122 (J613) internal display handoff (src/kboot_display_handoff.c) against
 # what the kernel's display enable gate and drm/apple's J613 board read from the device tree.
 #
@@ -56,6 +57,17 @@ for dtb in $dtbs; do
             tail -n 1 "$tmp/$s.log"
         fi
     done
+done
+sed -e 's/t8122/t6030/g' -e 's/j613/j516s/g' tests/t8122-j613-display.dts |
+    ${DTC:-dtc} -q -I dts -O dtb -o "$tmp/j516s.dtb" -
+for s in t6030-publish-27_2 t6030-publish-27_2-unlisted-board t6030-27_2-owner-disabled \
+    t6030-27_2-m3-defaults-off t6030-27_2-config-lost t6030-14_7-panel-dcpext t6030-reordered-text-dcpext; do
+    if ! "$tmp/t8122-display-host" "$tmp/j516s.dtb" "$s" > "$tmp/$s.log" 2>&1; then
+        fail=1
+        cat "$tmp/$s.log"
+    else
+        grep -E '^(ok|FAIL) ' "$tmp/$s.log" | sed "s/^/$s: /"
+    fi
 done
 [ $fail = 0 ] && echo "T8122 display handoff: every scenario passes"
 exit $fail
