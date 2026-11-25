@@ -376,7 +376,12 @@ __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
     return 0;
 }
 
-/* SPTM's static image map offset (VA - PA), derived from the handoff boot_args. */
+/*
+ * SPTM's static image map offset (VA - PA), derived from the handoff boot_args.
+ * Before sptm_virt_load() records it, fall back to SPTM's standard virtual base
+ * (0xfffffe0000000000) minus the machine's 4 GiB-aligned DRAM base (0xfffffd0000000000
+ * for a 1 TiB DRAM base, 0xfffffdf800000000 for a 32 GiB DRAM base).
+ */
 u64 sptm_virt_image_va_offset(void)
 {
     if (sptm_va_offset)

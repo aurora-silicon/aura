@@ -440,84 +440,78 @@ dwc3_dev_t *usb_iodev_bringup(u32 idx)
 
 /*
  * IODEV_USB0 (CDC pipe 0) and IODEV_USB_VUART (CDC pipe 1) share one dwc3_dev_t with separate
- * iodev->locks. Serialize all DWC3 operations across both pipes once the MMU is up (SMP safe).
+ * iodev->locks. Serialize all DWC3 operations across both pipes once the MMU is up (SMP safe), and
+ * keep console prints inside DWC3 error paths off console_lock to avoid a cross-CPU ABBA with
+ * iodev_console_write() -> USB0.
  */
 static DECLARE_SPINLOCK(usb_dwc3_lock);
+
+#define USB_DWC3_LOCK()                                                                            \
+    bool lk = mmu_active();                                                                        \
+    if (lk) {                                                                                      \
+        spin_lock(&usb_dwc3_lock);                                                                 \
+        iodev_console_enter_nolock();                                                              \
+    }
+
+#define USB_DWC3_UNLOCK()                                                                          \
+    if (lk) {                                                                                      \
+        iodev_console_leave_nolock();                                                              \
+        spin_unlock(&usb_dwc3_lock);                                                               \
+    }
 
 #define USB_IODEV_WRAPPER(name, pipe)                                                              \
     static ssize_t usb_##name##_can_read(void *dev)                                                \
     {                                                                                              \
-        bool lk = mmu_active();                                                                    \
-        if (lk)                                                                                    \
-            spin_lock(&usb_dwc3_lock);                                                             \
+        USB_DWC3_LOCK();                                                                           \
         ssize_t r = usb_dwc3_can_read(dev, pipe);                                                  \
-        if (lk)                                                                                    \
-            spin_unlock(&usb_dwc3_lock);                                                           \
+        USB_DWC3_UNLOCK();                                                                         \
         return r;                                                                                  \
     }                                                                                              \
                                                                                                    \
     static bool usb_##name##_can_write(void *dev)                                                  \
     {                                                                                              \
-        bool lk = mmu_active();                                                                    \
-        if (lk)                                                                                    \
-            spin_lock(&usb_dwc3_lock);                                                             \
+        USB_DWC3_LOCK();                                                                           \
         bool r = usb_dwc3_can_write(dev, pipe);                                                    \
-        if (lk)                                                                                    \
-            spin_unlock(&usb_dwc3_lock);                                                           \
+        USB_DWC3_UNLOCK();                                                                         \
         return r;                                                                                  \
     }                                                                                              \
                                                                                                    \
     static ssize_t usb_##name##_read(void *dev, void *buf, size_t count)                           \
     {                                                                                              \
-        bool lk = mmu_active();                                                                    \
-        if (lk)                                                                                    \
-            spin_lock(&usb_dwc3_lock);                                                             \
+        USB_DWC3_LOCK();                                                                           \
         ssize_t r = usb_dwc3_read(dev, pipe, buf, count);                                          \
-        if (lk)                                                                                    \
-            spin_unlock(&usb_dwc3_lock);                                                           \
+        USB_DWC3_UNLOCK();                                                                         \
         return r;                                                                                  \
     }                                                                                              \
                                                                                                    \
     static ssize_t usb_##name##_write(void *dev, const void *buf, size_t count)                    \
     {                                                                                              \
-        bool lk = mmu_active();                                                                    \
-        if (lk)                                                                                    \
-            spin_lock(&usb_dwc3_lock);                                                             \
+        USB_DWC3_LOCK();                                                                           \
         ssize_t r = usb_dwc3_write(dev, pipe, buf, count);                                         \
-        if (lk)                                                                                    \
-            spin_unlock(&usb_dwc3_lock);                                                           \
+        USB_DWC3_UNLOCK();                                                                         \
         return r;                                                                                  \
     }                                                                                              \
                                                                                                    \
     static ssize_t usb_##name##_queue(void *dev, const void *buf, size_t count)                    \
     {                                                                                              \
-        bool lk = mmu_active();                                                                    \
-        if (lk)                                                                                    \
-            spin_lock(&usb_dwc3_lock);                                                             \
+        USB_DWC3_LOCK();                                                                           \
         ssize_t r = usb_dwc3_queue(dev, pipe, buf, count);                                         \
-        if (lk)                                                                                    \
-            spin_unlock(&usb_dwc3_lock);                                                           \
+        USB_DWC3_UNLOCK();                                                                         \
         return r;                                                                                  \
     }                                                                                              \
                                                                                                    \
     static void usb_##name##_handle_events(void *dev)                                              \
     {                                                                                              \
-        bool lk = mmu_active();                                                                    \
-        if (lk)                                                                                    \
-            spin_lock(&usb_dwc3_lock);                                                             \
+        USB_DWC3_LOCK();                                                                           \
         usb_dwc3_handle_events(dev);                                                               \
-        if (lk)                                                                                    \
-            spin_unlock(&usb_dwc3_lock);                                                           \
+        USB_DWC3_UNLOCK();                                                                         \
     }                                                                                              \
                                                                                                    \
     static void usb_##name##_flush(void *dev)                                                      \
     {                                                                                              \
-        bool lk = mmu_active();                                                                    \
-        if (lk)                                                                                    \
-            spin_lock(&usb_dwc3_lock);                                                             \
+        USB_DWC3_LOCK();                                                                           \
         usb_dwc3_flush(dev, pipe);                                                                 \
-        if (lk)                                                                                    \
-            spin_unlock(&usb_dwc3_lock);                                                           \
+        USB_DWC3_UNLOCK();                                                                         \
     }
 
 USB_IODEV_WRAPPER(0, CDC_ACM_PIPE_0)

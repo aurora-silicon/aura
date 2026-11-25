@@ -4,6 +4,7 @@
 
 #include "iodev.h"
 #include "memory.h"
+#include "smp.h"
 #include "string.h"
 
 #ifdef DEBUG_IODEV
@@ -182,6 +183,23 @@ void iodev_unlock(iodev_id_t id)
 int in_iodev = 0;
 
 static DECLARE_SPINLOCK(console_lock);
+static int console_nolock[MAX_CPUS];
+
+void iodev_console_enter_nolock(void)
+{
+    int cpu = smp_id();
+
+    if (cpu >= 0 && cpu < MAX_CPUS)
+        console_nolock[cpu]++;
+}
+
+void iodev_console_leave_nolock(void)
+{
+    int cpu = smp_id();
+
+    if (cpu >= 0 && cpu < MAX_CPUS && console_nolock[cpu] > 0)
+        console_nolock[cpu]--;
+}
 
 static void _iodev_console_write_helper(iodev_id_t iod, char prefix, const void *buf, size_t length)
 {
@@ -207,8 +225,15 @@ void iodev_console_write(const void *buf, size_t length)
         return;
     }
 
-    if (do_lock)
+    if (do_lock) {
+        int cpu = smp_id();
+        if (cpu >= 0 && cpu < MAX_CPUS && console_nolock[cpu]) {
+            _iodev_console_write_helper(IODEV_UART, '+', buf, length);
+            _iodev_console_write_helper(IODEV_DOCKCHANNEL_UART, '+', buf, length);
+            return;
+        }
         spin_lock(&console_lock);
+    }
 
     if (in_iodev) {
         _iodev_console_write_helper(IODEV_UART, '+', buf, length);
