@@ -611,14 +611,16 @@ static void test_hooks(void)
           9 + 2 + 4 + 12 + 4 + 4); /* PMGR blocks, PMS pages, AMCC planes, mailboxes, rest, APR */
     CHECK(req_ptr()->buf_used == total * sizeof(struct auractl_range));
     const struct auractl_range *e = (void *)gptr(PA_BUF);
-    int absent = 0;
-    for (u64 i = 0; i < total; i++)
+    int absent = 0, found_apr = 0;
+    for (u64 i = 0; i < total; i++) {
         if (!strcmp(e[i].name, "gfx-mbox") || !strcmp(e[i].name, "gfx1-mbox") ||
-            !strcmp(e[i].name, "pmgr-pwrgate") || !strcmp(e[i].name, "apr-core") ||
-            !strcmp(e[i].name, "apr-wrapper") || !strcmp(e[i].name, "dart-apr") ||
-            !strcmp(e[i].name, "dart-apr-aux"))
+            !strcmp(e[i].name, "pmgr-pwrgate"))
             absent += !(e[i].flags & AURACTL_RANGE_FOUND) && !e[i].size && !e[i].base;
-    CHECK(absent == 7);
+        if (!strcmp(e[i].name, "apr-core") || !strcmp(e[i].name, "apr-wrapper") ||
+            !strcmp(e[i].name, "dart-apr") || !strcmp(e[i].name, "dart-apr-aux"))
+            found_apr += !!(e[i].flags & AURACTL_RANGE_FOUND) && e[i].size && e[i].base;
+    }
+    CHECK(absent == 3 && found_apr == 4);
     CHECK(call(AURACTL_LIST, 0, 0, 0, VA_BUF, sizeof(*e) * 3) == 0 && req_ptr()->ret0 == total);
     CHECK(req_ptr()->buf_used == 3 * sizeof(*e));
     /* By name: two ranges of one name, then the same again (nothing changes) */
