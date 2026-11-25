@@ -2528,22 +2528,28 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
 
         const struct dcp6_run *r;
         const u32 owner_ph[3] = {ph_dcp, ph_disp, ph_pio};
+        fdt32_t iommu_tuples[3 * 5];
+        int ntuples = 0;
         for (int k = 0; k < 3; k++) {
             if (k == 0 && i == dcp6.seg_oslog)
                 r = NULL; /* physical buffer: memory-region entry only, no DART address */
             else if (!(r = dcp6_run_of(k, i)))
                 continue;
             if (r) {
-                node = fdt_subnode_offset(dt, fdt_path_offset(dt, "/reserved-memory"), name);
-                if (node < 0 ||
-                    dcp6_append_iommu_addr(dt, node, owner_ph[k], alias_base[k], r->dva, r->size))
-                    return -1;
+                fdt32_t *tuple = &iommu_tuples[ntuples * 5];
+                tuple[0] = cpu_to_fdt32(owner_ph[k]);
+                fdt64_st(&tuple[1], alias_base[k] | r->dva);
+                fdt64_st(&tuple[3], r->size);
+                ntuples++;
             }
             size_t nl = strlen(d->name) + 1;
             mr[k][count[k]++] = cpu_to_fdt32(ph);
             memcpy(names[k] + names_len[k], d->name, nl);
             names_len[k] += nl;
         }
+        if (ntuples && fdt_appendprop(dt, node, "iommu-addresses", iommu_tuples,
+                                      ntuples * 5 * sizeof(fdt32_t)))
+            return -1;
     }
 
     if (dcp6_set_list(dt, n->dcp, mr[0], count[0], names[0], names_len[0]) ||
