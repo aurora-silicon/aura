@@ -6,13 +6,16 @@
 #include "aic_regs.h"
 #include "cpu_regs.h"
 #include "dockchannel_uart.h"
+#include "iodev.h"
 #include "malloc.h"
 #include "memory.h"
+#include "pcie.h"
 #include "pmgr.h"
 #include "soc.h"
 #include "string.h"
 #include "types.h"
 #include "utils.h"
+#include "wdt.h"
 #include "xnuboot.h"
 
 #define CPU_START_OFF_S5L8960X 0x30000
@@ -542,6 +545,37 @@ bool smp_s2r_published(void)
     return s2r_mailbox.magic == AURA_S2R_MAGIC;
 }
 
+/* The bring-up below takes well under a second at boot; Linux's default watchdog period. */
+#define S2R_PCIE_WDT_SECONDS 30
+
+/*
+ * Where the PCIe complex's setup is this image's alone (pcie_needs_sleep_reinit()), the sleep
+ * took it: set it up again before the OS runs. Nobody drains the console now and a full FIFO
+ * holds the core, so the console goes first. The step runs only under a watchdog: the OS's, if
+ * it left one armed (Linux's T8103 sleep does, from its commit to the wake), or one borrowed for
+ * the step and put back after. Without either, or if the complex doesn't come back, the SoC is
+ * in no state the OS knows: reboot rather than resume into it.
+ */
+static void smp_s2r_pcie_reinit(void)
+{
+    struct wdt_guard guard;
+
+    if (!pcie_needs_sleep_reinit())
+        return;
+
+    for (iodev_id_t id = 0; id < IODEV_NUM; id++)
+        iodev_set_usage(id, iodev_get_usage(id) & ~USAGE_CONSOLE);
+
+    if (wdt_s2r_guard_enter(&guard, S2R_PCIE_WDT_SECONDS))
+        reboot();
+    int ret = pmgr_adt_power_enable("/arm-io/ans");
+    if (!ret)
+        ret = pcie_reinit_after_sleep();
+    if (ret)
+        reboot();
+    wdt_s2r_guard_exit(&guard);
+}
+
 /*
  * The boot core back from a sleep, with the OS live: nothing here may rerun the boot
  * flow. The OS gets EL2h with the MMU and caches off and interrupts masked, as at
@@ -552,7 +586,7 @@ void smp_s2r_return_to_os(void)
 {
     u64 entry = s2r_mailbox.resume_pa;
 
-    /* exception_initialize() unmasked everything. */
+    /* exception_initialize() left everything masked; the OS expects it so. */
     msr(DAIF, 0xf << 6);
 
     /* A reset the OS didn't arm: reboot rather than guess what state it's in. */
@@ -566,6 +600,8 @@ void smp_s2r_return_to_os(void)
                                     : "aura: S2R reset not armed, rebooting");
     if (!armed)
         reboot();
+
+    smp_s2r_pcie_reinit();
 
     s2r_mailbox.resume_pa = 0;
     s2r_mailbox.resumes++;

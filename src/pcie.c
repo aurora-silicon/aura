@@ -270,6 +270,8 @@ struct state {
     bool initialized;
     bool dirty;
     u32 active_ports;
+    /* The ADT node this controller last came up from, for pcie_reinit_after_sleep() */
+    const char *up_path;
 };
 
 static struct state controllers[NUM_CONTROLLERS];
@@ -371,8 +373,11 @@ static u32 pcie_phy_up(const struct state *state)
     return BIT(27);
 }
 
-/* With ans_off, only read the windows, stop the shared PHY and power ANS's gates off. */
-static int pcie_init_controller(int controller, const char *path, bool ans_off)
+/*
+ * With ans_off, only read the windows, stop the shared PHY and power ANS's gates off. With wake,
+ * the controller comes up again after a system sleep (pcie_reinit_after_sleep()).
+ */
+static int pcie_init_controller(int controller, const char *path, bool ans_off, bool wake)
 {
     struct state *state = &controllers[controller];
     int adt_path[8];
@@ -627,7 +632,8 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
     /* ??? */
     if (state->pcie_regs->type == APCIE_T8140)
         printf("pcie: T8140 RC reg[1] setup\n");
-    if (controller == APCIE)
+    /* On the way back from a sleep, read first: written only if the sleep left it set. */
+    if (controller == APCIE && (!wake || read32(state->rc_base + 0x4)))
         write32(state->rc_base + 0x4, 0);
 
     if (!adt_getprop(adt, adt_offset, "apcie-common-tunables", NULL)) {
@@ -1110,6 +1116,7 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
     printf("pcie: Initialized controller %d\n", controller);
     state->initialized = true;
     state->dirty = false;
+    state->up_path = path;
 
     return 0;
 }
@@ -1134,7 +1141,7 @@ int pcie_init(void)
             printf("pcie: T8140 controller absent\n");
             return 1;
         }
-        int ret = pcie_init_controller(APCIE, path, false);
+        int ret = pcie_init_controller(APCIE, path, false, false);
         if (!ret) {
             pcie_initialized = true;
             return 0;
@@ -1153,15 +1160,77 @@ int pcie_init(void)
         return ret;
     }
 
-    success |= pcie_init_controller(APCIE, "/arm-io/apcie", false) == 0;
-    success |= pcie_init_controller(APCIE, "/arm-io/apcie0", false) == 0;
-    success |= pcie_init_controller(APCIE_GE0, "/arm-io/apcie-ge0", false) == 0;
-    success |= pcie_init_controller(APCIE_GE1, "/arm-io/apcie-ge1", false) == 0;
+    success |= pcie_init_controller(APCIE, "/arm-io/apcie", false, false) == 0;
+    success |= pcie_init_controller(APCIE, "/arm-io/apcie0", false, false) == 0;
+    success |= pcie_init_controller(APCIE_GE0, "/arm-io/apcie-ge0", false, false) == 0;
+    success |= pcie_init_controller(APCIE_GE1, "/arm-io/apcie-ge1", false, false) == 0;
 
     if (success)
         pcie_initialized = true;
 
     return success ? 0 : -1;
+}
+
+/* Set by kboot once it has handed the OS the APCIe tables (pcie_apcie_tables_fdt()). */
+static bool pcie_os_restores_apcie;
+
+void pcie_set_os_restores_apcie(bool restores)
+{
+    pcie_os_restores_apcie = restores;
+}
+
+/*
+ * Whether the ADT leaves a system sleep's PCIe bring-up to aura at all: an ANS without
+ * nvme-secure-bar does not run on the APCIe block (before M4), so the OS is never handed the
+ * APCIe tables for it. Known before kboot sets PCIe up, for the S2R mailbox's own check.
+ */
+bool pcie_sleep_reinit_possible(void)
+{
+    int ans = adt_path_offset(adt, "/arm-io/ans");
+
+    return ans >= 0 && !adt_get_property(adt, ans, "nvme-secure-bar");
+}
+
+/*
+ * A system sleep takes the PCIe complex's power with the rest of the SoC. An OS that was handed
+ * the APCIe tables brings the block back itself. Without them, only this image's boot setup
+ * describes the complex, so if that setup brought a controller up, it has to run again before
+ * the OS does: ANS's power domains first (pcie_init() runs at boot with them already on), then
+ * the complex. Only controllers set up by pcie_init_controller() can be replayed; a SoC whose
+ * PCIe came up another way (T6050) or whose ANS runs on the APCIe block never is.
+ */
+bool pcie_needs_sleep_reinit(void)
+{
+    bool up = false;
+
+    for (int i = 0; i < NUM_CONTROLLERS; i++)
+        up |= controllers[i].up_path != NULL;
+    return up && pcie_initialized && !pcie_os_restores_apcie && pcie_sleep_reinit_possible();
+}
+
+/*
+ * pcie_needs_sleep_reinit()'s step: each controller that came up at boot, from the ADT node it
+ * came up from, and nothing else. Every one of them must come up again.
+ */
+int pcie_reinit_after_sleep(void)
+{
+    int count = 0;
+
+    for (int i = 0; i < NUM_CONTROLLERS; i++) {
+        struct state *state = &controllers[i];
+
+        if (!state->up_path)
+            continue;
+        count++;
+        if (pcie_init_controller(i, state->up_path, false, true)) {
+            pcie_initialized = false;
+            return -1;
+        }
+    }
+    if (!count)
+        return -1;
+    pcie_initialized = true;
+    return 0;
 }
 
 /* For a stage done with a post-M4 ANS, which runs on the APCIe PHY: the PHY and ANS powered off. */
@@ -1246,7 +1315,7 @@ int pcie_ans_power_off(void)
         return 0;
     }
     pcie_initialized = false;
-    return pcie_init_controller(APCIE, pcie_ans_path(), true);
+    return pcie_init_controller(APCIE, pcie_ans_path(), true, false);
 }
 
 int pcie_ans_power_on(void)

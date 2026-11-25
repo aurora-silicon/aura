@@ -48,6 +48,7 @@
 #include "usb_dwc3.h"
 #include "utils.h"
 #include "vsprintf.h"
+#include "wdt.h"
 #include "xnuboot.h"
 
 #include "libfdt/libfdt.h"
@@ -739,6 +740,18 @@ static int dt_set_s2r_mailbox(int node)
         printf("FDT: no S2R mailbox: CTXR_D is armed and the OS is outside its window\n");
         fdt_setprop_string(dt, node, "aurora,s2r-unavailable",
                            "CTXR_D armed, OS outside its window");
+        return 0;
+    }
+
+    /*
+     * A wake may have to set PCIe up again before the OS runs (smp_s2r_pcie_reinit()), which it
+     * does only under a watchdog that can still reset the SoC. kboot sets PCIe up after this, so
+     * decide from the ADT alone whether that step can come up at all.
+     */
+    if (pcie_sleep_reinit_possible() && !wdt_s2r_guard_supported()) {
+        printf("FDT: no S2R mailbox: no watchdog for the wake's PCIe bring-up\n");
+        fdt_setprop_string(dt, node, "aurora,s2r-unavailable",
+                           "no watchdog for the wake's PCIe bring-up");
         return 0;
     }
 
@@ -14368,8 +14381,10 @@ int kboot_boot(void *kernel)
         return -1;
     }
     /* Linux's deep sleep needs them to bring ANS's APCIe block back. */
-    if (!ret && pcie_apcie_tables_fdt(dt, dt_bufsize) < 0)
+    int apcie_tables = ret ? 0 : pcie_apcie_tables_fdt(dt, dt_bufsize);
+    if (apcie_tables < 0)
         printf("kboot: APCIe tables not published; deep sleep stays refused\n");
+    pcie_set_os_restores_apcie(apcie_tables > 0);
     if (chip_id == T8140) {
         if (ret < 0) {
             printf("kboot: refusing T8140 handoff after partial PCIe setup\n");
