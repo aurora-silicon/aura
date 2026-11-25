@@ -1,11 +1,7 @@
-/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
-
 ENTRY(_start)
 
 _stack_size = 0x20000;
 _stack_size_el3 = 0x8000;
-/* The largest page mapped by aura's MMU. */
-_file_section_align = 0x4000;
 
 /* We are actually relocatable */
 . = 0;
@@ -27,7 +23,7 @@ SECTIONS {
         *(.init.*)
         /*
          * Code that only runs when aura hosts a guest, or once per boot. .text follows .init
-     * directly, so where an object goes no longer changes the room left; these stay here to
+         * directly, so where an object goes no longer changes the room left; these stay here to
          * keep the order of the code.
          */
         *hv/hv_vm.o(.text .text.*)
@@ -46,8 +42,9 @@ SECTIONS {
         _init_content_end = .; /* tools/stage1_room.py */
     } :text
     /*
-     * .init and .text share the executable segment. The raw image's file-backed sections
-     * need page alignment; rounding each to 64 KiB can push vital data into the DCP log.
+     * No 64 KiB step between .init and .text: both are in the one read-execute segment, which
+     * still starts and ends on 64 KiB (_text_size). A step here left up to 64 KiB of .init
+     * unused, and code had to be moved between the two slots by hand to fit.
      */
     .text : {
         _text_content_start = .;
@@ -57,10 +54,10 @@ SECTIONS {
         . = ALIGN(8);
         *(.got.plt)
         _text_content_end = .;
-        . = ALIGN(_file_section_align);
+        . = ALIGN(0x10000);
     } :text
     _text_size = . - _text_start;
-    .rodata : ALIGN(_file_section_align) {
+    .rodata : ALIGN(0x10000) {
         /* Guest-only code uses the existing executable read-only region. */
         *sptm_virt*.o(.text .text.*)
         /* The compressed logos are .rodata (Makefile), but they go with the pixel data below. */
@@ -87,15 +84,14 @@ SECTIONS {
          * padding and out of the range apply_rela() walks, which only accepts relative entries. */
         *(.rela.init)
         _rodata_content_end = .;
-        . = ALIGN(_file_section_align);
+        . = ALIGN(0x10000);
     } :rodata
     _rodata_end = .;
     _data_start = .;
-    .data : ALIGN(_file_section_align) {
+    .data : ALIGN(0x10000) {
         _smp_shared_start = .;
         *(.data.smp_shared)
-        /* Keep the uncached SMP mapping on its own complete pages. */
-        . = ALIGN(_file_section_align);
+        . = ALIGN(0x10000);
         _smp_shared_end = .;
         *(EXCLUDE_FILE(*_48.o *_128.o *_256.o *font.o *font_retina.o) .data)
         *(.data.*)

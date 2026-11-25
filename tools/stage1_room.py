@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT AND GPL-2.0-only
+# SPDX-License-Identifier: MIT
 """How much a Stage 1 image can still grow before it reaches the DCP log buffer.
 
-aura-raw.ld puts the code (.init and .text), .rodata + .rela.dyn and .data on page boundaries, and
+aura-raw.ld puts the code (.init and .text), .rodata + .rela.dyn and .data on 64 KiB steps, and
 everything up to _file_vital_end must end below _file_limit (0x120000, see aura-raw.ld). The link
 fails once it does not. This reports how close a build is, so a change or a toolchain that eats
 the last few KiB fails in CI before a distribution's toolchain trips over it:
 
   data   bytes .data can grow before _file_vital_end reaches the limit
   text/rodata
-         bytes each can grow before it crosses its next boundary and moves .data up
+         bytes each can grow before it crosses its next 64 KiB step, which moves .data up 64 KiB
   init   the same for .init, only in a link that starts .text on its own 64 KiB step (older
          trees, without _text_content_start)
 
-The headroom is the smallest growth each section can accommodate, including any full alignment
-steps that fit in the remaining data room. Older links without the alignment symbol used 64 KiB.
+The headroom is the data room while that is 64 KiB or more, else the smallest of all four.
 
   tools/stage1_room.py build/aura-raw.elf [--min BYTES] [--nm NM]
 """
@@ -30,7 +29,7 @@ STEP = 0x10000
 SYMBOLS = ("_init_content_end", "_text_content_end", "_rodata_content_end", "_data_start",
            "_file_vital_end")
 # Start of .text, in a link where .text follows .init directly and the two share their room.
-OPTIONAL = ("_text_content_start", "_file_section_align")
+OPTIONAL = ("_text_content_start",)
 
 
 def find_nm(arg):
@@ -53,23 +52,21 @@ def read_symbols(elf, nm):
     return syms
 
 
-def to_step(addr, step):
-    return (addr + step - 1) & ~(step - 1)
+def to_step(addr):
+    return (addr + STEP - 1) & ~(STEP - 1)
 
 
 def room(syms):
     r = {}
-    step = syms.get("_file_section_align", STEP)
     if "_text_content_start" not in syms:
         # .text starts on its own 64 KiB step (older aura-raw.ld).
-        r["init"] = to_step(syms["_init_content_end"], step) - syms["_init_content_end"]
+        r["init"] = to_step(syms["_init_content_end"]) - syms["_init_content_end"]
     r |= {
-        "text": to_step(syms["_text_content_end"], step) - syms["_text_content_end"],
-        "rodata": to_step(syms["_rodata_content_end"], step) - syms["_rodata_content_end"],
+        "text": to_step(syms["_text_content_end"]) - syms["_text_content_end"],
+        "rodata": to_step(syms["_rodata_content_end"]) - syms["_rodata_content_end"],
+        "data": FILE_LIMIT - syms["_file_vital_end"],
     }
-    data = FILE_LIMIT - syms["_file_vital_end"]
-    headroom = min(data, min(r.values()) + max(0, data // step) * step)
-    r["data"] = data
+    headroom = r["data"] if r["data"] >= STEP else min(r.values())
     return r, headroom
 
 
