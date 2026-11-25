@@ -36,6 +36,7 @@ def test_acio_generation_handoff(tmp_path):
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "libfdt.h"
 typedef uint8_t u8;
