@@ -30,6 +30,54 @@
 
 #include "tinf.h"
 
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#include <stdint.h>
+
+unsigned int tinf_crc32(const void *data, unsigned int length)
+{
+	const unsigned char *buf = (const unsigned char *) data;
+	unsigned int crc = 0xFFFFFFFF;
+
+	if (length == 0) {
+		return 0;
+	}
+
+	while (length && ((uintptr_t) buf & 7)) {
+		__asm__("crc32b %w0, %w0, %w1" : "+r"(crc) : "r"((unsigned int) *buf++));
+		--length;
+	}
+
+	while (length >= 8) {
+		uint64_t v;
+		__builtin_memcpy(&v, buf, sizeof(v));
+		__asm__("crc32x %w0, %w0, %x1" : "+r"(crc) : "r"(v));
+		buf += 8;
+		length -= 8;
+	}
+
+	if (length >= 4) {
+		uint32_t v;
+		__builtin_memcpy(&v, buf, sizeof(v));
+		__asm__("crc32w %w0, %w0, %w1" : "+r"(crc) : "r"(v));
+		buf += 4;
+		length -= 4;
+	}
+
+	if (length >= 2) {
+		uint16_t v;
+		__builtin_memcpy(&v, buf, sizeof(v));
+		__asm__("crc32h %w0, %w0, %w1" : "+r"(crc) : "r"((unsigned int) v));
+		buf += 2;
+		length -= 2;
+	}
+
+	if (length) {
+		__asm__("crc32b %w0, %w0, %w1" : "+r"(crc) : "r"((unsigned int) *buf));
+	}
+
+	return crc ^ 0xFFFFFFFF;
+}
+#else
 static const unsigned int tinf_crc32tab[16] = {
 	0x00000000, 0x1DB71064, 0x3B6E20C8, 0x26D930AC, 0x76DC4190,
 	0x6B6B51F4, 0x4DB26158, 0x5005713C, 0xEDB88320, 0xF00F9344,
@@ -55,3 +103,4 @@ unsigned int tinf_crc32(const void *data, unsigned int length)
 
 	return crc ^ 0xFFFFFFFF;
 }
+#endif
