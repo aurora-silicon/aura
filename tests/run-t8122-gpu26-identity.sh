@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 set -eu
 cd "$(dirname "$0")/.."
 test_dir=$(mktemp -d)
