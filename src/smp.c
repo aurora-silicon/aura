@@ -1471,24 +1471,30 @@ static u64 smp_guest_mpidr(int i)
 }
 
 /*
- * The stock-SPTM guest's reset contract. A7 to M3 leave RVBAR writable, and the ordinary SMP path
- * writes it only in smp_start_cpu(), just before releasing a core. Here the guest performs CPUSTART
- * itself, so publish this image's vector into an unlocked RVBAR now and read it back. A locked
- * RVBAR (M4 on, or a core's own lock bit) is never written; smp_prepare_rvbar() checks it.
+ * The stock-SPTM guest's reset contract. A7 to M3 leave RVBAR writable on a powered-off secondary
+ * core (and writing it clears RVBAR_LOCK, as smp_start_cpu() does); the ordinary SMP path writes
+ * it only in smp_start_cpu() just before releasing a core, whereas here the guest performs
+ * CPUSTART itself. Publish this image's vector now and read it back. A running core's locked RVBAR
+ * is never written (a store to a running locked core takes an SError on T8122); on M4+,
+ * smp_prepare_rvbar() checks or installs the locked-RVBAR relay.
  */
 static int smp_prepare_guest_rvbar(const struct cpu_info *cpu)
 {
     u64 target = (u64)_vectors_start;
     u64 rvbar = read64(cpu->impl_reg);
 
-    if (!cpu_features->apple_sysregs_unlocked || (rvbar & RVBAR_LOCK) ||
-        (rvbar & RVBAR_ADDR_UNLOCKED) == target)
+    if (!cpu_features->apple_sysregs_unlocked)
         return smp_prepare_rvbar(cpu);
+    if ((rvbar & RVBAR_ADDR_UNLOCKED) == target && !(rvbar & RVBAR_LOCK))
+        return 0;
+    if ((rvbar & RVBAR_LOCK) && (read64(cpu->impl_reg + 0x100) & 0xff))
+        return (rvbar & RVBAR_ADDR_UNLOCKED) == target ? 0 : -1;
     if (target & ~RVBAR_ADDR_UNLOCKED)
         return -1;
     write64(cpu->impl_reg, target);
     sysop("dsb sy");
-    return (read64(cpu->impl_reg) & RVBAR_ADDR_UNLOCKED) == target ? 0 : -1;
+    rvbar = read64(cpu->impl_reg);
+    return !(rvbar & RVBAR_LOCK) && (rvbar & RVBAR_ADDR_UNLOCKED) == target ? 0 : -1;
 }
 
 /*
@@ -1525,6 +1531,7 @@ int smp_prepare_guest_resets(void)
             smp_reset_stacks[i].mpidr = mpidr;
             smp_reset_stacks[i].stack = (u64)cpu_stack(i) + SECONDARY_STACK_SIZE;
             rc = smp_prepare_guest_rvbar(cpu);
+            rvbar = read64(cpu->impl_reg);
         }
         /* A secondary must be powered off here: XNU's CPUSTART only resets a core that is
          * off, and one left running (an earlier stage's park loop) never reaches SPTM. */
