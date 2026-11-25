@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 # Host test of the T8122 (J613) internal display handoff (src/kboot_display_handoff.c) against
 # what the kernel's display enable gate and drm/apple's J613 board read from the device tree.
 #

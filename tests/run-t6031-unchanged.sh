@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 # Shows that the T6031 handoff leaves the other SoCs' handoff results as they were.
 #
 #   sh tests/run-t6031-unchanged.sh <base-ref>     (e.g. the integration/aurora tip it is built on)
