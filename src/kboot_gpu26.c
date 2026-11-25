@@ -70,12 +70,17 @@ static const char *const t8122_gpu_nodes[T8122_GPU_UAT] = {
     "uat-handoff",
     "uat-pagetables-l2",
 };
-static const char *const t8122_gpu_adt_regions[T8122_GPU_UAT] = {
-    "gpu-region",
-    "gfx-shared-region",
-    "gfx-handoff",
-    "gfx-shared-l2-region",
+/* Keep the ADT property names together for publication and reservation fallback. */
+#define UAT_REGION(name) {name, name "-base", name "-size"}
+static const struct {
+    const char *name, *base, *size;
+} gpu26_uat[T8122_GPU_UAT] = {
+    UAT_REGION("gpu-region"),
+    UAT_REGION("gfx-shared-region"),
+    UAT_REGION("gfx-handoff"),
+    UAT_REGION("gfx-shared-l2-region"),
 };
+#undef UAT_REGION
 
 /*
  * Which GPU the handoff is for: the name in the log, the /arm-io/sgx compatible to require (NULL:
@@ -136,12 +141,7 @@ static const struct {
 
 static int t8122_adt_u64(int node, const char *name, u64 *val)
 {
-    u32 len;
-    const void *p = adt_getprop(adt, node, name, &len);
-    if (!p || len != sizeof(*val))
-        return -1;
-    memcpy(val, p, sizeof(*val));
-    return 0;
+    return ADT_GETPROP(adt, node, name, val) == sizeof(*val) ? 0 : -1;
 }
 
 static bool t8122_adt_compatible(int node, const char *compat)
@@ -184,13 +184,10 @@ static int gpu26_read_adt(const struct gpu26_target *t, struct t8122_gpu_fw *fw)
              t->sgx_compat ? t->sgx_compat : "present");
 
     for (int i = 0; i < T8122_GPU_UAT; i++) {
-        char prop[64];
-        snprintf(prop, sizeof(prop), "%s-base", t8122_gpu_adt_regions[i]);
-        if (t8122_adt_u64(sgx, prop, &fw->base[i]))
-            bail("ADT: GPU: %s sgx %s missing\n", t->tag, prop);
-        snprintf(prop, sizeof(prop), "%s-size", t8122_gpu_adt_regions[i]);
-        if (t8122_adt_u64(sgx, prop, &fw->size[i]))
-            bail("ADT: GPU: %s sgx %s missing\n", t->tag, prop);
+        if (t8122_adt_u64(sgx, gpu26_uat[i].base, &fw->base[i]))
+            bail("ADT: GPU: %s sgx %s missing\n", t->tag, gpu26_uat[i].base);
+        if (t8122_adt_u64(sgx, gpu26_uat[i].size, &fw->size[i]))
+            bail("ADT: GPU: %s sgx %s missing\n", t->tag, gpu26_uat[i].size);
     }
 
     int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
@@ -209,11 +206,7 @@ static int gpu26_read_adt(const struct gpu26_target *t, struct t8122_gpu_fw *fw)
     const char *names = adt_getprop(adt, asc, "segment-names", &len);
     if (!names || len < strlen(layout) + 1 || memcmp(names, layout, strlen(layout) + 1))
         bail("ADT: GPU: %s gfx-asc segment-names is not %s\n", t->tag, layout);
-    const void *pre = adt_getprop(adt, nub, "pre-loaded", &len);
-    if (!pre || len != sizeof(preloaded))
-        bail("ADT: GPU: %s GPU firmware is not pre-loaded\n", t->tag);
-    memcpy(&preloaded, pre, sizeof(preloaded));
-    if (preloaded != 1)
+    if (ADT_GETPROP(adt, nub, "pre-loaded", &preloaded) != sizeof(preloaded) || preloaded != 1)
         bail("ADT: GPU: %s GPU firmware is not pre-loaded\n", t->tag);
 
     u64 next_va = t->fw_va;
@@ -772,14 +765,11 @@ static int gpu26_reserve_all(void *dt, const struct gpu26_target *t)
     if (sgx < 0)
         err = -1;
     for (int i = 0; sgx >= 0 && i < T8122_GPU_UAT; i++) {
-        char prop[64];
         struct t8122_gpu_range r = {t8122_gpu_names[i], i, 0, 0};
-        snprintf(prop, sizeof(prop), "%s-base", t8122_gpu_adt_regions[i]);
-        int missing = t8122_adt_u64(sgx, prop, &r.base);
-        snprintf(prop, sizeof(prop), "%s-size", t8122_gpu_adt_regions[i]);
-        missing |= t8122_adt_u64(sgx, prop, &r.size);
+        int missing = t8122_adt_u64(sgx, gpu26_uat[i].base, &r.base);
+        missing |= t8122_adt_u64(sgx, gpu26_uat[i].size, &r.size);
         if (missing) {
-            printf("ADT: GPU: %s sgx has no %s region\n", t->tag, t8122_gpu_adt_regions[i]);
+            printf("ADT: GPU: %s sgx has no %s region\n", t->tag, gpu26_uat[i].name);
             err = -1;
         } else if (gpu26_reserve_range(dt, t, &r, dram_start, dram_end)) {
             err = -1;
@@ -790,7 +780,6 @@ static int gpu26_reserve_all(void *dt, const struct gpu26_target *t)
     const char *paths[] = {"/arm-io/gfx-asc", "/arm-io/gfx-asc/iop-gfx-nub"};
     const void *first = NULL;
     u32 first_len = 0;
-    bool saw_segs = false;
     for (int p = 0; p < 2; p++) {
         int node = adt_path_offset(adt, paths[p]);
         u32 len = 0;
@@ -801,7 +790,6 @@ static int gpu26_reserve_all(void *dt, const struct gpu26_target *t)
             err = -1;
             continue;
         }
-        saw_segs = true;
         if (first && len == first_len && !memcmp(seg, first, len))
             continue;
         first = seg;
@@ -815,8 +803,6 @@ static int gpu26_reserve_all(void *dt, const struct gpu26_target *t)
                 err = -1;
         }
     }
-    if (!saw_segs)
-        err = -1;
     return err;
 }
 

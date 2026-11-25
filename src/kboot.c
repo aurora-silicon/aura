@@ -53,6 +53,20 @@
 #include "libfdt/libfdt.h"
 #include "tinf/tinf.h"
 
+/*
+ * The ADT reader checks each property header's four-byte alignment. Its value
+ * follows the 36-byte header, so even packed firmware records can be read a
+ * word at a time. A u64 within a record still need not be eight-byte aligned.
+ */
+__typeof__(adt_getprop) adt_getprop __attribute__((assume_aligned(4)));
+
+/* Share libfdt's strlen + property write across the boot-time fixups. */
+#undef fdt_setprop_string
+static int fdt_setprop_string(void *fdt, int node, const char *name, const char *value)
+{
+    return fdt_setprop(fdt, node, name, value, strlen(value) + 1);
+}
+
 #define MAX_CHOSEN_PARAMS 16
 #define MAX_UBOOT_CONFIGS 4
 

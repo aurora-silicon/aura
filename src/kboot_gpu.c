@@ -44,6 +44,64 @@ struct aux_perf_states {
     struct aux_perf_state states[];
 };
 
+/* M4 Pro/Max: state zero is off and all clusters share a frequency ladder. */
+static bool t6040_cluster_states_valid(const struct perf_state *states, u32 len, u32 count,
+                                       u32 tables)
+{
+    if (!states || len != count * tables * sizeof(*states))
+        return false;
+    for (u32 j = 0; j < tables; j++)
+        if (states[j * count].freq)
+            return false;
+    for (u32 j = 0; j < tables; j++)
+        for (u32 i = 1; i < count; i++)
+            if (!states[j * count + i].freq || states[j * count + i].freq != states[i].freq ||
+                states[j * count + i].volt < 400 || states[j * count + i].volt > 1300)
+                return false;
+    return true;
+}
+
+static bool t6040_aux_states_valid(const struct aux_perf_states *aux, u32 len)
+{
+    if (!aux || len < sizeof(*aux) || aux->dies != 1 || aux->count < 2 ||
+        aux->count > MAX_PSTATES || len < sizeof(*aux) + aux->count * sizeof(aux->states[0]))
+        return false;
+    for (u32 i = 0; i < aux->count; i++)
+        if (!aux->states[i].freq || aux->states[i].volt < 400000 || aux->states[i].volt > 1300000)
+            return false;
+    return true;
+}
+
+/* Firmware ranges must be disjoint 16K pages in the 42-bit physical address space. */
+static bool t6040_region_valid(const u64 *base, const u64 *size, size_t i)
+{
+    if (!base[i] || !size[i] || ((base[i] | size[i]) & (SZ_16K - 1)) || base[i] >= (1ULL << 42) ||
+        size[i] > (1ULL << 42) - base[i])
+        return false;
+    for (size_t j = 0; j < i; j++)
+        if (base[i] < base[j] + size[j] && base[j] < base[i] + size[i])
+            return false;
+    return true;
+}
+
+/* Both selector maps must climb in Hz. The relative-B scale uses map A in whole MHz. */
+static bool t6040_relative_frequencies(const struct perf_state *states, const u32 *index_a,
+                                       const u32 *index_b, int count, u32 base, u32 *relative)
+{
+    for (int i = 2; i < count; i++)
+        if (states[index_a[i]].freq <= states[index_a[i - 1]].freq ||
+            states[index_b[i]].freq <= states[index_b[i - 1]].freq)
+            return false;
+
+    u32 floor_mhz = states[index_a[base]].freq / 1000000;
+    u32 span_mhz = states[index_a[count - 1]].freq / 1000000 - floor_mhz;
+    if (!span_mhz)
+        return false;
+    for (int i = base; i < count; i++)
+        relative[i] = 100ULL * (states[index_a[i]].freq / 1000000 - floor_mhz) / span_mhz;
+    return true;
+}
+
 int32_t rust_gpu_initdata_size(uint32_t compat_maj, uint32_t compat_min, size_t *data_a,
                                size_t *data_b, size_t *globals);
 
@@ -423,18 +481,25 @@ static int dt_set_resvmem(void *dt, const char *path, u64 base, u64 size)
     return 0;
 }
 
+/* Return the missing or invalid component so each handoff can report its own failure. */
+static const char *gpu_adt_region(int sgx, const char *name, u64 *base, u64 *size)
+{
+    char prop[64];
+    snprintf(prop, sizeof(prop), "%s-base", name);
+    if (ADT_GETPROP(adt, sgx, prop, base) != sizeof(*base) || !*base)
+        return "base";
+    snprintf(prop, sizeof(prop), "%s-size", name);
+    if (ADT_GETPROP(adt, sgx, prop, size) != sizeof(*size) || !*size)
+        return "size";
+    return NULL;
+}
+
 static int dt_set_region(void *dt, int sgx, const char *name, const char *path)
 {
     u64 base, size;
-    char prop[64];
-
-    snprintf(prop, sizeof(prop), "%s-base", name);
-    if (ADT_GETPROP(adt, sgx, prop, &base) < 0 || !base)
-        bail("ADT: GPU: failed to find %s property\n", prop);
-
-    snprintf(prop, sizeof(prop), "%s-size", name);
-    if (ADT_GETPROP(adt, sgx, prop, &size) < 0 || !size)
-        bail("ADT: GPU: failed to find %s property\n", prop);
+    const char *bad = gpu_adt_region(sgx, name, &base, &size);
+    if (bad)
+        bail("ADT: GPU: failed to find %s-%s property\n", name, bad);
 
     return dt_set_resvmem(dt, path, base, size);
 }
@@ -507,7 +572,7 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
  * - marks the gpu node disabled before it does anything else,
  * - positively identifies the loaded GPU firmware as the 14.8.3 ABI before it touches any GPU
  *   register (drm/asahi only accepts apple,firmware-compat = <14 8 3> for G15),
- * - length/range checks every ADT input (no ADT_GETPROP: it copies before checking the length),
+ * - length/range checks every ADT input (ADT_GETPROP copies only an exact-sized property),
  * - touches no GPU hardware and leaves the node disabled unless boot.bin carries the opt-in config
  *   line chosen.asahi,t6030-gpu=1 (aura cannot tell which kernel will boot, so this is per
  *   boot.bin); without it, it only runs and logs the firmware/ADT/DT checks (dry run),
@@ -640,22 +705,12 @@ static int g15_guard_end(int before)
 
 static int g15_adt_u32(int node, const char *name, u32 *val)
 {
-    u32 len = 0;
-    const void *p = adt_getprop(adt, node, name, &len);
-    if (!p || len != sizeof(*val))
-        return -1;
-    memcpy(val, p, sizeof(*val));
-    return 0;
+    return ADT_GETPROP(adt, node, name, val) == sizeof(*val) ? 0 : -1;
 }
 
 static int g15_adt_u64(int node, const char *name, u64 *val)
 {
-    u32 len = 0;
-    const void *p = adt_getprop(adt, node, name, &len);
-    if (!p || len != sizeof(*val))
-        return -1;
-    memcpy(val, p, sizeof(*val));
-    return 0;
+    return ADT_GETPROP(adt, node, name, val) == sizeof(*val) ? 0 : -1;
 }
 
 /*
@@ -749,15 +804,9 @@ static int g15_get_pstates(const struct g15_soc *soc, int sgx, u32 *count_out, u
 
 static int g15_get_region(void *dt, int sgx, struct g15_region *r)
 {
-    char prop[64];
-
-    snprintf(prop, sizeof(prop), "%s-base", r->adt_name);
-    if (g15_adt_u64(sgx, prop, &r->base) || !r->base)
-        bail("ADT: GPU: missing or invalid %s\n", prop);
-
-    snprintf(prop, sizeof(prop), "%s-size", r->adt_name);
-    if (g15_adt_u64(sgx, prop, &r->size) || !r->size)
-        bail("ADT: GPU: missing or invalid %s\n", prop);
+    const char *bad = gpu_adt_region(sgx, r->adt_name, &r->base, &r->size);
+    if (bad)
+        bail("ADT: GPU: missing or invalid %s-%s\n", r->adt_name, bad);
 
     /*
      * The UAT maps these with 16K pages and the TTBAT base must be 16K aligned; the
@@ -1333,11 +1382,11 @@ static int g15_set_float_array(void *dt, const char *name, float val, int count)
     if (count > MAX_CLUSTERS)
         bail("FDT: GPU: g15_set_float_array() with too many values\n");
 
-    for (int i = 0; i < count; i++) {
-        u32 raw;
-        memcpy(&raw, &val, sizeof(raw));
-        data[i] = cpu_to_fdt32(raw);
-    }
+    u32 raw;
+    memcpy(&raw, &val, sizeof(raw));
+    fdt32_t cell = cpu_to_fdt32(raw);
+    for (int i = 0; i < count; i++)
+        data[i] = cell;
 
     int gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0)
@@ -2254,24 +2303,18 @@ static bool g15_optin(void *dt, const char *name)
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
     const char *optin = chosen >= 0 ? fdt_getprop(dt, chosen, name, &len) : NULL;
-    return optin && len == 2 && !strcmp(optin, "1");
-}
-
-/* Whether /chosen explicitly disables `name` (any value other than "1") */
-static bool g15_optout(void *dt, const char *name)
-{
-    int chosen = fdt_path_offset(dt, "/chosen");
-    int len = 0;
-    const char *val = chosen >= 0 ? fdt_getprop(dt, chosen, name, &len) : NULL;
-    return val && (len != 2 || strcmp(val, "1"));
+    return optin && len == 2 && optin[0] == '1' && !optin[1];
 }
 
 int dt_gpu_t6030_27_calibrate(void *dt)
 {
     if (kboot_config_lost())
         bail("FDT: GPU: T6030 27.2: config line lost; GPU stays disabled\n");
-    if (g15_optout(dt, g15_soc_t6030.optin) ||
-        (!g15_optin(dt, g15_soc_t6030.optin) && g15_optout(dt, "asahi,m3-defaults")))
+    int chosen = fdt_path_offset(dt, "/chosen"), len;
+    const char *intent = chosen < 0 ? NULL : fdt_getprop(dt, chosen, g15_soc_t6030.optin, &len);
+    if (!intent && chosen >= 0)
+        intent = fdt_getprop(dt, chosen, "asahi,m3-defaults", &len);
+    if (intent && (len != 2 || intent[0] != '1' || intent[1]))
         bail("FDT: GPU: T6030 27.2: GPU disabled by chosen config\n");
     return dt_gpu_g15_calibrate(dt, &g15_soc_t6030);
 }
@@ -2817,14 +2860,21 @@ int t8122_read_powered_identity(void *dt, int gpu)
     if (identity.result == T8122_ID_POWER_OFF_FAILED)
         printf("FDT: GPU: T8122 failed to release SGX power vote\n");
 
-    if (t8122_identity_set_u32(dt, node, "id-version", identity.id_version) ||
-        t8122_identity_set_u32(dt, node, "core-mask-0", identity.core_mask[0]) ||
-        t8122_identity_set_u32(dt, node, "core-mask-1", identity.core_mask[1]) ||
-        t8122_identity_set_u32(dt, node, "core-mask-2", identity.core_mask[2]) ||
-        t8122_identity_set_u32(dt, node, "id-counts-1", identity.id_counts_1) ||
-        t8122_identity_set_u32(dt, node, "id-counts-2", identity.id_counts_2) ||
-        t8122_identity_set_u32(dt, node, "probe-result", identity.result))
-        printf("FDT: GPU: T8122 could not publish powered identity result\n");
+    static const char *const properties[] = {
+        "id-version",  "core-mask-0", "core-mask-1",  "core-mask-2",
+        "id-counts-1", "id-counts-2", "probe-result",
+    };
+    const u32 values[] = {
+        identity.id_version,  identity.core_mask[0], identity.core_mask[1], identity.core_mask[2],
+        identity.id_counts_1, identity.id_counts_2,  identity.result,
+    };
+    /* Publish the result only after all the register values are in place. */
+    for (size_t i = 0; i < ARRAY_SIZE(properties); i++) {
+        if (t8122_identity_set_u32(dt, node, properties[i], values[i])) {
+            printf("FDT: GPU: T8122 could not publish powered identity result\n");
+            break;
+        }
+    }
     printf("FDT: GPU: T8122 bounded powered identity result %u; GPU and ASC remain disabled\n",
            identity.result);
     printf("FDT: GPU: T8122 powered identity: ID_VERSION 0x%08x ID_COUNTS_1 0x%08x ID_COUNTS_2 "
@@ -2959,11 +3009,7 @@ static int dt_set_gpu_t8122(void *dt)
         return 0;
     }
 
-    int chosen = fdt_path_offset(dt, "/chosen");
-    int len = 0;
-    const char *optin =
-        chosen >= 0 ? fdt_getprop(dt, chosen, "asahi,t8122-gpu-handoff-diag", &len) : NULL;
-    if (!optin || len != 2 || strcmp(optin, "1"))
+    if (!g15_optin(dt, "asahi,t8122-gpu-handoff-diag"))
         return 0;
 
     /* Never carry a compatibility claim from an input DT into a diagnostic boot.
@@ -3085,7 +3131,8 @@ static bool t8142_gpu_firmware_role_known(const char *path, u32 text_size, const
         return false;
 
     u32 len = 0;
-    const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+    const struct adt_segment_ranges *seg =
+        __builtin_assume_aligned(adt_getprop(adt, node, "segment-ranges", &len), 4);
     if (!seg || len != 2 * sizeof(*seg) || seg[0].size != text_size || !seg[0].phys)
         return false;
     const char *names = adt_getprop(adt, node, "segment-names", &len);
@@ -3154,12 +3201,7 @@ static int g17_set_fw_data(void *dt, int sgx, const u64 data_base[2], const u64 
     if (fdt_path_offset(dt, path) < 0)
         return 0;
     for (int i = 0; i < 2; i++) {
-        char prop[64];
-        snprintf(prop, sizeof(prop), "%s-base", ro[i]);
-        if (ADT_GETPROP(adt, sgx, prop, &ro_base[i]) != sizeof(u64) || !ro_base[i])
-            return 0;
-        snprintf(prop, sizeof(prop), "%s-size", ro[i]);
-        if (ADT_GETPROP(adt, sgx, prop, &ro_size[i]) != sizeof(u64) || !ro_size[i])
+        if (gpu_adt_region(sgx, ro[i], &ro_base[i], &ro_size[i]))
             return 0;
         if (ro_base[i] != data_base[i] + data_size[i] || ro_size[i] > UINT64_MAX - ro_base[i] ||
             (ro_size[i] & (SZ_16K - 1)))
@@ -3193,13 +3235,8 @@ static int g17_set_data_span(void *dt, int sgx)
     if (node < 0)
         return 0;
     for (int i = 0; i < 2; i++) {
-        char prop[64];
-        snprintf(prop, sizeof(prop), "%s-base", data[i]);
-        bool ok = ADT_GETPROP(adt, sgx, prop, &base[i]) == sizeof(u64);
-        snprintf(prop, sizeof(prop), "%s-size", data[i]);
-        ok = ok && ADT_GETPROP(adt, sgx, prop, &size[i]) == sizeof(u64);
-        if (!ok || !base[i] || !size[i] || ((base[i] | size[i]) & (SZ_16K - 1)) ||
-            base[i] > UINT64_MAX - size[i]) {
+        if (gpu_adt_region(sgx, data[i], &base[i], &size[i]) ||
+            ((base[i] | size[i]) & (SZ_16K - 1)) || base[i] > UINT64_MAX - size[i]) {
             printf("FDT: GPU: no valid %s in the ADT, leaving %s disabled\n", data[i], path);
             return 0;
         }
@@ -3253,7 +3290,8 @@ static int g17_set_fw_text(void *dt)
         if (node < 0)
             return 0;
         u32 len = 0;
-        const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+        const struct adt_segment_ranges *seg =
+            __builtin_assume_aligned(adt_getprop(adt, node, "segment-ranges", &len), 4);
         const char *names = adt_getprop(adt, node, "segment-names", NULL);
         if (!seg || len < sizeof(*seg) || !names || strncmp(names, "__TEXT;", 7))
             return 0;
@@ -3335,14 +3373,9 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
     size_t nregions = ARRAY_SIZE(regions) - (soc->firmware_data ? 0 : 2);
     u64 base[ARRAY_SIZE(regions)], size[ARRAY_SIZE(regions)];
     for (size_t i = 0; i < nregions; i++) {
-        char prop[64];
-        snprintf(prop, sizeof(prop), "%s-base", regions[i].name);
-        if (ADT_GETPROP(adt, sgx, prop, &base[i]) != sizeof(u64))
-            goto disable;
-        snprintf(prop, sizeof(prop), "%s-size", regions[i].name);
-        if (ADT_GETPROP(adt, sgx, prop, &size[i]) != sizeof(u64) || !base[i] || !size[i] ||
-            (base[i] & (SZ_16K - 1)) || (size[i] & (SZ_16K - 1)) ||
-            base[i] > UINT64_MAX - size[i] || fdt_path_offset(dt, regions[i].path) < 0)
+        if (gpu_adt_region(sgx, regions[i].name, &base[i], &size[i]) || (base[i] & (SZ_16K - 1)) ||
+            (size[i] & (SZ_16K - 1)) || base[i] > UINT64_MAX - size[i] ||
+            fdt_path_offset(dt, regions[i].path) < 0)
             goto disable;
         for (size_t j = 0; j < i; j++)
             if (base[i] < base[j] + size[j] && base[j] < base[i] + size[i])
@@ -3410,14 +3443,14 @@ disable:
 static float t6040_f32(u32 w)
 {
     float f;
-    memcpy(&f, &w, sizeof(f));
+    __builtin_memcpy(&f, &w, sizeof(f));
     return f;
 }
 
 static double t6040_f64(u64 w)
 {
     double d;
-    memcpy(&d, &w, sizeof(d));
+    __builtin_memcpy(&d, &w, sizeof(d));
     return d;
 }
 
@@ -3654,15 +3687,17 @@ static int t6040_opp_table(void *dt, int gpu, const char *prop, u32 count, int v
 }
 
 static const struct {
-    const char *name;
-    const char *path;
+    const char *name; /* reserved-memory path */
+    const char *base_prop;
+    const char *size_prop;
 } t6040_regions[] = {
-    {"gfx-handoff", "/reserved-memory/uat-handoff"},
-    {"gfx-shared-l2-region", "/reserved-memory/uat-l2-pagetables"},
-    {"gfx-shared-region", "/reserved-memory/uat-pagetables"},
-    {"gpu-region", "/reserved-memory/uat-ttbs"},
-    {"gfx-data", "/reserved-memory/gpu-fw-data"},
-    {NULL, "/reserved-memory/gpu-fw-text"},
+    {"/reserved-memory/uat-handoff", "gfx-handoff-base", "gfx-handoff-size"},
+    {"/reserved-memory/uat-l2-pagetables", "gfx-shared-l2-region-base",
+     "gfx-shared-l2-region-size"},
+    {"/reserved-memory/uat-pagetables", "gfx-shared-region-base", "gfx-shared-region-size"},
+    {"/reserved-memory/uat-ttbs", "gpu-region-base", "gpu-region-size"},
+    {"/reserved-memory/gpu-fw-data", "gfx-data-base", "gfx-data-size"},
+    {"/reserved-memory/gpu-fw-text", NULL, NULL},
 };
 
 /*
@@ -3679,7 +3714,8 @@ int gpu_fw_layout(int sgx, struct gpu_fw_layout *fw)
     int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
     if (asc < 0)
         return -1;
-    const struct adt_segment_ranges *seg = adt_getprop(adt, asc, "segment-ranges", &len);
+    const struct adt_segment_ranges *seg =
+        __builtin_assume_aligned(adt_getprop(adt, asc, "segment-ranges", &len), 4);
     if (!seg || (len != 2 * sizeof(*seg) && len != 3 * sizeof(*seg)))
         return -1;
     fw->seg = seg;
@@ -3746,29 +3782,15 @@ static int dt_set_gpu_t6040(void *dt)
 
     /* Operating point 0 is the off state; every other one is checked here before any use. */
     const struct perf_state *states = adt_getprop(adt, sgx, "perf-states", &len);
-    if (!states || len != count * tables * sizeof(*states))
+    if (!t6040_cluster_states_valid(states, len, count, tables))
         goto disable;
-    for (u32 j = 0; j < tables; j++)
-        if (states[j * count].freq)
-            goto disable;
-    for (u32 j = 0; j < tables; j++)
-        for (u32 i = 1; i < count; i++)
-            if (!states[j * count + i].freq || states[j * count + i].freq != states[i].freq ||
-                states[j * count + i].volt < 400 || states[j * count + i].volt > 1300)
-                goto disable;
 
     const struct aux_perf_states *aux[2];
     const char *aux_name[2] = {"cs-perf-states", "afr-perf-states"};
     for (int j = 0; j < 2; j++) {
         aux[j] = adt_getprop(adt, sgx, aux_name[j], &len);
-        if (!aux[j] || len < sizeof(*aux[j]) || aux[j]->dies != 1 || aux[j]->count < 2 ||
-            aux[j]->count > MAX_PSTATES ||
-            len < sizeof(*aux[j]) + aux[j]->count * sizeof(aux[j]->states[0]))
+        if (!t6040_aux_states_valid(aux[j], len))
             goto disable;
-        for (u32 i = 0; i < aux[j]->count; i++)
-            if (!aux[j]->states[i].freq || aux[j]->states[i].volt < 400000 ||
-                aux[j]->states[i].volt > 1300000)
-                goto disable;
     }
 
     /* Base policy defaults to the first active state, as in the T6040 power policy.
@@ -3792,13 +3814,9 @@ static int dt_set_gpu_t6040(void *dt)
     /* The reserved regions, the OPP tables and the GPU node must all take the fill. */
     u64 region_base[ARRAY_SIZE(t6040_regions)], region_size[ARRAY_SIZE(t6040_regions)];
     for (size_t i = 0; i < ARRAY_SIZE(t6040_regions); i++) {
-        char prop[64];
-        if (t6040_regions[i].name) {
-            snprintf(prop, sizeof(prop), "%s-base", t6040_regions[i].name);
-            if (ADT_GETPROP(adt, sgx, prop, &region_base[i]) != sizeof(u64))
-                goto disable;
-            snprintf(prop, sizeof(prop), "%s-size", t6040_regions[i].name);
-            if (ADT_GETPROP(adt, sgx, prop, &region_size[i]) != sizeof(u64))
+        if (t6040_regions[i].base_prop) {
+            if (ADT_GETPROP(adt, sgx, t6040_regions[i].base_prop, &region_base[i]) != sizeof(u64) ||
+                ADT_GETPROP(adt, sgx, t6040_regions[i].size_prop, &region_size[i]) != sizeof(u64))
                 goto disable;
         } else {
             region_base[i] = fw.text_base;
@@ -3810,15 +3828,9 @@ static int dt_set_gpu_t6040(void *dt)
                 goto disable;
             region_size[4] += fw.ro_size;
         }
-        if (!region_base[i] || !region_size[i] || (region_base[i] & (SZ_16K - 1)) ||
-            (region_size[i] & (SZ_16K - 1)) || region_base[i] > UINT64_MAX - region_size[i] ||
-            region_base[i] + region_size[i] > (1ULL << 42) ||
-            fdt_path_offset(dt, t6040_regions[i].path) < 0)
+        if (!t6040_region_valid(region_base, region_size, i) ||
+            fdt_path_offset(dt, t6040_regions[i].name) < 0)
             goto disable;
-        for (size_t j = 0; j < i; j++)
-            if (region_base[i] < region_base[j] + region_size[j] &&
-                region_base[j] < region_base[i] + region_size[i])
-                goto disable;
     }
     int table =
         t6040_opp_table(dt, gpu, "operating-points-v2", count, T6040_CLUSTERS * sizeof(u32));
@@ -3872,16 +3884,12 @@ static int dt_set_gpu_t6040(void *dt)
             goto disable;
     }
 
-    /* Both maps must climb in frequency, so the B ladder below cannot wrap. */
-    for (int i = 2; i < n; i++)
-        if (states[index_a[i]].freq <= states[index_a[i - 1]].freq ||
-            states[index_b[i]].freq <= states[index_b[i - 1]].freq)
-            goto disable;
+    u32 rel_b[T6040_OPPS] = {0};
+    if (!t6040_relative_frequencies(states, index_a, index_b, n, base_pstate, rel_b))
+        goto disable;
 
-    /* Maximum power of each logical A state, and the relative tables. State 0 stays at 0. */
-    u32 power[T6040_MAP_STATES] = {0}, freq[T6040_MAP_STATES] = {0};
-    for (int i = 1; i < n; i++)
-        freq[i] = states[index_a[i]].freq / 1000000;
+    /* Maximum power of each logical A state. State 0 stays at 0. */
+    u32 power[T6040_MAP_STATES] = {0};
     for (int i = 1; i < n; i++) {
         const struct perf_state *s = &states[index_a[i]];
         u32 c = min((u32)i, (u32)aux[0]->count - 1);
@@ -3899,15 +3907,12 @@ static int dt_set_gpu_t6040(void *dt)
     }
 
     /* Keep the unpopulated selector slots explicit and zero in the handoff. */
-    u32 rel_a[T6040_OPPS] = {0}, rel_b[T6040_OPPS] = {0};
-    u64 span_p = power[n - 1] - power[0], span_f = freq[n - 1] - freq[base_pstate];
-    if (!span_p || !span_f)
+    u32 rel_a[T6040_OPPS] = {0};
+    u64 span_p = power[n - 1] - power[0];
+    if (!span_p)
         goto disable;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; i++)
         rel_a[i] = (u32)(100ULL * (power[i] - power[0]) / span_p);
-        rel_b[i] =
-            i < (int)base_pstate ? 0 : (u32)(100ULL * (freq[i] - freq[base_pstate]) / span_f);
-    }
 
     /* Everything is validated. Fill the GPU node, then publish the reserved regions last. */
     int opp;
@@ -3942,7 +3947,7 @@ static int dt_set_gpu_t6040(void *dt)
 
     while (touched < ARRAY_SIZE(t6040_regions)) {
         size_t r = touched++;
-        if (dt_set_resvmem(dt, t6040_regions[r].path, region_base[r], region_size[r]))
+        if (dt_set_resvmem(dt, t6040_regions[r].name, region_base[r], region_size[r]))
             goto disable;
     }
 
@@ -3957,7 +3962,7 @@ static int dt_set_gpu_t6040(void *dt)
 disable:
     /* A region published before a failure would stay reserved for a disabled GPU. */
     for (size_t r = 0; r < touched; r++) {
-        int node = fdt_path_offset(dt, t6040_regions[r].path);
+        int node = fdt_path_offset(dt, t6040_regions[r].name);
         if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
             return -1;
     }
@@ -4068,29 +4073,15 @@ static int dt_set_gpu_t6041(void *dt)
 
     /* Operating point 0 is the off state; every cluster runs the same clocks. */
     const struct perf_state *states = adt_getprop(adt, sgx, "perf-states", &len);
-    if (!states || len != count * tables * sizeof(*states))
+    if (!t6040_cluster_states_valid(states, len, count, tables))
         goto disable;
-    for (u32 j = 0; j < tables; j++)
-        if (states[j * count].freq)
-            goto disable;
-    for (u32 j = 0; j < tables; j++)
-        for (u32 i = 1; i < count; i++)
-            if (!states[j * count + i].freq || states[j * count + i].freq != states[i].freq ||
-                states[j * count + i].volt < 400 || states[j * count + i].volt > 1300)
-                goto disable;
 
     const struct aux_perf_states *aux[2];
     const char *aux_name[2] = {"cs-perf-states", "afr-perf-states"};
     for (int j = 0; j < 2; j++) {
         aux[j] = adt_getprop(adt, sgx, aux_name[j], &len);
-        if (!aux[j] || len < sizeof(*aux[j]) || aux[j]->dies != 1 || aux[j]->count < 2 ||
-            aux[j]->count > MAX_PSTATES ||
-            len < sizeof(*aux[j]) + aux[j]->count * sizeof(aux[j]->states[0]))
+        if (!t6040_aux_states_valid(aux[j], len))
             goto disable;
-        for (u32 i = 0; i < aux[j]->count; i++)
-            if (!aux[j]->states[i].freq || aux[j]->states[i].volt < 400000 ||
-                aux[j]->states[i].volt > 1300000)
-                goto disable;
     }
 
     u32 base_pstate = 1;
@@ -4115,13 +4106,9 @@ static int dt_set_gpu_t6041(void *dt)
 
     u64 region_base[ARRAY_SIZE(t6040_regions)], region_size[ARRAY_SIZE(t6040_regions)];
     for (size_t i = 0; i < ARRAY_SIZE(t6040_regions); i++) {
-        char prop[64];
-        if (t6040_regions[i].name) {
-            snprintf(prop, sizeof(prop), "%s-base", t6040_regions[i].name);
-            if (ADT_GETPROP(adt, sgx, prop, &region_base[i]) != sizeof(u64))
-                goto disable;
-            snprintf(prop, sizeof(prop), "%s-size", t6040_regions[i].name);
-            if (ADT_GETPROP(adt, sgx, prop, &region_size[i]) != sizeof(u64))
+        if (t6040_regions[i].base_prop) {
+            if (ADT_GETPROP(adt, sgx, t6040_regions[i].base_prop, &region_base[i]) != sizeof(u64) ||
+                ADT_GETPROP(adt, sgx, t6040_regions[i].size_prop, &region_size[i]) != sizeof(u64))
                 goto disable;
         } else {
             region_base[i] = fw.text_base;
@@ -4133,15 +4120,9 @@ static int dt_set_gpu_t6041(void *dt)
                 goto disable;
             region_size[4] += fw.ro_size;
         }
-        if (!region_base[i] || !region_size[i] || (region_base[i] & (SZ_16K - 1)) ||
-            (region_size[i] & (SZ_16K - 1)) || region_base[i] > UINT64_MAX - region_size[i] ||
-            region_base[i] + region_size[i] > (1ULL << 42) ||
-            fdt_path_offset(dt, t6040_regions[i].path) < 0)
+        if (!t6040_region_valid(region_base, region_size, i) ||
+            fdt_path_offset(dt, t6040_regions[i].name) < 0)
             goto disable;
-        for (size_t j = 0; j < i; j++)
-            if (region_base[i] < region_base[j] + region_size[j] &&
-                region_base[j] < region_base[i] + region_size[i])
-                goto disable;
     }
     int table =
         t6040_opp_table(dt, gpu, "operating-points-v2", count, T6041_CLUSTERS * sizeof(u32));
@@ -4176,21 +4157,9 @@ static int dt_set_gpu_t6041(void *dt)
             goto disable;
     }
 
-    for (int i = 2; i < n; i++)
-        if (states[index_a[i]].freq <= states[index_a[i - 1]].freq ||
-            states[index_b[i]].freq <= states[index_b[i - 1]].freq)
-            goto disable;
-
-    u32 freq[T6040_MAP_STATES] = {0};
-    for (int i = 1; i < n; i++)
-        freq[i] = states[index_a[i]].freq / 1000000;
     u32 rel_b[T6040_OPPS] = {0};
-    u64 span_f = freq[n - 1] - freq[base_pstate];
-    if (!span_f)
+    if (!t6040_relative_frequencies(states, index_a, index_b, n, base_pstate, rel_b))
         goto disable;
-    for (int i = 0; i < n; i++)
-        rel_b[i] =
-            i < (int)base_pstate ? 0 : (u32)(100ULL * (freq[i] - freq[base_pstate]) / span_f);
 
     /* Everything is validated. Fill the GPU node, then publish the reserved regions last. */
     int opp;
@@ -4221,7 +4190,7 @@ static int dt_set_gpu_t6041(void *dt)
 
     while (touched < ARRAY_SIZE(t6040_regions)) {
         size_t r = touched++;
-        if (dt_set_resvmem(dt, t6040_regions[r].path, region_base[r], region_size[r]))
+        if (dt_set_resvmem(dt, t6040_regions[r].name, region_base[r], region_size[r]))
             goto disable;
     }
 
@@ -4237,7 +4206,7 @@ static int dt_set_gpu_t6041(void *dt)
 disable:
     /* A region published before a failure would stay reserved for a disabled GPU. */
     for (size_t r = 0; r < touched; r++) {
-        int node = fdt_path_offset(dt, t6040_regions[r].path);
+        int node = fdt_path_offset(dt, t6040_regions[r].name);
         if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
             return -1;
     }
@@ -4539,6 +4508,14 @@ static int gpu_leave_disabled(void *dt, int sgx)
     return fdt_setprop_string(dt, gpu, "status", "disabled");
 }
 
+static void gpu_log_leakage(const char *label, const float *values, u32 count)
+{
+    printf("FDT: GPU: %s leakage table: ", label);
+    for (u32 i = 0; i < count; i++)
+        printf("%d.%03d ", (int)values[i], ((int)(values[i] * 1000) % 1000));
+    printf("\n");
+}
+
 int dt_set_gpu(void *dt)
 {
     if (chip_id == T8152) {
@@ -4631,15 +4608,13 @@ int dt_set_gpu(void *dt)
     }
 
     /* check for old-style downstream compatibles */
+    static const char *const downstream_compat[] = {
+        "apple,agx-t8103", "apple,agx-t8112", "apple,agx-t6000", "apple,agx-t6001",
+        "apple,agx-t6002", "apple,agx-t6020", "apple,agx-t6021", "apple,agx-t6022",
+    };
     bool downstream_dtb = false;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t8103") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t8112") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6000") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6001") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6002") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6020") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6021") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6022") == 0;
+    for (size_t i = 0; i < ARRAY_SIZE(downstream_compat); i++)
+        downstream_dtb |= !fdt_node_check_compatible(dt, gpu, downstream_compat[i]);
 
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
     if (sgx < 0)
@@ -4731,28 +4706,12 @@ int dt_set_gpu(void *dt)
     for (u32 i = 0; i < perf_state_count; i++) {
         printf("%d ", max_pwr[i]);
     }
-    printf("\nFDT: GPU: Core leakage table: ");
-    for (u32 i = 0; i < perf_state_table_count; i++) {
-        printf("%d.%03d ", (int)core_leak[i], ((int)(core_leak[i] * 1000) % 1000));
-    }
-    printf("\nFDT: GPU: SRAM leakage table: ");
-    for (u32 i = 0; i < perf_state_table_count; i++) {
-        printf("%d.%03d ", (int)sram_leak[i], ((int)(sram_leak[i] * 1000) % 1000));
-    }
     printf("\n");
-
+    gpu_log_leakage("Core", core_leak, perf_state_table_count);
+    gpu_log_leakage("SRAM", sram_leak, perf_state_table_count);
     if (has_cs_afr) {
-        printf("FDT: GPU: CS leakage table: ");
-        for (u32 i = 0; i < dies; i++) {
-            printf("%d.%03d ", (int)cs_leak[i], ((int)(cs_leak[i] * 1000) % 1000));
-        }
-        printf("\n");
-
-        printf("FDT: GPU: AFR leakage table: ");
-        for (u32 i = 0; i < dies; i++) {
-            printf("%d.%03d ", (int)afr_leak[i], ((int)(afr_leak[i] * 1000) % 1000));
-        }
-        printf("\n");
+        gpu_log_leakage("CS", cs_leak, dies);
+        gpu_log_leakage("AFR", afr_leak, dies);
     }
 
     if (downstream_dtb) {
