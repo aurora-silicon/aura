@@ -2501,7 +2501,7 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
 
     if (fdt_node_check_compatible(dt, gpu, soc->compatible)) {
         printf("FDT: GPU: gpu node is not %s, leaving it alone\n", soc->compatible);
-        return 0;
+        return soc->handoff ? soc->handoff(dt, NULL) : 0;
     }
 
     /* Disabled until everything below has succeeded */
@@ -2776,10 +2776,10 @@ static int dt_set_gpu_t6031(void *dt)
  * T8122 handoff checks. Power is voted on solely for bounded ID/core-mask
  * reads, then voted off before Linux starts. Neither GPU nor mailbox is enabled.
  */
-void t8122_read_powered_identity(void *dt, int gpu)
+int t8122_read_powered_identity(void *dt, int gpu)
 {
     if (!t8122_power_probe_opted_in(dt))
-        return;
+        return 0;
 
     int sgx_path[8];
     u64 sgx_base, sgx_size, dt_sgx;
@@ -2788,7 +2788,7 @@ void t8122_read_powered_identity(void *dt, int gpu)
         g15_dt_reg_by_name(dt, gpu, "sgx", &dt_sgx) || !sgx_base || sgx_base != dt_sgx ||
         sgx_size < G15_SGX_CORE_MASK + 12) {
         printf("FDT: GPU: T8122 powered identity preflight rejected SGX window\n");
-        return;
+        return 0;
     }
 
     /* The SGX gates are virtual on T8122; their real GFX parent must be off
@@ -2796,14 +2796,14 @@ void t8122_read_powered_identity(void *dt, int gpu)
      */
     if (pmgr_adt_power_is_off("/arm-io/sgx") != 1) {
         printf("FDT: GPU: T8122 SGX power closure was not off; skipping probe\n");
-        return;
+        return 0;
     }
 
     /* Reserve all result properties before powering hardware. */
     int node = t8122_identity_node(dt);
     if (node < 0) {
         printf("FDT: GPU: T8122 powered identity result node unavailable\n");
-        return;
+        return 0;
     }
 
     static const struct t8122_power_probe_ops ops = {
@@ -2829,6 +2829,7 @@ void t8122_read_powered_identity(void *dt, int gpu)
            "0x%08x core masks 0x%x 0x%x 0x%x\n",
            identity.id_version, identity.id_counts_1, identity.id_counts_2, identity.core_mask[0],
            identity.core_mask[1], identity.core_mask[2]);
+    return identity.result == T8122_ID_POWER_OFF_FAILED ? GPU26_ERR_FATAL : 0;
 }
 
 static bool t8122_identity_matches_j613(void *dt)
@@ -3032,7 +3033,9 @@ static int dt_set_gpu_t8122(void *dt)
 
     printf("FDT: GPU: T8122 UAT and firmware reservations supplied from ADT; "
            "GPU and ASC remain disabled\n");
-    t8122_read_powered_identity(dt, gpu);
+    int ret = t8122_read_powered_identity(dt, gpu);
+    if (ret)
+        return ret;
     t8122_admit_image_metadata(dt, &image);
     t8122_enable_asc_preflight(dt);
     return 0;

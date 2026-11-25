@@ -1224,6 +1224,15 @@ static void t8122_powered_identity(void)
     assert(unguarded_faults == 0);
 }
 
+static void t8122_diag_release_failure(void)
+{
+    prepare_powered_identity();
+    pmgr_off_after_release = 0;
+    assert(run() == GPU26_ERR_FATAL);
+    assert(pmgr_enables == 1 && pmgr_disables == 1 && !pmgr_off);
+    assert(identity_u32("probe-result") == T8122_ID_POWER_OFF_FAILED);
+}
+
 static void t8122_powered_identity_counts(void)
 {
     /* Any ID_COUNTS_1 is published as read; it does not change the result */
@@ -2285,6 +2294,16 @@ static void t6030_27_missing_alias(void)
     assert(!pmgr_enables && !pmgr_disables);
 }
 
+static void t6030_27_incompatible_alias(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/aliases"), "gpu", "/chosen"));
+    assert(run() == 0);
+    assert(prop_len(dtbuf, "/chosen", "status") < 0);
+    check_t6030_27_reserve_only();
+    assert(!pmgr_enables && !pmgr_disables);
+}
+
 static void t6030_27_unknown_image(void)
 {
     prepare_t6030_27(t6030_27_unknown);
@@ -2479,6 +2498,28 @@ static void t8122_27_identity(void)
     assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1 && unguarded_faults == 0);
     assert(log_has("GPU and ASC remain disabled"));
 }
+static void t8122_27_diag_release_failure(void)
+{
+    prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-power-diag",
+                           "1"));
+    pmgr_off_after_release = 0;
+    assert(run() == GPU26_ERR_FATAL);
+    assert(pmgr_enables == 1 && pmgr_disables == 1 && !pmgr_off);
+    assert(log_has("failed to release SGX power vote"));
+    assert(!gpu_prop("apple,m3-handoff-version", NULL));
+}
+
+static void t8122_27_reserve_failure(void)
+{
+    prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
+    CHK(fdt_del_node(dtbuf, fdt_path_offset(dtbuf, "/reserved-memory")));
+    assert(run() < 0);
+    assert(log_has("not reserved (no /reserved-memory)"));
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(!pmgr_enables && !pmgr_disables);
+}
+
 static void t8122_27_no_identity(void)
 {
     /* Without the switch: no identity node and the GPU is never powered. */
@@ -3139,6 +3180,7 @@ static const struct {
     {"t6030-27-handoff-a000", t6030_27_handoff_a000},
     {"t6030-27-afr-already-on", t6030_27_afr_already_on},
     {"t6030-27-missing-alias", t6030_27_missing_alias},
+    {"t6030-27-incompatible-alias", t6030_27_incompatible_alias},
     {"t6030-27-unknown-image", t6030_27_unknown_image},
     {"t6030-27-identity-failure", t6030_27_identity_failure},
     {"t6030-27-unlisted-board-default", t6030_27_unlisted_board_default},
@@ -3147,6 +3189,8 @@ static const struct {
     {"t6030-27-full-fdt", t6030_27_full_fdt},
     {"t6030-27-closure-restore-fail", t6030_27_closure_restore_fail},
     {"t6030-27-reserve-partial-overlap", t6030_27_reserve_partial_overlap},
+    {"t8122-27-diag-release-failure", t8122_27_diag_release_failure},
+    {"t8122-27-reserve-failure", t8122_27_reserve_failure},
     {"t6030-27-reserve-failure", t6030_27_reserve_failure},
 #endif
     {"t8122-25-calibrated", t8122_25_calibrated},
@@ -3218,6 +3262,7 @@ static const struct {
     {"t8122-small-dt", t8122_small_dt},
     {"t8122-with-diag-optin", t8122_with_diag_optin},
     {"t8122-powered-identity", t8122_powered_identity},
+    {"t8122-diag-release-failure", t8122_diag_release_failure},
     {"t8122-powered-identity-counts", t8122_powered_identity_counts},
     {"t8122-powered-identity-counts2", t8122_powered_identity_counts2},
     {"t8122-powered-identity-counts-fault", t8122_powered_identity_counts_fault},

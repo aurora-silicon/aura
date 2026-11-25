@@ -32,7 +32,7 @@ int kboot_set_uboot(const char *name, const char *value);
 #define GPU26_ERR_FATAL (-2)
 int dt_gpu_t8122_26_calibrate(void *dt);
 int dt_gpu_t6030_27_calibrate(void *dt);
-void t8122_read_powered_identity(void *dt, int gpu);
+int t8122_read_powered_identity(void *dt, int gpu);
 int dt_set_gpu_t8122_26(void *dt);
 
 /*

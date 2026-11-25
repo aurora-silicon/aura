@@ -594,8 +594,11 @@ static int t8122_gpu_publish_27(void *dt, const struct t8122_gpu_fw *fw)
         return 0;
     }
     gpu = t8122_gpu_node(dt);
-    if (gpu >= 0)
-        t8122_read_powered_identity(dt, gpu);
+    if (gpu >= 0) {
+        ret = t8122_read_powered_identity(dt, gpu);
+        if (ret)
+            return ret;
+    }
     t8122_gpu_log(fw, "left disabled (27.2 firmware: the GPU start is not fully described)");
     return 0;
 }
@@ -838,8 +841,7 @@ int dt_set_gpu_t8122_26(void *dt)
     printf("FDT: GPU: T8122 handoff not published; reserving the GPU firmware memory only\n");
     if (t8122_fdt_transaction(dt, gpu26_disable, (void *)&t8122_target))
         printf("FDT: GPU: T8122 cannot mark the GPU node disabled\n");
-    gpu26_reserve_all(dt, &t8122_target);
-    return 0;
+    return gpu26_reserve_all(dt, &t8122_target);
 }
 
 struct t6030_handoff {
