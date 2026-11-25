@@ -4676,6 +4676,55 @@ static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits)
 }
 
 /*
+ * The M3 MTP firmware gets RTKit buffers through its own mapper. Give the
+ * OS and any intervening boot stage the DMA window iBoot described for it.
+ */
+static int dt_set_mtp_dma_window(void)
+{
+    if (chip_id != T8122 && chip_id != T6030 && chip_id != T6031 && chip_id != T6034)
+        return 0;
+
+    int mtp = fdt_node_offset_by_compatible(dt, -1, "apple,mtp");
+    if (mtp < 0)
+        return 0;
+    const char *status = fdt_getprop(dt, mtp, "status", NULL);
+    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+        return 0;
+
+    int dart = dt_get_iommu_node(mtp, 0);
+    if (dart < 0 || fdt_getprop(dt, dart, "apple,dma-range", NULL))
+        return 0;
+
+    int asc = adt_path_offset(adt, "/arm-io/mtp");
+    int trace[8];
+    int adart = adt_path_offset_trace(adt, "/arm-io/dart-mtp", trace);
+    if (asc < 0 || adart < 0)
+        return 0;
+
+    u64 base, size, adt_mmio, mmio, mmio_size;
+    if (ADT_GETPROP(adt, adart, "vm-base", &base) != sizeof(base) ||
+        ADT_GETPROP(adt, adart, "vm-size", &size) != sizeof(size) || !size ||
+        ((base | size) & (SZ_16K - 1)) || adt_get_reg(adt, trace, "reg", 0, &adt_mmio, NULL) < 0 ||
+        dt_device_dart_mmio(mtp, asc, &mmio, &mmio_size) || mmio != adt_mmio ||
+        mmio_size < DART_T8110_PARAMS3 + sizeof(u32))
+        return 0;
+
+    u32 bits = FIELD_GET(DART_T8110_PARAMS3_VA_WIDTH, read32(mmio + DART_T8110_PARAMS3));
+    if (bits < 32 || bits > 44)
+        return 0;
+    u64 limit = 1ULL << bits;
+    if (base >= limit || size > limit - base)
+        return 0;
+
+    fdt64_t range[] = {cpu_to_fdt64(base), cpu_to_fdt64(size)};
+    int ret = fdt_setprop(dt, dart, "apple,dma-range", range, sizeof(range));
+    if (ret)
+        bail("FDT: MTP DART DMA window: %s\n", fdt_strerror(ret));
+    printf("FDT: MTP DART DMA window 0x%lx+0x%lx\n", base, size);
+    return 0;
+}
+
+/*
  * Reserve the firmware segments of an ASC coprocessor from its ADT
  * segment-ranges and attach them to its FDT node. With dram_only, segments
  * outside DRAM (such as the coprocessor's own SRAM, which the OS maps as MMIO)
@@ -13679,6 +13728,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_setup_sio())
         return -1;
     if (dt_set_aop_firmware())
+        return -1;
+    if (dt_set_mtp_dma_window())
         return -1;
     if (dt_set_isp())
         return -1;
