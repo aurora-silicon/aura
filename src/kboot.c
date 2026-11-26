@@ -10421,31 +10421,40 @@ static int dt_fill_pmp(int pmp_node)
 }
 
 /*
- * The boot arguments the PMP driver patches into the firmware from an optional
- * apple,<name>; the firmware's default for each is 0. Absent properties are
- * skipped. When @strict is set, a present property that is not a u32 fails the
- * copy; otherwise it is skipped so legacy alias-based boots keep their prior
- * behavior.
+ * Copies each optional u32 @names[i] of the ADT node @anode onto @pmp_node as apple,<name>.
+ * Absent properties are skipped. When @strict is set, a present property that is not a u32 fails
+ * the copy; otherwise it is skipped so legacy alias-based boots keep their prior behavior.
+ */
+static int dt_copy_pmp_u32s(int pmp_node, int anode, const char *const *names, size_t count,
+                            bool strict)
+{
+    for (size_t i = 0; i < count; i++) {
+        u32 val;
+        char prop_name[64];
+
+        if (!adt_getprop(adt, anode, names[i], NULL))
+            continue;
+        if (adt_get_u32_exact(anode, names[i], &val)) {
+            if (strict)
+                bail("ADT: pmp %s is not a u32\n", names[i]);
+            continue;
+        }
+        snprintf(prop_name, sizeof(prop_name), "apple,%s", names[i]);
+        if (fdt_setprop_u32(dt, pmp_node, prop_name, val))
+            bail("FDT: failed to set pmp %s\n", prop_name);
+        printf("FDT: pmp %s = 0x%x\n", names[i], val);
+    }
+    return 0;
+}
+
+/*
+ * The boot arguments the PMP driver patches into the firmware from an optional apple,<name>; the
+ * firmware's default for each is 0.
  */
 static int dt_set_pmp_bootargs(int pmp_node, int pmp_iop_anode, bool strict)
 {
-    for (size_t i = 0; i < ARRAY_SIZE(pmp_bootargs); i++) {
-        u32 val;
-        char arg_name[64];
-
-        if (!adt_getprop(adt, pmp_iop_anode, pmp_bootargs[i], NULL))
-            continue;
-        if (adt_get_u32_exact(pmp_iop_anode, pmp_bootargs[i], &val)) {
-            if (strict)
-                bail("ADT: pmp boot argument %s is not a u32\n", pmp_bootargs[i]);
-            continue;
-        }
-        snprintf(arg_name, sizeof(arg_name), "apple,%s", pmp_bootargs[i]);
-        if (fdt_setprop_u32(dt, pmp_node, arg_name, val))
-            bail("FDT: failed to set pmp boot argument %s\n", pmp_bootargs[i]);
-        printf("FDT: pmp %s = 0x%x\n", pmp_bootargs[i], val);
-    }
-    return 0;
+    return dt_copy_pmp_u32s(pmp_node, pmp_iop_anode, pmp_bootargs, ARRAY_SIZE(pmp_bootargs),
+                            strict);
 }
 
 /*
@@ -10461,19 +10470,7 @@ static int dt_set_pmp_pmgr(int pmp_node)
 
     if (pmgr_anode < 0)
         return 0;
-    for (size_t i = 0; i < ARRAY_SIZE(pmgr_props); i++) {
-        u32 val;
-        char prop_name[32];
-
-        if (!adt_getprop(adt, pmgr_anode, pmgr_props[i], NULL))
-            continue;
-        if (adt_get_u32_exact(pmgr_anode, pmgr_props[i], &val))
-            bail("ADT: /arm-io/pmgr %s is not a u32\n", pmgr_props[i]);
-        snprintf(prop_name, sizeof(prop_name), "apple,%s", pmgr_props[i]);
-        if (fdt_setprop_u32(dt, pmp_node, prop_name, val))
-            bail("FDT: failed to set pmp %s\n", prop_name);
-    }
-    return 0;
+    return dt_copy_pmp_u32s(pmp_node, pmgr_anode, pmgr_props, ARRAY_SIZE(pmgr_props), true);
 }
 
 /*
