@@ -3486,11 +3486,100 @@ static void t6041_ext_handoffs(void *dt)
 /* ---- external display processors the ADT describes ---- */
 
 /*
- * ESP Stage 2 only (kboot.h): Stage 1 has no room for this handoff, and a Stage 1 normally
- * chainloads the ESP Stage 2, which hands the processors over. A Stage 1 that starts an OS itself
- * keeps kboot.c's firmware-ready path for them, as before this handoff existed.
+ * Both stages: whether an external display processor the ADT describes may still run as iBoot left
+ * it, from its ADT clock-gates and the PMGR power states they resolve to (only read, guarded).
  */
+
+/* An ADT string property (device_type) is `want` */
+static bool dcpext_adt_is(int node, const char *prop, const char *want)
+{
+    u32 len = 0;
+    size_t n = strlen(want);
+    const char *v = adt_getprop(adt, node, prop, &len);
+    return v && len > n && !memcmp(v, want, n) && !v[n];
+}
+
+/*
+ * Whether PMGR device g, or a device above it (either parent, up to the first virtual one), is
+ * fully off: power-gated, targeted power-gated and not under automatic power management. A device
+ * under one that is off is off too. Read only, guarded; what cannot be read is not off.
+ */
+static bool dcpext_chain_off(const struct pmgr_gate *g, int depth)
+{
+    if (!g->found || g->virt || !g->psreg || depth >= DCP6_GATE_DEPTH)
+        return false;
+    int guard = dcp6_guard_begin();
+    u32 ps = read32(g->psreg);
+    if (dcp6_guard_end(guard))
+        return false;
+    /* Power-gated (state 0) and targeted so */
+    if (!FIELD_GET(PMGR_PS_TARGET, ps) && !FIELD_GET(PMGR_PS_ACTUAL, ps) &&
+        !(ps & PMGR_AUTO_ENABLE))
+        return true;
+    for (int p = 0; p < 2; p++) {
+        struct pmgr_gate parent;
+        if (g->parent[p] && g->parent[p] != g->id &&
+            pmgr_device_gate(g->die, g->parent[p], &parent) >= 0 &&
+            dcpext_chain_off(&parent, depth + 1))
+            return true;
+    }
+    return false;
+}
+
+/*
+ * /arm-io/<name> provably does not run: it has ADT clock-gates and each of them is off
+ * (dcpext_chain_off()). Without clock-gates, or with one that is on or cannot be read, it may.
+ */
+static bool dcpext_not_running(const char *name)
+{
+    char path[DCP6_NAME_LEN + 16];
+    u32 n;
+
+    snprintf(path, sizeof(path), "/arm-io/%s", name);
+    for (n = 0; n < DCP6_GATES_MAX; n++) {
+        struct pmgr_gate g;
+        if (pmgr_adt_gate(path, "clock-gates", n, &g) < 0)
+            break;
+        if (!dcpext_chain_off(&g, 0))
+            return false;
+    }
+    return n > 0 && n < DCP6_GATES_MAX;
+}
+
+/*
+ * How many external processors the ADT describes (/arm-io children of device_type dcp other than
+ * the internal /arm-io/dcp) may still run as iBoot left them: all but those that provably do not
+ * (dcpext_not_running()). Each is logged. With no /arm-io, 1: none can be shown not to run.
+ * A Stage 1's (kboot.c); the ESP Stage 2 does not link it.
+ */
+int dcpext_may_run(void)
+{
+    int io = adt_path_offset(adt, "/arm-io"), internal = adt_path_offset(adt, "/arm-io/dcp");
+    int child = io, n = 0;
+
+    if (io < 0)
+        return 1;
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        if (child == internal || !dcpext_adt_is(child, "device_type", "dcp"))
+            continue;
+        const char *name = adt_get_name(adt, child);
+        if (name && dcpext_not_running(name))
+            continue;
+        printf("DCP: %s may still run as iBoot left it\n", name ? name : "an unnamed processor");
+        n++;
+    }
+    return n;
+}
+
 #ifdef ESP_STAGE2
+
+/*
+ * ESP Stage 2 only (kboot.h): Stage 1 has no room for this handoff, nor for keeping the memory of a
+ * processor that is not handed over (dcpext_keep_rest()). A Stage 1 normally chainloads the ESP
+ * Stage 2, which does both. A Stage 1 that starts an OS itself keeps kboot.c's firmware-ready path
+ * for them, as before this handoff existed.
+ */
 
 /*
  * External display processors whose handoff this boot's ADT describes completely, by block: the
@@ -3540,15 +3629,6 @@ static struct {
     int handed[DCPEXT_MAX];           /* the ADT nodes of the processors handed over */
     struct dcpext_tables keep_tables; /* scratch for one processor's memory kept from the OS */
 } dcpext_run;
-
-/* An ADT string property (device_type) is `want` */
-static bool dcpext_adt_is(int node, const char *prop, const char *want)
-{
-    u32 len = 0;
-    size_t n = strlen(want);
-    const char *v = adt_getprop(adt, node, prop, &len);
-    return v && len > n && !memcmp(v, want, n) && !v[n];
-}
 
 /* reg[0] of /arm-io/<child>, with the /arm-io ranges applied */
 static int dcpext_adt_reg(int child, u64 *addr)
@@ -4245,53 +4325,6 @@ static void dcpext_reserve_oslogs(void *dt)
 }
 
 /* ---- the memory of an external processor that is not handed over ---- */
-
-/*
- * Whether PMGR device g, or a device above it (either parent, up to the first virtual one), is
- * fully off: power-gated, targeted power-gated and not under automatic power management. A device
- * under one that is off is off too. Read only, guarded; what cannot be read is not off.
- */
-static bool dcpext_chain_off(const struct pmgr_gate *g, int depth)
-{
-    if (!g->found || g->virt || !g->psreg || depth >= DCP6_GATE_DEPTH)
-        return false;
-    int guard = dcp6_guard_begin();
-    u32 ps = read32(g->psreg);
-    if (dcp6_guard_end(guard))
-        return false;
-    /* Power-gated (state 0) and targeted so */
-    if (!FIELD_GET(PMGR_PS_TARGET, ps) && !FIELD_GET(PMGR_PS_ACTUAL, ps) &&
-        !(ps & PMGR_AUTO_ENABLE))
-        return true;
-    for (int p = 0; p < 2; p++) {
-        struct pmgr_gate parent;
-        if (g->parent[p] && g->parent[p] != g->id &&
-            pmgr_device_gate(g->die, g->parent[p], &parent) >= 0 &&
-            dcpext_chain_off(&parent, depth + 1))
-            return true;
-    }
-    return false;
-}
-
-/*
- * /arm-io/<name> provably does not run: it has ADT clock-gates and each of them is off
- * (dcpext_chain_off()). Without clock-gates, or with one that is on or cannot be read, it may.
- */
-static bool dcpext_not_running(const char *name)
-{
-    char path[DCP6_NAME_LEN + 16];
-    u32 n;
-
-    snprintf(path, sizeof(path), "/arm-io/%s", name);
-    for (n = 0; n < DCP6_GATES_MAX; n++) {
-        struct pmgr_gate g;
-        if (pmgr_adt_gate(path, "clock-gates", n, &g) < 0)
-            break;
-        if (!dcpext_chain_off(&g, 0))
-            return false;
-    }
-    return n > 0 && n < DCP6_GATES_MAX;
-}
 
 /*
  * Add a table page to `t` if it is a 16K page in DRAM outside the memory carveouts; returns whether

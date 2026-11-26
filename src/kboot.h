@@ -99,6 +99,11 @@ static inline int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bo
     return 0;
 }
 #endif
+/*
+ * How many external display processors the ADT describes may still run as iBoot left them, from
+ * their ADT clock-gates (kboot_display_handoff.c). A Stage 1's: the ESP Stage 2 does not link it.
+ */
+int dcpext_may_run(void);
 
 // from rust/usb4.rs
 u64 rust_usb4_router_uuid(void);
