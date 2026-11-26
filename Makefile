@@ -67,9 +67,17 @@ QUIET :=
 endif
 endif
 
-# Keep boot images below the DCP log-buffer boundary enforced by aura-raw.ld.
+# Keep boot images below the DCP log-buffer boundary enforced by aura-raw.ld. The ESP Stage 2
+# links the code Stage 1 has no room for (the external display processors' handoff,
+# kboot_display_handoff.c) below the same boundary, so it is optimized for size throughout, as the
+# macOS ESP Stage 2 (SPTM_VIRT_ESP) is built; its bulk-data code keeps -Os (below).
 # EXTRA_CFLAGS can still override the optimization level for development builds.
-BASE_CFLAGS := -Os -Wall -g -Wundef -Werror=strict-prototypes -fno-common -fno-PIE \
+ifeq ($(ESP_STAGE2),1)
+OPT_CFLAGS := -Oz
+else
+OPT_CFLAGS := -Os
+endif
+BASE_CFLAGS := $(OPT_CFLAGS) -Wall -g -Wundef -Werror=strict-prototypes -fno-common -fno-PIE \
 	-Werror=implicit-function-declaration -Werror=implicit-int \
 	-Wsign-compare -Wunused-parameter -Wno-multichar \
 	-ffreestanding -fpic -ffunction-sections -fdata-sections \
@@ -376,6 +384,16 @@ build/sptm_virt_%.o: CFLAGS += -Oz
 build/kboot.o: CFLAGS += -Oz
 build/kboot_%.o: CFLAGS += -Oz
 build/kboot_%.o: BASE_CFLAGS += -Oz
+# The Linux ESP Stage 2's bulk-data paths keep -Os, as in Stage 1: the inflate of its U-Boot and
+# logos, xz, and the byte loops of memcpy() and friends and of the framebuffer console.
+ifeq ($(ESP_STAGE2),1)
+ifneq ($(SPTM_VIRT_ESP),1)
+build/string.o: CFLAGS += -Os
+build/fb.o: CFLAGS += -Os
+build/tinf/%.o: CFLAGS += -Os
+build/minilzlib/%.o: CFLAGS += -Os
+endif
+endif
 
 build/%.o: src/%.c build-tag build-cfg
 	$(QUIET)echo "  CC    $@"

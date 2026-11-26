@@ -50,7 +50,8 @@ jobs:
       - name: Build the ESP Stage 2
         run: |
           make clean
-          make -j2 ARCH=aarch64-linux-gnu- CHAINLOADING=1 ESP_STAGE2=1 EXTRA_CFLAGS='-Wstack-usage=2048 -Os'
+          # The Makefile's optimization levels for the ESP Stage 2 (size first), as release.yml builds it.
+          make -j2 ARCH=aarch64-linux-gnu- CHAINLOADING=1 ESP_STAGE2=1 EXTRA_CFLAGS='-Wstack-usage=2048'
           mkdir -p out/esp-stage2
           cp build/aura.macho build/aura.bin out/esp-stage2/
 
