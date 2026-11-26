@@ -115,8 +115,18 @@ int main(void)
     assert(R0(1) == 0x11 && START(1) == 0x10000b28000);
     reset(); row(0x1f000000000, 0x1f0ffffffff, 0x33);
     assert(!dapf_init_t8020("/arm-io/dart-ave0", 0, ADT_DART) && R0(1) == 0);
+    /* A SoC's one encoder: dart-ave admits ave's TEXT. */
     reset(); adt_encoder = "/arm-io/ave"; row(0x1f000000000, 0x1f0ffffffff, 0x33);
-    assert(!dapf_init_t8020("/arm-io/dart-ave", 0, ADT_DART) && R0(1) == 0);
+    assert(!dapf_init_t8020("/arm-io/dart-ave", 0, ADT_DART));
+    assert(R0(1) == 0x11 && START(1) == 0x10000b28000);
+    /* The J313's ADT filter: TEXT at its physical address and the 0xf window, nothing added. */
+    reset(); adt_encoder = "/arm-io/ave";
+    seg[0].phys = 0x800a20000; seg[0].size = 0x114000;
+    row(0x800a20000, 0x800b33fff, 0x11); row(0xf00000000, 0xfffffffff, 0x33);
+    assert(!dapf_init_t8020("/arm-io/dart-ave", 0, ADT_DART));
+    assert(R0(0) == 0x11 && START(0) == 0x800a20000 && END(0) == 0x800b33fff);
+    assert(R0(1) == 0x33 && START(1) == 0xf00000000 && END(1) == 0xfffffffff);
+    assert(R0(2) == 0 && START(2) == 0);
     reset(); adt_encoder = "/arm-io/ave1x"; row(0x1f000000000, 0x1f0ffffffff, 0x33);
     assert(!dapf_init_t8020("/arm-io/dart-ave1x", 0, ADT_DART) && R0(1) == 0);
     adt_encoder = "/arm-io/ave0";
