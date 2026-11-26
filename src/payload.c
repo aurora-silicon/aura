@@ -290,6 +290,7 @@ static bool check_var(u8 **p)
     printf("Found variable %.*s\n", (int)(val - (char *)*p - 1), (char *)*p);
 
     if (IS_VAR("chosen.")) {
+        secboot_note_chosen((char *)*p);
         if (chosen_cnt >= MAX_CHOSEN_VARS) {
             printf("Too many chosen vars, ignoring %.*s\n", (int)(val - (char *)*p - 1),
                    (char *)*p);

@@ -35,7 +35,13 @@ int secboot_check_payloads(u8 *p, u8 **next);
  */
 u8 *secboot_payload_next(u8 *p);
 
-/* Whether a payload kind this stage cannot verify (ESP boot= files) may still run. */
+/* Note a /chosen line from the payloads: an earlier stage's enforce policy carries over. */
+void secboot_note_chosen(const char *line);
+
+/*
+ * Whether a payload kind this stage cannot verify (ESP boot= files) may still run: not when this
+ * stage enforces, nor when the stage that loaded it did.
+ */
 bool secboot_allow_unverified(const char *what);
 
 /*
