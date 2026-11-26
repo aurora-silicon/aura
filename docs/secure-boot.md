@@ -105,10 +105,10 @@ that builds the OS device tree writes `/chosen/aurora,boot-security`:
   `bad-format`), `sha256`, and for signed items `key-id` and
   `security-version`.
 
-U-Boot adds one entry when it follows an enforcing stage (below): stage
-`u-boot`, component `EFI/BOOT/BOOTAA64.EFI`, the image's SHA-256, verdict
-`verified`. Otherwise U-Boot adds nothing, and the record ends with aura's
-stages.
+U-Boot (aurora-silicon/u-boot, `aurora-wip`, `EFI_AURORA_MEASURE`, on by
+default for Apple) adds an entry for every EFI image it loads: stage
+`u-boot`, component `efi-image`, its SHA-256 and the UEFI Secure Boot
+verdict (`measured` when Secure Boot is off).
 The record is only as good as the first stage that enforces: a stage nobody
 verified can write anything here.
 
@@ -126,21 +126,22 @@ the Aurora distributions' secure path, the rest of the chain is:
    enforcing stage does: `boot=` files on the ESP and a `chainload=` next
    stage without a verified trailer. Its own payloads came in the image Stage
    1 verified.
-3. U-Boot (aurora-silicon/u-boot) reads this record. When any stage enforced
-   (`policy = "enforce"` on the node or on a measurement, or `state =
-   "verified"`), it ignores its saved environment on the ESP, gives no console
-   (no boot delay, no Ctrl-C), and boots only `EFI/BOOT/BOOTAA64.EFI` from the
-   internal ESP through UEFI Secure Boot, resetting on any failure. There is no
-   `booti`, bootflow, boot script or USB boot. Its Secure Boot keys (PK, KEK,
-   db, dbx) come only from the variable seed built into U-Boot, which
-   `aurora-secboot` fills with the owner's keys before it signs Stage 2, so
-   step 1 checks them too. A U-Boot with no keys in its seed refuses to boot.
+3. U-Boot checks what it starts only when it is built for it: with
+   `apple_secboot.config` (aurora-silicon/u-boot `aurora-wip`) it boots only
+   `EFI/BOOT/BOOTAA64.EFI` from the internal ESP through UEFI Secure Boot,
+   with no saved environment, no prompt and a reset when nothing boots. Its
+   keys (PK, KEK, db, dbx) come only from the variable seed built into it,
+   which Stage 2 carries, so step 1 checks them too. That build audits by
+   default (an image that fails still starts); it enforces with
+   `EFI_AURORA_SECBOOT_AUDIT` off. The default U-Boot does not check what it
+   starts, whatever the earlier stages enforced: with it, the chain ends at
+   U-Boot.
 4. `EFI/BOOT/BOOTAA64.EFI` is then the owner's UKI, signed with the db key:
    kernel, initramfs and command line in one signature. The command line binds
    the vendor firmware archive on the ESP (`aurora.vendorfw=`), which the
    initramfs checks before it uses the archive.
 
-Without an enforcing stage, U-Boot boots as configured (the ESP's `uboot.env`,
-shim or GRUB, BLS entries), and nothing after aura is checked: anyone who can
-write the ESP controls that boot, and the record says so (`state` is not
-`verified`).
+With the default U-Boot, or without an enforcing stage, U-Boot boots as
+configured (the ESP's `uboot.env`, shim or GRUB, BLS entries), and nothing
+after aura is checked: anyone who can write the ESP controls that boot, and
+the record says so (U-Boot's entries are not `verified`).
