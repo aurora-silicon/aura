@@ -3540,8 +3540,9 @@ static bool dcpext_adt_is(int node, const char *prop, const char *want)
  * its own state reads. A device at the top is off when it is power-gated, targeted so and not
  * under automatic power management. On the T8132 an external processor's clock-gate is its CPU
  * domain, under its pipe's FE and SYS domains: its CPU being off says nothing of the pipe, which
- * may still scan out and walk its DART. Read only, guarded; what cannot be resolved or read is not
- * off.
+ * may still scan out and walk its DART. So a processor's own clock-gate (depth 0) with no physical
+ * device above it is not off: nothing tells its pipe's power (dcpext_powered() asks the same).
+ * Read only, guarded; what cannot be resolved or read is not off.
  */
 static bool dcpext_chain_off(const struct pmgr_gate *g, int depth)
 {
@@ -3563,6 +3564,8 @@ static bool dcpext_chain_off(const struct pmgr_gate *g, int depth)
     }
     if (above)
         return true; /* under devices that are off */
+    if (!depth)
+        return false; /* a processor with no pipe domain above it: its pipe may run */
     int guard = dcp6_guard_begin();
     u32 ps = read32(g->psreg);
     if (dcp6_guard_end(guard))
@@ -3574,8 +3577,9 @@ static bool dcpext_chain_off(const struct pmgr_gate *g, int depth)
 
 /*
  * /arm-io/<name> provably does not run, nor its pipe: it has ADT clock-gates and each of them is
- * off with everything above it (dcpext_chain_off()). Without clock-gates, or with one that is on
- * or cannot be read, it may.
+ * under physical PMGR devices (its pipe's domains) and off with everything above it
+ * (dcpext_chain_off()). Without clock-gates, with one that has no physical device above it, or
+ * with one that is on or cannot be read, it may.
  */
 static bool dcpext_not_running(const char *name)
 {

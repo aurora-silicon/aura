@@ -730,6 +730,7 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-no-adt-node-kept", "J713: dcpext1's DT address matches no ADT processor: ADT one kept"},
     {"j773g-refused-kept", "J773g: disp0's DART unlocked, nothing handed over: both kept"},
     {"j713-pipe-left-on", "J713: DISPEXT1_CPU off, its FE and SYS on: no boot"},
+    {"j713-cpu-off-no-parent", "J713: DISPEXT1_CPU off with no PMGR parent, its pipe live: no boot"},
     {"j713-keep-overlap", "J713: a dcpext1 heap page in a mappable reservation: no boot"},
     {"j713-keep-fault-peer", "J713: dcpext1's DART faults: dcpext0's pages kept, no boot"},
     {"j713-incomplete-ready", "J713: internal incomplete, the input tree promises both: withdrawn"},
@@ -772,6 +773,7 @@ static const char *const t8132_no_boot[] = {
     "j713-auto-off-kept",    /* DARTs not readable */
     "j713-no-adt-node-kept", /* no ADT pipe holds dcpext1 */
     "j713-pipe-left-on",
+    "j713-cpu-off-no-parent", /* CPU off, nothing tells its pipe's power: the pipe may run */
     "j713-keep-overlap",
     "j713-keep-fault-peer",
     "j713-two-pipes", /* its pipe, and so its pipe's DART, is not known */
@@ -1214,6 +1216,19 @@ int main(int argc, char **argv)
         region_of(ext_dart[1])->base = 0x7e0000000ULL;
         region_of(pipe_dart[1])->base = 0x7e0100000ULL;
     }
+    if (is(s, "j713-cpu-off-no-parent")) {
+        /*
+         * The PMGR table gives the off CPU domain no parent: its pipe's FE and SYS are on and its
+         * DARTs answer, the pipe's stream 16 translating through a root in usable RAM
+         */
+        u16 cpu = pm_sys(1) + 2;
+        ext_segs_in_ram(1);
+        ext_tables_in_ram(1);
+        poke32(ps_reg(cpu), 0x0);
+        for (int i = 0; i < nfdevs; i++)
+            if (fdevs[i].id == cpu)
+                fdevs[i].parent[0] = fdevs[i].parent[1] = 0;
+    }
     if (is(s, "j713-keep-overlap") || is(s, "j713-keep-fault-peer") ||
         is(s, "j713-incomplete-ready") || is(s, "j713-early-exit-ready")) {
         for (int i = 0; i < 2; i++) {
@@ -1466,7 +1481,7 @@ int main(int argc, char **argv)
             check_internal_untouched(in, dt);
         else
             check_display(in, dt, false);
-    } else if (is(s, "j713-pipe-left-on")) {
+    } else if (is(s, "j713-pipe-left-on") || is(s, "j713-cpu-off-no-parent")) {
         check(!exc_count, "no DART of the processor is read (%d faults)", exc_count);
         check(ext_untouched(in, dt, 1), "dcpext1 is not published");
         check(ext_segs_kept(dt, 1) && !resv_tables(dt),

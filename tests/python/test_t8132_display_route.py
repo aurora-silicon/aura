@@ -327,8 +327,9 @@ static bool has(const char *s, const char *part)
 /* The boots that must not start the OS: memory a processor may still use cannot all be kept */
 static bool stage1_no_boot(const char *s)
 {
-    return is(s, "fw27-overlap") || is(s, "fw27-pipe-left-on") || is(s, "fw27-power-unknown") ||
-           is(s, "fw27-pmgr-faults") || is(s, "fw27-no-clock-gates") || is(s, "fw27-dart-faults") ||
+    return is(s, "fw27-overlap") || is(s, "fw27-pipe-left-on") || is(s, "fw27-cpu-off-no-parent") ||
+           is(s, "fw27-power-unknown") || is(s, "fw27-pmgr-faults") ||
+           is(s, "fw27-no-clock-gates") || is(s, "fw27-dart-faults") ||
            is(s, "fw27-refused-dt-full") || has(s, "-no-mappers");
 }
 
@@ -448,6 +449,18 @@ int main(int argc, char **argv)
             region_of(ext_dart[i])->base = 0x7e0000000ULL + 0x200000ULL * i;
             region_of(pipe_dart[i])->base = 0x7e0100000ULL + 0x200000ULL * i;
         }
+    if (is(s, "fw27-cpu-off-no-parent"))
+        /*
+         * Both CPUs are off and the PMGR table gives them no parent: their pipes' FE and SYS are
+         * on and their DARTs answer, translating through tables in the OS's RAM
+         */
+        for (int i = 0; i < 2; i++) {
+            u16 cpu = pm_sys(i) + 2;
+            poke32(ps_reg(cpu), 0x0);
+            for (int k = 0; k < nfdevs; k++)
+                if (fdevs[k].id == cpu)
+                    fdevs[k].parent[0] = fdevs[k].parent[1] = 0;
+        }
     if (is(s, "fw27-power-unknown"))
         poke32(ps_reg(pm_sys(1) + 2), 0x44); /* clock-gated, targeted so: neither on nor off */
     if (is(s, "fw27-pmgr-faults"))
@@ -563,17 +576,17 @@ int main(int argc, char **argv)
     if (stage1_no_boot(s)) {
         expect(ret == -1, "the route refuses: no boot");
         /* What can be kept is kept all the same */
-        if (runs[0] && !has(s, "-dt-full") && !is(s, "fw27-pipe-left-on"))
+        bool cpu_off = is(s, "fw27-pipe-left-on") || is(s, "fw27-cpu-off-no-parent");
+        if (runs[0] && !has(s, "-dt-full") && !cpu_off)
             expect(segs_kept(0, 0) && ext_tables_kept(dt, 0), "dcpext0's memory is kept");
-        if (is(s, "fw27-pipe-left-on"))
+        if (cpu_off)
             expect(segs_kept(0, 0) && !resv_tables(dt),
                    "dcpext0's segments are kept; no DART is read, with only its CPU off");
         if (is(s, "fw27-overlap"))
             expect(segs_kept(1, seg_in_ram(1, 3) + 0x4000) &&
                        !page_kept(seg_in_ram(1, 3) + 0x4000) && ext_tables_kept(dt, 1),
                    "dcpext1's tables and every firmware page but the mappable one are kept");
-        if (is(s, "fw27-pipe-left-on") || is(s, "fw27-power-unknown") ||
-            is(s, "fw27-no-clock-gates"))
+        if (cpu_off || is(s, "fw27-power-unknown") || is(s, "fw27-no-clock-gates"))
             expect(segs_kept(1, 0) && !resv_page(dt, RAM_TABLES + 0x10000) &&
                        !resv_page(dt, RAM_TABLES + 0x18000),
                    "dcpext1's segments are kept; its DARTs are not read");
@@ -625,13 +638,15 @@ FDT_SCENARIOS = [
     # running, and some of their memory cannot be kept: no boot
     "fw27-overlap", "fw27-pipe-left-on", "fw27-power-unknown", "fw27-pmgr-faults",
     "fw27-no-clock-gates", "fw27-dart-faults", "fw27-refused-dt-full",
+    # their CPUs off, with no PMGR parent to tell their pipes' power: no boot
+    "fw27-cpu-off-no-parent",
     # the ADT names no DART for a running processor's pipe (or the processor): no boot
     "fw27-pipe-no-mappers", "fw27-no-dt-ext-pipe-no-mappers", "fw27-ext-no-mappers",
     # iBoot left them off: a Stage 1 boots, promising and keeping nothing
     "fw27-off", "fw27-refused-off", "fw27-no-alias-off", "fw27-prepopulated-off",
 ]
-NO_BOOT = {"fw27-overlap", "fw27-pipe-left-on", "fw27-power-unknown", "fw27-pmgr-faults",
-           "fw27-no-clock-gates", "fw27-dart-faults", "fw27-refused-dt-full",
+NO_BOOT = {"fw27-overlap", "fw27-pipe-left-on", "fw27-cpu-off-no-parent", "fw27-power-unknown",
+           "fw27-pmgr-faults", "fw27-no-clock-gates", "fw27-dart-faults", "fw27-refused-dt-full",
            "fw27-pipe-no-mappers", "fw27-no-dt-ext-pipe-no-mappers", "fw27-ext-no-mappers"}
 BOARDS = {"j713": "J713_DTB", "j773g": "J773G_DTB"}
 
