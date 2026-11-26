@@ -3424,8 +3424,8 @@ static const struct {
     bool ext; /* also hand off the external display engines running this image */
 } t6050_images[] = {
     {V27_0, "64863924-B56B-3E32-87FE-038677F52709", true},
-    /* K116s (16" M5 Pro, OLED), 26B8125: the internal panel only */
-    {V27_2, "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E", false},
+    /* K116s (16" M5 Pro, OLED), 26B8125 */
+    {V27_2, "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E", true},
     /* J775c (Mac Studio M5 Max) on 27.2 (26B123): its own DCP image, measured on that
      * machine; the image id is not shared across T6050 boards, so the rows pair with the
      * image the ADT reports below. The J775D's (M5 Ultra) dcpext engines run it too */

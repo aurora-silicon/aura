@@ -530,7 +530,7 @@ static int panel(int argc, char **argv)
     u8 agent[24] = {1, 0, 3};
     u32 fn[3] = {0x77, 0, 0x2a5}, clock = 256 + 7, freq[8] = {0};
 
-    prop(DCP6_NUB, "uuid", image(false), 37);
+    prop(DCP6_NUB, "uuid", image(true), 37);
     prop_u32(DCP6_NUB, "running", 1);
     segments(DCP6_NUB, vram, (u32)vram_size == vram_size ? vram_size : 0);
     reg("/arm-io/dcp", 0, COPROC, 0x4000);
