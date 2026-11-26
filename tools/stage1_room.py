@@ -15,7 +15,11 @@ the last few KiB fails in CI before a distribution's toolchain trips over it:
 
 The headroom is the data room while that is 64 KiB or more, else the smallest of all four.
 
-  tools/stage1_room.py build/aura-raw.elf [--min BYTES] [--nm NM]
+It also checks which code the build links, from the same symbol read: --forbid SYM fails a build
+that links SYM (a Stage 1 that links code built into the ESP Stage 2 only), --require SYM one that
+does not. The ESP Stage 2 is measured the same way: aura-raw.ld links it below the same limit.
+
+  tools/stage1_room.py build/aura-raw.elf [--min BYTES] [--nm NM] [--forbid SYM] [--require SYM]
 """
 
 import argparse
@@ -40,16 +44,27 @@ def find_nm(arg):
 
 
 def read_symbols(elf, nm):
+    """The layout symbols' addresses, and the names of every symbol the link defines."""
     out = subprocess.run(nm.split() + [elf], check=True, capture_output=True, text=True).stdout
-    syms = {}
+    syms, names = {}, set()
     for line in out.splitlines():
         f = line.split()
-        if len(f) >= 3 and f[-1] in SYMBOLS + OPTIONAL:
+        if len(f) < 3:
+            continue
+        names.add(f[-1])
+        if f[-1] in SYMBOLS + OPTIONAL:
             syms[f[-1]] = int(f[0], 16)
     missing = [s for s in SYMBOLS if s not in syms]
     if missing:
         sys.exit(f"stage1_room: {elf} has no {', '.join(missing)}: not an aura-raw.ld link")
-    return syms
+    return syms, names
+
+
+def symbol_problems(names, forbid=(), require=()):
+    """What a link that defines the symbols `names` gets wrong: a --forbid symbol it links, a
+    --require symbol it does not."""
+    return ([f"links {s}, which it must not" for s in forbid if s in names] +
+            [f"does not link {s}" for s in require if s not in names])
 
 
 def to_step(addr):
@@ -76,18 +91,26 @@ def main():
     ap.add_argument("--min", type=int, default=0, help="fail when the headroom is below this")
     ap.add_argument("--nm", help="nm to use (default: $NM, llvm-nm, aarch64-linux-gnu-nm, nm)")
     ap.add_argument("--label", default="", help="name printed with the result")
+    ap.add_argument("--forbid", action="append", default=[], metavar="SYM",
+                    help="fail if the link has this symbol (repeatable)")
+    ap.add_argument("--require", action="append", default=[], metavar="SYM",
+                    help="fail if the link does not have this symbol (repeatable)")
     args = ap.parse_args()
 
-    syms = read_symbols(args.elf, find_nm(args.nm))
+    syms, names = read_symbols(args.elf, find_nm(args.nm))
     r, headroom = room(syms)
     label = f"{args.label}: " if args.label else ""
     print(f"{label}_file_vital_end {syms['_file_vital_end']:#x} of {FILE_LIMIT:#x}; room " +
           ", ".join(f"{k} {v}" for k, v in r.items()) + f"; headroom {headroom} B")
+    status = 0
     if headroom < args.min:
-        print(f"{label}headroom {headroom} B is below {args.min} B: this Stage 1 is about to "
+        print(f"{label}headroom {headroom} B is below {args.min} B: this image is about to "
               "reach the DCP log buffer (aura-raw.ld)", file=sys.stderr)
-        return 1
-    return 0
+        status = 1
+    for problem in symbol_problems(names, args.forbid, args.require):
+        print(f"{label}{problem}", file=sys.stderr)
+        status = 1
+    return status
 
 
 if __name__ == "__main__":
