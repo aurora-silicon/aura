@@ -8,6 +8,7 @@
 void wdt_disable(void);
 void wdt_reboot(void);
 int wdt_arm_seconds(unsigned seconds);
+bool wdt_simple_reconfig_reg(u64 *primary_out, u64 *reconfig_out);
 
 /* wdt_s2r_guard_enter(): the primary watchdog as read, and whether it was borrowed */
 struct wdt_guard {
