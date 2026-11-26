@@ -18,6 +18,8 @@ MAKE=${MAKE:-make}
 PYTHON=${PYTHON:-python3}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}
 WARN=${WARN:-8192}
+# Built into the ESP Stage 2 only (ESP_STAGE2): a Stage 1 that links one of these fails.
+STAGE2_ONLY='dt_set_dcpext_handoff'
 status=0
 
 check() {
@@ -39,6 +41,12 @@ check() {
 		# A GitHub Actions annotation; plain text elsewhere.
 		echo "::warning::$label $name: Stage 1 headroom is below $WARN B"
 	fi
+	for sym in $STAGE2_ONLY; do
+		if ${NM:-nm} build/aura-raw.elf | grep -q " $sym\$"; then
+			echo "$label $name: links $sym, which is built into the ESP Stage 2 only"
+			[ "$required" = yes ] && status=1
+		fi
+	done
 }
 
 # The Stage 1 that ships (dev flavour, no signature checks): fails below 4 KiB of headroom, and

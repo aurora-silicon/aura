@@ -56,6 +56,8 @@ jobs:
         run: |
           gmake clean
           gmake -j3 RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1 BUILTIN_LOGO=aurora
+          # It carries the code Stage 1 must not link (STAGE2_ONLY in tools/stage1_size.sh).
+          "$(brew --prefix llvm)/bin/llvm-nm" build/aura-raw.elf | grep -q ' dt_set_dcpext_handoff$'
 
   fedora:
     # As fedora-aurora's aura.spec builds it: Fedora clang and Rust, core built from rust-src.
