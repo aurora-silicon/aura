@@ -4987,6 +4987,8 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
     return dt_reserve_asc_segments(adt_path, adt_path_alt, fdt_path, remap, base, false);
 }
 
+/* Stage 2 only: the OS is booted from Stage 2, and Stage 1 must stay below the DCP log buffer */
+#if !defined(CHAINLOADING) || defined(ESP_STAGE2)
 /*
  * iBoot puts the __OS_LOG segment (segment-ranges flags 0xa) of a coprocessor it loads in DRAM it
  * then gives the OS, and a coprocessor it leaves running keeps writing it. A driver that takes its
@@ -5095,6 +5097,7 @@ static void dt_reserve_coprocessor_oslogs(void)
     else if (total)
         printf("FDT: reserved %d coprocessor __OS_LOG segment(s) no hand-off had\n", total);
 }
+#endif
 
 /*
  * The AVE video encoders run firmware that iBoot preloads, each its own copy. The ADT calls an
@@ -14334,8 +14337,10 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_t6040_sleep_dcpext())
         return -1;
     dt_set_t6050_sleep();
+#if !defined(CHAINLOADING) || defined(ESP_STAGE2)
     /* After every hand-off has reserved its coprocessor's segments */
     dt_reserve_coprocessor_oslogs();
+#endif
 #ifndef RELEASE
     if (dt_transfer_virtios())
         return 1;
