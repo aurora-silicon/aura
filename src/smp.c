@@ -535,6 +535,8 @@ u64 smp_s2r_publish(void)
     s2r_mailbox.resume_pa = 0;
     s2r_mailbox.resumes = 0;
     dc_cvac_range(&s2r_mailbox, sizeof(s2r_mailbox));
+    dc_cvac_range((void *)_base, _rodata_end - (char *)_base);
+    dc_cvac_range((void *)_data_start, _bss_end - _data_start);
     sysop("dsb sy");
     return (u64)&s2r_mailbox;
 }

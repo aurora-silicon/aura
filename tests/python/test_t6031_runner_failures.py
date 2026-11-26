@@ -13,6 +13,8 @@ import sys
 
 import pytest
 
+from host_compiler import display_handoff_sources
+
 
 REPO = Path(__file__).resolve().parents[2]
 HANDOFF = Path(os.environ.get("AURA_T6031_HANDOFF_RUNNER_SOURCE",
@@ -65,6 +67,8 @@ def runner(tmp_path):
         (tree / directory).mkdir(parents=True, exist_ok=True)
     for name, source in (("handoff", HANDOFF), ("unchanged", UNCHANGED)):
         (tree / f"tests/run-t6031-{name}.sh").write_bytes(source.read_bytes())
+    (tree / "tests/display-handoff-sources.txt").write_bytes(
+        (REPO / "tests/display-handoff-sources.txt").read_bytes())
     (tree / "rust/src/adt.rs").write_text("// from_raw_parts(self.name.as_ptr() as *const u8, 32)\n")
     (tree / "src/kboot.c").write_text("""
 static int dt_fill_pmp_from_node(void) { return 0;
@@ -80,9 +84,9 @@ static int dt_set_pmp_t6031(void) { return 0;
 static const struct pmp_values_soc pmp_values_t6031 = {
 };
 """)
-    for name in ("kboot_display_handoff.c", "kboot_gpu.c", "kboot_gpu26.c",
-                 "kboot_gpu_t6031.c", "kboot_gpu_t8122_power.c", "kboot_t6031.c",
-                 "firmware.c", "pmgr.c"):
+    for name in (*display_handoff_sources(REPO), "kboot_gpu.c",
+                 "kboot_gpu26.c", "kboot_gpu_t6031.c", "kboot_gpu_t8122_power.c",
+                 "kboot_t6031.c", "firmware.c", "pmgr.c"):
         (tree / "src" / name).write_text("/* synthetic input */\n")
     for name in ("t6031_host", "g15_host", "t8122_display_host"):
         (tree / "tests" / name / "stub.h").write_text("/* synthetic header */\n")
