@@ -15,6 +15,8 @@ int pcie_shutdown(void);
 int pcie_t6050_init(void);
 /* Disable an untrained optional port's root port and DART in the handed-over tree */
 int pcie_t6050_handoff_fdt(void *dt);
+/* The ADT's link speed for a root port's bridge node (pcie.c): 0, or -1 when it sets none */
+int pcie_adt_link_speed(int bridge, u32 *speed);
 int pcie_ans_power_off(void);
 /* Back on after pcie_ans_power_off(), CPU stopped */
 int pcie_ans_power_on(void);

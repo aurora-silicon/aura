@@ -117,6 +117,7 @@
 #include "adt.h"
 #include "exception.h"
 #include "firmware.h"
+#include "kboot_display_routes.h"
 #include "malloc.h"
 #include "mcc.h"
 #include "pmgr.h"
@@ -4999,7 +5000,32 @@ static T6050_TEXT bool t6050_pick_image(const char *uuid, u32 len)
     return false;
 }
 
-/* The ADT side: firmware, VRAM and segments, bandwidth agent, clocks, panel */
+/*
+ * The scratch offset of the PMGR bandwidth requester that `disp`'s bw_req interrupt names (ADT
+ * /arm-io/pmgr bwr-agent), or 0; if `die` is non-NULL, *die is that interrupt's die.
+ */
+static T6050_TEXT u32 t6050_bw_agent(const char *disp, u32 *die)
+{
+    u32 len = 0, val = 0, fn[3];
+    int node = adt_path_offset(adt, disp), pmgr = adt_path_offset(adt, "/arm-io/pmgr");
+    const u8 *agents = pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "bwr-agent", &len);
+    if (!agents || node < 0 || dcp6_adt_u32(pmgr, "AAPL,phandle", &val) ||
+        adt_getprop_copy(adt, node, "function-bw_req_interrupt0", fn, sizeof(fn)) != sizeof(fn) ||
+        fn[0] != val)
+        return 0;
+    for (u32 off = 0; off + 24 <= len; off += 24) {
+        u32 birq;
+        memcpy(&birq, agents + off + 4, sizeof(birq));
+        if (agents[off] == 1 && birq == fn[2]) {
+            if (die)
+                *die = birq >> 28;
+            return T6050_BW_BASE + agents[off + 2] * T6050_BW_STRIDE;
+        }
+    }
+    return 0;
+}
+
+/* The ADT side: firmware, VRAM and segments, bandwidth scratch, clocks, panel */
 static T6050_INIT int t6050_check_adt(void)
 {
     u32 len = 0, val = 0;
@@ -5033,24 +5059,13 @@ static T6050_INIT int t6050_check_adt(void)
     if (!vram_seg)
         bail("/vram is not a DCP segment\n");
 
-    /* The scratch of the PMGR bandwidth agent disp0's bw_req interrupt names */
-    u32 fn[3];
-    int pmgr = adt_path_offset(adt, "/arm-io/pmgr");
-    const u8 *agents = pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "bwr-agent", &len);
+    /* The scratch of the PMGR bandwidth requester disp0's bw_req interrupt names */
     if (t6050_adt_reg("/arm-io/dcp", 0, &t6050.coproc, NULL) ||
-        t6050_adt_reg("/arm-io/disp0", 4, &t6050.pmc, &t6050.pmc_size) || t6050.pmc_size < 4 ||
-        !agents || dcp6_adt_u32(pmgr, "AAPL,phandle", &val) ||
-        adt_getprop_copy(adt, disp0, "function-bw_req_interrupt0", fn, sizeof(fn)) != sizeof(fn) ||
-        fn[0] != val)
-        bail("no dcp registers, PMC metadata or PMGR bandwidth interrupt\n");
-    for (u32 off = 0; off + 24 <= len && !t6050.bw_offset; off += 24) {
-        u32 birq;
-        memcpy(&birq, agents + off + 4, sizeof(birq));
-        if (agents[off] == 1 && birq == fn[2])
-            t6050.bw_offset = T6050_BW_BASE + agents[off + 2] * T6050_BW_STRIDE;
-    }
+        t6050_adt_reg("/arm-io/disp0", 4, &t6050.pmc, &t6050.pmc_size) || t6050.pmc_size < 4)
+        bail("no dcp registers or PMC metadata\n");
+    t6050.bw_offset = t6050_bw_agent("/arm-io/disp0", NULL);
     if (!t6050_bw_valid(t6050.bw_offset, t6050.pmc_size))
-        bail("no bandwidth agent scratch for BIRQ 0x%x\n", fn[2]);
+        bail("no bandwidth scratch for disp0\n");
 
     /* The firmware's clocks: clock-ids index /arm-io clock-frequencies from 256 */
     int arm = adt_path_offset(adt, "/arm-io");
@@ -5245,46 +5260,13 @@ static T6050_TEXT int t6050_publish(void *dt)
 
 /*
  * Headless, the device tree keeps what an engine's output needs disabled until that engine is
- * handed off. A Type-C route (typec-routes: dcpext0's on J775D): the PHYs (phys) with their
- * mailboxes and the crossbar (mux-controls), each with its power domains, and the HPM its route@0
- * endpoint leads to, with the bus it sits on. A fixed route (die 1's dcpext4, the HDMI port): the
- * PHY with its power domains, and the GPIO controllers of the converter's hotplug input and power
- * enables. The walk finds the first of them still disabled, or with `all` checks the whole route.
+ * handed off. A Type-C route (typec-routes): the PHYs (phys) with their mailboxes and the
+ * crossbars (mux-controls), each with its power domains, and the HPM each route's endpoint leads
+ * to, with the bus it sits on. A fixed route (die 1's dcpext4, the HDMI port): the PHY with its
+ * power domains, and the GPIO controllers of the converter's hotplug input and power enables.
+ * The walk finds the first of them still disabled, or with `all` checks the whole route.
  */
-enum { T6050_ROUTE_DONE = -1, T6050_ROUTE_BAD = -2 };
-
-static T6050_TEXT int t6050_route_refs(void *dt, int node, const char *prop, const char *cells,
-                                       int depth, bool all);
-
-/* `target`, then its power domains */
-static T6050_TEXT int t6050_route_node(void *dt, int target, int depth, bool all)
-{
-    const char *status = target < 0 ? NULL : fdt_getprop(dt, target, "status", NULL);
-    if (target < 0 || depth > 4)
-        return T6050_ROUTE_BAD;
-    if (!all && status && !strcmp(status, "disabled"))
-        return target;
-    return t6050_route_refs(dt, target, "power-domains", "#power-domain-cells", depth + 1, all);
-}
-
-/* Each target of a phandle list, its arguments counted by the target's `cells` property */
-static T6050_TEXT int t6050_route_refs(void *dt, int node, const char *prop, const char *cells,
-                                       int depth, bool all)
-{
-    int len;
-    const fdt32_t *v = fdt_getprop(dt, node, prop, &len);
-    for (int i = 0; v && i < len / 4;) {
-        int target = fdt_node_offset_by_phandle(dt, fdt32_ld(&v[i]));
-        const fdt32_t *n = target < 0 ? NULL : fdt_getprop(dt, target, cells, NULL);
-        int r = t6050_route_node(dt, target, depth, all);
-        if (r != T6050_ROUTE_DONE)
-            return r;
-        i += 1 + (n ? fdt32_ld(n) : 0);
-        if (i > len / 4)
-            return T6050_ROUTE_BAD;
-    }
-    return T6050_ROUTE_DONE;
-}
+enum { T6050_ROUTE_DONE = DCP_TYPEC_ROUTE_DONE, T6050_ROUTE_BAD = DCP_TYPEC_ROUTE_BAD };
 
 static T6050_TEXT int t6050_route_next(void *dt, int node, bool all)
 {
@@ -5295,45 +5277,62 @@ static T6050_TEXT int t6050_route_next(void *dt, int node, bool all)
 
     if (!phys)
         return T6050_ROUTE_DONE;
-    r = t6050_route_refs(dt, node, "phys", "#phy-cells", 0, all);
+    r = dcp_typec_route_refs(dt, node, "phys", "#phy-cells", 0, all);
     for (size_t i = 0; ep < 0 && r == T6050_ROUTE_DONE && i < ARRAY_SIZE(gpios); i++)
-        r = t6050_route_refs(dt, node, gpios[i], "#gpio-cells", 0, all);
+        r = dcp_typec_route_refs(dt, node, gpios[i], "#gpio-cells", 0, all);
     if (ep < 0 || r != T6050_ROUTE_DONE)
         return r;
-    r = t6050_route_refs(dt, node, "mux-controls", "#mux-control-cells", 0, all);
+    r = dcp_typec_route_refs(dt, node, "mux-controls", "#mux-control-cells", 0, all);
     for (int i = 0; r == T6050_ROUTE_DONE && i < len / 4; i++) {
         int phy = fdt_node_offset_by_phandle(dt, fdt32_ld(&phys[i]));
         const fdt32_t *n = phy < 0 ? NULL : fdt_getprop(dt, phy, "#phy-cells", NULL);
-        r = phy < 0 ? T6050_ROUTE_BAD : t6050_route_refs(dt, phy, "mboxes", "#mbox-cells", 0, all);
+        r = phy < 0 ? T6050_ROUTE_BAD
+                    : dcp_typec_route_refs(dt, phy, "mboxes", "#mbox-cells", 0, all);
         i += n ? fdt32_ld(n) : 0;
     }
     if (r != T6050_ROUTE_DONE)
         return r;
 
-    static const char *const hops[] = {"route@0", "port", "endpoint"};
-    for (size_t i = 0; ep >= 0 && i < ARRAY_SIZE(hops); i++)
-        ep = fdt_subnode_offset(dt, ep, hops[i]);
-    const fdt32_t *remote = ep < 0 ? NULL : fdt_getprop(dt, ep, "remote-endpoint", NULL);
-    int hpm = remote ? fdt_node_offset_by_phandle(dt, fdt32_ld(remote)) : -1;
-    for (int up = 0; hpm >= 0 && up < 5 && fdt_node_check_compatible(dt, hpm, "apple,sn201202x");
-         up++)
-        hpm = fdt_parent_offset(dt, hpm);
-    if (hpm < 0 || fdt_node_check_compatible(dt, hpm, "apple,sn201202x"))
-        return T6050_ROUTE_BAD;
-    r = t6050_route_node(dt, hpm, 0, all);
-    return r == T6050_ROUTE_DONE ? t6050_route_node(dt, fdt_parent_offset(dt, hpm), 0, all) : r;
+    /* Every route's PD controller, and the bus it sits on */
+    int rt, routes = 0;
+    fdt_for_each_subnode(rt, dt, ep)
+    {
+        const char *status = fdt_getprop(dt, rt, "status", NULL);
+        if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+            continue;
+        int e = fdt_subnode_offset(dt, rt, "port");
+        e = e < 0 ? e : fdt_subnode_offset(dt, e, "endpoint");
+        const fdt32_t *remote = e < 0 ? NULL : fdt_getprop(dt, e, "remote-endpoint", NULL);
+        int rnode = remote ? fdt_node_offset_by_phandle(dt, fdt32_ld(remote)) : -1;
+        int hpm = dcp_typec_route_controller(dt, rnode);
+        if (hpm < 0)
+            return T6050_ROUTE_BAD;
+        r = dcp_typec_route_node(dt, hpm, 0, all);
+        if (r == T6050_ROUTE_DONE)
+            r = dcp_typec_route_node(dt, fdt_parent_offset(dt, hpm), 0, all);
+        if (r != T6050_ROUTE_DONE)
+            return r;
+        routes++;
+    }
+    return routes ? T6050_ROUTE_DONE : T6050_ROUTE_BAD;
 }
 
-/* Enable an engine's route, node by node (each write moves the offsets); one not fully described
- * is left disabled */
+/*
+ * Enable an engine's routes, node by node (each write moves the offsets); routes not fully
+ * described are left disabled. Each step enables one disabled node, so the tree's node count
+ * bounds the walk.
+ */
 static T6050_TEXT int t6050_route(void *dt, const char *path, int n)
 {
-    int count = 0, r = t6050_route_next(dt, kboot_fdt_path_exact(dt, path), true);
+    int count = 0, nodes = 0, r = t6050_route_next(dt, kboot_fdt_path_exact(dt, path), true);
     if (r == T6050_ROUTE_BAD) {
         dlog("dcpext%d: its route is not fully described: handed off without it\n", n);
         return 0;
     }
-    while ((r = t6050_route_next(dt, kboot_fdt_path_exact(dt, path), false)) >= 0 && count < 16) {
+    for (int o = fdt_next_node(dt, -1, NULL); o >= 0; o = fdt_next_node(dt, o, NULL))
+        nodes++;
+    while ((r = t6050_route_next(dt, kboot_fdt_path_exact(dt, path), false)) >= 0 &&
+           count < nodes) {
         if (fdt_setprop_string(dt, r, "status", "okay"))
             return -1;
         count++;
@@ -5370,7 +5369,7 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
 {
     char a[40], b[40];
     u64 coproc, base[2], l1, cnt, vm_base, vm_size;
-    u32 len = 0, val = 0, fn[3];
+    u32 len = 0, val = 0;
     int node = -1, dart[2];
 
     snprintf(a, sizeof(a), "/arm-io/dcpext%d/iop-dcpext%d-nub", n, n);
@@ -5434,11 +5433,16 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
 
     /* Its bandwidth agent: the one dispextN's bw_req interrupt names */
     snprintf(b, sizeof(b), "/arm-io/dispext%d", n);
-    u32 bw = 0;
+    u32 die = 0, bw = 0, agent = t6050_bw_agent(b, &die);
     int pmc = -1;
     fdt32_t v[4] = {0};
     if (t6050.headless) {
-        /* No panel's PMC node: the scratch the node names, in the PMC metadata of dispextN */
+        /*
+         * No panel's PMC node: the scratch the node names, in the PMC metadata of dispextN, at
+         * the ADT's bandwidth agent. Agents are numbered across both dies; how a die-1 agent's
+         * number maps into its die's PMC metadata is not known yet, so a die-1 engine keeps
+         * the offset its node names.
+         */
         u64 meta, meta_size;
         const fdt32_t *s = fdt_getprop(dt, node, "apple,bw-scratch", (int *)&len);
         if (s && len == sizeof(v)) {
@@ -5447,22 +5451,20 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
         }
         const fdt64_t *r = pmc < 0 ? NULL : fdt_getprop(dt, pmc, "reg", (int *)&len);
         bw = fdt32_ld(&v[3]);
+        if (agent && !die) {
+            if (bw && bw != agent)
+                dlog("dcpext%d: apple,bw-scratch names 0x%x, the ADT's agent is at 0x%x: the "
+                     "ADT's is used\n",
+                     n, bw, agent);
+            bw = agent;
+            v[3] = cpu_to_fdt32(bw);
+        }
         if (!r || len != 16 || t6050_adt_reg(b, 4, &meta, &meta_size) || fdt64_ld(&r[0]) != meta ||
             fdt64_ld(&r[1]) != meta_size || fdt32_ld(&v[1]) || fdt32_ld(&v[2]) != T6050_NDISP ||
             !t6050_bw_valid(bw, meta_size))
             bail("dcpext%d: apple,bw-scratch is not in %s's PMC metadata\n", n, b);
     } else {
-        int disp = adt_path_offset(adt, b), pmgr = adt_path_offset(adt, "/arm-io/pmgr");
-        const u8 *agents = pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "bwr-agent", &len);
-        if (!agents || disp < 0 ||
-            adt_getprop_copy(adt, disp, "function-bw_req_interrupt0", fn, sizeof(fn)) != sizeof(fn))
-            bail("dcpext%d: no bandwidth interrupt\n", n);
-        for (u32 off = 0; off + 24 <= len && !bw; off += 24) {
-            u32 birq;
-            memcpy(&birq, agents + off + 4, sizeof(birq));
-            if (agents[off] == 1 && birq == fn[2])
-                bw = T6050_BW_BASE + agents[off + 2] * T6050_BW_STRIDE;
-        }
+        bw = agent;
         v[0] = cpu_to_fdt32(t6050.pmc_ph);
         v[1] = 0;
         v[2] = cpu_to_fdt32(T6050_NDISP);
@@ -5508,7 +5510,11 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
     for (int i = 0; i < ntargets; i++)
         if (fdt_setprop_string(dt, kboot_fdt_path_exact(dt, path[i]), "status", "okay"))
             return -1;
-    if (t6050.headless && t6050_route(dt, path[0], n))
+    /* The Type-C display routes the tree asks for (an empty typec-routes), from the ADT */
+    int routes = kboot_dcp_typec_routes(dt, path[0], a);
+    if (routes < 0)
+        return -1;
+    if ((t6050.headless || routes) && t6050_route(dt, path[0], n))
         return -1;
     dlog("dcpext%d handed off: bw-scratch 0x%x\n", n, bw);
     return 0;

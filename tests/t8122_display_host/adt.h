@@ -27,12 +27,14 @@ int adt_get_child_count(const void *adt, int offset);
 int adt_first_child_offset(const void *adt, int offset);
 int adt_next_sibling_offset(const void *adt, int offset);
 const char *adt_get_name(const void *adt, int nodeoffset);
+int host_adt_nprops(int node);
+const struct adt_property *host_adt_prop(int node, int i);
+#define ADT_GETPROP(adt, nodeoffset, name, val)                                                    \
+    adt_getprop_copy(adt, nodeoffset, name, (val), sizeof(*(val)))
 #define ADT_FOREACH_CHILD(adt, node)                                                               \
     for (int _child_count = adt_get_child_count(adt, node); _child_count; _child_count = 0)        \
         for (node = adt_first_child_offset(adt, node); _child_count--;                             \
              node = adt_next_sibling_offset(adt, node))
-int host_adt_nprops(int node);
-const struct adt_property *host_adt_prop(int node, int i);
 #define ADT_FOREACH_PROPERTY(adt, node, prop)                                                      \
     for (int _pi = 0; _pi < host_adt_nprops(node); _pi++)                                          \
         for (const struct adt_property *prop = host_adt_prop(node, _pi); prop; prop = NULL)

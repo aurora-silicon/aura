@@ -23,7 +23,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from host_compiler import host_cc
+from host_compiler import display_handoff_sources, host_cc
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -681,16 +681,21 @@ def stage1_fdt(tmp_path_factory):
         shutil.copy(ROOT / "tests" / name, src)
     for header in (ROOT / "tests/t8122_display_host").glob("*.h"):
         shutil.copy(header, src)
-    shutil.copy(ROOT / "src/kboot_display_handoff.c", src)
+    handoff_srcs = display_handoff_sources(ROOT)
+    for name in handoff_srcs:
+        shutil.copy(ROOT / "src" / name, src)
+        hdr = ROOT / "src" / name.replace(".c", ".h")
+        if hdr.exists():
+            shutil.copy(hdr, src)
     (src / "stage1_route_host.c").write_text(stage1_fdt_source())
     binary = tmp / "stage1-fdt"
-    # A Stage 1: kboot_display_handoff.c without ESP_STAGE2
+    # A Stage 1: the display handoff sources without ESP_STAGE2
     subprocess.run(
         [*cc, "-std=gnu11", "-D_GNU_SOURCE", "-O1", "-g", "-Wall", "-Wno-unused-function",
          "-Wno-format", "-Wno-format-truncation", "-fsanitize=address,undefined",
          "-fno-omit-frame-pointer", "-fno-sanitize-recover=undefined", "-DCHAINLOADING",
          "-I", str(src), "-I", str(ROOT / "src"), str(src / "stage1_route_host.c"),
-         str(src / "kboot_display_handoff.c"),
+         *(str(src / name) for name in handoff_srcs),
          *(str(ROOT / "src/libfdt" / f) for f in LIBFDT), "-o", str(binary)],
         check=True)
     return binary
