@@ -32,6 +32,8 @@ typedef uint8_t u8;
 _Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define T6040 0x6040
 #define T6041 0x6041
+#define T6050 0x6050
+#define T8132 0x8132
 #define SZ_4K  0x1000UL
 #define SZ_16K 0x4000UL
 #define SZ_1M  0x100000UL
@@ -124,9 +126,28 @@ static void *dt = blob;
 #define FIXED_END (LO + 0xa200000UL)
 #define WINDOW    (128 * SZ_1M)
 
+struct board {
+    int chip_id;
+    u64 ram, ram_size, r25_base, r25_size, r4_base, r4_size, r14_base, mcc_base;
+    u64 below, dt_size, sepfw_off, preoslog_off, boot_args_off, top_off;
+};
+
+static const struct board J616S = {
+    T6040, RAM, RAM_SIZE, 0x10001c18000UL, 0x16a0000, 0, 0, 0x10bd1474000UL, 0x10bd9ce0000UL,
+    BELOW, 0x94000, ARMED + 0x84000, 0, BOOT_ARGS, TOP,
+};
+/* J616c (T6041, Mac16,5): exact low-RAM geometry from a live 36 GiB j616c.adt */
+static const struct board J616C = {
+    T6041, 0x10003538000UL, 0x8c70fc000UL, 0x10001d64000UL, 0x17d4000, 0x108ca634000UL, 0x1fd0000,
+    0x108d1474000UL, 0x108d9ce0000UL, 0xfc000UL, 0x9c000, 0xc2e8000UL, 0xc894000UL, 0xc8d4000UL,
+    0xc8d8000UL,
+};
+#define J616C_LOAD     0x10006b30000UL
+#define J616C_LOAD_MIN (LO + 0x1004000UL)
+
 static unsigned char input[1 << 16];
 
-static void reset(void)
+static void reset_for(const struct board *b)
 {
     window_checked = false;
     window_problem = NULL;
@@ -138,29 +159,32 @@ static void reset(void)
     memset(map_count, 0, sizeof(map_count));
     mcc_carveout_count = 0;
     confined = true;
-    chip_id = T6040;
-    cur_boot_args.phys_base = RAM;
-    cur_boot_args.mem_size = RAM_SIZE;
+    chip_id = b->chip_id;
+    cur_boot_args.phys_base = b->ram;
+    cur_boot_args.mem_size = b->ram_size;
     map_entry(2, "region-id-1", 0x10000000000UL, 0x4000);
-    map_entry(2, "region-id-25", 0x10001c18000UL, 0x16a0000);
-    map_entry(2, "region-id-24", RAM, RAM_SIZE);
+    map_entry(2, "region-id-25", b->r25_base, b->r25_size);
+    map_entry(2, "region-id-24", b->ram, b->ram_size);
     map_entry(2, "region-id-45", 0x10003000000UL, 0x20000000);
     map_entry(2, "region-id-46", 0x10023000000UL, 0x1e000000);
     map_entry(2, "region-id-48", 0x10041100000UL, 0x20000000);
     map_entry(2, "region-id-167", 0x10074004000UL, 0x9c00000);
-    map_entry(2, "region-id-14", 0x10bd1474000UL, 0x72c4000);
-    mcc_carveouts[mcc_carveout_count++] = (struct mcc_carveout){0x10bd9ce0000UL, 0x25800000};
+    if (b->r4_size)
+        map_entry(2, "region-id-4", b->r4_base, b->r4_size);
+    map_entry(2, "region-id-14", b->r14_base, 0x72c4000);
+    mcc_carveouts[mcc_carveout_count++] = (struct mcc_carveout){b->mcc_base, 0x25800000};
 }
 
 /* A boot with iBoot's object at @load, arming CTXR_D @armed above it. */
-static void boot_armed(u64 load, u64 armed)
+static void boot_for(const struct board *b, u64 load, u64 armed)
 {
-    reset();
+    reset_for(b);
     aura_base = load + 0x10000;
     aura_end = aura_base + 0x4a0000;
-    SYS_IMP_APL_CTXR_D_LWR_EL1 = load - BELOW;
+    SYS_IMP_APL_CTXR_D_LWR_EL1 = load - b->below;
     SYS_IMP_APL_CTXR_D_UPR_EL1 = load + armed + 0x3000 - SZ_4K;
-    u64 w = load + (armed > ARMED ? armed - ARMED : 0) + LOW_WINS;
+    u64 shift = armed > ARMED ? armed - ARMED : 0;
+    u64 w = load + shift + LOW_WINS;
     SYS_IMP_APL_CTXR_A_LWR_EL1 = SYS_IMP_APL_CTRR_C_LWR_EL1 = w;
     SYS_IMP_APL_CTXR_A_UPR_EL1 = w + 0x3000;
     SYS_IMP_APL_CTXR_B_LWR_EL1 = w + SZ_16K;
@@ -168,16 +192,19 @@ static void boot_armed(u64 load, u64 armed)
     SYS_IMP_APL_CTXR_C_LWR_EL1 = w + 2 * SZ_16K;
     SYS_IMP_APL_CTXR_C_UPR_EL1 = SYS_IMP_APL_CTRR_C_UPR_EL1 = w + 2 * SZ_16K + 0x3000;
     SYS_IMP_APL_CTRR_D_LWR_EL1 = SYS_IMP_APL_CTRR_D_UPR_EL1 = 0;
-    u64 shift = armed > ARMED ? armed - ARMED : 0;
-    boot_args_addr = load + shift + BOOT_ARGS;
-    cur_boot_args.top_of_kernel_data = load + shift + TOP;
+    boot_args_addr = load + shift + b->boot_args_off;
+    cur_boot_args.top_of_kernel_data = load + shift + b->top_off;
     heap_base = (void *)(load + shift + HEAP);
-    map_entry(1, "DeviceTree", load - BELOW, 0x94000);
-    map_entry(1, "TrustCache", load - BELOW + 0x94000, 0x60000);
-    map_entry(1, "SEPFW", load + shift + ARMED + 0x84000, 0x5ac000);
+    map_entry(1, "DeviceTree", load - b->below, b->dt_size);
+    map_entry(1, "TrustCache", load - b->below + b->dt_size, 0x60000);
+    map_entry(1, "SEPFW", load + shift + b->sepfw_off, 0x5ac000);
+    if (b->preoslog_off)
+        map_entry(1, "preoslog", load + shift + b->preoslog_off, 0x40000);
     map_entry(1, "BootArgs", boot_args_addr, SZ_16K);
 }
+static void boot_armed(u64 load, u64 armed) { boot_for(&J616S, load, armed); }
 static void boot(u64 load) { boot_armed(load, ARMED); }
+static void boot_j616c(u64 load) { boot_for(&J616C, load, ARMED); }
 
 static void make_input(void)
 {
@@ -367,11 +394,49 @@ int main(void)
            strstr(log_text, "did not arm a large enough window"));
 
     /* Another chip doesn't get the fixed window; its hib=1 is refused as before. */
-    boot(0x10005904000UL);
-    chip_id = T6041;
-    kboot_request_hibernate_layout(true);
-    moving(0x10005904000UL, &s, &e);
-    assert(window(&base, &size) && base == s && !ctxr_exec_window_is_fixed());
+    static const int unsupported_chips[] = {T8132, T6050};
+    for (size_t i = 0; i < ARRAY_SIZE(unsupported_chips); i++) {
+        boot(0x10005904000UL);
+        chip_id = unsupported_chips[i];
+        kboot_request_hibernate_layout(true);
+        moving(0x10005904000UL, &s, &e);
+        assert(window(&base, &size) && base == s && !ctxr_exec_window_is_fixed());
+    }
+
+    /*
+     * T6041 (J616c): full 2048-slide sweep over every 16 KiB placement iBoot can choose produces
+     * the identical [0x10008200000, 0x1000e200000) fixed window, layout, and FDT bytes.
+     */
+    boot_j616c(J616C_LOAD);
+    moving(J616C_LOAD, &s, &e);
+    assert(window(&base, &size) && base == s && base + size == e && !ctxr_exec_window_is_fixed());
+
+    unsigned j616c_n = 0;
+    u32 j616c_len = 0;
+    for (u64 load = J616C_LOAD_MIN; load <= LOAD_MAX; load += SZ_16K, j616c_n++) {
+        u64 jl[2], js, jw[2];
+        uint64_t ra, rs;
+        boot_j616c(load);
+        kboot_request_hibernate_layout(true);
+        assert(!prepare_dt() && window(&base, &size) && base == FIXED && base + size == FIXED_END);
+        assert(ctxr_exec_window_is_fixed() && !strstr(log_text, "(this boot is outside that)"));
+        assert(hib_dt_base == SLOT && hib_heap_end == END && hib_window_base == FIXED &&
+               hib_window_end == FIXED_END);
+        chosen_u64s("aura,hibernate-layout", jl, 2);
+        chosen_u64s("aura,hibernate-dt", &js, 1);
+        chosen_u64s("aurora,ctxr-exec-window", jw, 2);
+        assert(jl[0] == J616C.ram && jl[1] == END && js == SLOT && jw[0] == FIXED &&
+               jw[1] == FIXED_END - FIXED);
+        int base_rsv = fdt_num_mem_rsv(input);
+        assert(!fdt_get_mem_rsv(dt, base_rsv, &ra, &rs) && ra == J616C.ram && ra + rs == FIXED);
+        assert(!fdt_get_mem_rsv(dt, base_rsv + 1, &ra, &rs) && ra == FIXED_END && ra + rs == END);
+        if (!j616c_len) {
+            j616c_len = fdt_totalsize(dt);
+            memcpy(first, dt, j616c_len);
+        }
+        assert(fdt_totalsize(dt) == j616c_len && !memcmp(first, dt, j616c_len));
+    }
+    assert(j616c_n == 2048);
 
     /* Asked for once the window was looked up: too late, and no layout on that boot. */
     boot(0x10005904000UL);
@@ -447,9 +512,12 @@ def test_fixed_window_is_asked_for_before_the_window_is_found():
         start = kboot.index(signature)
         return kboot[start:kboot.index("\n}\n", start)]
 
+    supported = body("static bool hib_chip_supported(void)\n{")
+    assert "return chip_id == T6040 || chip_id == T6041;" in supported
     request = body("void kboot_request_hibernate_layout(bool on)\n{")
-    assert "ctxr_exec_request_fixed_window(on && chip_id == T6040);" in request
+    assert "ctxr_exec_request_fixed_window(on && hib_chip_supported());" in request
     refused = body("static const char *hib_layout_refused(")
+    assert "if (!hib_chip_supported())" in refused
     assert refused.index("ctxr_exec_window(&win, &win_size)") < \
         refused.index("!ctxr_exec_window_is_fixed()")
     ctxr = (REPO / "src/ctxr_exec.c").read_text()
