@@ -20,6 +20,7 @@ them, else the host's), and checks what each ABI leaves in the tree.
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -683,7 +684,11 @@ def stage1_fdt(tmp_path_factory):
         shutil.copy(header, src)
     handoff_srcs = display_handoff_sources(ROOT)
     for name in handoff_srcs:
-        shutil.copy(ROOT / "src" / name, src)
+        code = (ROOT / "src" / name).read_text()
+        if sys.platform == "darwin":
+            # The host fixture has no aura ELF linker script; retain a dedicated Mach-O section.
+            code = code.replace('section(".init.t6050")', 'section("__TEXT,__t6050_init")')
+        (src / name).write_text(code)
         hdr = ROOT / "src" / name.replace(".c", ".h")
         if hdr.exists():
             shutil.copy(hdr, src)
