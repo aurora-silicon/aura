@@ -203,7 +203,9 @@ def test_every_firmware_27_outcome_keeps_memory():
 
 @pytest.fixture(scope="module")
 def host(tmp_path_factory):
-    return build_host(tmp_path_factory.mktemp("t8132-dcpext"), host_source=HOST)
+    # The handoff is built into the ESP Stage 2 only (src/kboot.h)
+    return build_host(tmp_path_factory.mktemp("t8132-dcpext"), host_source=HOST,
+                      defines=("CHAINLOADING", "ESP_STAGE2"))
 
 
 @pytest.mark.parametrize("scenario", SCENARIOS)

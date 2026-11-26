@@ -88,3 +88,54 @@ int main(void)
     subprocess.run([*host_cc(), "-std=gnu11", "-Wall", "-Werror", str(tmp_path / "route.c"),
                     "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+
+
+def stage1_stub():
+    """kboot.h's dt_set_dcpext_handoff() for a build without ESP_STAGE2 (Stage 1)."""
+    header = (ROOT / "src/kboot.h").read_text()
+    start = header.index("#ifdef ESP_STAGE2\nint dt_set_dcpext_handoff(")
+    stub = header[header.index("#else\n", start) + len("#else\n"):header.index("#endif", start)]
+    assert "dt_set_dcpext_handoff" in stub
+    return stub
+
+
+# Stage 1 has no ADT path for the external processors: whatever the firmware, it keeps the
+# firmware-ready path after an internal handoff that was not refused, as before that path existed.
+@pytest.mark.parametrize("m4_ret,outcome", sorted({(c[0], c[1]) for c in CASES}))
+def test_stage1_route(tmp_path, m4_ret, outcome):
+    header = (ROOT / "src/kboot.h").read_text()
+    start = header.index("enum dcp_internal {")
+    enum = header[start:header.index("\n};", start) + 3]
+    source = f'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
+#define T8132 0x8132
+{enum}
+{stage1_stub()}
+static int chip_id = T8132, ready_calls;
+static void *dt;
+static int dt_set_m4_dcp_handoff(enum dcp_internal *internal)
+{{
+    *internal = {outcome};
+    return {m4_ret};
+}}
+static int dt_dcp_fw_clocks(void) {{ return 1; }}
+static void dt_reserve_j713_dcpext(void) {{ ready_calls++; }}
+static int route(void)
+{{
+{route_block()}
+    return 1;
+}}
+int main(void)
+{{
+    assert(route() == 0);
+    assert(ready_calls == {0 if m4_ret else 1});
+    return 0;
+}}
+'''
+    (tmp_path / "route.c").write_text(source)
+    binary = tmp_path / "route"
+    subprocess.run([*host_cc(), "-std=gnu11", "-Wall", "-Werror", str(tmp_path / "route.c"),
+                    "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)

@@ -99,6 +99,7 @@
  * a complete internal handoff (the processors keep their status) or on a board with no panel (the
  * processors must be disabled, and the display subsystem is enabled for them). Each processor
  * must be powered and its firmware DART stream locked, read only (guarded) through the ADT.
+ * Built into the ESP Stage 2 only (ESP_STAGE2); Stage 1 keeps the firmware-ready path.
  *
  * T6050 (M5 Pro/Max): the __OS_LOG buffers of every running display coprocessor are reserved on
  * every boot. When the device tree describes the internal display (aliases dcp and disp0, all its
@@ -3485,6 +3486,13 @@ static void t6041_ext_handoffs(void *dt)
 /* ---- external display processors the ADT describes ---- */
 
 /*
+ * ESP Stage 2 only (kboot.h): Stage 1 has no room for this handoff, and a Stage 1 normally
+ * chainloads the ESP Stage 2, which hands the processors over. A Stage 1 that starts an OS itself
+ * keeps kboot.c's firmware-ready path for them, as before this handoff existed.
+ */
+#ifdef ESP_STAGE2
+
+/*
  * External display processors whose handoff this boot's ADT describes completely, by block: the
  * device tree compatible of the processor, and of the display subsystem its pipe joins on a board
  * with no panel. A later SoC whose processor lists one of these as a fallback compatible is the
@@ -4732,6 +4740,7 @@ int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
     dcpext_keep_rest(dt);
     return 1;
 }
+#endif /* ESP_STAGE2 */
 
 /*
  * For an SoC without an opt-in: the device tree has the display block the handoff is for, the dcp

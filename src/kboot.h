@@ -3,6 +3,8 @@
 #ifndef KBOOT_H
 #define KBOOT_H
 
+#include "../build/build_cfg.h"
+
 #include "types.h"
 
 // declarations for kboot_t6020_compat.c
@@ -82,7 +84,21 @@ enum dcp_internal {
                               firmware clocks */
     DCP_INTERNAL_NO_PANEL, /* not attempted: ADT /arm-io/disp0 is external (no panel) */
 };
+/*
+ * The handoff is built into the ESP Stage 2 only (kboot_display_handoff.c). A Stage 1 that boots
+ * an OS itself declines it: 0 keeps kboot.c's firmware-ready path for the external processors.
+ */
+#ifdef ESP_STAGE2
 int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks);
+#else
+static inline int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
+{
+    (void)dt;
+    (void)internal;
+    (void)fw_clocks;
+    return 0;
+}
+#endif
 
 // from rust/usb4.rs
 u64 rust_usb4_router_uuid(void);
