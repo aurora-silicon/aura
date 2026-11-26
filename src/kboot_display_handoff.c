@@ -3578,7 +3578,8 @@ int dcpext_may_run(void)
  * ESP Stage 2 only (kboot.h): Stage 1 has no room for this handoff, nor for keeping the memory of a
  * processor that is not handed over (dcpext_keep_rest()). A Stage 1 normally chainloads the ESP
  * Stage 2, which does both. A Stage 1 that starts an OS itself keeps kboot.c's firmware-ready path
- * for them, as before this handoff existed.
+ * for older firmware; on firmware given its clocks it boots only if no processor may run
+ * (dcpext_may_run()).
  */
 
 /*

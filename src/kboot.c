@@ -6430,6 +6430,45 @@ static void dt_reserve_j713_dcpext(void)
     }
 }
 
+#ifndef ESP_STAGE2
+/*
+ * A Stage 1 that boots an OS itself on firmware the OS gives clocks (dt_dcp_fw_clocks()) hands no
+ * external processor over: kboot_display_handoff.c does that in the ESP Stage 2 only (kboot.h).
+ * Whatever the input tree already says of an apple,t8132-dcpext that the kernel adopts it by is
+ * withdrawn: the ready marker of the 26.6.2 handoff, its image, firmware version and
+ * compatibility, the firmware clock ids, and memory-region entries past those the tree names (the
+ * ones the firmware-ready path appends). The reservations they point at stay. With none of these
+ * the kernel leaves the processor and its DARTs as iBoot left them, as after a refused handoff.
+ */
+static int dt_withdraw_j713_dcpext(void)
+{
+    static const char props[][36] = {
+        T8132_DCPEXT_READY,      "apple,firmware-uuid", "apple,firmware-version",
+        "apple,firmware-compat", "apple,clock-ids",
+    };
+    int node = -1;
+
+    while ((node = fdt_node_offset_by_compatible(dt, node, "apple,t8132-dcpext")) >= 0) {
+        int len, named = fdt_stringlist_count(dt, node, "memory-region-names");
+        const fdt32_t *mr = fdt_getprop(dt, node, "memory-region", &len);
+        fdt32_t keep[8];
+        if (mr && named >= 0 && len > named * (int)sizeof(*mr)) {
+            if (named > (int)ARRAY_SIZE(keep))
+                return -1;
+            memcpy(keep, mr, named * sizeof(*mr));
+            if (fdt_setprop(dt, node, "memory-region", keep, named * sizeof(*mr)))
+                return -1;
+        }
+        for (size_t i = 0; i < ARRAY_SIZE(props); i++) {
+            int ret = fdt_delprop(dt, node, props[i]);
+            if (ret && ret != -FDT_ERR_NOTFOUND)
+                return -1;
+        }
+    }
+    return node == -FDT_ERR_NOTFOUND ? 0 : -1;
+}
+#endif
+
 /*
  * The first firmware segment of the ADT nub at @path: where the processor's image (its text) sits.
  */
@@ -9933,11 +9972,33 @@ static int dt_set_display(void)
             printf("FDT: M4 DCP handoff refused; keeping the boot framebuffer\n");
         /*
          * The external processors of firmware the OS gives clocks (firmware 27) are handed over
-         * from the ADT by kboot_display_handoff.c, beside a complete internal handoff or with no
-         * panel; those of older firmware keep the firmware-ready path.
+         * from the ADT by kboot_display_handoff.c in the ESP Stage 2, beside a complete internal
+         * handoff or with no panel. A Stage 1 has no such handoff (kboot.h): it boots only if none
+         * may still run, and withdraws what the input tree promised of them. Those of older
+         * firmware keep the firmware-ready path.
          */
-        if (!dt_set_dcpext_handoff(dt, internal, dt_dcp_fw_clocks()) && !refused)
-            dt_reserve_j713_dcpext();
+        bool fw_clocks = dt_dcp_fw_clocks();
+        if (dt_set_dcpext_handoff(dt, internal, fw_clocks))
+            return 0;
+        if (!fw_clocks) {
+            if (!refused)
+                dt_reserve_j713_dcpext();
+            return 0;
+        }
+#ifndef ESP_STAGE2
+        /*
+         * Fail closed. A processor that may still run uses its firmware segments and DART tables
+         * as iBoot left them, and this stage has no room to find and keep them (the ESP Stage 2's
+         * dcpext_keep_rest()): the OS must not get that memory.
+         */
+        int running = dcpext_may_run();
+        if (running || dt_withdraw_j713_dcpext()) {
+            printf("FDT: %d external display processor(s) may still run, and this stage cannot "
+                   "keep their memory from the OS (boot through the ESP Stage 2): not booting\n",
+                   running);
+            return -1;
+        }
+#endif
         return 0;
     }
 

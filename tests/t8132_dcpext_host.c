@@ -19,7 +19,9 @@
  *   t8132-dcpext-host list
  *   t8132-dcpext-host <scenario>
  *
- * tests/python/test_t8132_dcpext_handoff.py runs every scenario.
+ * tests/python/test_t8132_dcpext_handoff.py runs every scenario. With
+ * T8132_DCPEXT_HOST_WORLD_ONLY defined it has no main, and gives
+ * tests/python/test_t8132_display_route.py the same ADT, PMGR and DARTs for a Stage 1's route.
  */
 #define main t6041_main
 #include "t6041_display_host.c"
@@ -807,6 +809,8 @@ static bool ext_tables_kept(void *dt, int i)
     return all;
 }
 
+/* Without a main, as the T8132 world (ADT, PMGR, DARTs) of another host test */
+#ifndef T8132_DCPEXT_HOST_WORLD_ONLY
 int main(int argc, char **argv)
 {
     if (argc == 2 && !strcmp(argv[1], "list")) {
@@ -1264,3 +1268,4 @@ int main(int argc, char **argv)
     printf("%s: pass\n", s);
     return 0;
 }
+#endif /* T8132_DCPEXT_HOST_WORLD_ONLY */
