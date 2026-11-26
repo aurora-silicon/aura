@@ -53,6 +53,7 @@ struct sptm_virt_placement {
 /* bit 9 is AURA_AURACTL in the feat/auractl runner; left free here so the two never clash */
 #define SPTM_VIRT_CTL_DCC BIT(10) /* arm auractl's DCC transport (MDCR_EL2.TDCC) at boot */
 #define SPTM_VIRT_SEP     BIT(11) /* record the SEP mailbox and its OOL buffers (debug only) */
+#define SPTM_VIRT_DCP_AFK BIT(12) /* record the DCPs' AFK/EPIC ring entries (debug only) */
 /* sptm_virt_s2r_cp_ansx, with COPROC on T6050 */
 #define S2R_CP_ANSX_SART  BIT(0) /* sart-ans reg[0-2], first page each */
 #define S2R_CP_ANSX_NVME  BIT(1) /* the NVMe BAR's first page (reg[9]) */

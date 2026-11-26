@@ -13,6 +13,9 @@ import sys
 HDR = struct.Struct("<8sII5Q48s")
 REC = struct.Struct("<4Q")
 SEPH, SEPD = 0x48504553, 0x44504553
+# AURA_DCP_AFK_TRACE records in the same ring (tools/auractl/dcp_afk_decode.py reads them)
+DAF = {int.from_bytes(k.encode(), "little")
+       for k in ("DAFM", "DAFR", "DAFH", "DAFD", "DAFX", "DAFN")}
 
 
 def main():
@@ -62,6 +65,8 @@ def main():
         if lo == SEPD:
             if cur and (pc >> 32) == cur[0]:
                 cur[3].append(struct.pack("<Q", val))
+            continue
+        if lo in DAF:
             continue
         flush()
         off = pa & 0xFFF

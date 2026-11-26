@@ -118,6 +118,7 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr);
 /* sptm_virt_gpu.c */
 void sptm_virt_gpu_setup(void);
 void sptm_virt_sep_setup(void);       /* sptm_virt_sep.c */
+void sptm_virt_dcp_afk_setup(void);   /* sptm_virt_dcp_afk.c */
 bool sptm_virt_s2r_ring_ensure(void); /* sptm_virt_s2r.c */
 void sptm_virt_s2r_rec_raw(u64 pa, u64 val, u64 tag, bool write);
 

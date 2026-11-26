@@ -54,6 +54,10 @@ Environment (all optional; 1 enables a switch):
   AURA_SEP_TRACE           record the SEP mailbox and each endpoint's OOL buffers into the ring
                            (AURACTL=1 builds; read with auractl; debug only)
   AURA_SEP_MAXB=<n>        bytes copied per OOL buffer at most (default 128 KiB)
+  AURA_DCP_AFK_TRACE       record the DCPs' AFK/EPIC ring entries on chosen endpoints into the ring
+                           (AURACTL=1 build, debug only; tools/auractl/dcp_afk_decode.py)
+  AURA_DCP_AFK_EPS=<mask>  endpoints followed, bit n = endpoint 0x20 + n (default 0x800 = 0x2b)
+  AURA_DCP_AFK_MAXB=<n>    bytes copied per ring entry and per OOB buffer at most (default 4096)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
@@ -122,6 +126,7 @@ CONFIG_FLAGS = {
     # bit 9 is reserved for AURA_AURACTL in the feat/auractl runner
     "AURA_AURACTL_DCC": 1 << 10,  # arm auractl's kext-free DCC transport (off by default)
     "AURA_SEP_TRACE": 1 << 11,  # SEP mailbox + OOL buffers into the ring (AURACTL=1, debug only)
+    "AURA_DCP_AFK_TRACE": 1 << 12,  # DCP AFK/EPIC ring entries into the ring (AURACTL=1, debug only)
 }
 KNOWN_ENV = {
     "AURA_S2R_ARM_S",
@@ -159,6 +164,8 @@ KNOWN_ENV = {
     "AURA_GPU_STOP_MSG",
     "AURA_GPU_PRINT_MAX",
     "AURA_SEP_MAXB",
+    "AURA_DCP_AFK_EPS",
+    "AURA_DCP_AFK_MAXB",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
     "AURA_XNU_ENTRY",
@@ -773,6 +780,12 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
         p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
     if os.environ.get("AURA_SEP_MAXB"):
         p.write32(sym["sptm_virt_sep_maxb"], env_int("AURA_SEP_MAXB"))
+    for env, symbol in (("AURA_DCP_AFK_EPS", "sptm_virt_dcp_afk_eps"),
+                        ("AURA_DCP_AFK_MAXB", "sptm_virt_dcp_afk_maxb")):
+        if os.environ.get(env):
+            p.write32(sym[symbol], env_int(env))
+    if env_on("AURA_DCP_AFK_TRACE"):
+        print("DCP AFK trace: endpoints mask", os.environ.get("AURA_DCP_AFK_EPS", "0x800 (0x2b)"))
     if env_on("AURA_S2R_DCP_PKT"):
         p.write32(sym["sptm_virt_s2r_dcp_pkt"], 1)
         print("coprocessor trace: DCP IOMFB packets copied into the ring")
