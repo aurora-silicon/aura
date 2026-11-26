@@ -306,6 +306,11 @@ OBJECTS := \
 	$(HV_OBJECTS) \
 	$(MINILZLIB_OBJECTS) $(TINF_OBJECTS) $(DLMALLOC_OBJECTS) $(LIBFDT_OBJECTS)
 
+# After the 2 KiB-aligned vector objects (exception_asm.o, gxf_asm.o, hv/hv_asm.o), so that its
+# code (in .text, out of kboot.o's .init slot) cannot push one of them to its next 2 KiB step
+# (tools/stage1_size.sh).
+OBJECTS += kboot_pmp.o
+
 ifeq ($(SPTM_VIRT),1)
 OBJECTS += nv2.o nv2_asm.o sptm_virt.o sptm_virt_cl4.o sptm_virt_gl.o sptm_virt_s2.o sptm_virt_s2r.o sptm_virt_s2r_soc.o sptm_virt_gpu.o sptm_virt_sep.o s2r_dcp_pkt.o
 endif
