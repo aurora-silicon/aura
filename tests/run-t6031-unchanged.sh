@@ -41,7 +41,8 @@ run() { # run <out> <cmd...>
 # ---- 1. the G15 GPU setup ----
 build_g15() { # build_g15 <tree> <out>
     tree=$1 out=$2
-    mkdir -p "$out/src"
+    mkdir -p "$out/src" "$out/build"
+    : > "$out/build/build_cfg.h" # a host build: no Stage 1 or Stage 2 options
     cp "$tree/src/kboot_gpu.c" "$tree/src/firmware.c" "$tree/src/kboot_gpu26.c" "$out/src/"
     cp tests/g15_host/*.h tests/kboot_gpu_g15_host.c "$out/src/"
     extra="$tree/src/kboot_gpu_t8122_power.c"

@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
+#include "../build/build_cfg.h"
+
 #include "kboot.h"
 #include "adt.h"
 #include "assert.h"
@@ -4434,6 +4436,106 @@ static T6050_GPU_TEXT_FN int t6050_gpu_leakage(void *dt)
     return -1;
 }
 
+#ifdef ESP_STAGE2
+/*
+ * M5 Pro (G17S) operating points, filled in place where the DT has their tables on the GPU node:
+ * operating-points-v2 (opp-hz, then opp-microvolt and opp-microvolt-sram, one cell per voltage
+ * table), apple,afr-opp and apple,cs-opp (one cell), and apple,csafr-min-sram-microvolt.
+ *
+ * sgx perf-states and perf-states-sram are perf-state-table-count tables of perf-state-count
+ * {Hz, mV} states. afr-perf-states, which cs-perf-states must equal, is {u64 dies, u64 count}, then
+ * count {u64 uV, u64 Hz}, then the SRAM floor in uV.
+ *
+ * These are the part's own voltages; the driver keeps its board's states and takes them only where
+ * every frequency is its own. The shapes are checked before the first write. Returns 0 when filled,
+ * 1 for a DT without the tables, and a negative step when the ADT or the DT does not fit; the DT is
+ * then left as it is.
+ *
+ * Stage 2 only: Stage 1 has no room for it, and on these Macs Stage 1 loads the ESP's Stage 2,
+ * which boots Linux.
+ */
+#define T6050_GPU_TABLES 2
+
+static T6050_GPU_TEXT_FN int t6050_gpu_opps(void *dt)
+{
+    int gpu = kboot_fdt_path_exact(dt, "gpu"), len;
+    if (gpu < 0 || !fdt_getprop(dt, gpu, "operating-points-v2", NULL))
+        return 1;
+
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    u32 count, tables, clen, slen, alen, cslen;
+    if (sgx < 0 || ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
+        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) || count < 2 ||
+        count > MAX_PSTATES || tables != T6050_GPU_TABLES)
+        return -2;
+    const struct perf_state *core = adt_getprop(adt, sgx, "perf-states", &clen);
+    const struct perf_state *sram = adt_getprop(adt, sgx, "perf-states-sram", &slen);
+    if (!core || !sram || clen != tables * count * sizeof(*core) || slen != clen)
+        return -3;
+    /*
+     * State 0 is off. The tables share one rising frequency ladder. Linux checks every state and
+     * voltage against its board's, so only the shape is checked here.
+     */
+    for (u32 k = 0; k < tables * count; k++) {
+        u32 i = k % count;
+        if (core[k].freq != core[i].freq || sram[k].freq != core[i].freq ||
+            (i ? core[i].freq <= core[i - 1].freq : core[i].freq))
+            return -4;
+    }
+
+    /* {dies, count}, count {uV, Hz}, the SRAM floor */
+    const u64 *aux = adt_getprop(adt, sgx, "afr-perf-states", &alen);
+    const void *cs = adt_getprop(adt, sgx, "cs-perf-states", &cslen);
+    if (!aux || !cs || alen < 3 * sizeof(u64) || aux[0] != 1 || aux[1] < 2 ||
+        aux[1] > MAX_PSTATES || alen != (3 + 2 * aux[1]) * sizeof(u64) || cslen != alen ||
+        memcmp(aux, cs, alen))
+        return -5;
+    u32 n = aux[1];
+    const u64 *st = aux + 2, sram_uv = aux[2 + 2 * n];
+
+    /*
+     * Pass 0 checks the DT tables' shape and pass 1 fills them, so nothing is written unless
+     * everything fits. In-place writes move no offset.
+     */
+    static const char *const props[3] = {"operating-points-v2", "apple,afr-opp", "apple,cs-opp"};
+    for (int pass = 0; pass < 2; pass++) {
+        for (int t = 0; t < 3; t++) {
+            int cells = t ? 1 : tables, opp;
+            int table = t6040_opp_table(dt, gpu, props[t], t ? n : count, cells * sizeof(u32));
+            if (table < 0)
+                return -7;
+            u32 i = 0;
+            fdt_for_each_subnode(opp, dt, table)
+            {
+                const void *p = fdt_getprop(dt, opp, "opp-microvolt-sram", &len);
+                if (t ? p != NULL : !p || len != cells * (int)sizeof(u32))
+                    return -7;
+                if (!pass)
+                    continue;
+                fdt32_t volts[2 * T6050_GPU_TABLES];
+                for (int j = 0; j < cells; j++) {
+                    volts[j] = cpu_to_fdt32(t ? st[2 * i] : core[j * count + i].volt * 1000);
+                    if (!t)
+                        volts[cells + j] = cpu_to_fdt32(sram[j * count + i].volt * 1000);
+                }
+                if (fdt_setprop_inplace_u64(dt, opp, "opp-hz", t ? st[2 * i + 1] : core[i].freq) ||
+                    fdt_setprop_inplace(dt, opp, "opp-microvolt", volts, cells * sizeof(u32)) ||
+                    (!t && fdt_setprop_inplace(dt, opp, "opp-microvolt-sram", volts + cells,
+                                               cells * sizeof(u32))))
+                    return -8;
+                i++;
+            }
+        }
+        const void *floor = fdt_getprop(dt, gpu, "apple,csafr-min-sram-microvolt", &len);
+        if (!floor || len != sizeof(u32))
+            return -7;
+    }
+    if (fdt_setprop_inplace_u32(dt, gpu, "apple,csafr-min-sram-microvolt", sram_uv))
+        return -8;
+    return 0;
+}
+#endif
+
 static T6050_GPU_INIT int dt_set_gpu_t6050(void *dt)
 {
     if (chip_id != T6050) {
@@ -4464,6 +4566,11 @@ static T6050_GPU_INIT int dt_set_gpu_t6050(void *dt)
         printf("FDT: GPU: T6050: no apple,firmware-version for the driver\n");
     if (t6050_gpu_leakage(dt))
         printf("FDT: GPU: no leakage calibration words; the driver's generic configuration\n");
+#ifdef ESP_STAGE2
+    int opps = t6050_gpu_opps(dt);
+    if (opps <= 0)
+        printf("FDT: GPU: T6050 operating points: %s (%d)\n", opps ? "not filled" : "filled", opps);
+#endif
     return 0;
 }
 
