@@ -6,7 +6,8 @@
  * Mac to Mac (the DRAM vendor, for one). Never fatal and all or nothing: an unpaired or ambiguous
  * window, a missing nub, a malformed value or a full DT leaves the node as the DT has it.
  *
- * Kept out of kboot.c: the raw image puts kboot.o's code in the .init slot, which has no room.
+ * The code goes in .rodata (AURA_XTEXT): the raw image puts kboot.o's code in the .init slot, and
+ * neither that nor .text has room for it.
  */
 
 #include "kboot_pmp.h"
@@ -20,7 +21,7 @@
 
 #include "libfdt/libfdt.h"
 
-static bool adt_name_is_component(const char *s, u32 nlen)
+static AURA_XTEXT bool adt_name_is_component(const char *s, u32 nlen)
 {
     if (!s || nlen < 2 || s[nlen - 1] != '\0')
         return false;
@@ -32,7 +33,7 @@ static bool adt_name_is_component(const char *s, u32 nlen)
     return true;
 }
 
-static int adt_find_pmp_nub(int pmp_anode, const char *name)
+static AURA_XTEXT int adt_find_pmp_nub(int pmp_anode, const char *name)
 {
     char expected[64];
     int elen = snprintf(expected, sizeof(expected), "iop-%s-nub", name);
@@ -56,7 +57,7 @@ static int adt_find_pmp_nub(int pmp_anode, const char *name)
  * DARTs: names need not match (T6050's DT has pmp@284e00000, whose first reg, the PMP window
  * 0x284500000, is the ADT pmp0's third).
  */
-static int adt_find_pmp_by_window(u64 address, char *name, size_t name_size)
+static AURA_XTEXT int adt_find_pmp_by_window(u64 address, char *name, size_t name_size)
 {
     int path[8];
     int arm_io = adt_path_offset_trace(adt, "/arm-io", path);
@@ -99,7 +100,8 @@ static int adt_find_pmp_by_window(u64 address, char *name, size_t name_size)
     return found;
 }
 
-int kboot_pmp_set_by_window(void *dt, int dt_bufsize, int (*fill)(int pmp_node, int nub_anode))
+AURA_XTEXT int kboot_pmp_set_by_window(void *dt, int dt_bufsize,
+                                       int (*fill)(int pmp_node, int nub_anode))
 {
     int node = -1, enabled = 0;
 

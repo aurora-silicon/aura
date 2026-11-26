@@ -57,6 +57,8 @@ static void *test_malloc(size_t size)
 {
     return fail_malloc ? NULL : malloc(size);
 }
+/* kboot_pmp.c's section attribute (types.h), which a host build leaves out */
+#define AURA_XTEXT
 #define malloc test_malloc
 static const unsigned char calibration[] = {0, 0x81, 0xff, 0x12, 0, 0x45, 0x67};
 struct adt_property {
