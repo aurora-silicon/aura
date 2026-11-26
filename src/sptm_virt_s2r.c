@@ -1457,6 +1457,21 @@ static u64 s2r_cp_cut(u64 addr, u64 v, int width)
 }
 
 /* T6050 COPROC: a raw record for s2r_dcp_pkt.c, whose packet bytes go in the ring as they pass. */
+/* A record with extra meta bits (AURA_MMIO_TRACE: bit 63 and its node in [62:58]); t = 0: now.
+ * Returns its value field, which the caller may update while the record is in the ring. */
+volatile u64 *sptm_virt_s2r_rec_ext(u64 t, u64 meta_hi, u64 pa, int width, bool write, bool marker,
+                                    u64 val, u64 pc)
+{
+    struct s2r_rec *r = s2r_slot();
+    if (!r)
+        return NULL;
+    r->t = t ? t : mrs(CNTPCT_EL0);
+    r->meta = S2R_META(pa, width, write, smp_id(), marker) | meta_hi;
+    r->val = val;
+    r->pc = pc;
+    return &r->val;
+}
+
 void sptm_virt_s2r_rec_raw(u64 pa, u64 val, u64 tag, bool write)
 {
     struct s2r_rec *r = s2r_slot();

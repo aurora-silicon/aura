@@ -223,6 +223,17 @@ systemctl --failed
   command, `auractl read <file>`; decode with `tools/auractl/sep_decode.py
   <file> <dir>`. The capture holds device nonces and keys in transit: keep it
   private. `AURA_SEP_MAXB` caps the bytes copied per buffer (128 KiB).
+- **`AURA_MMIO_TRACE` records the guest's MMIO to chosen ADT nodes (debug only,
+  `AURACTL=1`):** `AURA_MMIO_NODES` lists `/arm-io` children (`name` for all
+  of its `reg` ranges, `name/a-b+c` for chosen indices; default the DP PHY,
+  the ATC DP crossbars and DP inputs). Every page gets a pass-through hook: the
+  access is done once, as the guest asked, then recorded with its value, width,
+  cpu, time and guest PC. Coprocessor (`iop`) and DART registers, pages another
+  tracer hooks and ranges over 64 pages (unless their index is named) are left
+  alone. Identical consecutive reads (polls) are folded, and `AURA_MMIO_MAX`
+  caps the records per node (65536; drops are counted). Decode with
+  `tools/auractl/mmio_decode.py <file> <dir> [--afk]` (`--afk` joins the DCP
+  and SEP timelines of the same dump).
 - **T8112 (M2) specifics:** macOS 27.2 on T8112 runs SPTM, TXM, and XNU without
   exclaves. External monitors over HDMI and USB-C (including HDR) work with
   discrete refresh rates; MCDP29xx/2900 HDMI bridges report no VRR support.

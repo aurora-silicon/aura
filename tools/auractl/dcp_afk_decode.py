@@ -184,6 +184,8 @@ class Decoder:
             self.sepcur = None
 
     def record(self, ts, cpu, meta, val, pc):
+        if meta >> 63:  # AURA_MMIO_TRACE records (tools/auractl/mmio_decode.py)
+            return
         pa = meta & 0xFFFFFFFFFFFF
         lo, hi = pc & 0xFFFFFFFF, pc >> 32
         tag = TAGS.get(lo)

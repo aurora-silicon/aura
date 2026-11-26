@@ -58,6 +58,12 @@ Environment (all optional; 1 enables a switch):
                            (AURACTL=1 build, debug only; tools/auractl/dcp_afk_decode.py)
   AURA_DCP_AFK_EPS=<mask>  endpoints followed, bit n = endpoint 0x20 + n (default 0x800 = 0x2b)
   AURA_DCP_AFK_MAXB=<n>    bytes copied per ring entry and per OOB buffer at most (default 4096)
+  AURA_MMIO_TRACE          record every guest access to chosen ADT nodes' registers into the ring
+                           (AURACTL=1 build, debug only; tools/auractl/mmio_decode.py)
+  AURA_MMIO_NODES=<list>   /arm-io children, comma separated; name/a-b+c hooks only those reg
+                           indices (default dptx-phy,atc0-dpxbar,atc0-dpin0,atc0-dpin1,
+                           atc1-dpxbar,atc1-dpin0,atc1-dpin1; e.g. atc-phy0/20-22 its lpdptx)
+  AURA_MMIO_MAX=<n>        access records kept per node (default 65536; polls are folded)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
@@ -127,6 +133,7 @@ CONFIG_FLAGS = {
     "AURA_AURACTL_DCC": 1 << 10,  # arm auractl's kext-free DCC transport (off by default)
     "AURA_SEP_TRACE": 1 << 11,  # SEP mailbox + OOL buffers into the ring (AURACTL=1, debug only)
     "AURA_DCP_AFK_TRACE": 1 << 12,  # DCP AFK/EPIC ring entries into the ring (AURACTL=1, debug only)
+    "AURA_MMIO_TRACE": 1 << 13,  # guest MMIO to chosen ADT nodes into the ring (AURACTL=1, debug)
 }
 KNOWN_ENV = {
     "AURA_S2R_ARM_S",
@@ -166,6 +173,8 @@ KNOWN_ENV = {
     "AURA_SEP_MAXB",
     "AURA_DCP_AFK_EPS",
     "AURA_DCP_AFK_MAXB",
+    "AURA_MMIO_NODES",
+    "AURA_MMIO_MAX",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
     "AURA_XNU_ENTRY",
@@ -786,6 +795,19 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
             p.write32(sym[symbol], env_int(env))
     if env_on("AURA_DCP_AFK_TRACE"):
         print("DCP AFK trace: endpoints mask", os.environ.get("AURA_DCP_AFK_EPS", "0x800 (0x2b)"))
+    if os.environ.get("AURA_MMIO_MAX"):
+        p.write32(sym["sptm_virt_mmio_max"], env_int("AURA_MMIO_MAX"))
+    nodes = os.environ.get("AURA_MMIO_NODES")
+    if nodes:
+        raw = nodes.encode()
+        if len(raw) > 255:
+            raise SystemExit("AURA_MMIO_NODES: at most 255 characters")
+        raw += bytes(256 - len(raw))
+        for i in range(0, 256, 4):
+            p.write32(sym["sptm_virt_mmio_nodes"] + i, int.from_bytes(raw[i:i + 4], "little"))
+    if env_on("AURA_MMIO_TRACE"):
+        print("MMIO trace: nodes", nodes or "default (dptx-phy, atc0/1 dpxbar + dpin0/1)",
+              "max", os.environ.get("AURA_MMIO_MAX", "65536"), "records per node")
     if env_on("AURA_S2R_DCP_PKT"):
         p.write32(sym["sptm_virt_s2r_dcp_pkt"], 1)
         print("coprocessor trace: DCP IOMFB packets copied into the ring")

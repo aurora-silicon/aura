@@ -119,8 +119,11 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr);
 void sptm_virt_gpu_setup(void);
 void sptm_virt_sep_setup(void);       /* sptm_virt_sep.c */
 void sptm_virt_dcp_afk_setup(void);   /* sptm_virt_dcp_afk.c */
+void sptm_virt_mmio_setup(void);      /* sptm_virt_mmio.c */
 bool sptm_virt_s2r_ring_ensure(void); /* sptm_virt_s2r.c */
 void sptm_virt_s2r_rec_raw(u64 pa, u64 val, u64 tag, bool write);
+volatile u64 *sptm_virt_s2r_rec_ext(u64 t, u64 meta_hi, u64 pa, int width, bool write, bool marker,
+                                    u64 val, u64 pc);
 
 #ifdef AURACTL
 /* auractl (sptm_virt_ctl.c, src/auractl_abi.h) */

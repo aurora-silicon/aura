@@ -574,6 +574,7 @@ void sptm_virt_s2_setup(void)
     sptm_virt_gpu_setup();
     sptm_virt_sep_setup();
     sptm_virt_dcp_afk_setup();
+    sptm_virt_mmio_setup(); /* last: skips pages the tracers above hooked */
 #ifdef AURACTL
     sptm_virt_ctl_s2_setup(); /* splits blocks: before the tree is summed */
 #endif

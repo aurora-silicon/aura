@@ -42,6 +42,8 @@ def main():
         cur = None
 
     for t, meta, val, pc in recs:
+        if meta >> 63:  # AURA_MMIO_TRACE (tools/auractl/mmio_decode.py)
+            continue
         ts = (t - t0) / frq
         cpu = ((meta >> 51) & 15) | (((meta >> 56) & 3) << 4)
         pa = meta & 0xFFFFFFFFFFFF
