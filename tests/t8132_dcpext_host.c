@@ -659,7 +659,7 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-stream-bypass", "J713: dcpext0's stream 23 bypasses the DART"},
     {"j713-dart-read-faults", "J713: reading dcpext1's DART faults"},
     {"j713-no-pipe", "J713: no ADT pipe on the piodma stream"},
-    {"j713-two-pipes", "J713: two ADT pipes on the piodma stream"},
+    {"j713-two-pipes", "J713: two ADT pipes hold dcpext0's registers"},
     {"j713-no-adt-node", "J713: no ADT processor at the DT address"},
     {"j713-text-not-shared", "J713: dcpext1's __TEXT is not the internal one"},
     {"j713-bad-layout", "J713: dcpext0's segment layout is broken"},
@@ -716,6 +716,9 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-early-exit-ready", "J713: no uuid on the internal nub, the input promises: withdrawn"},
     {"j713-handed-ready", "J713: both handed over, the input tree has the 26.6.2 ready marker"},
     {"j713-refused-ready", "J713: dcpext1 refused, the input tree promises it: withdrawn"},
+    {"j713-pipe-no-mappers", "J713: dispext1 has no ADT iommu-parent: no boot, the rest kept"},
+    {"j713-no-dt-ext-pipe-no-mappers", "J713: no DT external node, no dispext1 iommu-parent"},
+    {"j713-ext-no-mappers", "J713: dcpext1 has no ADT iommu-parent: no boot, the rest kept"},
 };
 
 /*
@@ -748,6 +751,10 @@ static const char *const t8132_no_boot[] = {
     "j713-pipe-left-on",
     "j713-keep-overlap",
     "j713-keep-fault-peer",
+    "j713-two-pipes", /* its pipe, and so its pipe's DART, is not known */
+    "j713-pipe-no-mappers",
+    "j713-no-dt-ext-pipe-no-mappers",
+    "j713-ext-no-mappers",
 };
 
 static bool no_boot(const char *s)
@@ -949,7 +956,8 @@ int main(int argc, char **argv)
     size_t size = DT_SIZE;
     const char *root = j773g ? J773G : later ? J9XX : J713;
     build_t8132(dt, root, j773g ? sizeof(J773G) : sizeof(J713), size);
-    for (int i = 0; i < 2 && !is(s, "j713-no-dt-ext-kept"); i++)
+    bool no_dt_ext = is(s, "j713-no-dt-ext-kept") || is(s, "j713-no-dt-ext-pipe-no-mappers");
+    for (int i = 0; i < 2 && !no_dt_ext; i++)
         build_t8132_ext(dt, i, later ? T8140_EXT : T8132_EXT,
                         later ? sizeof(T8140_EXT) : sizeof(T8132_EXT),
                         !j773g || is(s, "j773g-enabled"), !is(s, "j773g-headless") || i == 0);
@@ -1006,8 +1014,10 @@ int main(int argc, char **argv)
     if (is(s, "j713-no-pipe"))
         node_drop("/arm-io/dispext1");
     if (is(s, "j713-two-pipes")) {
+        /* A second pipe whose registers also hold dcpext0's: which is its pipe is not known */
         u32 parents[1] = {aph_mapper_disp(0, 1)};
         prop_str("/arm-io/dispext9", "device_type", "ext-display-subsystem");
+        reg_add("/arm-io/dispext9", ext_coproc[0], 0x4000);
         prop_set("/arm-io/dispext9", "iommu-parent", parents, sizeof(parents));
     }
     if (is(s, "j713-no-adt-node"))
@@ -1206,6 +1216,18 @@ int main(int argc, char **argv)
     if (is(s, "j713-refused-ready")) {
         prop_str("/arm-io/dcpext1/iop-dcpext1-nub", "uuid", UUID_X);
         ext_promise(dt, 1, false);
+    }
+
+    /* The ADT lists no mapper for a pipe or a processor: its DARTs are not known */
+    if (is(s, "j713-pipe-no-mappers") || is(s, "j713-no-dt-ext-pipe-no-mappers") ||
+        is(s, "j713-ext-no-mappers")) {
+        for (int i = 0; i < 2; i++) {
+            if (i || no_dt_ext) /* a processor handed over has its own placeholders */
+                ext_segs_in_ram(i);
+            ext_tables_in_ram(i);
+        }
+        prop_drop(is(s, "j713-ext-no-mappers") ? "/arm-io/dcpext1" : "/arm-io/dispext1",
+                  "iommu-parent");
     }
 
     memcpy(in, dt, fdt_totalsize(dt));
@@ -1438,6 +1460,22 @@ int main(int argc, char **argv)
     } else if (is(s, "j713-refused-ready")) {
         check_ext(in, dt, 0, false);
         check(ext_unpromised(dt, 1), "the refused dcpext1's promises are withdrawn");
+    } else if (is(s, "j713-pipe-no-mappers") || is(s, "j713-no-dt-ext-pipe-no-mappers") ||
+               is(s, "j713-ext-no-mappers")) {
+        bool own = !is(s, "j713-ext-no-mappers"); /* which of dcpext1's DARTs the ADT names */
+        if (!no_dt_ext) {
+            check_ext(in, dt, 0, false);
+            check(ext_untouched(in, dt, 1), "dcpext1 is not published");
+        }
+        check((!no_dt_ext || ext_segs_kept(dt, 0)) && ext_tables_kept(dt, 0) &&
+                  ext_segs_kept(dt, 1),
+              "dcpext0's memory and dcpext1's firmware segments are kept");
+        check(resv_page(dt, RAM_TABLES + 0x10000) == own &&
+                  resv_page(dt, RAM_TABLES + 0x14000) == own &&
+                  resv_page(dt, RAM_TABLES + 0x18000) == !own &&
+                  resv_page(dt, RAM_TABLES + 0x1c000) == !own && resv_tables(dt) == 6,
+              "dcpext1's tables on the DART the ADT names are kept, not the unnamed one's (%d)",
+              resv_tables(dt));
     } else if (is(s, "j713-26-6-2-no-uuid")) {
         check(fdt_totalsize(in) == fdt_totalsize(dt) && !memcmp(in, dt, fdt_totalsize(dt)),
               "the device tree is byte for byte unchanged");

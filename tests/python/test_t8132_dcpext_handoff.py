@@ -78,10 +78,11 @@ REASONS = {
     "j713-dart-read-faults": [H0, "dcpext1: reading DART 0x48a340000 faulted", NB],
     "j713-no-mapper": [H0, "dcpext1: the ADT does not describe its DART stream", NB],
     "j713-no-pipe": [H0, "dcpext1: 0 ADT display pipes use its piodma stream 16 at 0x48a300000",
-                     "dcpext1 memory: no ADT pipe holds it", NB],
-    "j713-two-pipes": [H1, "dcpext0: 2 ADT display pipes use its piodma stream 16 at 0x286300000"],
+                     "dcpext1 memory: 0 ADT ext-display-subsystem nodes hold it: its pipe is not known", NB],
+    "j713-two-pipes": [H1, "dcpext0: 2 ADT display pipes use its piodma stream 16 at 0x286300000",
+                       "dcpext0 memory: 2 ADT ext-display-subsystem nodes hold it", NB],
     "j713-no-adt-node": [H0, "/soc/dcp@48ae00000: 0 ADT processors at 0x48ae00000",
-                         "dcpext1 memory: no ADT pipe holds it", NB],
+                         "dcpext1 memory: 0 ADT ext-display-subsystem nodes hold it: its pipe is not known", NB],
     "j713-text-not-shared": [H0, "dcpext1: __TEXT 0x10284000000+0x10000 is not the internal DCP's"],
     "j713-bad-layout": [H1, "dcpext0: iBoot did not leave its four-segment firmware loaded and running"],
     "j713-has-clocks": [H1, "dcpext0: already has clocks"],
@@ -127,7 +128,7 @@ REASONS = {
     "j713-refused-segs-kept": [H0, "dcpext1: segment 1 0x10121000000+0x8000 at 0x10051100000 is kernel RAM",
                                K(1, 6, 0)],
     "j713-refused-pipe-kept": [H0, "dcpext1: 0 ADT display pipes use its piodma stream 16",
-                               "dcpext1 memory: no ADT pipe holds it", K(1, 0, 2), NB],
+                               "dcpext1 memory: 0 ADT ext-display-subsystem nodes hold it: its pipe is not known", K(1, 0, 2), NB],
     "j713-refused-power-kept": [H0, "dcpext1: DISPEXT1_FE is not on (0xf)", "dcpext1 memory: DISPEXT1_FE is not on",
                                 "dcpext1 memory: may run but is not powered as a running one: its 2 DART(s) not read",
                                 K(1, 6, 0), NB],
@@ -145,7 +146,7 @@ REASONS = {
                             "firmware-ready path"],
     "j713-no-dt-ext-kept": ["the device tree describes no external processor", K(0, 7, 4), K(1, 7, 4)],
     "j713-no-adt-node-kept": [H0, "/soc/dcp@48ae00000: 0 ADT processors at 0x48ae00000",
-                              "dcpext1 memory: no ADT pipe holds it", K(1, 7, 0), NB],
+                              "dcpext1 memory: 0 ADT ext-display-subsystem nodes hold it: its pipe is not known", K(1, 7, 0), NB],
     "j773g-refused-kept": ["no panel, and the display subsystem's DART is not as iBoot leaves it",
                            K(0, 6, 4), K(1, 6, 4)],
     "j713-pipe-left-on": [H0, "dcpext1: DISPEXT1_CPU is not requested (0x0)",
@@ -160,6 +161,12 @@ REASONS = {
     "j713-early-exit-ready": ["no image uuid on /arm-io/dcp/iop-dcp-nub", K(0, 6, 4), K(1, 6, 4)],
     "j713-handed-ready": [H0, H1],
     "j713-refused-ready": [H0, "dcpext1: no text, data and heap memory-region placeholders"],
+    "j713-pipe-no-mappers": [H0, "dcpext1: segment 1 0x10121000000+0x8000 at 0x10051100000 is kernel RAM",
+                             "dcpext1 memory: dispext1 has no iommu-parent list", K(1, 6, 2), NB],
+    "j713-no-dt-ext-pipe-no-mappers": ["dcpext1 memory: dispext1 has no iommu-parent list",
+                                       K(0, 7, 4), K(1, 7, 2), NB],
+    "j713-ext-no-mappers": [H0, "dcpext1: the ADT does not describe its DART stream",
+                            "dcpext1 memory: dcpext1 has no iommu-parent list", K(1, 6, 2), NB],
     "j773g-disp-piodma-bypass": ["the display subsystem: DART 0x30a300000 stream 16 is not a two-level translation (TCR 0x3, ",
                                  "no panel, and the display subsystem's DART is not as iBoot leaves it"],
 }
@@ -177,7 +184,8 @@ ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-
                "j713-extra-child-dart", "j713-iommu-cells-2", "j713-refused-segs-kept",
                "j713-refused-pipe-kept", "j713-refused-power-kept", "j713-refused-image-kept",
                "j713-refused-unlocked-kept", "j713-off-nothing-kept", "j713-auto-off-kept",
-               "j713-no-adt-node-kept", "j713-pipe-left-on", "j713-refused-ready"}
+               "j713-no-adt-node-kept", "j713-pipe-left-on", "j713-refused-ready",
+               "j713-pipe-no-mappers", "j713-ext-no-mappers"}
 # Processors that are not handed over keep their memory, with their own lines (" memory: ")
 
 

@@ -3510,6 +3510,7 @@ static const struct {
 
 #define DCPEXT_MAX        8
 #define DCPEXT_TABLES_MAX 256
+#define DCPEXT_REFS_MAX   8
 #define DCPEXT_DARTS_MAX  8
 
 /* The page-table pages of the DARTs an external processor uses, as iBoot left them */
@@ -3710,7 +3711,8 @@ static int dcpext_ps_add(struct dcpext_ps *ps, int *n, const struct pmgr_gate *g
  * /arm-io/<name> is powered as iBoot leaves a processor it started: each PMGR device its ADT
  * clock-gates name is requested (the hardware gates an idle processor's CPU domain by itself), and
  * each parent above it, through both parents of every device, up to the first virtual one, is on
- * (DISPEXTn_CPU, then _FE and _SYS on the T8132). Through the ADT's PMGR table; the power state
+ * (DISPEXTn_CPU, then _FE and _SYS on the T8132): those parents are its pipe's domains, so its
+ * pipe's DART may be read only once there is one. Through the ADT's PMGR table; the power state
  * registers are only read, guarded. `what` names it in the log.
  */
 static int dcpext_powered(const char *name, const char *what)
@@ -3736,10 +3738,15 @@ static int dcpext_powered(const char *name, const char *what)
         val[i] = read32(ps[i].addr);
     if (dcp6_guard_end(guard))
         bail("%s: reading its power state faulted\n", what);
-    for (int i = 0; i < n; i++)
+    bool above = false;
+    for (int i = 0; i < n; i++) {
+        above |= !ps[i].gate;
         if (ps[i].gate ? !dcp6_ps_on(val[i]) : FIELD_GET(PMGR_PS_ACTUAL, val[i]) != PMGR_PS_ACTIVE)
             bail("%s: %.16s is not %s (0x%x)\n", what, ps[i].name, ps[i].gate ? "requested" : "on",
                  val[i]);
+    }
+    if (!above)
+        bail("%s: no PMGR device above its clock-gates: its pipe's power is not known\n", what);
     return 0;
 }
 
@@ -3876,36 +3883,50 @@ static void dcpext_keep_dart(u64 dart, struct dcpext_tables *t, const char *what
     }
 }
 
-/* Add `base` to darts[] (n of them) once; one that does not fit is counted in *missed */
-static void dcpext_dart_add(u64 *darts, int *n, u64 base, int *missed)
-{
-    for (int k = 0; k < *n; k++)
-        if (darts[k] == base)
-            return;
-    if (*n < DCPEXT_DARTS_MAX)
-        darts[(*n)++] = base;
-    else
-        (*missed)++;
-}
+/* A DART stream the ADT gives a device: its DART's address, the stream, and whether a pipe's */
+struct dcpext_ref {
+    u64 dart;
+    u32 sid;
+    bool pipe;
+};
 
 /*
- * Add the DART of each stream ADT node `src`'s iommu-parent names (a list of mapper phandles) to
- * darts[]; one that does not resolve to an ADT dart,t8110 is counted in *missed.
+ * Add each stream ADT node `src`'s iommu-parent names (a list of mapper phandles) to refs[] (n of
+ * them) once, marked `pipe` for a pipe's. A list that is missing, empty or not whole phandles, a
+ * phandle that does not resolve to a stream of an ADT dart,t8110, and a stream past
+ * DCPEXT_REFS_MAX are logged and counted in *missed: the DARTs it uses are then not all known.
  */
-static void dcpext_adt_darts(int src, u64 *darts, int *n, int *missed)
+static void dcpext_adt_refs(int src, struct dcpext_ref *refs, int *n, bool pipe, const char *what,
+                            int *missed)
 {
+    const char *name = adt_get_name(adt, src);
     u32 len = 0;
     const u8 *phs = adt_getprop(adt, src, "iommu-parent", &len);
 
-    for (u32 i = 0; phs && i + sizeof(u32) <= len; i += sizeof(u32)) {
-        u32 ph, sid;
-        u64 base;
+    if (!phs || !len || len % sizeof(u32)) {
+        dlog("%s: %s has no iommu-parent list: its DARTs are not known\n", what, name);
+        (*missed)++;
+        return;
+    }
+    for (u32 i = 0; i < len; i += sizeof(u32)) {
+        struct dcpext_ref r = {.pipe = pipe};
+        u32 ph;
+        int k;
         memcpy(&ph, phs + i, sizeof(ph));
-        int dart = dcpext_adt_stream(ph, &sid);
-        if (dart < 0 || dcpext_adt_reg(dart, &base))
+        int dart = dcpext_adt_stream(ph, &r.sid);
+        if (dart < 0 || dcpext_adt_reg(dart, &r.dart)) {
+            dlog("%s: %s iommu-parent[%u] is not a DART stream\n", what, name, i / 4);
             (*missed)++;
+            continue;
+        }
+        for (k = 0; k < *n && (refs[k].dart != r.dart || refs[k].sid != r.sid); k++)
+            ;
+        if (k < *n)
+            refs[k].pipe |= pipe;
+        else if (*n < DCPEXT_REFS_MAX)
+            refs[(*n)++] = r;
         else
-            dcpext_dart_add(darts, n, base, missed);
+            (*missed)++;
     }
 }
 
@@ -3921,33 +3942,76 @@ static bool dcpext_adt_holds(int node, u64 addr)
 }
 
 /*
- * The DARTs whose tables an external processor that is not handed over may use, all from the ADT,
- * whatever the device tree has: its own stream's (iommu-parent), and the streams of each pipe
- * (ext-display-subsystem) whose registers hold the processor's, as the display subsystem's hold
- * its DCP's. A stream that does not resolve, or a processor no pipe holds (logged), is counted in
- * *missed. No register is read.
+ * The pipe of the processor at ADT /arm-io child `child`: the one /arm-io child of device_type
+ * `type` (ext-display-subsystem; display-subsystem for the internal DCP) whose register ranges
+ * hold the processor's reg[0] (the T8132 ADT's dispextN reg[3] holds dcpextN's, as disp0's holds
+ * dcp's). Its FE and SYS power domains are the processor's clock-gate's PMGR parents, which
+ * dcpext_powered() checks. -1 (logged) if no such node, or more than one, holds it.
+ */
+static int dcpext_adt_pipe(int child, const char *type, const char *what)
+{
+    int node = adt_path_offset(adt, "/arm-io"), pipe = -1, n = 0;
+    u64 coproc;
+
+    if (node < 0 || dcpext_adt_reg(child, &coproc))
+        bail("%s: no ADT registers to find its pipe by\n", what);
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        if (dcpext_adt_is(node, "device_type", type) && dcpext_adt_holds(node, coproc)) {
+            pipe = node;
+            n++;
+        }
+    }
+    if (n != 1)
+        bail("%s: %d ADT %s nodes hold it: its pipe is not known\n", what, n, type);
+    return pipe;
+}
+
+/*
+ * The DART streams the external processor at ADT /arm-io child `child` and its pipe use, all from
+ * the ADT, whatever the device tree has: its own iommu-parent's and its pipe's
+ * (dcpext_adt_pipe()), into refs[]. Returns how many; *pipe is the pipe, or -1. What cannot be
+ * found is logged and counted in *missed. No register is read.
+ */
+static int dcpext_adt_supply(int child, struct dcpext_ref *refs, int *pipe, const char *what,
+                             int *missed)
+{
+    int n = 0;
+
+    dcpext_adt_refs(child, refs, &n, false, what, missed);
+    *pipe = dcpext_adt_pipe(child, "ext-display-subsystem", what);
+    if (*pipe < 0)
+        (*missed)++;
+    else
+        dcpext_adt_refs(*pipe, refs, &n, true, what, missed);
+    return n;
+}
+
+/* The DARTs of refs[] (n of them), each once, into darts[]; returns how many */
+static int dcpext_ref_darts(const struct dcpext_ref *refs, int n, u64 *darts)
+{
+    int nd = 0;
+
+    for (int i = 0; i < n; i++) {
+        int k;
+        for (k = 0; k < nd && darts[k] != refs[i].dart; k++)
+            ;
+        if (k == nd)
+            darts[nd++] = refs[i].dart;
+    }
+    return nd;
+}
+
+/*
+ * The DARTs whose tables an external processor that is not handed over may use
+ * (dcpext_adt_supply()), each once. What cannot be found is counted in *missed.
  */
 static int dcpext_keep_darts(int child, u64 *darts, const char *what, int *missed)
 {
-    int n = 0, pipes = 0, pipe = adt_path_offset(adt, "/arm-io");
-    u64 coproc;
+    struct dcpext_ref refs[DCPEXT_REFS_MAX];
+    int pipe;
 
-    dcpext_adt_darts(child, darts, &n, missed);
-    if (pipe >= 0 && !dcpext_adt_reg(child, &coproc)) {
-        ADT_FOREACH_CHILD(adt, pipe)
-        {
-            if (dcpext_adt_is(pipe, "device_type", "ext-display-subsystem") &&
-                dcpext_adt_holds(pipe, coproc)) {
-                dcpext_adt_darts(pipe, darts, &n, missed);
-                pipes++;
-            }
-        }
-    }
-    if (!pipes) {
-        dlog("%s: no ADT pipe holds it: its pipe's DART is not known\n", what);
-        (*missed)++;
-    }
-    return n;
+    return dcpext_ref_darts(refs, dcpext_adt_supply(child, refs, &pipe, what, missed), darts);
 }
 
 /*
@@ -4043,7 +4107,7 @@ static int dcpext_keep(void *dt, int child)
     const char *name = adt_get_name(adt, child);
     struct dcpext_tables *t = &dcpext_kept.tables;
     char what[DCP6_NAME_LEN + 8];
-    u64 darts[DCPEXT_DARTS_MAX];
+    u64 darts[DCPEXT_REFS_MAX];
     int missed = 0, tables = 0;
 
     if (!name) {

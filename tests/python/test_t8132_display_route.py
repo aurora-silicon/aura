@@ -329,7 +329,7 @@ static bool stage1_no_boot(const char *s)
 {
     return is(s, "fw27-overlap") || is(s, "fw27-pipe-left-on") || is(s, "fw27-power-unknown") ||
            is(s, "fw27-pmgr-faults") || is(s, "fw27-no-clock-gates") || is(s, "fw27-dart-faults") ||
-           is(s, "fw27-refused-dt-full");
+           is(s, "fw27-refused-dt-full") || has(s, "-no-mappers");
 }
 
 /* External processor i's __DATA and heap moved into the RAM the OS gets, apart */
@@ -458,6 +458,11 @@ int main(int argc, char **argv)
         poke32(pipe_dart[1] + 0x200, 0x1e0); /* unlocked with a live stream: still walked */
     if (is(s, "fw27-dart-faults"))
         region_of(ext_dart[1])->base = 0x7e0000000ULL; /* dcpext1's firmware DART: no answer */
+    /* The ADT lists no mapper for dcpext1's pipe (or for dcpext1): that DART is not known */
+    if (has(s, "-pipe-no-mappers"))
+        prop_drop("/arm-io/dispext1", "iommu-parent");
+    if (is(s, "fw27-ext-no-mappers"))
+        prop_drop("/arm-io/dcpext1", "iommu-parent");
 
     /* The device tree */
     if (has(s, "-no-alias")) {
@@ -467,7 +472,7 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-    if (is(s, "fw27-no-dt-ext")) {
+    if (has(s, "-no-dt-ext")) {
         /* The device tree has no external processor: the ADT's are kept all the same */
         int node;
         while ((node = fdt_node_offset_by_compatible(dt, -1, T8132_EXT)) >= 0)
@@ -572,10 +577,15 @@ int main(int argc, char **argv)
             expect(segs_kept(1, 0) && !resv_page(dt, RAM_TABLES + 0x10000) &&
                        !resv_page(dt, RAM_TABLES + 0x18000),
                    "dcpext1's segments are kept; its DARTs are not read");
-        if (is(s, "fw27-dart-faults"))
+        if (is(s, "fw27-dart-faults") || is(s, "fw27-ext-no-mappers"))
             expect(segs_kept(1, 0) && resv_page(dt, RAM_TABLES + 0x18000) &&
                        !resv_page(dt, RAM_TABLES + 0x10000),
-                   "dcpext1's segments and pipe tables are kept, not its faulting DART's");
+                   "dcpext1's segments and pipe tables are kept, not its own DART's");
+        if (has(s, "-pipe-no-mappers"))
+            expect(segs_kept(1, 0) && resv_page(dt, RAM_TABLES + 0x10000) &&
+                       resv_page(dt, RAM_TABLES + 0x14000) && !resv_page(dt, RAM_TABLES + 0x18000) &&
+                       resv_tables(dt) == 6,
+                   "dcpext1's segments and own DART tables are kept, not its unnamed pipe DART's");
     } else if (!off) {
         /* Running, kept: it boots */
         int tables = 0;
@@ -615,11 +625,14 @@ FDT_SCENARIOS = [
     # running, and some of their memory cannot be kept: no boot
     "fw27-overlap", "fw27-pipe-left-on", "fw27-power-unknown", "fw27-pmgr-faults",
     "fw27-no-clock-gates", "fw27-dart-faults", "fw27-refused-dt-full",
+    # the ADT names no DART for a running processor's pipe (or the processor): no boot
+    "fw27-pipe-no-mappers", "fw27-no-dt-ext-pipe-no-mappers", "fw27-ext-no-mappers",
     # iBoot left them off: a Stage 1 boots, promising and keeping nothing
     "fw27-off", "fw27-refused-off", "fw27-no-alias-off", "fw27-prepopulated-off",
 ]
 NO_BOOT = {"fw27-overlap", "fw27-pipe-left-on", "fw27-power-unknown", "fw27-pmgr-faults",
-           "fw27-no-clock-gates", "fw27-dart-faults", "fw27-refused-dt-full"}
+           "fw27-no-clock-gates", "fw27-dart-faults", "fw27-refused-dt-full",
+           "fw27-pipe-no-mappers", "fw27-no-dt-ext-pipe-no-mappers", "fw27-ext-no-mappers"}
 BOARDS = {"j713": "J713_DTB", "j773g": "J773G_DTB"}
 
 
