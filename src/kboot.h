@@ -87,9 +87,9 @@ enum dcp_internal {
 /*
  * The handoff is built into the ESP Stage 2 only (kboot_display_handoff.c). A Stage 1 that boots
  * an OS itself declines it (0): kboot.c then keeps the firmware-ready path for the external
- * processors of older firmware, and on firmware given its clocks keeps their memory from the OS
- * without handing them over (dt_keep_dcpext()). The ESP Stage 2's returns 1 on such firmware, -1
- * if the memory of a processor it did not hand over could not all be kept.
+ * processors of older firmware, and on firmware given its clocks boots only if none may still run
+ * (dt_keep_dcpext()). The ESP Stage 2's returns 1 on such firmware, -1 if the memory of a
+ * processor it did not hand over could not all be kept.
  */
 #ifdef ESP_STAGE2
 int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks);
@@ -104,9 +104,10 @@ static inline int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bo
 #endif
 /*
  * Both stages, on firmware given its clocks: withdraw what the device tree promised of every
- * external display processor not handed over, and keep the memory of each one the ADT describes
- * that may still run as iBoot left it (kboot_display_handoff.c). -1 if that memory could not all
- * be kept: the OS must then not start.
+ * external display processor not handed over. The ESP Stage 2 keeps the memory of each one the
+ * ADT describes that may still run as iBoot left it; a Stage 1, which has no room for that, fails
+ * if any may still run (kboot_display_handoff.c). -1 if that memory could not all be kept: the OS
+ * must then not start.
  */
 int dt_keep_dcpext(void *dt);
 

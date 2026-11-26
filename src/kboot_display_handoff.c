@@ -3487,12 +3487,13 @@ static void t6041_ext_handoffs(void *dt)
 /* ---- external display processors the ADT describes ---- */
 
 /*
- * Both stages keep the memory of every external display processor the ADT describes that is not
- * handed over to the OS, all of them in a Stage 1, while it may still run as iBoot left it: its
- * firmware segments and the page tables of the DARTs it and its pipe use (dt_keep_dcpext()). Only
- * the ESP Stage 2 hands processors over (dt_set_dcpext_handoff(), kboot.h): a Stage 1 has no room
- * for that. The only register accesses are guarded reads of PMGR power states and, once a
- * processor's power is checked, of the DARTs the ADT and the device tree point at and their tables.
+ * The ESP Stage 2 hands external display processors over (dt_set_dcpext_handoff(), kboot.h) and
+ * keeps the memory of every one the ADT describes that it does not hand over while it may still
+ * run as iBoot left it: its firmware segments and the page tables of the DARTs it and its pipe use
+ * (dt_keep_dcpext()). A Stage 1 has no room for either: it withdraws what the input tree promised
+ * of them and boots only if none may run. The only register accesses are guarded reads of PMGR
+ * power states and, in the ESP Stage 2 once a processor's power is checked, of the DARTs the ADT
+ * and the device tree point at and their tables.
  */
 
 static const struct dcp_soc dcp_soc_dcpext = {.name = "dcpext"};
@@ -3519,11 +3520,13 @@ struct dcpext_tables {
     u64 page[DCPEXT_TABLES_MAX];
 };
 
-/* The processors handed over in this boot (ESP Stage 2 only), and the keep's scratch */
+/* The processors handed over in this boot, and the keep's scratch (ESP Stage 2 only) */
 static struct {
     int nhanded;
-    u64 handed[DCPEXT_MAX];      /* their address: ADT and device tree reg[0] */
+    u64 handed[DCPEXT_MAX]; /* their address: ADT and device tree reg[0] */
+#ifdef ESP_STAGE2
     struct dcpext_tables tables; /* one processor's table pages to keep from the OS */
+#endif
 } dcpext_kept;
 
 /* An ADT string property (device_type) is `want` */
@@ -3598,6 +3601,7 @@ static bool dcpext_not_running(const char *name)
     return n > 0 && n < DCP6_GATES_MAX;
 }
 
+#ifdef ESP_STAGE2
 /* reg[idx] of /arm-io/<child>, address and size (if `size`), with the /arm-io ranges applied */
 static int dcpext_adt_reg_at(int child, int idx, u64 *addr, u64 *size)
 {
@@ -3655,6 +3659,7 @@ static int dcpext_adt_stream(u32 ph, u32 *sid)
         return -1;
     return dart;
 }
+#endif /* ESP_STAGE2 */
 
 /* reg[0] of a device tree node whose parent has 2 address and 2 size cells */
 static int dcpext_dt_reg(void *dt, int node, u64 *addr)
@@ -3668,6 +3673,7 @@ static int dcpext_dt_reg(void *dt, int node, u64 *addr)
     return 0;
 }
 
+#ifdef ESP_STAGE2
 /* The power states a processor's clock-gates resolve to: each gate, then its parents */
 struct dcpext_ps {
     u64 addr;
@@ -4143,6 +4149,7 @@ static int dcpext_keep(void *dt, int child)
          what, fw, tables, ndarts, missed);
     return missed;
 }
+#endif /* ESP_STAGE2 */
 
 /* Whether the processor at `coproc` (its reg[0]) is handed over */
 static bool dcpext_is_handed(u64 coproc)
@@ -4200,9 +4207,10 @@ static int dcpext_withdraw(void *dt)
     return 0;
 }
 
+#ifdef ESP_STAGE2
 /*
- * kboot.c's T8132 route on firmware the OS gives its clocks, in both stages, after any handoff
- * (dt_set_dcpext_handoff(), ESP Stage 2 only): withdraw what the input tree promised of every
+ * kboot.c's T8132 route on firmware the OS gives its clocks, in the ESP Stage 2, after the handoff
+ * (dt_set_dcpext_handoff()): withdraw what the input tree promised of every
  * processor not handed over (dcpext_withdraw()), and keep the memory of every external processor
  * the ADT describes (an /arm-io child of device_type dcp other than the internal /arm-io/dcp) that
  * is not handed over (dcpext_keep()), whatever the device tree says of it or why it was not handed
@@ -4238,6 +4246,46 @@ int dt_keep_dcpext(void *dt)
              missed);
     return missed ? -1 : 0;
 }
+#else
+/*
+ * kboot.c's T8132 route on firmware the OS gives its clocks, in a Stage 1, which has no room to
+ * hand the external processors over or to keep their memory: withdraw what the input tree
+ * promised of each (dcpext_withdraw()), and boot only if every external processor the ADT
+ * describes provably does not run, nor its pipe (dcpext_not_running()). One that may still run
+ * uses its firmware segments and DART tables as iBoot left them, and only the ESP Stage 2 finds
+ * and keeps those (dcpext_keep()). Returns -1 (each reason logged) if one may run or the
+ * withdrawal failed: the OS must then not be started.
+ */
+int dt_keep_dcpext(void *dt)
+{
+    int io = adt_path_offset(adt, "/arm-io"), internal = adt_path_offset(adt, "/arm-io/dcp");
+    int child = io, running = 0;
+
+    dcp6.soc = &dcp_soc_dcpext;
+    if (dcpext_withdraw(dt)) {
+        dlog("what the device tree promised of the external processors cannot be withdrawn\n");
+        return -1;
+    }
+    if (io < 0) {
+        dlog("no ADT /arm-io: the external processors cannot be found\n");
+        return -1;
+    }
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        const char *name;
+        if (child == internal || !dcpext_adt_is(child, "device_type", "dcp"))
+            continue;
+        name = adt_get_name(adt, child);
+        if (!name || !dcpext_not_running(name)) {
+            dlog("%s: may still run, and a Stage 1 cannot keep its memory from the OS (boot "
+                 "through the ESP Stage 2)\n",
+                 name ? name : "an ADT processor without a name");
+            running++;
+        }
+    }
+    return running ? -1 : 0;
+}
+#endif /* ESP_STAGE2 */
 
 #ifdef ESP_STAGE2
 

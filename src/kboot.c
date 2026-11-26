@@ -9934,10 +9934,11 @@ static int dt_set_display(void)
         /*
          * The external processors of firmware the OS gives clocks (firmware 27) are handed over
          * from the ADT by kboot_display_handoff.c in the ESP Stage 2, beside a complete internal
-         * handoff or with no panel. A Stage 1 has no such handoff (kboot.h), and keeps the memory
-         * of all of them (dt_keep_dcpext()): the ESP Stage 2 keeps that of those it does not hand
-         * over the same way. Both withdraw what the input tree promised of those not handed over.
-         * Those of older firmware keep the firmware-ready path.
+         * handoff or with no panel, and the ESP Stage 2 keeps the memory of those it does not
+         * hand over (dt_keep_dcpext()). A Stage 1 has no such handoff (kboot.h) and no room for
+         * the keep: it boots only if none may still run. Both withdraw what the input tree
+         * promised of those not handed over. Those of older firmware keep the firmware-ready
+         * path.
          */
         bool fw_clocks = dt_dcp_fw_clocks();
         int claimed = dt_set_dcpext_handoff(dt, internal, fw_clocks);
