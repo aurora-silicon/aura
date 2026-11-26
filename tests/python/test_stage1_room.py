@@ -114,3 +114,21 @@ def test_cli_nm_failure_fails(tmp_path):
     nm = fake_nm(tmp_path, [], status=1)
     r = room_cli(tmp_path, nm, "--forbid", "dt_set_dcpext_handoff")
     assert r.returncode != 0
+
+
+def test_vector_tables_ahead_of_the_c_code():
+    """Every 2 KiB aligned code object (an exception vector table) is linked in .init right after
+    start.S's, before any C code: anywhere in .text, a few bytes more code before it moved it, and
+    everything after it, up 2 KiB, and the room could drop under the floor by itself."""
+    import re
+    script = (ROOT / "aura-raw.ld").read_text()
+    init = script[script.index(".init : "):script.index("*(.init.*)")]
+    aligned = []
+    for asm in sorted((ROOT / "src").rglob("*.S")):
+        text = asm.read_text()
+        if re.search(r"^\s*\.(align\s+1[1-9]|p2align\s+1[1-9]|balign\s+(2048|4096|0x800|0x1000))\b",
+                     text, re.M) and asm.name != "start.S":
+            aligned.append(asm.relative_to(ROOT / "src").with_suffix(".o").as_posix())
+    assert aligned, "no vector table found: the scan is wrong"
+    for obj in aligned:
+        assert f"*{obj}(.text .text.*)" in init, obj
