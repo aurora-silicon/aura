@@ -712,6 +712,10 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-pipe-left-on", "J713: DISPEXT1_CPU off, its FE and SYS on: no boot"},
     {"j713-keep-overlap", "J713: a dcpext1 heap page in a mappable reservation: no boot"},
     {"j713-keep-fault-peer", "J713: dcpext1's DART faults: dcpext0's pages kept, no boot"},
+    {"j713-incomplete-ready", "J713: internal incomplete, the input tree promises both: withdrawn"},
+    {"j713-early-exit-ready", "J713: no uuid on the internal nub, the input promises: withdrawn"},
+    {"j713-handed-ready", "J713: both handed over, the input tree has the 26.6.2 ready marker"},
+    {"j713-refused-ready", "J713: dcpext1 refused, the input tree promises it: withdrawn"},
 };
 
 /*
@@ -761,6 +765,42 @@ static void ext_off(int i)
         poke32(ps_reg(pm_sys(i) + k), 0x0);
 }
 
+/* The input tree already promises external processor i (as a 26.6.2 or earlier boot's would) */
+static void ext_promise(void *dt, int i, bool ready_only)
+{
+    char path[96];
+    ext_path(path, sizeof(path), i);
+    int node = OK(fdt_path_offset(dt, path));
+    OK(fdt_setprop_u32(dt, node, READY, 1));
+    if (ready_only)
+        return;
+    fdt32_t ids[2] = {cpu_to_fdt32(pipe_clk[i][0]), cpu_to_fdt32(pipe_clk[i][1])};
+    fdt32_t ver[3] = {cpu_to_fdt32(27), cpu_to_fdt32(2), 0};
+    OK(fdt_setprop_string(dt, node, "apple,firmware-uuid", UUID27));
+    OK(fdt_setprop(dt, node, "apple,firmware-version", ver, sizeof(ver)));
+    OK(fdt_setprop(dt, node, "apple,firmware-compat", ver, sizeof(ver)));
+    OK(fdt_setprop(dt, node, "apple,clock-ids", ids, sizeof(ids)));
+    int len = 0;
+    const fdt32_t *mr = fdt_getprop(dt, node, "memory-region", &len);
+    u32 first = mr && len >= 4 ? fdt32_ld(mr) : 1;
+    for (int k = 0; k < 4; k++)
+        OK(fdt_appendprop_u32(dt, node, "memory-region", first));
+}
+
+/* External processor i promises nothing: no adoption property, memory-region its named entries */
+static bool ext_unpromised(const void *dt, int i)
+{
+    static const char *const props[] = {READY, "apple,firmware-uuid", "apple,firmware-version",
+                                        "apple,firmware-compat", "apple,clock-ids"};
+    char path[96];
+    ext_path(path, sizeof(path), i);
+    int node = fdt_path_offset(dt, path), len = 0;
+    for (size_t k = 0; k < ARRAY_SIZE(props); k++)
+        if (node < 0 || fdt_getprop(dt, node, props[k], NULL))
+            return false;
+    int named = fdt_stringlist_count(dt, node, "memory-region-names");
+    return !fdt_getprop(dt, node, "memory-region", &len) || len == 4 * (named > 0 ? named : 0);
+}
 
 /* A page of usable RAM for the scenarios that put tables there */
 #define RAM_TABLES (TB + 0x100000000ULL)
@@ -917,7 +957,8 @@ int main(int argc, char **argv)
     if (!j773g && !is(s, "j713-dcp-uuid-missing"))
         m4_handoff(dt, image, !unknown && !is(s, "j713-dcp-no-clocks"));
     if (is(s, "j713-internal-walk-failed") || is(s, "j713-internal-incomplete-kept") ||
-        is(s, "j713-keep-overlap") || is(s, "j713-keep-fault-peer"))
+        is(s, "j713-keep-overlap") || is(s, "j713-keep-fault-peer") ||
+        is(s, "j713-incomplete-ready"))
         internal = DCP_INTERNAL_NONE;
 
     /* ADT changes */
@@ -1140,7 +1181,8 @@ int main(int argc, char **argv)
         region_of(ext_dart[1])->base = 0x7e0000000ULL;
         region_of(pipe_dart[1])->base = 0x7e0100000ULL;
     }
-    if (is(s, "j713-keep-overlap") || is(s, "j713-keep-fault-peer")) {
+    if (is(s, "j713-keep-overlap") || is(s, "j713-keep-fault-peer") ||
+        is(s, "j713-incomplete-ready") || is(s, "j713-early-exit-ready")) {
         for (int i = 0; i < 2; i++) {
             ext_segs_in_ram(i);
             ext_tables_in_ram(i);
@@ -1153,17 +1195,36 @@ int main(int argc, char **argv)
     }
     if (is(s, "j713-keep-fault-peer"))
         region_of(ext_dart[1])->base = 0x7e0000000ULL; /* dcpext1's firmware DART faults */
+    if (is(s, "j713-early-exit-ready"))
+        prop_drop("/arm-io/dcp/iop-dcp-nub", "uuid");
+    if (is(s, "j713-incomplete-ready") || is(s, "j713-early-exit-ready"))
+        for (int i = 0; i < 2; i++)
+            ext_promise(dt, i, false);
+    if (is(s, "j713-handed-ready"))
+        for (int i = 0; i < 2; i++)
+            ext_promise(dt, i, true);
+    if (is(s, "j713-refused-ready")) {
+        prop_str("/arm-io/dcpext1/iop-dcpext1-nub", "uuid", UUID_X);
+        ext_promise(dt, 1, false);
+    }
 
     memcpy(in, dt, fdt_totalsize(dt));
     mmio_reads = mmio_writes = 0;
     bool fw_clocks = os_firmware.version >= V27_0; /* kboot.c's dt_dcp_fw_clocks() */
     int ret = dt_set_dcpext_handoff(dt, internal, fw_clocks);
     if (is(s, "j713-repeat")) {
+        /*
+         * A second call finds the processors already published, and refuses them: what an input
+         * tree promised of a processor this call does not hand over is withdrawn, its memory kept.
+         */
         static u8 once[DT_SIZE];
         memcpy(once, dt, fdt_totalsize(dt));
         check(dt_set_dcpext_handoff(dt, internal, fw_clocks) == 1, "the second call is ours too");
-        check(fdt_totalsize(dt) == fdt_totalsize(once) && node_same(once, dt, "/"),
-              "the second call changes nothing");
+        check(ext_unpromised(dt, 0) && ext_unpromised(dt, 1),
+              "the second call withdraws the promises it did not make itself");
+        check(node_same(once, dt, "/reserved-memory") && resv_count(dt, "dcpext-") == 0,
+              "and keeps every reservation, adding none");
+        memcpy(dt, once, fdt_totalsize(once)); /* the first call's tree, checked below */
     }
 
     check(!mmio_writes, "no register written (%d reads, %d writes)", mmio_reads, mmio_writes);
@@ -1364,6 +1425,19 @@ int main(int argc, char **argv)
                   resv_tables(dt) == 6,
               "dcpext1's pipe DART tables are kept, not its faulting DART's (%d)",
               resv_tables(dt));
+    } else if (is(s, "j713-incomplete-ready") || is(s, "j713-early-exit-ready")) {
+        check(ext_unpromised(dt, 0) && ext_unpromised(dt, 1),
+              "the input tree's ready marker, uuid, version, compat, clock ids and extra "
+              "memory-region entries are withdrawn from both");
+        check(ext_segs_kept(dt, 0) && ext_segs_kept(dt, 1) && ext_tables_kept(dt, 0) &&
+                  ext_tables_kept(dt, 1) && resv_tables(dt) == 8,
+              "both processors' memory is kept (%d table pages)", resv_tables(dt));
+    } else if (is(s, "j713-handed-ready")) {
+        check_ext(in, dt, 0, false); /* published, without the ready marker */
+        check_ext(in, dt, 1, false);
+    } else if (is(s, "j713-refused-ready")) {
+        check_ext(in, dt, 0, false);
+        check(ext_unpromised(dt, 1), "the refused dcpext1's promises are withdrawn");
     } else if (is(s, "j713-26-6-2-no-uuid")) {
         check(fdt_totalsize(in) == fdt_totalsize(dt) && !memcmp(in, dt, fdt_totalsize(dt)),
               "the device tree is byte for byte unchanged");

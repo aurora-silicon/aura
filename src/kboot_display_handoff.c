@@ -3639,7 +3639,7 @@ static struct {
     struct dcpext_tables tables;      /* scratch for one processor's DARTs */
     struct dcpext_tables disp_tables; /* with no panel: the display subsystem DART's */
     int nhanded;
-    int handed[DCPEXT_MAX];           /* the ADT nodes of the processors handed over */
+    u64 handed[DCPEXT_MAX];           /* the addresses (reg[0]) of the processors handed over */
     struct dcpext_tables keep_tables; /* scratch for one processor's memory kept from the OS */
 } dcpext_run;
 
@@ -4618,30 +4618,90 @@ static int dcpext_keep(void *dt, int child)
     return missed;
 }
 
+/* Whether the processor at `coproc` (its reg[0]) is handed over */
+static bool dcpext_is_handed(u64 coproc)
+{
+    for (int i = 0; i < dcpext_run.nhanded; i++)
+        if (dcpext_run.handed[i] == coproc)
+            return true;
+    return false;
+}
+
 /*
- * Every external processor the ADT describes (an /arm-io child of device_type dcp other than the
- * internal /arm-io/dcp) that was not handed over keeps its memory (dcpext_keep()), whatever the
- * device tree says of it or why it was refused. Returns how many references to memory one that
- * may still run uses could not be followed or kept (logged): 0 if all of it is kept.
+ * Withdraw from each device tree processor of a known block (dcpext_blocks[]) that is not handed
+ * over what the input tree promised of it, by which the kernel would adopt it: the ready marker of
+ * the firmware-ready path (older firmware), its image, firmware version and compatibility, the
+ * firmware clock ids, and memory-region entries past those memory-region-names names (the ones
+ * the firmware-ready path appends). The reservations they point at stay. One handed over loses
+ * only the ready marker, which firmware given its clocks never gets. With none of these the
+ * kernel leaves the processor and its DARTs as iBoot left them. Returns -1 if the tree cannot be
+ * edited.
+ */
+static int dcpext_withdraw(void *dt)
+{
+    static const char props[][36] = {
+        "apple,t8132-dcpext-firmware-ready",
+        "apple,firmware-uuid",
+        "apple,firmware-version",
+        "apple,firmware-compat",
+        "apple,clock-ids",
+    };
+
+    for (size_t b = 0; b < ARRAY_SIZE(dcpext_blocks); b++) {
+        int node = -1;
+        while ((node = fdt_node_offset_by_compatible(dt, node, dcpext_blocks[b].dcpext)) >= 0) {
+            int len, named = fdt_stringlist_count(dt, node, "memory-region-names");
+            const fdt32_t *mr = fdt_getprop(dt, node, "memory-region", &len);
+            u64 coproc;
+            bool handed = !dcpext_dt_reg(dt, node, &coproc) && dcpext_is_handed(coproc);
+            if (!handed && mr && named >= 0 && len > named * (int)sizeof(*mr)) {
+                fdt32_t keep[8];
+                if (named > (int)ARRAY_SIZE(keep))
+                    return -1;
+                memcpy(keep, mr, named * sizeof(*mr));
+                if (fdt_setprop(dt, node, "memory-region", keep, named * sizeof(*mr)))
+                    return -1;
+            }
+            for (size_t i = 0; i < (handed ? 1 : ARRAY_SIZE(props)); i++) {
+                int ret = fdt_delprop(dt, node, props[i]);
+                if (ret && ret != -FDT_ERR_NOTFOUND)
+                    return -1;
+            }
+        }
+        if (node != -FDT_ERR_NOTFOUND)
+            return -1;
+    }
+    return 0;
+}
+
+/*
+ * What the input tree promised of every processor not handed over is withdrawn
+ * (dcpext_withdraw()), and every external processor the ADT describes (an /arm-io child of
+ * device_type dcp other than the internal /arm-io/dcp) that was not handed over keeps its memory
+ * (dcpext_keep()), whatever the device tree says of it or why it was refused. Returns how many
+ * references to memory one that may still run uses could not be followed or kept, or 1 more if
+ * the withdrawal failed (logged): 0 if all of it is kept.
  */
 static int dcpext_keep_rest(void *dt)
 {
     int io = adt_path_offset(adt, "/arm-io"), internal = adt_path_offset(adt, "/arm-io/dcp");
     int child = io, missed = 0;
 
+    if (dcpext_withdraw(dt)) {
+        dlog("what the device tree promised of the external processors cannot be withdrawn\n");
+        missed++;
+    }
     if (io < 0) {
         dlog("no ADT /arm-io: the external processors cannot be found\n");
         return 1;
     }
     ADT_FOREACH_CHILD(adt, child)
     {
-        bool handed = false;
-        if (child == internal || !dcpext_adt_is(child, "device_type", "dcp"))
+        u64 addr;
+        if (child == internal || !dcpext_adt_is(child, "device_type", "dcp") ||
+            (!dcpext_adt_reg(child, &addr) && dcpext_is_handed(addr)))
             continue;
-        for (int i = 0; i < dcpext_run.nhanded; i++)
-            handed |= dcpext_run.handed[i] == child;
-        if (!handed)
-            missed += dcpext_keep(dt, child);
+        missed += dcpext_keep(dt, child);
     }
     if (missed)
         dlog("%d reference(s) to memory an external processor may still use not kept from the "
@@ -4727,7 +4787,7 @@ static void dcpext_hand_over(void *dt, enum dcp_internal internal)
         if (!dcp6_commit(dt, scratch)) {
             dlog("%s handed over (image %s, stream %u, %u pipe clocks)\n", x->name, uuid, x->sid,
                  x->clk.n);
-            dcpext_run.handed[dcpext_run.nhanded++] = x->adt;
+            dcpext_run.handed[dcpext_run.nhanded++] = x->coproc;
             display = display ?: x->display;
         }
     }
@@ -4773,9 +4833,10 @@ static void dcpext_hand_over(void *dt, enum dcp_internal internal)
  * subsystem and its DART are enabled for them. After any other internal outcome nothing is handed
  * over: an external processor must never cost the panel.
  *
- * Every external processor the ADT describes that is not handed over, for any reason, then keeps
- * its memory from the OS (dcpext_keep_rest()): it may still run as iBoot left it. If that memory
- * cannot all be kept, -1: the OS must not start.
+ * Every processor that is not handed over, for any reason, then has what the input tree promised
+ * of it withdrawn, and every one the ADT describes keeps its memory from the OS
+ * (dcpext_keep_rest()): it may still run as iBoot left it. If that memory cannot all be kept, -1:
+ * the OS must not start.
  */
 int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
 {

@@ -156,6 +156,10 @@ REASONS = {
                           K(1, 5, 4), NB],
     "j713-keep-fault-peer": ["internal DCP handoff not complete", K(0, 6, 4),
                              "dcpext1 memory: reading DART 0x48a340000 or its tables faulted", K(1, 6, 2), NB],
+    "j713-incomplete-ready": ["internal DCP handoff not complete", K(0, 6, 4), K(1, 6, 4)],
+    "j713-early-exit-ready": ["no image uuid on /arm-io/dcp/iop-dcp-nub", K(0, 6, 4), K(1, 6, 4)],
+    "j713-handed-ready": [H0, H1],
+    "j713-refused-ready": [H0, "dcpext1: no text, data and heap memory-region placeholders"],
     "j773g-disp-piodma-bypass": ["the display subsystem: DART 0x30a300000 stream 16 is not a two-level translation (TCR 0x3, ",
                                  "no panel, and the display subsystem's DART is not as iBoot leaves it"],
 }
@@ -173,7 +177,7 @@ ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-
                "j713-extra-child-dart", "j713-iommu-cells-2", "j713-refused-segs-kept",
                "j713-refused-pipe-kept", "j713-refused-power-kept", "j713-refused-image-kept",
                "j713-refused-unlocked-kept", "j713-off-nothing-kept", "j713-auto-off-kept",
-               "j713-no-adt-node-kept", "j713-pipe-left-on"}
+               "j713-no-adt-node-kept", "j713-pipe-left-on", "j713-refused-ready"}
 # Processors that are not handed over keep their memory, with their own lines (" memory: ")
 
 
@@ -214,9 +218,9 @@ def test_no_silent_early_return():
 
 def test_every_firmware_27_outcome_keeps_memory():
     """Once the firmware is given its clocks, the handoff always ends in dcpext_keep_rest() (every
-    processor not handed over keeps its memory) and returns 1, or -1 if that memory could not all
-    be kept: the only 0 (kboot.c's 26.6.2 firmware-ready path) is decided from fw_clocks before
-    anything else."""
+    processor not handed over has its promises withdrawn and keeps its memory) and returns 1, or -1
+    if that memory could not all be kept: the only 0 (kboot.c's 26.6.2 firmware-ready path) is
+    decided from fw_clocks before anything else."""
     code = re.sub(r"/\*.*?\*/", "", (ROOT / "src/kboot_display_handoff.c").read_text(), flags=re.S)
     body = function_body(code, "int dt_set_dcpext_handoff(void *dt")
     head, tail = body.split("if (!fw_clocks) {", 1)
