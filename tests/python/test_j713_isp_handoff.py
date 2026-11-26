@@ -54,7 +54,12 @@ def test_j713_isp_handoff_fills_placeholders_or_leaves_the_camera_off(tmp_path):
     dtb = tmp_path / "j713.dtb"
     subprocess.run(["dtc", "-q", "-I", "dts", "-O", "dtb", "-o", str(dtb), "-"],
                    input=TREE, text=True, check=True)
-    run_c(tmp_path, "j713-isp-handoff", '#define DTB_PATH "%s"\n' % dtb + r'''
+    # The J715 (15-inch M4 Air) carries the same camera description; only the board differs.
+    dtb_j715 = tmp_path / "j715.dtb"
+    subprocess.run(["dtc", "-q", "-I", "dts", "-O", "dtb", "-o", str(dtb_j715), "-"],
+                   input=TREE.replace('"apple,j713"', '"apple,j715"'), text=True, check=True)
+    run_c(tmp_path, "j713-isp-handoff", '#define DTB_PATH "%s"\n' % dtb +
+          '#define DTB_J715_PATH "%s"\n' % dtb_j715 + r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -204,6 +209,17 @@ int main(void)
     assert(heap && len == 20 && fdt32_ld(heap + 4) == 0x1400000);
     assert(!fdt_getprop(dt, fdt_path_offset(dt, "/reserved-memory/isp-heap"), "reg", NULL));
 
+    /* The tree decides, not the board: a J715 tree with the same description is handed over. */
+    world(DTB_J715_PATH);
+    dt_set_j713_isp();
+    check_region("/reserved-memory/isp-firmware-text", 0x10000d30000ULL, 0x10000000000ULL,
+                 0xca4000);
+    check_region("/reserved-memory/isp-firmware-data", 0x10001f40000ULL, 0x10000ca4000ULL,
+                 0x748000);
+    assert(!strcmp(status("/soc/isp@48c000000"), "okay"));
+    for (int i = 0; i < 3; i++)
+        assert(!strcmp(status(darts[i]), "okay"));
+
     /*
      * 27.2 (26B123) on this J713: DATA ends at 0x1aec000, past the tree's 20 MiB window. The
      * window grows to the next 2 MiB boundary (28 MiB) and the ISP is handed over.
@@ -283,14 +299,18 @@ int main(void)
     }
 
     /* Trees that are not handoff targets are left alone: an enabled ISP (a kernel that
-     * reserves its own firmware), no placeholders, another machine. */
-    for (fault = 20; fault <= 22; fault++) {
+     * reserves its own firmware), a missing placeholder or heap window, another SoC. */
+    for (fault = 20; fault <= 24; fault++) {
         world(DTB_PATH);
         int isp = fdt_path_offset(dt, "/soc/isp@48c000000");
         if (fault == 20) assert(!fdt_setprop_string(dt, isp, "status", "okay"));
         if (fault == 21)
             assert(!fdt_del_node(dt, fdt_path_offset(dt, "/reserved-memory/isp-firmware-text")));
         if (fault == 22) chip_id = 0x8122;
+        if (fault == 23)
+            assert(!fdt_del_node(dt, fdt_path_offset(dt, "/reserved-memory/isp-firmware-data")));
+        if (fault == 24)
+            assert(!fdt_del_node(dt, fdt_path_offset(dt, "/reserved-memory/isp-heap")));
         memcpy(original, blob, sizeof(blob));
         dt_set_j713_isp();
         assert(!memcmp(original, blob, sizeof(blob)));

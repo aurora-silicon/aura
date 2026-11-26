@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -19,23 +19,25 @@
 #define G15_ARRAY_CLUSTERS   4
 #define G15_AUX_MAX          16
 #define T8122                0x8122
+#define GPU26_ERR_FATAL      (-2)
 #define bail(...)                                                                                  \
     do {                                                                                           \
         printf(__VA_ARGS__);                                                                       \
         return -1;                                                                                 \
     } while (0)
 
-/* SOURCE STRUCTS */
-
-struct g15_power_values {
-    u32 unused;
-    u32 min_sram_uv;
-};
 struct fw_version_info {
     int version;
     const char *string;
     u32 num[3];
     int num_length;
+};
+
+/* SOURCE STRUCTS */
+
+struct g15_power_values {
+    u32 unused;
+    u32 min_sram_uv;
 };
 enum { V14_8_3 = 1 };
 static const struct fw_version_info firmware = {V14_8_3, "14.8.3", {14, 8, 3}, 3};
@@ -265,6 +267,7 @@ static const struct g15_soc soc = {
     .dies = 1,
     .mask2_bits = 32,
     .power_closure = true,
+    .publish_powered_identity = true,
     .fw_experimental = true,
     .power_props = true,
     .read_leak = leak,
@@ -440,6 +443,7 @@ int main(void)
     setup(dt, true);
     struct g15_soc pro = soc;
     pro.chip = 0x6030;
+    pro.publish_powered_identity = false;
     pro.id_variant = 3;
     pro.cores_per_cluster = 10;
     pro.clusters = 2;

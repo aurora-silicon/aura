@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 set -eu
 cd "$(dirname "$0")/.."
 test_dir=$(mktemp -d)
@@ -25,7 +26,7 @@ def definition(pattern):
 structs = ['perf_state', 'g15_soc']
 prelude = ''.join(definition(r'^struct ' + name + r' \{') for name in structs)
 functions = ['g15_dt_reg_by_name', 't8122_identity_read', 'g15_read_hw',
-             'dt_gpu_t8122_26_calibrate']
+             'dt_gpu_g15_calibrate', 'dt_gpu_t8122_26_calibrate']
 bodies = ''.join(definition(r'^static (?:int|bool|void) ' + name + r'\([^;]+?\)\n\{')
                  if name != 'dt_gpu_t8122_26_calibrate' else
                  definition(r'^int ' + name + r'\([^;]+?\)\n\{')

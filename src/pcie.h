@@ -23,5 +23,12 @@ int pcie_ans_power_on(void);
 int pcie_disable_j713_fdt(void *dt);
 /* Post-M4: copy the APCIe tables from the ADT to the DT's PCIe host and its port. */
 int pcie_apcie_tables_fdt(void *dt, int capacity);
+/* Whether the OS was handed those tables, so that it brings the APCIe block back itself */
+void pcie_set_os_restores_apcie(bool restores);
+/* Whether the ADT can leave a system sleep's PCIe bring-up to aura (before M4) */
+bool pcie_sleep_reinit_possible(void);
+/* After a system sleep, before the OS runs again: whether the complex is aura's to set up */
+bool pcie_needs_sleep_reinit(void);
+int pcie_reinit_after_sleep(void);
 
 #endif

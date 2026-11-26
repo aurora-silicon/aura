@@ -229,6 +229,12 @@ AURA_XTEXT static void ctl_catalogue(void)
     ctl_add_adt("/arm-io/nub-spmi0", "spmi0", 0, 0, PG);
     ctl_add_adt("/arm-io/nub-spmi-a0", "spmi-a0", 0, 0, PG);
     ctl_add_adt("/arm-io/dart-dcp", "dart-dcp", 0, 0, 0);
+
+    /* Trace the APR core, wrapper, and DART windows described by this machine. */
+    ctl_add_adt("/arm-io/apr", "apr-core", 0, 0, 0);
+    ctl_add_adt("/arm-io/apr", "apr-wrapper", 1, 0, 0);
+    ctl_add_adt("/arm-io/dart-apr", "dart-apr", 0, 0, 0);
+    ctl_add_adt("/arm-io/dart-apr", "dart-apr-aux", 1, 0, 0);
 }
 
 AURA_XTEXT static void ctl_deny_adt(const char *path)
