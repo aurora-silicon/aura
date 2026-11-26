@@ -704,7 +704,15 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-no-dt-ext-kept", "J713: the device tree has no external processor: the ADT's kept"},
     {"j713-no-adt-node-kept", "J713: dcpext1's DT address matches no ADT processor: ADT one kept"},
     {"j773g-refused-kept", "J773g: disp0's DART unlocked, nothing handed over: both kept"},
+    {"j713-pipe-left-on", "J713: DISPEXT1_CPU off, its FE and SYS on: may run, kept"},
 };
+
+/* iBoot left external processor i off, with its pipe: CPU, FE and SYS power-gated, targeted so */
+static void ext_off(int i)
+{
+    for (int k = 0; k < 3; k++)
+        poke32(ps_reg(pm_sys(i) + k), 0x0);
+}
 
 /* A page of usable RAM for the scenarios that put tables there */
 #define RAM_TABLES (TB + 0x100000000ULL)
@@ -1044,8 +1052,10 @@ int main(int argc, char **argv)
         u16 sys = pm_sys(1);
         if (is(s, "j713-refused-power-kept"))
             poke32(ps_reg(sys + 1), 0x0f); /* FE: target on, actual off */
+        else if (is(s, "j713-auto-off-kept"))
+            poke32(ps_reg(sys + 2), 0x10000000u);
         else
-            poke32(ps_reg(sys + 2), is(s, "j713-auto-off-kept") ? 0x10000000u : 0x0);
+            ext_off(1);
     }
     if (is(s, "j713-refused-image-kept")) {
         prop_str("/arm-io/dcpext1/iop-dcpext1-nub", "uuid", UUID_X);
@@ -1072,6 +1082,15 @@ int main(int argc, char **argv)
     }
     if (is(s, "j773g-refused-kept"))
         poke32(M4_DART_DISP + 0x200, 0x1e0);
+    if (is(s, "j713-pipe-left-on")) {
+        /* Only the CPU domain is off: the pipe may still scan out through its DART */
+        ext_segs_in_ram(1);
+        ext_tables_in_ram(1);
+        poke32(ps_reg(pm_sys(1) + 2), 0x0);
+        /* Neither of its DARTs answers: a read of one would fault */
+        region_of(ext_dart[1])->base = 0x7e0000000ULL;
+        region_of(pipe_dart[1])->base = 0x7e0100000ULL;
+    }
 
     memcpy(in, dt, fdt_totalsize(dt));
     mmio_reads = mmio_writes = 0;
@@ -1257,6 +1276,12 @@ int main(int argc, char **argv)
             check_internal_untouched(in, dt);
         else
             check_display(in, dt, false);
+    } else if (is(s, "j713-pipe-left-on")) {
+        check(!exc_count, "no DART of the processor is read (%d faults)", exc_count);
+        check(ext_untouched(in, dt, 1), "dcpext1 is not published");
+        check(ext_segs_kept(dt, 1) && !resv_tables(dt),
+              "it may run: its firmware segments are kept, its tables cannot be read (%d)",
+              resv_tables(dt));
     } else if (is(s, "j713-26-6-2-no-uuid")) {
         check(fdt_totalsize(in) == fdt_totalsize(dt) && !memcmp(in, dt, fdt_totalsize(dt)),
               "the device tree is byte for byte unchanged");

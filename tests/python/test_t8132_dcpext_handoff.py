@@ -24,7 +24,8 @@ tree's src/kboot_display_handoff.c and runs each scenario. The trees have the T8
   any reason, an incomplete internal handoff, no uuid on the internal nub, no device tree node)
   keeps its memory: its firmware segments and the table pages of its DARTs in usable RAM are
   reserved no-map and nothing is published for it (no uuid, clocks or 26.6.2 marker), unless its
-  clock-gates show it is not running (power-gated, not under auto power).
+  clock-gates show that it and its pipe are not running (its CPU domain and every domain above it,
+  the pipe's FE and SYS, power-gated, not under auto power).
 Registers are only read (the fake MMIO counts writes: none in any scenario).
 """
 import re
@@ -119,7 +120,8 @@ REASONS = {
     "j713-refused-image-kept": [H0, "dcpext1: does not run the internal DCP's image B3BA603C-", K(1, 6, 4)],
     "j713-refused-unlocked-kept": [H1, "dcpext0: DART 0x286340000 is not locked (PROTECT 0x1e0)", K(0, 0, 4)],
     "j713-off-nothing-kept": [H0, "dcpext1: DISPEXT1_CPU is not requested (0x0)",
-                              "dcpext1 memory: not running (its clock-gates are off): nothing to keep"],
+                              "dcpext1 memory: not running, its pipe neither (its power domains are off): "
+                              "nothing to keep"],
     "j713-auto-off-kept": [H0, "dcpext1: DISPEXT1_CPU is not requested (0x10000000)", K(1, 6, 0)],
     "j713-internal-incomplete-kept": ["internal DCP handoff not complete: external processors not handed over",
                                       K(0, 6, 4), K(1, 6, 4)],
@@ -131,6 +133,8 @@ REASONS = {
     "j713-no-adt-node-kept": [H0, "/soc/dcp@48ae00000: 0 ADT processors at 0x48ae00000", K(1, 7, 0)],
     "j773g-refused-kept": ["no panel, and the display subsystem's DART is not as iBoot leaves it",
                            K(0, 6, 4), K(1, 6, 4)],
+    "j713-pipe-left-on": [H0, "dcpext1: DISPEXT1_CPU is not requested (0x0)",
+                          "dcpext1 memory: not fully powered: its 2 DART(s) not read", K(1, 6, 0)],
     "j773g-disp-piodma-bypass": ["the display subsystem: DART 0x30a300000 stream 16 is not a two-level translation (TCR 0x3, ",
                                  "no panel, and the display subsystem's DART is not as iBoot leaves it"],
 }
@@ -148,7 +152,7 @@ ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-
                "j713-extra-child-dart", "j713-iommu-cells-2", "j713-refused-segs-kept",
                "j713-refused-pipe-kept", "j713-refused-power-kept", "j713-refused-image-kept",
                "j713-refused-unlocked-kept", "j713-off-nothing-kept", "j713-auto-off-kept",
-               "j713-no-adt-node-kept"}
+               "j713-no-adt-node-kept", "j713-pipe-left-on"}
 # Processors that are not handed over keep their memory, with their own lines (" memory: ")
 
 

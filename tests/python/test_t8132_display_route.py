@@ -318,10 +318,11 @@ static void dump(void)
     }
 }
 
-/* iBoot left external processor i off: its CPU domain power-gated, not targeted on, no auto */
+/* iBoot left external processor i off with its pipe: CPU, FE and SYS power-gated, targeted so */
 static void processor_off(int i)
 {
-    poke32(ps_reg(pm_sys(i) + 2), 0x0);
+    for (int k = 0; k < 3; k++)
+        poke32(ps_reg(pm_sys(i) + k), 0x0);
 }
 
 static bool has(const char *s, const char *part)
@@ -376,11 +377,15 @@ int main(int argc, char **argv)
     bool runs = !has(s, "-off");
     if (has(s, "-off") || is(s, "fw27-one-running") || is(s, "fw27-power-unknown") ||
         is(s, "fw27-pmgr-faults") || is(s, "fw27-no-clock-gates"))
-        processor_off(0), processor_off(1);
-    if (is(s, "fw27-one-running"))
-        poke32(ps_reg(pm_sys(1) + 2), PS_CPU_REQ);
+        processor_off(0);
+    if (has(s, "-off"))
+        processor_off(1);
     if (is(s, "fw27-power-unknown"))
         poke32(ps_reg(pm_sys(1) + 2), 0x44); /* clock-gated, targeted so: neither on nor off */
+    if (is(s, "fw27-pipe-left-on"))
+        /* Only the CPU domains are off: the pipes may still scan out through their DARTs */
+        for (int i = 0; i < 2; i++)
+            poke32(ps_reg(pm_sys(i) + 2), 0x0);
     if (is(s, "fw27-pmgr-faults"))
         region_of(T8132_PMGR)->base = 0x7f0000000ULL; /* nothing answers at the power states */
     if (is(s, "fw27-no-clock-gates"))
@@ -493,7 +498,7 @@ FDT_SCENARIOS = [
     # iBoot left them running (as the J713's iBoot does): a Stage 1 does not boot
     "fw27", "fw27-refused", "fw27-one-running", "fw27-no-alias", "fw27-overlap",
     "fw27-power-unknown", "fw27-pmgr-faults", "fw27-no-clock-gates", "fw27-dart-refuses",
-    "fw27-prepopulated",
+    "fw27-prepopulated", "fw27-pipe-left-on",
     # iBoot left them off: a Stage 1 boots, promising nothing
     "fw27-off", "fw27-refused-off", "fw27-no-alias-off", "fw27-prepopulated-off",
 ]

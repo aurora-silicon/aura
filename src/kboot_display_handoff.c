@@ -3500,35 +3500,47 @@ static bool dcpext_adt_is(int node, const char *prop, const char *want)
 }
 
 /*
- * Whether PMGR device g, or a device above it (either parent, up to the first virtual one), is
- * fully off: power-gated, targeted power-gated and not under automatic power management. A device
- * under one that is off is off too. Read only, guarded; what cannot be read is not off.
+ * Whether PMGR device g is off and nothing above it may run: g and every device above it (either
+ * parent, up to the first virtual one) are off, a device under one that is off being off whatever
+ * its own state reads. A device at the top is off when it is power-gated, targeted so and not
+ * under automatic power management. On the T8132 an external processor's clock-gate is its CPU
+ * domain, under its pipe's FE and SYS domains: its CPU being off says nothing of the pipe, which
+ * may still scan out and walk its DART. Read only, guarded; what cannot be resolved or read is not
+ * off.
  */
 static bool dcpext_chain_off(const struct pmgr_gate *g, int depth)
 {
+    int above = 0;
+
     if (!g->found || g->virt || !g->psreg || depth >= DCP6_GATE_DEPTH)
         return false;
+    for (int p = 0; p < 2; p++) {
+        struct pmgr_gate parent;
+        if (!g->parent[p] || g->parent[p] == g->id) /* a device listed as its own parent */
+            continue;
+        if (pmgr_device_gate(g->die, g->parent[p], &parent) < 0)
+            return false;
+        if (parent.virt)
+            continue;
+        if (!dcpext_chain_off(&parent, depth + 1))
+            return false;
+        above++;
+    }
+    if (above)
+        return true; /* under devices that are off */
     int guard = dcp6_guard_begin();
     u32 ps = read32(g->psreg);
     if (dcp6_guard_end(guard))
         return false;
     /* Power-gated (state 0) and targeted so */
-    if (!FIELD_GET(PMGR_PS_TARGET, ps) && !FIELD_GET(PMGR_PS_ACTUAL, ps) &&
-        !(ps & PMGR_AUTO_ENABLE))
-        return true;
-    for (int p = 0; p < 2; p++) {
-        struct pmgr_gate parent;
-        if (g->parent[p] && g->parent[p] != g->id &&
-            pmgr_device_gate(g->die, g->parent[p], &parent) >= 0 &&
-            dcpext_chain_off(&parent, depth + 1))
-            return true;
-    }
-    return false;
+    return !FIELD_GET(PMGR_PS_TARGET, ps) && !FIELD_GET(PMGR_PS_ACTUAL, ps) &&
+           !(ps & PMGR_AUTO_ENABLE);
 }
 
 /*
- * /arm-io/<name> provably does not run: it has ADT clock-gates and each of them is off
- * (dcpext_chain_off()). Without clock-gates, or with one that is on or cannot be read, it may.
+ * /arm-io/<name> provably does not run, nor its pipe: it has ADT clock-gates and each of them is
+ * off with everything above it (dcpext_chain_off()). Without clock-gates, or with one that is on
+ * or cannot be read, it may.
  */
 static bool dcpext_not_running(const char *name)
 {
@@ -4553,7 +4565,8 @@ static void dcpext_keep(void *dt, int child, int node)
         return;
     }
     if (dcpext_not_running(name)) {
-        dlog("%s: not running (its clock-gates are off): nothing to keep\n", what);
+        dlog("%s: not running, its pipe neither (its power domains are off): nothing to keep\n",
+             what);
         return;
     }
     /*
