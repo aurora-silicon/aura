@@ -214,6 +214,15 @@ systemctl --failed
   agx_interrupt(4)`) right after a USB-C display power or mode change. The same
   unplugs without it did not panic. The sample is small (2 of 10 boots with it),
   so treat a GPU panic under the tracer as unproven, and rerun without it first.
+- **`AURA_SEP_TRACE` records the SEP's traffic (debug only, `AURACTL=1`):** it
+  hooks the SEP mailbox page and puts every message, both ways, into the
+  auractl ring. It also copies each endpoint's shared in/out buffers (the ones
+  the control endpoint's OOL messages register) at every send and reply,
+  through dart-sep's live tables (T8110 layout; on another DART it says so and
+  stays off). In the guest: `auractl clear`, `auractl mark <tag>`, run the
+  command, `auractl read <file>`; decode with `tools/auractl/sep_decode.py
+  <file> <dir>`. The capture holds device nonces and keys in transit: keep it
+  private. `AURA_SEP_MAXB` caps the bytes copied per buffer (128 KiB).
 - **T8112 (M2) specifics:** macOS 27.2 on T8112 runs SPTM, TXM, and XNU without
   exclaves. External monitors over HDMI and USB-C (including HDR) work with
   discrete refresh rates; MCDP29xx/2900 HDMI bridges report no VRR support.
