@@ -607,7 +607,7 @@ static int t6041_headless_fb(void)
 
     memset(&dcp6, 0, sizeof(dcp6));
     dcp6.soc = &dcp_soc_t6041_max;
-    int rc = t6041_headless_display(dt);
+    int rc = dcp6_headless_display(dt, dcp6.soc->disp_compat);
     printf("result rc=%d\n", rc);
     int len = 0, n, count = 0;
     fdt_for_each_subnode(n, dt, fdt_path_offset(dt, "/reserved-memory"))
