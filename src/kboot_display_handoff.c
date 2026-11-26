@@ -3643,14 +3643,23 @@ static struct {
     struct dcpext_tables keep_tables; /* scratch for one processor's memory kept from the OS */
 } dcpext_run;
 
-/* reg[0] of /arm-io/<child>, with the /arm-io ranges applied */
-static int dcpext_adt_reg(int child, u64 *addr)
+/* reg[idx] of /arm-io/<child>, address and size (if `size`), with the /arm-io ranges applied */
+static int dcpext_adt_reg_at(int child, int idx, u64 *addr, u64 *size)
 {
     const char *name = adt_get_name(adt, child);
     char path[DCP6_NAME_LEN * 2];
-    if (!name || snprintf(path, sizeof(path), "/arm-io/%s", name) >= (int)sizeof(path))
+    int trace[8];
+
+    if (!name || snprintf(path, sizeof(path), "/arm-io/%s", name) >= (int)sizeof(path) ||
+        adt_path_offset_trace(adt, path, trace) < 0)
         return -1;
-    return dcp6_adt_reg(path, 0, addr);
+    return adt_get_reg(adt, trace, "reg", idx, addr, size);
+}
+
+/* reg[0] of /arm-io/<child>, with the /arm-io ranges applied */
+static int dcpext_adt_reg(int child, u64 *addr)
+{
+    return dcpext_adt_reg_at(child, 0, addr, NULL);
 }
 
 /* The /arm-io child or grandchild whose AAPL,phandle is `ph`, and its parent */
@@ -3933,6 +3942,34 @@ static bool dcpext_table_in_dram(u64 page, u64 dram_base, u64 dram_size)
            page - dram_base <= dram_size - SZ_16K;
 }
 
+/*
+ * Add a table page to `t` if it is a 16K page in DRAM outside the memory carveouts (which are not
+ * DART table memory, and need not read back as they are), and `t` has room; returns whether it is
+ * in `t` (then it may be read). Any other page is counted in *missed.
+ */
+static bool dcpext_keep_page(struct dcpext_tables *t, u64 page, u64 dram_base, u64 dram_size,
+                             int *missed)
+{
+    if (!dcpext_table_in_dram(page, dram_base, dram_size)) {
+        (*missed)++;
+        return false;
+    }
+    for (size_t j = 0; j < mcc_carveout_count; j++)
+        if (dcp6_overlaps(page, SZ_16K, mcc_carveouts[j].base, mcc_carveouts[j].size)) {
+            (*missed)++;
+            return false;
+        }
+    for (int i = 0; i < t->n; i++)
+        if (t->page[i] == page)
+            return true;
+    if (t->n >= DCPEXT_TABLES_MAX) {
+        (*missed)++;
+        return false;
+    }
+    t->page[t->n++] = page;
+    return true;
+}
+
 /* Why dcpext_dart_tables() refused, printed once its guarded reads are known not to have faulted */
 static char dcpext_why[192];
 #define refuse(...)                                                                                \
@@ -3943,18 +3980,13 @@ static char dcpext_why[192];
 
 static int dcpext_table_add(struct dcpext_tables *t, u64 page, const char *what, u64 dart)
 {
-    /* A memory-controller carveout is not DART table memory, and need not read back as it is */
-    for (size_t j = 0; j < mcc_carveout_count; j++)
-        if (dcp6_overlaps(page, SZ_16K, mcc_carveouts[j].base, mcc_carveouts[j].size))
-            refuse("%s: DART 0x%lx table page 0x%lx is in memory carveout 0x%lx+0x%lx\n", what,
-                   dart, page, mcc_carveouts[j].base, mcc_carveouts[j].size);
-    for (int i = 0; i < t->n; i++)
-        if (t->page[i] == page)
-            return 0;
-    if (t->n >= DCPEXT_TABLES_MAX)
-        refuse("%s: DART 0x%lx has more than %d table pages to keep\n", what, dart,
-               DCPEXT_TABLES_MAX);
-    t->page[t->n++] = page;
+    int missed = 0;
+
+    /* In DRAM (checked by the caller); a memory-controller carveout is not DART table memory */
+    if (!dcpext_keep_page(t, page, 0, UINT64_MAX, &missed))
+        refuse("%s: DART 0x%lx table page 0x%lx is in a memory carveout, or past %d pages to "
+               "keep\n",
+               what, dart, page, DCPEXT_TABLES_MAX);
     return 0;
 }
 
@@ -4079,30 +4111,23 @@ static int dcpext_page_kept(void *dt, u64 page, const char *what, const char *no
     return kept;
 }
 
+static int dcpext_keep_range(void *dt, u64 base, u64 size, const char *what, const char *noun,
+                             const char *prefix, bool per_page, int *missed);
+
 /*
- * Keep the table pages in `t` from the OS: a page in the RAM the OS gets that no reservation
- * holds yet is reserved (no-map, named by its address, as kboot.c's dcpext handoff names them);
- * one outside that RAM is not the OS's.
+ * Keep the table pages in `t` from the OS (dcpext_keep_range()): a page in the RAM the OS gets that
+ * no reservation holds yet is reserved (no-map, named by its address); one outside that RAM is not
+ * the OS's. -1 (logged) at the first one that cannot be kept.
  */
 static int dcpext_reserve_tables(void *dt, const struct dcpext_tables *t, const char *what)
 {
-    u64 ram_min = kboot_ram_base(), ram_max = kboot_ram_base() + kboot_ram_size();
+    int missed = 0;
 
-    for (int i = 0; i < t->n; i++) {
-        u64 page = t->page[i];
-        char name[48];
-        if (page + SZ_16K <= ram_min || page >= ram_max)
-            continue;
-        int kept = dcpext_page_kept(dt, page, what, "DART table page");
-        if (kept < 0)
+    for (int i = 0; !missed && i < t->n; i++)
+        if (dcpext_keep_range(dt, t->page[i], SZ_16K, what, "DART table page", "dcpext-tables",
+                              true, &missed) < 0)
             return -1;
-        if (kept)
-            continue;
-        snprintf(name, sizeof(name), "dcpext-tables@%lx", page);
-        if (!dcp6_add_resv(dt, name, page, SZ_16K, "apple,asc-mem"))
-            bail("%s: cannot reserve DART table page 0x%lx\n", what, page);
-    }
-    return 0;
+    return missed ? -1 : 0;
 }
 
 #define DCPEXT_DARTS_MAX 8
@@ -4338,33 +4363,6 @@ static void dcpext_reserve_oslogs(void *dt)
 }
 
 /* ---- the memory of an external processor that is not handed over ---- */
-
-/*
- * Add a table page to `t` if it is a 16K page in DRAM outside the memory carveouts; returns whether
- * it is in `t` (then it may be read). Any other page is counted in *missed.
- */
-static bool dcpext_keep_page(struct dcpext_tables *t, u64 page, u64 dram_base, u64 dram_size,
-                             int *missed)
-{
-    if (!dcpext_table_in_dram(page, dram_base, dram_size)) {
-        (*missed)++;
-        return false;
-    }
-    for (size_t j = 0; j < mcc_carveout_count; j++)
-        if (dcp6_overlaps(page, SZ_16K, mcc_carveouts[j].base, mcc_carveouts[j].size)) {
-            (*missed)++;
-            return false;
-        }
-    for (int i = 0; i < t->n; i++)
-        if (t->page[i] == page)
-            return true;
-    if (t->n >= DCPEXT_TABLES_MAX) {
-        (*missed)++;
-        return false;
-    }
-    t->page[t->n++] = page;
-    return true;
-}
 
 /*
  * The table pages of every enabled stream of a DART that translates through a valid root, locked
