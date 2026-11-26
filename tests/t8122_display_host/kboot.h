@@ -21,5 +21,7 @@ enum dcp_internal {
     DCP_INTERNAL_NO_PANEL, /* not attempted: ADT /arm-io/disp0 is external (no panel) */
 };
 int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks);
+int dt_keep_dcpext(void *dt);
+/* An earlier tree's (the route test can be run on it) */
 int dcpext_may_run(void);
 #endif

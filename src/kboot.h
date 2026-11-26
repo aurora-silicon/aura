@@ -87,9 +87,9 @@ enum dcp_internal {
 /*
  * The handoff is built into the ESP Stage 2 only (kboot_display_handoff.c). A Stage 1 that boots
  * an OS itself declines it (0): kboot.c then keeps the firmware-ready path for the external
- * processors of older firmware. On firmware given its clocks it cannot keep their memory from the
- * OS, and boots only if none may still run (dcpext_may_run()). The ESP Stage 2's returns 1 on such
- * firmware, -1 if the memory of a processor it did not hand over could not all be kept.
+ * processors of older firmware, and on firmware given its clocks keeps their memory from the OS
+ * without handing them over (dt_keep_dcpext()). The ESP Stage 2's returns 1 on such firmware, -1
+ * if the memory of a processor it did not hand over could not all be kept.
  */
 #ifdef ESP_STAGE2
 int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks);
@@ -103,10 +103,12 @@ static inline int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bo
 }
 #endif
 /*
- * How many external display processors the ADT describes may still run as iBoot left them, from
- * their ADT clock-gates (kboot_display_handoff.c). A Stage 1's: the ESP Stage 2 does not link it.
+ * Both stages, on firmware given its clocks: withdraw what the device tree promised of every
+ * external display processor not handed over, and keep the memory of each one the ADT describes
+ * that may still run as iBoot left it (kboot_display_handoff.c). -1 if that memory could not all
+ * be kept: the OS must then not start.
  */
-int dcpext_may_run(void);
+int dt_keep_dcpext(void *dt);
 
 // from rust/usb4.rs
 u64 rust_usb4_router_uuid(void);

@@ -70,7 +70,7 @@ endif
 # Keep boot images below the DCP log-buffer boundary enforced by aura-raw.ld: every stage is
 # optimized for size throughout (-Oz), as the macOS ESP Stage 2 (SPTM_VIRT_ESP) always was, except
 # the bulk-data code, which keeps -Os (below). The ESP Stage 2 links the external display
-# processors' handoff below that boundary (kboot_display_handoff.c).
+# processors' handoff below that boundary, and Stage 1 their memory keep (kboot_display_handoff.c).
 # EXTRA_CFLAGS can still override the optimization level for development builds.
 BASE_CFLAGS := -Oz -Wall -g -Wundef -Werror=strict-prototypes -fno-common -fno-PIE \
 	-Werror=implicit-function-declaration -Werror=implicit-int \

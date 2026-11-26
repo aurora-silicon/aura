@@ -4,19 +4,18 @@
 The external processors follow the internal M4 DCP handoff's reported outcome: there is no root
 compatible, chip id or OS release test in the route. dt_set_dcpext_handoff() is given that outcome
 whatever it is, with kboot.c's firmware-27 clocks rule (dt_dcp_fw_clocks()). In the ESP Stage 2 it
-takes every processor of firmware given its clocks; a Stage 1 has no such handoff (kboot.h's stub
-declines). The route then keeps the 26.6.2 firmware-ready path (dt_reserve_j713_dcpext()) for older
-firmware, after an internal handoff that was not refused. On firmware given its clocks, whatever the
-internal outcome, a Stage 1 cannot keep the processors' memory from the OS (the ESP Stage 2's
-dcpext_keep_rest() has no room in it): it boots only if no processor the ADT describes may still
-run (dcpext_may_run()), after withdrawing whatever the input tree promised of them
-(dt_withdraw_j713_dcpext()), and otherwise does not boot.
+takes every processor of firmware given its clocks: 1, or -1 if the memory of one it did not hand
+over could not all be kept. A Stage 1 has no such handoff (kboot.h's stub declines): on firmware
+given its clocks it keeps the memory of every processor the ADT describes (dt_keep_dcpext(), shared
+with the ESP Stage 2) after withdrawing what the input tree promised of them, and does not boot if
+that memory cannot all be kept. Older firmware keeps the 26.6.2 firmware-ready path
+(dt_reserve_j713_dcpext()) after an internal handoff that was not refused.
 
 test_route checks the route's calls against stubs. test_stage1_fdt runs the route with kboot.c's
-own firmware-ready publication and withdrawal and kboot_display_handoff.c's own dcpext_may_run(),
-on tests/t8132_dcpext_host.c's T8132 ADT, PMGR and DART registers, on a J713 and a J773g device
-tree (those of the candidate kernel when J713_DTB and J773G_DTB name them, else the host's), and
-checks what each ABI leaves in the tree.
+own firmware-ready publication and kboot_display_handoff.c's own dt_keep_dcpext() (built without
+ESP_STAGE2), on tests/t8132_dcpext_host.c's T8132 ADT, PMGR and DART registers and page tables, on
+a J713 and a J773g device tree (those of the candidate kernel when J713_DTB and J773G_DTB name
+them, else the host's), and checks what each ABI leaves in the tree.
 """
 import os
 import shutil
@@ -59,39 +58,37 @@ def test_route_has_no_board_or_release_test():
         assert banned not in block, banned
 
 
-# (M4 return, M4 outcome, firmware given clocks, dcpext handoff claims it, processors that may
-# run, withdrawal result) -> (route result, may-run asked, withdrawn, firmware-ready ran)
-# The ESP Stage 2's handoff claims exactly the firmware given clocks; kboot.h's Stage 1 stub none.
+# (M4 return, M4 outcome, firmware given clocks, dcpext handoff's result, keep's result)
+# -> (route result, keep asked, firmware-ready ran)
+# The ESP Stage 2's handoff claims exactly the firmware given clocks (1, or -1 if it could not keep
+# a processor's memory); kboot.h's Stage 1 stub none.
 CASES = [
-    (0, "DCP_INTERNAL_COMPLETE", 1, 1, 0, 0, 0, False, False, False),   # J713 27.2, ESP Stage 2
-    (0, "DCP_INTERNAL_NONE", 1, 1, 0, 0, 0, False, False, False),       # 27.2, walk failed
-    (-1, "DCP_INTERNAL_NONE", 1, 1, 0, 0, 0, False, False, False),      # refused internal handoff
-    (-1, "DCP_INTERNAL_NO_PANEL", 1, 1, 0, 0, 0, False, False, False),  # J773g 27.2: headless
-    (0, "DCP_INTERNAL_COMPLETE", 1, -1, 0, 0, -1, False, False, False), # ESP Stage 2 cannot keep
-    (-1, "DCP_INTERNAL_NO_PANEL", 1, -1, 0, 0, -1, False, False, False),
-    (0, "DCP_INTERNAL_COMPLETE", 1, 0, 2, 0, -1, True, False, False),   # Stage 1, both may run
-    (0, "DCP_INTERNAL_COMPLETE", 1, 0, 0, 0, 0, True, True, False),     # Stage 1, none runs
-    (0, "DCP_INTERNAL_COMPLETE", 1, 0, 0, -1, -1, True, True, False),   # withdrawal fails
-    (-1, "DCP_INTERNAL_NONE", 1, 0, 1, 0, -1, True, False, False),      # refused, one may run
-    (-1, "DCP_INTERNAL_NO_PANEL", 1, 0, 0, 0, 0, True, True, False),    # J773g 27.2, none runs
-    (0, "DCP_INTERNAL_COMPLETE", 0, 0, 0, 0, 0, False, False, True),    # 26.6.2: firmware-ready
-    (0, "DCP_INTERNAL_NONE", 0, 0, 0, 0, 0, False, False, True),        # 26.6.2 without the maps
-    (-1, "DCP_INTERNAL_NO_PANEL", 0, 0, 0, 0, 0, False, False, False),  # J773g 26.6.2: nothing
-    (-1, "DCP_INTERNAL_NONE", 0, 0, 0, 0, 0, False, False, False),      # refused: nothing
+    (0, "DCP_INTERNAL_COMPLETE", 1, 1, 0, 0, False, False),    # J713 27.2, ESP Stage 2
+    (0, "DCP_INTERNAL_NONE", 1, 1, 0, 0, False, False),        # 27.2, walk failed
+    (-1, "DCP_INTERNAL_NONE", 1, 1, 0, 0, False, False),       # refused internal handoff
+    (-1, "DCP_INTERNAL_NO_PANEL", 1, 1, 0, 0, False, False),   # J773g 27.2: headless
+    (0, "DCP_INTERNAL_COMPLETE", 1, -1, 0, -1, False, False),  # ESP Stage 2 could not keep
+    (-1, "DCP_INTERNAL_NO_PANEL", 1, -1, 0, -1, False, False),
+    (0, "DCP_INTERNAL_COMPLETE", 1, 0, 0, 0, True, False),     # Stage 1: kept
+    (0, "DCP_INTERNAL_COMPLETE", 1, 0, -1, -1, True, False),   # Stage 1: could not keep
+    (-1, "DCP_INTERNAL_NONE", 1, 0, 0, 0, True, False),        # Stage 1, refused: kept
+    (-1, "DCP_INTERNAL_NO_PANEL", 1, 0, -1, -1, True, False),  # Stage 1 J773g: could not keep
+    (0, "DCP_INTERNAL_COMPLETE", 0, 0, 0, 0, False, True),     # 26.6.2: firmware-ready
+    (0, "DCP_INTERNAL_NONE", 0, 0, 0, 0, False, True),         # 26.6.2 without the maps
+    (-1, "DCP_INTERNAL_NO_PANEL", 0, 0, 0, 0, False, False),   # J773g 26.6.2: nothing
+    (-1, "DCP_INTERNAL_NONE", 0, 0, 0, 0, False, False),       # refused: nothing
 ]
 
 
-@pytest.mark.parametrize("m4_ret,outcome,fw_clocks,claims,running,withdraw,ret,asked,withdrawn,"
-                         "ready", CASES)
-def test_route(tmp_path, m4_ret, outcome, fw_clocks, claims, running, withdraw, ret, asked,
-               withdrawn, ready):
+@pytest.mark.parametrize("m4_ret,outcome,fw_clocks,claims,kept,ret,asked,ready", CASES)
+def test_route(tmp_path, m4_ret, outcome, fw_clocks, claims, kept, ret, asked, ready):
     source = f'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
 #define T8132 0x8132
 {internal_enum()}
-static int chip_id = T8132, seen = -1, ready_calls, asked_calls, withdraw_calls;
+static int chip_id = T8132, seen = -1, ready_calls, keep_calls;
 static void *dt;
 static int dt_set_m4_dcp_handoff(enum dcp_internal *internal)
 {{
@@ -107,8 +104,7 @@ static int dt_set_dcpext_handoff(void *tree, enum dcp_internal internal, bool fw
     return {claims};
 }}
 static void dt_reserve_j713_dcpext(void) {{ ready_calls++; }}
-static int dcpext_may_run(void) {{ asked_calls++; return {running}; }}
-static int dt_withdraw_j713_dcpext(void) {{ withdraw_calls++; return {withdraw}; }}
+static int dt_keep_dcpext(void *tree) {{ (void)tree; keep_calls++; return {kept}; }}
 static int route(void)
 {{
 {route_block()}
@@ -118,19 +114,15 @@ int main(void)
 {{
     assert(route() == {ret});
     assert(seen == {outcome});
-    assert(asked_calls == {1 if asked else 0});
-    assert(withdraw_calls == {1 if withdrawn else 0});
+    assert(keep_calls == {1 if asked else 0});
     assert(ready_calls == {1 if ready else 0});
     return 0;
 }}
 '''
     (tmp_path / "route.c").write_text(source)
     binary = tmp_path / "route"
-    # The ESP Stage 2's rows as it builds the route (its Stage 1 only part left out), the rest as
-    # a Stage 1 does
     subprocess.run([*host_cc(), "-std=gnu11", "-Wall", "-Werror", "-Wno-unused-function",
-                    *(["-DESP_STAGE2"] if claims else []), str(tmp_path / "route.c"), "-o",
-                    str(binary)], check=True)
+                    str(tmp_path / "route.c"), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 
 
@@ -332,6 +324,62 @@ static bool has(const char *s, const char *part)
     return strstr(s, part) != NULL;
 }
 
+/* The boots that must not start the OS: memory a processor may still use cannot all be kept */
+static bool stage1_no_boot(const char *s)
+{
+    return is(s, "fw27-overlap") || is(s, "fw27-pipe-left-on") || is(s, "fw27-power-unknown") ||
+           is(s, "fw27-pmgr-faults") || is(s, "fw27-no-clock-gates") || is(s, "fw27-dart-faults") ||
+           is(s, "fw27-refused-dt-full");
+}
+
+/* External processor i's __DATA and heap moved into the RAM the OS gets, apart */
+static u64 seg_in_ram(int i, int k)
+{
+    return RAM_SEGS + 0x2000000ULL * i + (k == 3 ? 0x400000 : 0);
+}
+static void segs_in_ram(int i)
+{
+    ext_seg_move(i, 1, seg_in_ram(i, 1));
+    ext_seg_move(i, 3, seg_in_ram(i, 3));
+}
+
+/* A 16K page an enabled no-map /reserved-memory node holds */
+static bool page_kept(u64 page)
+{
+    int resv = fdt_path_offset(dt, "/reserved-memory"), node;
+    fdt_for_each_subnode(node, dt, resv) {
+        int len;
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        const char *status = fdt_getprop(dt, node, "status", NULL);
+        if (!reg || len < 16 || !fdt_getprop(dt, node, "no-map", NULL) ||
+            (status && !strcmp(status, "disabled")))
+            continue;
+        u64 base = fdt64_ld(&reg[0]), size = fdt64_ld(&reg[1]);
+        if (page >= base && page + 0x4000 <= base + size)
+            return true;
+    }
+    return false;
+}
+
+/* Every page of external processor i's ADT firmware segments in the OS's RAM is kept, but `skip` */
+static bool segs_kept(int i, u64 skip)
+{
+    char nub[64];
+    u32 len = 0;
+    adt_path_of(nub, sizeof(nub), "/arm-io/dcpext%d/iop-dcpext%d-nub", i);
+    const u8 *raw = adt_getprop(adt, adt_path_offset(adt, nub), "segment-ranges", &len);
+    for (u32 k = 0; raw && k < len / sizeof(struct seg); k++) {
+        struct seg sg;
+        memcpy(&sg, raw + k * sizeof(sg), sizeof(sg));
+        for (u64 page = sg.phys & ~0x3fffULL; page < ALIGN_UP(sg.phys + sg.size, 0x4000);
+             page += 0x4000)
+            if (page >= ram_base && page + 0x4000 <= ram_base + ram_size && page != skip &&
+                !page_kept(page))
+                return false;
+    }
+    return raw != NULL;
+}
+
 int main(int argc, char **argv)
 {
     static _Alignas(8) u8 tree[1 << 20], in[1 << 20];
@@ -375,30 +423,41 @@ int main(int argc, char **argv)
     if (has(s, "-refused"))
         m4_outcome = DCP_INTERNAL_NONE, m4_ret = -1;
 
-    /* The machine: iBoot leaves both processors running unless a scenario says otherwise */
-    bool runs = !has(s, "-off");
-    if (has(s, "-off") || is(s, "fw27-one-running") || is(s, "fw27-power-unknown") ||
+    /*
+     * The machine. iBoot leaves both processors running (as the J713's iBoot does) unless a
+     * scenario says otherwise; their __DATA and heap, and their firmware and pipe DART tables, are
+     * in the RAM the OS gets.
+     */
+    size_t slen = strlen(s);
+    bool off = slen > 4 && !strcmp(s + slen - 4, "-off");
+    bool runs[2] = {!off, !off};
+    if (off || is(s, "fw27-one-running") || is(s, "fw27-power-unknown") ||
         is(s, "fw27-pmgr-faults") || is(s, "fw27-no-clock-gates"))
-        processor_off(0);
-    if (has(s, "-off"))
+        processor_off(0), runs[0] = false;
+    if (off)
         processor_off(1);
+    if (!legacy && !off)
+        for (int i = 0; i < 2; i++) {
+            segs_in_ram(i);
+            ext_tables_in_ram(i);
+        }
+    if (is(s, "fw27-pipe-left-on"))
+        /* Both CPUs are off but their pipes' FE and SYS are on; no DART of theirs answers */
+        for (int i = 0; i < 2; i++) {
+            poke32(ps_reg(pm_sys(i) + 2), 0x0);
+            region_of(ext_dart[i])->base = 0x7e0000000ULL + 0x200000ULL * i;
+            region_of(pipe_dart[i])->base = 0x7e0100000ULL + 0x200000ULL * i;
+        }
     if (is(s, "fw27-power-unknown"))
         poke32(ps_reg(pm_sys(1) + 2), 0x44); /* clock-gated, targeted so: neither on nor off */
-    if (is(s, "fw27-pipe-left-on"))
-        /* Only the CPU domains are off: the pipes may still scan out through their DARTs */
-        for (int i = 0; i < 2; i++)
-            poke32(ps_reg(pm_sys(i) + 2), 0x0);
     if (is(s, "fw27-pmgr-faults"))
         region_of(T8132_PMGR)->base = 0x7f0000000ULL; /* nothing answers at the power states */
     if (is(s, "fw27-no-clock-gates"))
         prop_drop("/arm-io/dcpext1", "clock-gates");
-    if (is(s, "fw27-dart-refuses"))
-        poke32(pipe_dart[1] + 0x200, 0x1e0); /* unlocked with a live stream: not adoptable */
-    if (!legacy && !is(s, "fw27-dart-refuses"))
-        /* No DART answers: this stage reads none */
-        for (int i = 0; i < 2; i++)
-            region_of(ext_dart[i])->base = 0x7e0000000ULL + 0x100000ULL * i,
-            region_of(pipe_dart[i])->base = 0x7e0800000ULL + 0x100000ULL * i;
+    if (is(s, "fw27-dart-unlocked"))
+        poke32(pipe_dart[1] + 0x200, 0x1e0); /* unlocked with a live stream: still walked */
+    if (is(s, "fw27-dart-faults"))
+        region_of(ext_dart[1])->base = 0x7e0000000ULL; /* dcpext1's firmware DART: no answer */
 
     /* The device tree */
     if (has(s, "-no-alias")) {
@@ -408,12 +467,17 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+    if (is(s, "fw27-no-dt-ext")) {
+        /* The device tree has no external processor: the ADT's are kept all the same */
+        int node;
+        while ((node = fdt_node_offset_by_compatible(dt, -1, T8132_EXT)) >= 0)
+            if (fdt_del_node(dt, node))
+                return 1;
+    }
     if (is(s, "fw27-overlap")) {
-        /* Something else holds one page of dcpext1's heap */
-        struct seg es[4];
-        ext_segs(1, es);
+        /* A reservation the OS may map holds the second page of dcpext1's heap */
         int node = fdt_add_subnode(dt, fdt_path_offset(dt, "/reserved-memory"), "other@0");
-        fdt64_t reg[2] = {cpu_to_fdt64(es[3].phys + 0x4000), cpu_to_fdt64(0x4000)};
+        fdt64_t reg[2] = {cpu_to_fdt64(seg_in_ram(1, 3) + 0x4000), cpu_to_fdt64(0x4000)};
         if (node < 0 || fdt_setprop(dt, node, "reg", reg, sizeof(reg)))
             return 1;
     }
@@ -440,6 +504,8 @@ int main(int argc, char **argv)
             }
         }
     }
+    if (has(s, "-dt-full") && fdt_pack(dt)) /* no room left for a reservation */
+        return 1;
     memcpy(in, tree, sizeof(in));
     int ins[2] = {ext_node(0), ext_node(1)};
     int writes = mmio_writes;
@@ -447,8 +513,9 @@ int main(int argc, char **argv)
     int ret = route();
     dump();
     expect(mmio_writes == writes, "no MMIO write");
-    expect(is(s, "fw27-pmgr-faults") ? exc_count > 0 : exc_count == 0,
-           "no register read faulted (none of a DART)");
+    bool faults = is(s, "fw27-pmgr-faults") || is(s, "fw27-dart-faults");
+    expect(faults ? exc_count > 0 : exc_count == 0,
+           "no register read faulted, but in the scenarios that make one fault");
 
     u64 text = dcp_segs[0].phys;
     struct seg es[2][4];
@@ -469,24 +536,69 @@ int main(int argc, char **argv)
             expect(mr_count(dt, node) == mr_count(in, ins[i]) + (ran ? 4 : 0),
                    "a memory-region entry per segment");
         }
-    } else if (runs) {
-        /* A processor may still run, and this stage cannot keep its memory: it does not boot */
+        if (failures)
+            return 1;
+        printf("%s: pass\n", s);
+        return 0;
+    }
+
+    /* Firmware given its clocks: nothing is promised of any processor, whatever the input said */
+    for (int i = 0; i < 2; i++) {
+        int node = ext_node(i);
+        if (node < 0)
+            continue;
+        int named = fdt_stringlist_count(dt, node, "memory-region-names");
+        expect(!promised(node), "no ready marker, uuid, firmware version, compat or clock ids");
+        expect(mr_count(dt, node) == (named >= 0 ? named : mr_count(in, ins[i])),
+               "memory-region: the ones the tree names");
+    }
+    expect(reserved_at(text) == (m4_outcome == DCP_INTERNAL_COMPLETE),
+           "the shared __TEXT (below the OS's RAM) reserved by the internal handoff only");
+    expect(inherited_calls == 0, "no device tree driven DART walk");
+    if (stage1_no_boot(s)) {
         expect(ret == -1, "the route refuses: no boot");
-    } else {
-        /* None runs: it boots, with nothing promised and nothing of theirs reserved */
+        /* What can be kept is kept all the same */
+        if (runs[0] && !has(s, "-dt-full") && !is(s, "fw27-pipe-left-on"))
+            expect(segs_kept(0, 0) && ext_tables_kept(dt, 0), "dcpext0's memory is kept");
+        if (is(s, "fw27-pipe-left-on"))
+            expect(segs_kept(0, 0) && !resv_tables(dt),
+                   "dcpext0's segments are kept; no DART is read, with only its CPU off");
+        if (is(s, "fw27-overlap"))
+            expect(segs_kept(1, seg_in_ram(1, 3) + 0x4000) &&
+                       !page_kept(seg_in_ram(1, 3) + 0x4000) && ext_tables_kept(dt, 1),
+                   "dcpext1's tables and every firmware page but the mappable one are kept");
+        if (is(s, "fw27-pipe-left-on") || is(s, "fw27-power-unknown") ||
+            is(s, "fw27-no-clock-gates"))
+            expect(segs_kept(1, 0) && !resv_page(dt, RAM_TABLES + 0x10000) &&
+                       !resv_page(dt, RAM_TABLES + 0x18000),
+                   "dcpext1's segments are kept; its DARTs are not read");
+        if (is(s, "fw27-dart-faults"))
+            expect(segs_kept(1, 0) && resv_page(dt, RAM_TABLES + 0x18000) &&
+                       !resv_page(dt, RAM_TABLES + 0x10000),
+                   "dcpext1's segments and pipe tables are kept, not its faulting DART's");
+    } else if (!off) {
+        /* Running, kept: it boots */
+        int tables = 0;
         expect(ret == 0, "the route returns 0: boot");
         for (int i = 0; i < 2; i++) {
-            int node = ext_node(i);
-            int named = fdt_stringlist_count(dt, node, "memory-region-names");
-            expect(!promised(node), "no ready marker, uuid, firmware version, compat or clock ids");
-            expect(mr_count(dt, node) == (named >= 0 ? named : mr_count(in, ins[i])),
-                   "memory-region: the ones the tree names");
+            if (!runs[i])
+                continue;
+            expect(segs_kept(i, 0), "its firmware segments in RAM are reserved, no-map");
+            expect(ext_tables_kept(dt, i),
+                   "its firmware and pipe DART table pages in RAM are reserved, no-map");
+            tables += 4;
+        }
+        expect(resv_tables(dt) == tables, "no other table page is reserved");
+        if (is(s, "fw27-one-running"))
+            for (int k = 1; k < 4; k++)
+                expect(!reserved_at(es[0][k].phys), "none of the off dcpext0's segments reserved");
+    } else {
+        /* None runs: it boots, with nothing of theirs reserved */
+        expect(ret == 0, "the route returns 0: boot");
+        expect(!resv_count(dt, "dcpext-"), "nothing of theirs is reserved");
+        for (int i = 0; i < 2; i++)
             for (int k = 1; k < 4; k++)
                 expect(!reserved_at(es[i][k].phys), "none of its own segments reserved");
-        }
-        expect(reserved_at(text) == (m4_outcome == DCP_INTERNAL_COMPLETE),
-               "the shared __TEXT reserved by the internal handoff only");
-        expect(inherited_calls == 0, "no DART walked");
     }
     if (failures)
         return 1;
@@ -497,13 +609,17 @@ int main(int argc, char **argv)
 
 FDT_SCENARIOS = [
     "fw26", "fw26-refused",
-    # iBoot left them running (as the J713's iBoot does): a Stage 1 does not boot
-    "fw27", "fw27-refused", "fw27-one-running", "fw27-no-alias", "fw27-overlap",
-    "fw27-power-unknown", "fw27-pmgr-faults", "fw27-no-clock-gates", "fw27-dart-refuses",
-    "fw27-prepopulated", "fw27-pipe-left-on",
-    # iBoot left them off: a Stage 1 boots, promising nothing
+    # iBoot left them running (as the J713's iBoot does): kept, a Stage 1 boots
+    "fw27", "fw27-refused", "fw27-one-running", "fw27-no-alias", "fw27-dart-unlocked",
+    "fw27-prepopulated", "fw27-no-dt-ext",
+    # running, and some of their memory cannot be kept: no boot
+    "fw27-overlap", "fw27-pipe-left-on", "fw27-power-unknown", "fw27-pmgr-faults",
+    "fw27-no-clock-gates", "fw27-dart-faults", "fw27-refused-dt-full",
+    # iBoot left them off: a Stage 1 boots, promising and keeping nothing
     "fw27-off", "fw27-refused-off", "fw27-no-alias-off", "fw27-prepopulated-off",
 ]
+NO_BOOT = {"fw27-overlap", "fw27-pipe-left-on", "fw27-power-unknown", "fw27-pmgr-faults",
+           "fw27-no-clock-gates", "fw27-dart-faults", "fw27-refused-dt-full"}
 BOARDS = {"j713": "J713_DTB", "j773g": "J773G_DTB"}
 
 
@@ -556,20 +672,24 @@ def stage1_fdt(tmp_path_factory):
 @pytest.mark.parametrize("scenario", FDT_SCENARIOS)
 def test_stage1_fdt(stage1_fdt, board, scenario):
     """A Stage 1's route on a device tree: the 26.6.2 firmware-ready description for older
-    firmware, unchanged. On firmware given its clocks: if any processor the ADT describes may
-    still run (whatever the aliases, the device tree's power domains, its DARTs or reservations
-    say), no boot; if none does, a boot with no ready marker, uuid, firmware version, compat,
-    clock ids or added memory-region on any external processor, even when the input tree had
-    them. No DART is read and no register written."""
+    firmware, unchanged. On firmware given its clocks, every processor the ADT describes that may
+    still run keeps its firmware segments and its firmware and pipe DART table pages, found from
+    the ADT whatever the aliases, the device tree's nodes, power domains or reservations say, and
+    nothing is promised of any (even when the input tree had it): it boots. If some of that memory
+    cannot be kept (a page a mappable reservation holds, a power state that does not show a
+    running processor, a DART read that faults, no room), it does not boot, with what can be kept
+    kept. A processor that is off with its pipe keeps nothing. DARTs are read only once the
+    processor's power is checked, and no register is written."""
     tree = os.environ.get(BOARDS[board], "-")
     result = subprocess.run([str(stage1_fdt), board, tree, scenario], capture_output=True,
                             text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.rstrip().endswith(f"{scenario}: pass"), result.stdout
     assert "FAIL" not in result.stdout, result.stdout
+    refused = ("external display memory that may still be in use could not all be kept from the "
+               "OS (reasons in the DCP: dcpext lines above): not booting")
+    assert (refused in result.stdout) == (scenario in NO_BOOT), result.stdout
     if scenario.startswith("fw27") and not scenario.endswith("-off"):
-        assert "may still run as iBoot left it" in result.stdout, result.stdout
-        assert "this stage cannot keep their memory from the OS" in result.stdout
-        assert "not booting" in result.stdout
+        assert "not handed over, may run: " in result.stdout, result.stdout
     if scenario.startswith("fw27"):
         assert "firmware reserved, left to the kernel" not in result.stdout

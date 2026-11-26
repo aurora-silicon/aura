@@ -3486,9 +3486,44 @@ static void t6041_ext_handoffs(void *dt)
 /* ---- external display processors the ADT describes ---- */
 
 /*
- * Both stages: whether an external display processor the ADT describes may still run as iBoot left
- * it, from its ADT clock-gates and the PMGR power states they resolve to (only read, guarded).
+ * Both stages keep the memory of every external display processor the ADT describes that is not
+ * handed over to the OS, all of them in a Stage 1, while it may still run as iBoot left it: its
+ * firmware segments and the page tables of the DARTs it and its pipe use (dt_keep_dcpext()). Only
+ * the ESP Stage 2 hands processors over (dt_set_dcpext_handoff(), kboot.h): a Stage 1 has no room
+ * for that. The only register accesses are guarded reads of PMGR power states and, once a
+ * processor's power is checked, of the DARTs the ADT and the device tree point at and their tables.
  */
+
+static const struct dcp_soc dcp_soc_dcpext = {.name = "dcpext"};
+
+/*
+ * External display processors whose handoff this boot's ADT describes completely, by block: the
+ * device tree compatible of the processor, and of the display subsystem its pipe joins on a board
+ * with no panel. A later SoC whose processor lists one of these as a fallback compatible is the
+ * same block and needs no entry.
+ */
+static const struct {
+    const char *dcpext, *display;
+} dcpext_blocks[] = {
+    {"apple,t8132-dcpext", "apple,t8132-display-subsystem"},
+};
+
+#define DCPEXT_MAX        8
+#define DCPEXT_TABLES_MAX 256
+#define DCPEXT_DARTS_MAX  8
+
+/* The page-table pages of the DARTs an external processor uses, as iBoot left them */
+struct dcpext_tables {
+    int n;
+    u64 page[DCPEXT_TABLES_MAX];
+};
+
+/* The processors handed over in this boot (ESP Stage 2 only), and the keep's scratch */
+static struct {
+    int nhanded;
+    u64 handed[DCPEXT_MAX];      /* their address: ADT and device tree reg[0] */
+    struct dcpext_tables tables; /* one processor's table pages to keep from the OS */
+} dcpext_kept;
 
 /* An ADT string property (device_type) is `want` */
 static bool dcpext_adt_is(int node, const char *prop, const char *want)
@@ -3558,91 +3593,6 @@ static bool dcpext_not_running(const char *name)
     return n > 0 && n < DCP6_GATES_MAX;
 }
 
-/*
- * How many external processors the ADT describes (/arm-io children of device_type dcp other than
- * the internal /arm-io/dcp) may still run as iBoot left them: all but those that provably do not
- * (dcpext_not_running()). Each is logged. With no /arm-io, 1: none can be shown not to run.
- * A Stage 1's (kboot.c); the ESP Stage 2 does not link it.
- */
-int dcpext_may_run(void)
-{
-    int io = adt_path_offset(adt, "/arm-io"), internal = adt_path_offset(adt, "/arm-io/dcp");
-    int child = io, n = 0;
-
-    if (io < 0)
-        return 1;
-    ADT_FOREACH_CHILD(adt, child)
-    {
-        if (child == internal || !dcpext_adt_is(child, "device_type", "dcp"))
-            continue;
-        const char *name = adt_get_name(adt, child);
-        if (name && dcpext_not_running(name))
-            continue;
-        printf("DCP: %s may still run as iBoot left it\n", name ? name : "an unnamed processor");
-        n++;
-    }
-    return n;
-}
-
-#ifdef ESP_STAGE2
-
-/*
- * ESP Stage 2 only (kboot.h): Stage 1 has no room for this handoff, nor for keeping the memory of a
- * processor that is not handed over (dcpext_keep_rest()). A Stage 1 normally chainloads the ESP
- * Stage 2, which does both. A Stage 1 that starts an OS itself keeps kboot.c's firmware-ready path
- * for older firmware; on firmware given its clocks it boots only if no processor may run
- * (dcpext_may_run()).
- */
-
-/*
- * External display processors whose handoff this boot's ADT describes completely, by block: the
- * device tree compatible of the processor, and of the display subsystem its pipe joins on a board
- * with no panel. A later SoC whose processor lists one of these as a fallback compatible is the
- * same block and needs no entry.
- */
-static const struct {
-    const char *dcpext, *display;
-} dcpext_blocks[] = {
-    {"apple,t8132-dcpext", "apple,t8132-display-subsystem"},
-};
-
-#define DCPEXT_MAX 8
-
-static const struct dcp_soc dcp_soc_dcpext = {.name = "dcpext"};
-
-/* One external processor, as matched between the device tree and the ADT */
-struct dcpext {
-    char dt_path[DCP6_NAME_LEN * 2];
-    char name[DCP6_NAME_LEN]; /* its ADT node's (dcpext0), or the DT path until matched */
-    const char *display;      /* its block's display subsystem compatible */
-    int adt;                  /* /arm-io/<name> */
-    u32 sid;                  /* its firmware DART stream */
-    u64 coproc, dart, vm_base, vm_size;
-    struct dcp6_clocks clk; /* its pipe's */
-};
-
-#define DCPEXT_TABLES_MAX 256
-
-/* The page-table pages of the DARTs an external processor uses, as iBoot left them */
-struct dcpext_tables {
-    int n;
-    u64 page[DCPEXT_TABLES_MAX];
-};
-
-/* Per-call state of dt_set_dcpext_handoff() */
-static struct {
-    bool headless;        /* no panel: no internal handoff, the external processors only */
-    const char *uuid;     /* the image the internal DCP's nub runs, which each must run */
-    struct dcp6_seg text; /* the internal nub's __TEXT, which each must share */
-    int n;
-    struct dcpext ext[DCPEXT_MAX];
-    struct dcpext_tables tables;      /* scratch for one processor's DARTs */
-    struct dcpext_tables disp_tables; /* with no panel: the display subsystem DART's */
-    int nhanded;
-    u64 handed[DCPEXT_MAX];           /* the addresses (reg[0]) of the processors handed over */
-    struct dcpext_tables keep_tables; /* scratch for one processor's memory kept from the OS */
-} dcpext_run;
-
 /* reg[idx] of /arm-io/<child>, address and size (if `size`), with the /arm-io ranges applied */
 static int dcpext_adt_reg_at(int child, int idx, u64 *addr, u64 *size)
 {
@@ -3701,6 +3651,557 @@ static int dcpext_adt_stream(u32 ph, u32 *sid)
     return dart;
 }
 
+/* reg[0] of a device tree node whose parent has 2 address and 2 size cells */
+static int dcpext_dt_reg(void *dt, int node, u64 *addr)
+{
+    int len, parent = node < 0 ? node : fdt_parent_offset(dt, node);
+    const fdt64_t *reg = parent < 0 ? NULL : fdt_getprop(dt, node, "reg", &len);
+    if (!reg || len < 2 * (int)sizeof(fdt64_t) || fdt_address_cells(dt, parent) != 2 ||
+        fdt_size_cells(dt, parent) != 2)
+        return -1;
+    *addr = fdt64_ld(reg);
+    return 0;
+}
+
+/* The power states a processor's clock-gates resolve to: each gate, then its parents */
+struct dcpext_ps {
+    u64 addr;
+    const char *name;
+    bool gate; /* the processor's own device: requested is enough */
+};
+
+/*
+ * Add gate g and every parent above it (both PMGR parents of each device) up to the first virtual
+ * one. A register seen both as a gate and as a parent must be on.
+ */
+static int dcpext_ps_add(struct dcpext_ps *ps, int *n, const struct pmgr_gate *g, int depth,
+                         const char *name, u32 i)
+{
+    if (!g->found || (!depth && g->virt) || depth >= DCP6_GATE_DEPTH)
+        bail("%s: clock-gates[%u] does not resolve to PMGR power states\n", name, i);
+    if (g->virt)
+        return 0;
+    if (!g->psreg)
+        bail("%s: %.16s has no power state register\n", name, g->name);
+    int k;
+    for (k = 0; k < *n && ps[k].addr != g->psreg; k++)
+        ;
+    if (k == *n) {
+        if (*n >= DCP6_PS_MAX)
+            bail("%s: clock-gates[%u] resolves to more than %d power states\n", name, i,
+                 DCP6_PS_MAX);
+        ps[(*n)++] = (struct dcpext_ps){g->psreg, g->name, !depth};
+    } else if (depth) {
+        ps[k].gate = false;
+    }
+    for (int p = 0; p < 2; p++) {
+        struct pmgr_gate parent;
+        if (!g->parent[p] || g->parent[p] == g->id) /* a device listed as its own parent */
+            continue;
+        if (pmgr_device_gate(g->die, g->parent[p], &parent) < 0)
+            bail("%s: a parent of clock-gates[%u] is not in the PMGR table\n", name, i);
+        if (dcpext_ps_add(ps, n, &parent, depth + 1, name, i))
+            return -1;
+    }
+    return 0;
+}
+
+/*
+ * /arm-io/<name> is powered as iBoot leaves a processor it started: each PMGR device its ADT
+ * clock-gates name is requested (the hardware gates an idle processor's CPU domain by itself), and
+ * each parent above it, through both parents of every device, up to the first virtual one, is on
+ * (DISPEXTn_CPU, then _FE and _SYS on the T8132). Through the ADT's PMGR table; the power state
+ * registers are only read, guarded. `what` names it in the log.
+ */
+static int dcpext_powered(const char *name, const char *what)
+{
+    struct dcpext_ps ps[DCP6_PS_MAX];
+    char path[DCP6_NAME_LEN + 16];
+    u32 val[DCP6_PS_MAX];
+    int n = 0;
+
+    snprintf(path, sizeof(path), "/arm-io/%s", name);
+    for (u32 i = 0; i < DCP6_GATES_MAX; i++) {
+        struct pmgr_gate g;
+        if (pmgr_adt_gate(path, "clock-gates", i, &g) < 0)
+            break;
+        if (dcpext_ps_add(ps, &n, &g, 0, what, i))
+            return -1;
+    }
+    if (!n)
+        bail("%s: no ADT clock-gates to check its power by\n", what);
+
+    int guard = dcp6_guard_begin();
+    for (int i = 0; i < n; i++)
+        val[i] = read32(ps[i].addr);
+    if (dcp6_guard_end(guard))
+        bail("%s: reading its power state faulted\n", what);
+    for (int i = 0; i < n; i++)
+        if (ps[i].gate ? !dcp6_ps_on(val[i]) : FIELD_GET(PMGR_PS_ACTUAL, val[i]) != PMGR_PS_ACTIVE)
+            bail("%s: %.16s is not %s (0x%x)\n", what, ps[i].name, ps[i].gate ? "requested" : "on",
+                 val[i]);
+    return 0;
+}
+
+/* A 16K table page inside the ADT's DRAM */
+static bool dcpext_table_in_dram(u64 page, u64 dram_base, u64 dram_size)
+{
+    return dram_size >= SZ_16K && !(page & (SZ_16K - 1)) && page >= dram_base &&
+           page - dram_base <= dram_size - SZ_16K;
+}
+
+/*
+ * Whether a 16K page (`noun` in the log: a DART table page, a firmware page) is already kept from
+ * the OS: 1 if a /memreserve/ entry or an enabled no-map /reserved-memory node holds all of it, 0
+ * if nothing overlaps it, -1 (logged) on a partial overlap or an overlap with a reservation the OS
+ * may map.
+ */
+static int dcpext_page_kept(void *dt, u64 page, const char *what, const char *noun)
+{
+    int n = fdt_num_mem_rsv(dt), kept = 0;
+    for (int i = 0; i < n; i++) {
+        u64 a, sz;
+        if (fdt_get_mem_rsv(dt, i, &a, &sz) || !dcp6_overlaps(page, SZ_16K, a, sz))
+            continue;
+        if (sz < SZ_16K || a + sz < a || page < a || page - a > sz - SZ_16K)
+            bail("%s: %s 0x%lx straddles /memreserve/ 0x%lx+0x%lx\n", what, noun, page, a, sz);
+        kept = 1;
+    }
+    int resv = fdt_path_offset(dt, "/reserved-memory"), node;
+    if (resv < 0)
+        return kept;
+    fdt_for_each_subnode(node, dt, resv)
+    {
+        const char *status = fdt_getprop(dt, node, "status", NULL);
+        int len;
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        if ((status && !strcmp(status, "disabled")) || !reg || len <= 0)
+            continue;
+        for (int k = 0; (k + 2) * (int)sizeof(fdt64_t) <= len; k += 2) {
+            u64 a = fdt64_ld(&reg[k]), sz = fdt64_ld(&reg[k + 1]);
+            if (!dcp6_overlaps(page, SZ_16K, a, sz))
+                continue;
+            if (sz < SZ_16K || a + sz < a || page < a || page - a > sz - SZ_16K ||
+                !fdt_getprop(dt, node, "no-map", NULL))
+                bail("%s: %s 0x%lx overlaps /reserved-memory/%s\n", what, noun, page,
+                     fdt_get_name(dt, node, NULL));
+            kept = 1;
+        }
+    }
+    return kept;
+}
+
+/* ---- the memory of an external processor that is not handed over ---- */
+
+/*
+ * Add a table page to `t` if it is a 16K page in DRAM outside the memory carveouts (which are not
+ * DART table memory, and need not read back as they are), and `t` has room; returns whether it is
+ * in `t` (then it may be read). Any other page is counted in *missed.
+ */
+static bool dcpext_keep_page(struct dcpext_tables *t, u64 page, u64 dram_base, u64 dram_size,
+                             int *missed)
+{
+    if (!dcpext_table_in_dram(page, dram_base, dram_size)) {
+        (*missed)++;
+        return false;
+    }
+    for (size_t j = 0; j < mcc_carveout_count; j++)
+        if (dcp6_overlaps(page, SZ_16K, mcc_carveouts[j].base, mcc_carveouts[j].size)) {
+            (*missed)++;
+            return false;
+        }
+    for (int i = 0; i < t->n; i++)
+        if (t->page[i] == page)
+            return true;
+    if (t->n >= DCPEXT_TABLES_MAX) {
+        (*missed)++;
+        return false;
+    }
+    t->page[t->n++] = page;
+    return true;
+}
+
+/*
+ * The table pages of every enabled stream of a DART that translates through a valid root, locked
+ * or not and whatever else its TCR says (nothing is refused here): the root and the pages its valid
+ * entries point at, into `t`. A four-level stream's lower levels are not followed (counted in
+ * *missed, as is every page dcpext_keep_page() does not take).
+ */
+static void dcpext_keep_dart_inner(u64 dart, struct dcpext_tables *t, u64 dram_base, u64 dram_size,
+                                   int *missed)
+{
+    u32 sids = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS, read32(dart + DART_T8110_PARAMS4));
+
+    if (sids > DART_T8110_STREAMS_REG_MAX) {
+        (*missed)++;
+        sids = DART_T8110_STREAMS_REG_MAX;
+    }
+    for (u32 sid = 0; sid < sids; sid++) {
+        if (!(read32(dart + DART_T8110_ENABLE_STREAMS + 4 * (sid / 32)) & BIT(sid % 32)))
+            continue;
+        u32 tcr = read32(dart + DART_T8110_TCR(sid));
+        u32 ttbr = read32(dart + DART_T8110_TTBR(sid));
+        if (!(tcr & DART_T8110_TCR_TRANSLATE) || !(ttbr & DART_T8110_TTBR_VALID))
+            continue;
+        if (tcr & DART_T8110_TCR_FOUR_LEVEL)
+            (*missed)++;
+        u64 l1 = (u64)FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT;
+        if (!dcpext_keep_page(t, l1, dram_base, dram_size, missed))
+            continue;
+        for (u64 i = 0; i < DART_ENTRIES; i++) {
+            u64 e1 = read64(l1 + 8 * i);
+            if (e1 & DART_PTE_VALID)
+                dcpext_keep_page(t, (e1 & DART_PTE_ADDR) << DART_PTE_SHIFT, dram_base, dram_size,
+                                 missed);
+        }
+    }
+}
+
+/* dcpext_keep_dart_inner(), guarded: a DART that faults adds nothing (logged, counted) */
+static void dcpext_keep_dart(u64 dart, struct dcpext_tables *t, const char *what, int *missed)
+{
+    u64 dram_base, dram_size;
+    int before = t->n;
+
+    if (dcp6_dram(&dram_base, &dram_size)) {
+        (*missed)++;
+        return;
+    }
+    int guard = dcp6_guard_begin();
+    dcpext_keep_dart_inner(dart, t, dram_base, dram_size, missed);
+    if (dcp6_guard_end(guard)) {
+        t->n = before;
+        (*missed)++;
+        dlog("%s: reading DART 0x%lx or its tables faulted: none of its tables kept\n", what, dart);
+    }
+}
+
+/* Add `base` to darts[] (n of them) once; one that does not fit is counted in *missed */
+static void dcpext_dart_add(u64 *darts, int *n, u64 base, int *missed)
+{
+    for (int k = 0; k < *n; k++)
+        if (darts[k] == base)
+            return;
+    if (*n < DCPEXT_DARTS_MAX)
+        darts[(*n)++] = base;
+    else
+        (*missed)++;
+}
+
+/*
+ * Add the DART of each stream ADT node `src`'s iommu-parent names (a list of mapper phandles) to
+ * darts[]; one that does not resolve to an ADT dart,t8110 is counted in *missed.
+ */
+static void dcpext_adt_darts(int src, u64 *darts, int *n, int *missed)
+{
+    u32 len = 0;
+    const u8 *phs = adt_getprop(adt, src, "iommu-parent", &len);
+
+    for (u32 i = 0; phs && i + sizeof(u32) <= len; i += sizeof(u32)) {
+        u32 ph, sid;
+        u64 base;
+        memcpy(&ph, phs + i, sizeof(ph));
+        int dart = dcpext_adt_stream(ph, &sid);
+        if (dart < 0 || dcpext_adt_reg(dart, &base))
+            (*missed)++;
+        else
+            dcpext_dart_add(darts, n, base, missed);
+    }
+}
+
+/* Whether a reg range of ADT /arm-io child `node`, with the /arm-io ranges applied, holds addr */
+static bool dcpext_adt_holds(int node, u64 addr)
+{
+    u64 base, size;
+
+    for (int i = 0; i < 16 && !dcpext_adt_reg_at(node, i, &base, &size); i++)
+        if (addr >= base && addr - base < size)
+            return true;
+    return false;
+}
+
+/*
+ * The DARTs whose tables an external processor that is not handed over may use, all from the ADT,
+ * whatever the device tree has: its own stream's (iommu-parent), and the streams of each pipe
+ * (ext-display-subsystem) whose registers hold the processor's, as the display subsystem's hold
+ * its DCP's. A stream that does not resolve, or a processor no pipe holds (logged), is counted in
+ * *missed. No register is read.
+ */
+static int dcpext_keep_darts(int child, u64 *darts, const char *what, int *missed)
+{
+    int n = 0, pipes = 0, pipe = adt_path_offset(adt, "/arm-io");
+    u64 coproc;
+
+    dcpext_adt_darts(child, darts, &n, missed);
+    if (pipe >= 0 && !dcpext_adt_reg(child, &coproc)) {
+        ADT_FOREACH_CHILD(adt, pipe)
+        {
+            if (dcpext_adt_is(pipe, "device_type", "ext-display-subsystem") &&
+                dcpext_adt_holds(pipe, coproc)) {
+                dcpext_adt_darts(pipe, darts, &n, missed);
+                pipes++;
+            }
+        }
+    }
+    if (!pipes) {
+        dlog("%s: no ADT pipe holds it: its pipe's DART is not known\n", what);
+        (*missed)++;
+    }
+    return n;
+}
+
+/*
+ * Keep the 16K pages around [base, base + size) from the OS: each one in the RAM the OS gets that
+ * no reservation holds yet is reserved no-map as /reserved-memory/<prefix>@<address>, consecutive
+ * ones as one node unless `per_page`. A page a reservation holds in part (or a wrapping
+ * reservation), or one that cannot be reserved, is logged, left and counted in *missed; the others
+ * are kept all the same. Returns how many pages were reserved.
+ */
+static int dcpext_keep_range(void *dt, u64 base, u64 size, const char *what, const char *noun,
+                             const char *prefix, bool per_page, int *missed)
+{
+    u64 ram_min = kboot_ram_base(), ram_max = kboot_ram_base() + kboot_ram_size();
+    u64 start = base & ~(u64)(SZ_16K - 1), end = ALIGN_UP(base + size, SZ_16K), run = 0,
+        run_end = 0;
+    int pages = 0;
+
+    for (u64 page = start; page <= end; page += SZ_16K) {
+        bool in_ram = page < end && page + SZ_16K > ram_min && page < ram_max;
+        int kept = in_ram ? dcpext_page_kept(dt, page, what, noun) : 1;
+        if (kept < 0)
+            (*missed)++;
+        bool need = in_ram && kept == 0;
+        if (need && run_end == page && !per_page) {
+            run_end += SZ_16K;
+            continue;
+        }
+        if (run_end > run) {
+            char name[48];
+            snprintf(name, sizeof(name), "%s@%lx", prefix, run);
+            if (dcp6_add_resv(dt, name, run, run_end - run, "apple,asc-mem")) {
+                pages += (run_end - run) / SZ_16K;
+            } else {
+                dlog("%s: cannot reserve %s 0x%lx+0x%lx\n", what, noun, run, run_end - run);
+                (*missed)++;
+            }
+        }
+        run = run_end = need ? page : 0;
+        if (need)
+            run_end += SZ_16K;
+    }
+    return pages;
+}
+
+/*
+ * Keep each firmware segment of the ADT nub of /arm-io/<name> (__TEXT, __DATA, __OS_LOG, heaps:
+ * every one, whatever its flags) from the OS where it is in its RAM. Returns how many pages were
+ * reserved; a segment list (logged) or segment that cannot be kept is counted in *missed.
+ */
+static int dcpext_keep_segments(void *dt, const char *name, const char *what, int *missed)
+{
+    char nub_path[DCP6_NAME_LEN * 2 + 16];
+    u32 len = 0;
+    int pages = 0;
+
+    dcp6_nub_path(nub_path, sizeof(nub_path), name);
+    int nub = adt_path_offset(adt, nub_path);
+    const struct adt_segment_ranges *seg =
+        nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &len);
+    if (!seg || !len || len % sizeof(*seg) || len > 16 * sizeof(*seg)) {
+        dlog("%s: no segment-ranges on %s: its firmware memory is not known\n", what, nub_path);
+        (*missed)++;
+        return 0;
+    }
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        struct adt_segment_ranges r;
+        memcpy(&r, &seg[i], sizeof(r));
+        if (!r.size)
+            continue;
+        if (r.size > DCP6_SEG_MAX_SIZE || r.phys > UINT64_MAX - DCP6_SEG_MAX_SIZE - SZ_16K) {
+            (*missed)++; /* not a firmware segment's size or address */
+            continue;
+        }
+        pages += dcpext_keep_range(dt, r.phys, r.size, what, "firmware page", "dcpext-firmware",
+                                   false, missed);
+    }
+    return pages;
+}
+
+/*
+ * Keep the memory of the external processor at ADT /arm-io child `child`, which is not handed
+ * over, from the OS. Unless it and its pipe provably do not run
+ * (dcpext_not_running()), it may still run, and its DARTs keep translating through their tables,
+ * whatever the OS does: each of its firmware segments and the table pages of every DART it and its
+ * pipe use (dcpext_keep_darts()) are reserved no-map where they are in the OS's RAM and nothing
+ * holds them yet, each on its own. The DARTs are read only if it is powered as iBoot leaves a
+ * running processor (dcpext_powered()); otherwise its tables cannot be known. Nothing about the
+ * processor is published, so the kernel does not adopt it. Returns how many references could not
+ * be followed or kept: 0 if all of its memory in the OS's RAM is kept.
+ */
+static int dcpext_keep(void *dt, int child)
+{
+    const char *name = adt_get_name(adt, child);
+    struct dcpext_tables *t = &dcpext_kept.tables;
+    char what[DCP6_NAME_LEN + 8];
+    u64 darts[DCPEXT_DARTS_MAX];
+    int missed = 0, tables = 0;
+
+    if (!name) {
+        dlog("an ADT processor without a name: its memory is not known\n");
+        return 1;
+    }
+    snprintf(what, sizeof(what), "%s memory", name);
+    if (dcpext_not_running(name)) {
+        dlog("%s: not running, its pipe neither (its power domains are off): nothing to keep\n",
+             what);
+        return 0;
+    }
+    int ndarts = dcpext_keep_darts(child, darts, what, &missed);
+    t->n = 0;
+    if (ndarts && dcpext_powered(name, what)) {
+        dlog("%s: may run but is not powered as a running one: its %d DART(s) not read\n", what,
+             ndarts);
+        missed += ndarts;
+    } else {
+        for (int i = 0; i < ndarts; i++)
+            dcpext_keep_dart(darts[i], t, what, &missed);
+    }
+    int fw = dcpext_keep_segments(dt, name, what, &missed);
+    for (int i = 0; i < t->n; i++)
+        tables += dcpext_keep_range(dt, t->page[i], SZ_16K, what, "DART table page",
+                                    "dcpext-tables", true, &missed);
+    dlog("%s: not handed over, may run: %d firmware and %d DART table page(s) (of %d DART(s)) "
+         "reserved in the OS's RAM, %d reference(s) not followed or kept\n",
+         what, fw, tables, ndarts, missed);
+    return missed;
+}
+
+/* Whether the processor at `coproc` (its reg[0]) is handed over */
+static bool dcpext_is_handed(u64 coproc)
+{
+    for (int i = 0; i < dcpext_kept.nhanded; i++)
+        if (dcpext_kept.handed[i] == coproc)
+            return true;
+    return false;
+}
+
+/*
+ * Withdraw from each device tree processor of a known block (dcpext_blocks[]) that is not handed
+ * over what the input tree promised of it, by which the kernel would adopt it: the ready marker of
+ * the firmware-ready path (older firmware), its image, firmware version and compatibility, the
+ * firmware clock ids, and memory-region entries past those memory-region-names names (the ones
+ * the firmware-ready path appends). The reservations they point at stay. One handed over loses
+ * only the ready marker, which firmware given its clocks never gets. With none of these the
+ * kernel leaves the processor and its DARTs as iBoot left them. Returns -1 if the tree cannot be
+ * edited.
+ */
+static int dcpext_withdraw(void *dt)
+{
+    static const char props[][36] = {
+        "apple,t8132-dcpext-firmware-ready",
+        "apple,firmware-uuid",
+        "apple,firmware-version",
+        "apple,firmware-compat",
+        "apple,clock-ids",
+    };
+
+    for (size_t b = 0; b < ARRAY_SIZE(dcpext_blocks); b++) {
+        int node = -1;
+        while ((node = fdt_node_offset_by_compatible(dt, node, dcpext_blocks[b].dcpext)) >= 0) {
+            int len, named = fdt_stringlist_count(dt, node, "memory-region-names");
+            const fdt32_t *mr = fdt_getprop(dt, node, "memory-region", &len);
+            u64 coproc;
+            bool handed = !dcpext_dt_reg(dt, node, &coproc) && dcpext_is_handed(coproc);
+            if (!handed && mr && named >= 0 && len > named * (int)sizeof(*mr)) {
+                fdt32_t keep[8];
+                if (named > (int)ARRAY_SIZE(keep))
+                    return -1;
+                memcpy(keep, mr, named * sizeof(*mr));
+                if (fdt_setprop(dt, node, "memory-region", keep, named * sizeof(*mr)))
+                    return -1;
+            }
+            for (size_t i = 0; i < (handed ? 1 : ARRAY_SIZE(props)); i++) {
+                int ret = fdt_delprop(dt, node, props[i]);
+                if (ret && ret != -FDT_ERR_NOTFOUND)
+                    return -1;
+            }
+        }
+        if (node != -FDT_ERR_NOTFOUND)
+            return -1;
+    }
+    return 0;
+}
+
+/*
+ * kboot.c's T8132 route on firmware the OS gives its clocks, in both stages, after any handoff
+ * (dt_set_dcpext_handoff(), ESP Stage 2 only): withdraw what the input tree promised of every
+ * processor not handed over (dcpext_withdraw()), and keep the memory of every external processor
+ * the ADT describes (an /arm-io child of device_type dcp other than the internal /arm-io/dcp) that
+ * is not handed over (dcpext_keep()), whatever the device tree says of it or why it was not handed
+ * over. Returns 0 if each such processor provably does not run or all of its memory in the OS's
+ * RAM is kept, -1 (each reason logged) if not, or if the withdrawal failed: the OS must then not be
+ * started, as it could reuse memory a processor or its pipe still uses.
+ */
+int dt_keep_dcpext(void *dt)
+{
+    int io = adt_path_offset(adt, "/arm-io"), internal = adt_path_offset(adt, "/arm-io/dcp");
+    int child = io, missed = 0;
+
+    dcp6.soc = &dcp_soc_dcpext;
+    if (dcpext_withdraw(dt)) {
+        dlog("what the device tree promised of the external processors cannot be withdrawn\n");
+        missed++;
+    }
+    if (io < 0) {
+        dlog("no ADT /arm-io: the external processors cannot be found\n");
+        return -1;
+    }
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        u64 addr;
+        if (child == internal || !dcpext_adt_is(child, "device_type", "dcp") ||
+            (!dcpext_adt_reg(child, &addr) && dcpext_is_handed(addr)))
+            continue;
+        missed += dcpext_keep(dt, child);
+    }
+    if (missed)
+        dlog("%d reference(s) to memory an external processor may still use not kept from the "
+             "OS\n",
+             missed);
+    return missed ? -1 : 0;
+}
+
+#ifdef ESP_STAGE2
+
+/*
+ * ESP Stage 2 only (kboot.h): the handoff of the external processors. Stage 1 has no room for it.
+ * A Stage 1 normally chainloads the ESP Stage 2, which hands them over; one that starts an OS
+ * itself keeps kboot.c's firmware-ready path for older firmware, and on firmware given its clocks
+ * keeps their memory without handing them over (dt_keep_dcpext()).
+ */
+
+/* One external processor, as matched between the device tree and the ADT */
+struct dcpext {
+    char dt_path[DCP6_NAME_LEN * 2];
+    char name[DCP6_NAME_LEN]; /* its ADT node's (dcpext0), or the DT path until matched */
+    const char *display;      /* its block's display subsystem compatible */
+    int adt;                  /* /arm-io/<name> */
+    u32 sid;                  /* its firmware DART stream */
+    u64 coproc, dart, vm_base, vm_size;
+    struct dcp6_clocks clk; /* its pipe's */
+};
+
+/* Per-call state of dt_set_dcpext_handoff() */
+static struct {
+    bool headless;        /* no panel: no internal handoff, the external processors only */
+    const char *uuid;     /* the image the internal DCP's nub runs, which each must run */
+    struct dcp6_seg text; /* the internal nub's __TEXT, which each must share */
+    int n;
+    struct dcpext ext[DCPEXT_MAX];
+    struct dcpext_tables tables;      /* scratch for one processor's DARTs */
+    struct dcpext_tables disp_tables; /* with no panel: the display subsystem DART's */
+} dcpext_run;
+
 /*
  * The DART window of stream `sid`: the DART has that stream (sid-count) and gives vm-base and
  * vm-size-<sid> (or vm-size when it has no per-stream size).
@@ -3720,18 +4221,6 @@ static int dcpext_adt_window(int dart, u32 sid, u64 *vm_base, u64 *vm_size)
                    *vm_size > DART_DVA_MASK + 1
                ? -1
                : 0;
-}
-
-/* reg[0] of a device tree node whose parent has 2 address and 2 size cells */
-static int dcpext_dt_reg(void *dt, int node, u64 *addr)
-{
-    int len, parent = node < 0 ? node : fdt_parent_offset(dt, node);
-    const fdt64_t *reg = parent < 0 ? NULL : fdt_getprop(dt, node, "reg", &len);
-    if (!reg || len < 2 * (int)sizeof(fdt64_t) || fdt_address_cells(dt, parent) != 2 ||
-        fdt_size_cells(dt, parent) != 2)
-        return -1;
-    *addr = fdt64_ld(reg);
-    return 0;
 }
 
 /*
@@ -3831,86 +4320,6 @@ static int dcpext_pipe(void *dt, struct dcpext *x)
     return pipe;
 }
 
-/* The power states a processor's clock-gates resolve to: each gate, then its parents */
-struct dcpext_ps {
-    u64 addr;
-    const char *name;
-    bool gate; /* the processor's own device: requested is enough */
-};
-
-/*
- * Add gate g and every parent above it (both PMGR parents of each device) up to the first virtual
- * one. A register seen both as a gate and as a parent must be on.
- */
-static int dcpext_ps_add(struct dcpext_ps *ps, int *n, const struct pmgr_gate *g, int depth,
-                         const char *name, u32 i)
-{
-    if (!g->found || (!depth && g->virt) || depth >= DCP6_GATE_DEPTH)
-        bail("%s: clock-gates[%u] does not resolve to PMGR power states\n", name, i);
-    if (g->virt)
-        return 0;
-    if (!g->psreg)
-        bail("%s: %.16s has no power state register\n", name, g->name);
-    int k;
-    for (k = 0; k < *n && ps[k].addr != g->psreg; k++)
-        ;
-    if (k == *n) {
-        if (*n >= DCP6_PS_MAX)
-            bail("%s: clock-gates[%u] resolves to more than %d power states\n", name, i,
-                 DCP6_PS_MAX);
-        ps[(*n)++] = (struct dcpext_ps){g->psreg, g->name, !depth};
-    } else if (depth) {
-        ps[k].gate = false;
-    }
-    for (int p = 0; p < 2; p++) {
-        struct pmgr_gate parent;
-        if (!g->parent[p] || g->parent[p] == g->id) /* a device listed as its own parent */
-            continue;
-        if (pmgr_device_gate(g->die, g->parent[p], &parent) < 0)
-            bail("%s: a parent of clock-gates[%u] is not in the PMGR table\n", name, i);
-        if (dcpext_ps_add(ps, n, &parent, depth + 1, name, i))
-            return -1;
-    }
-    return 0;
-}
-
-/*
- * /arm-io/<name> is powered as iBoot leaves a processor it started: each PMGR device its ADT
- * clock-gates name is requested (the hardware gates an idle processor's CPU domain by itself), and
- * each parent above it, through both parents of every device, up to the first virtual one, is on
- * (DISPEXTn_CPU, then _FE and _SYS on the T8132). Through the ADT's PMGR table; the power state
- * registers are only read, guarded. `what` names it in the log.
- */
-static int dcpext_powered(const char *name, const char *what)
-{
-    struct dcpext_ps ps[DCP6_PS_MAX];
-    char path[DCP6_NAME_LEN + 16];
-    u32 val[DCP6_PS_MAX];
-    int n = 0;
-
-    snprintf(path, sizeof(path), "/arm-io/%s", name);
-    for (u32 i = 0; i < DCP6_GATES_MAX; i++) {
-        struct pmgr_gate g;
-        if (pmgr_adt_gate(path, "clock-gates", i, &g) < 0)
-            break;
-        if (dcpext_ps_add(ps, &n, &g, 0, what, i))
-            return -1;
-    }
-    if (!n)
-        bail("%s: no ADT clock-gates to check its power by\n", what);
-
-    int guard = dcp6_guard_begin();
-    for (int i = 0; i < n; i++)
-        val[i] = read32(ps[i].addr);
-    if (dcp6_guard_end(guard))
-        bail("%s: reading its power state faulted\n", what);
-    for (int i = 0; i < n; i++)
-        if (ps[i].gate ? !dcp6_ps_on(val[i]) : FIELD_GET(PMGR_PS_ACTUAL, val[i]) != PMGR_PS_ACTIVE)
-            bail("%s: %.16s is not %s (0x%x)\n", what, ps[i].name, ps[i].gate ? "requested" : "on",
-                 val[i]);
-    return 0;
-}
-
 /*
  * A DART stream as iBoot leaves a running device's: the DART's TTBR/TCR protection set (the
  * kernel then keeps its tables instead of resetting it), and the stream translating, not
@@ -3933,41 +4342,6 @@ static int dcpext_stream_locked(u64 dart, u32 sid, const char *what)
         bail("%s: DART 0x%lx stream %u is not translating through a root (TCR 0x%x, TTBR 0x%x)\n",
              what, dart, sid, tcr, ttbr);
     return 0;
-}
-
-/* A 16K table page inside the ADT's DRAM */
-static bool dcpext_table_in_dram(u64 page, u64 dram_base, u64 dram_size)
-{
-    return dram_size >= SZ_16K && !(page & (SZ_16K - 1)) && page >= dram_base &&
-           page - dram_base <= dram_size - SZ_16K;
-}
-
-/*
- * Add a table page to `t` if it is a 16K page in DRAM outside the memory carveouts (which are not
- * DART table memory, and need not read back as they are), and `t` has room; returns whether it is
- * in `t` (then it may be read). Any other page is counted in *missed.
- */
-static bool dcpext_keep_page(struct dcpext_tables *t, u64 page, u64 dram_base, u64 dram_size,
-                             int *missed)
-{
-    if (!dcpext_table_in_dram(page, dram_base, dram_size)) {
-        (*missed)++;
-        return false;
-    }
-    for (size_t j = 0; j < mcc_carveout_count; j++)
-        if (dcp6_overlaps(page, SZ_16K, mcc_carveouts[j].base, mcc_carveouts[j].size)) {
-            (*missed)++;
-            return false;
-        }
-    for (int i = 0; i < t->n; i++)
-        if (t->page[i] == page)
-            return true;
-    if (t->n >= DCPEXT_TABLES_MAX) {
-        (*missed)++;
-        return false;
-    }
-    t->page[t->n++] = page;
-    return true;
 }
 
 /* Why dcpext_dart_tables() refused, printed once its guarded reads are known not to have faulted */
@@ -4071,50 +4445,6 @@ static int dcpext_dart_tables(u64 dart, const char *what, struct dcpext_tables *
 #undef refuse
 
 /*
- * Whether a 16K page (`noun` in the log: a DART table page, a firmware page) is already kept from
- * the OS: 1 if a /memreserve/ entry or an enabled no-map /reserved-memory node holds all of it, 0
- * if nothing overlaps it, -1 (logged) on a partial overlap or an overlap with a reservation the OS
- * may map.
- */
-static int dcpext_page_kept(void *dt, u64 page, const char *what, const char *noun)
-{
-    int n = fdt_num_mem_rsv(dt), kept = 0;
-    for (int i = 0; i < n; i++) {
-        u64 a, sz;
-        if (fdt_get_mem_rsv(dt, i, &a, &sz) || !dcp6_overlaps(page, SZ_16K, a, sz))
-            continue;
-        if (sz < SZ_16K || a + sz < a || page < a || page - a > sz - SZ_16K)
-            bail("%s: %s 0x%lx straddles /memreserve/ 0x%lx+0x%lx\n", what, noun, page, a, sz);
-        kept = 1;
-    }
-    int resv = fdt_path_offset(dt, "/reserved-memory"), node;
-    if (resv < 0)
-        return kept;
-    fdt_for_each_subnode(node, dt, resv)
-    {
-        const char *status = fdt_getprop(dt, node, "status", NULL);
-        int len;
-        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
-        if ((status && !strcmp(status, "disabled")) || !reg || len <= 0)
-            continue;
-        for (int k = 0; (k + 2) * (int)sizeof(fdt64_t) <= len; k += 2) {
-            u64 a = fdt64_ld(&reg[k]), sz = fdt64_ld(&reg[k + 1]);
-            if (!dcp6_overlaps(page, SZ_16K, a, sz))
-                continue;
-            if (sz < SZ_16K || a + sz < a || page < a || page - a > sz - SZ_16K ||
-                !fdt_getprop(dt, node, "no-map", NULL))
-                bail("%s: %s 0x%lx overlaps /reserved-memory/%s\n", what, noun, page,
-                     fdt_get_name(dt, node, NULL));
-            kept = 1;
-        }
-    }
-    return kept;
-}
-
-static int dcpext_keep_range(void *dt, u64 base, u64 size, const char *what, const char *noun,
-                             const char *prefix, bool per_page, int *missed);
-
-/*
  * Keep the table pages in `t` from the OS (dcpext_keep_range()): a page in the RAM the OS gets that
  * no reservation holds yet is reserved (no-map, named by its address); one outside that RAM is not
  * the OS's. -1 (logged) at the first one that cannot be kept.
@@ -4128,8 +4458,6 @@ static int dcpext_reserve_tables(void *dt, const struct dcpext_tables *t, const 
                           &missed);
     return missed ? -1 : 0;
 }
-
-#define DCPEXT_DARTS_MAX 8
 
 /*
  * Every DART the device tree node at `node` and its children (piodma) reference, by reg[0], each
@@ -4361,358 +4689,9 @@ static void dcpext_reserve_oslogs(void *dt)
     dcp6_reserve_oslogs(dt);
 }
 
-/* ---- the memory of an external processor that is not handed over ---- */
-
-/*
- * The table pages of every enabled stream of a DART that translates through a valid root, locked
- * or not and whatever else its TCR says (nothing is refused here): the root and the pages its valid
- * entries point at, into `t`. A four-level stream's lower levels are not followed (counted in
- * *missed, as is every page dcpext_keep_page() does not take).
- */
-static void dcpext_keep_dart_inner(u64 dart, struct dcpext_tables *t, u64 dram_base, u64 dram_size,
-                                   int *missed)
-{
-    u32 sids = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS, read32(dart + DART_T8110_PARAMS4));
-
-    if (sids > DART_T8110_STREAMS_REG_MAX) {
-        (*missed)++;
-        sids = DART_T8110_STREAMS_REG_MAX;
-    }
-    for (u32 sid = 0; sid < sids; sid++) {
-        if (!(read32(dart + DART_T8110_ENABLE_STREAMS + 4 * (sid / 32)) & BIT(sid % 32)))
-            continue;
-        u32 tcr = read32(dart + DART_T8110_TCR(sid));
-        u32 ttbr = read32(dart + DART_T8110_TTBR(sid));
-        if (!(tcr & DART_T8110_TCR_TRANSLATE) || !(ttbr & DART_T8110_TTBR_VALID))
-            continue;
-        if (tcr & DART_T8110_TCR_FOUR_LEVEL)
-            (*missed)++;
-        u64 l1 = (u64)FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT;
-        if (!dcpext_keep_page(t, l1, dram_base, dram_size, missed))
-            continue;
-        for (u64 i = 0; i < DART_ENTRIES; i++) {
-            u64 e1 = read64(l1 + 8 * i);
-            if (e1 & DART_PTE_VALID)
-                dcpext_keep_page(t, (e1 & DART_PTE_ADDR) << DART_PTE_SHIFT, dram_base, dram_size,
-                                 missed);
-        }
-    }
-}
-
-/* dcpext_keep_dart_inner(), guarded: a DART that faults adds nothing (logged, counted) */
-static void dcpext_keep_dart(u64 dart, struct dcpext_tables *t, const char *what, int *missed)
-{
-    u64 dram_base, dram_size;
-    int before = t->n;
-
-    if (dcp6_dram(&dram_base, &dram_size)) {
-        (*missed)++;
-        return;
-    }
-    int guard = dcp6_guard_begin();
-    dcpext_keep_dart_inner(dart, t, dram_base, dram_size, missed);
-    if (dcp6_guard_end(guard)) {
-        t->n = before;
-        (*missed)++;
-        dlog("%s: reading DART 0x%lx or its tables faulted: none of its tables kept\n", what, dart);
-    }
-}
-
-/* Add `base` to darts[] (n of them) once; one that does not fit is counted in *missed */
-static void dcpext_dart_add(u64 *darts, int *n, u64 base, int *missed)
-{
-    for (int k = 0; k < *n; k++)
-        if (darts[k] == base)
-            return;
-    if (*n < DCPEXT_DARTS_MAX)
-        darts[(*n)++] = base;
-    else
-        (*missed)++;
-}
-
-/*
- * Add the DART of each stream ADT node `src`'s iommu-parent names (a list of mapper phandles) to
- * darts[]; one that does not resolve to an ADT dart,t8110 is counted in *missed.
- */
-static void dcpext_adt_darts(int src, u64 *darts, int *n, int *missed)
-{
-    u32 len = 0;
-    const u8 *phs = adt_getprop(adt, src, "iommu-parent", &len);
-
-    for (u32 i = 0; phs && i + sizeof(u32) <= len; i += sizeof(u32)) {
-        u32 ph, sid;
-        u64 base;
-        memcpy(&ph, phs + i, sizeof(ph));
-        int dart = dcpext_adt_stream(ph, &sid);
-        if (dart < 0 || dcpext_adt_reg(dart, &base))
-            (*missed)++;
-        else
-            dcpext_dart_add(darts, n, base, missed);
-    }
-}
-
-/* Whether a reg range of ADT /arm-io child `node`, with the /arm-io ranges applied, holds addr */
-static bool dcpext_adt_holds(int node, u64 addr)
-{
-    u64 base, size;
-
-    for (int i = 0; i < 16 && !dcpext_adt_reg_at(node, i, &base, &size); i++)
-        if (addr >= base && addr - base < size)
-            return true;
-    return false;
-}
-
-/*
- * The DARTs whose tables an external processor that is not handed over may use, all from the ADT,
- * whatever the device tree has: its own stream's (iommu-parent), and the streams of each pipe
- * (ext-display-subsystem) whose registers hold the processor's, as the display subsystem's hold
- * its DCP's. A stream that does not resolve, or a processor no pipe holds (logged), is counted in
- * *missed. No register is read.
- */
-static int dcpext_keep_darts(int child, u64 *darts, const char *what, int *missed)
-{
-    int n = 0, pipes = 0, pipe = adt_path_offset(adt, "/arm-io");
-    u64 coproc;
-
-    dcpext_adt_darts(child, darts, &n, missed);
-    if (pipe >= 0 && !dcpext_adt_reg(child, &coproc)) {
-        ADT_FOREACH_CHILD(adt, pipe)
-        {
-            if (dcpext_adt_is(pipe, "device_type", "ext-display-subsystem") &&
-                dcpext_adt_holds(pipe, coproc)) {
-                dcpext_adt_darts(pipe, darts, &n, missed);
-                pipes++;
-            }
-        }
-    }
-    if (!pipes) {
-        dlog("%s: no ADT pipe holds it: its pipe's DART is not known\n", what);
-        (*missed)++;
-    }
-    return n;
-}
-
-/*
- * Keep the 16K pages around [base, base + size) from the OS: each one in the RAM the OS gets that
- * no reservation holds yet is reserved no-map as /reserved-memory/<prefix>@<address>, consecutive
- * ones as one node unless `per_page`. A page a reservation holds in part (or a wrapping
- * reservation), or one that cannot be reserved, is logged, left and counted in *missed; the others
- * are kept all the same. Returns how many pages were reserved.
- */
-static int dcpext_keep_range(void *dt, u64 base, u64 size, const char *what, const char *noun,
-                             const char *prefix, bool per_page, int *missed)
-{
-    u64 ram_min = kboot_ram_base(), ram_max = kboot_ram_base() + kboot_ram_size();
-    u64 start = base & ~(u64)(SZ_16K - 1), end = ALIGN_UP(base + size, SZ_16K), run = 0,
-        run_end = 0;
-    int pages = 0;
-
-    for (u64 page = start; page <= end; page += SZ_16K) {
-        bool in_ram = page < end && page + SZ_16K > ram_min && page < ram_max;
-        int kept = in_ram ? dcpext_page_kept(dt, page, what, noun) : 1;
-        if (kept < 0)
-            (*missed)++;
-        bool need = in_ram && kept == 0;
-        if (need && run_end == page && !per_page) {
-            run_end += SZ_16K;
-            continue;
-        }
-        if (run_end > run) {
-            char name[48];
-            snprintf(name, sizeof(name), "%s@%lx", prefix, run);
-            if (dcp6_add_resv(dt, name, run, run_end - run, "apple,asc-mem")) {
-                pages += (run_end - run) / SZ_16K;
-            } else {
-                dlog("%s: cannot reserve %s 0x%lx+0x%lx\n", what, noun, run, run_end - run);
-                (*missed)++;
-            }
-        }
-        run = run_end = need ? page : 0;
-        if (need)
-            run_end += SZ_16K;
-    }
-    return pages;
-}
-
-/*
- * Keep each firmware segment of the ADT nub of /arm-io/<name> (__TEXT, __DATA, __OS_LOG, heaps:
- * every one, whatever its flags) from the OS where it is in its RAM. Returns how many pages were
- * reserved; a segment list (logged) or segment that cannot be kept is counted in *missed.
- */
-static int dcpext_keep_segments(void *dt, const char *name, const char *what, int *missed)
-{
-    char nub_path[DCP6_NAME_LEN * 2 + 16];
-    u32 len = 0;
-    int pages = 0;
-
-    dcp6_nub_path(nub_path, sizeof(nub_path), name);
-    int nub = adt_path_offset(adt, nub_path);
-    const struct adt_segment_ranges *seg =
-        nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &len);
-    if (!seg || !len || len % sizeof(*seg) || len > 16 * sizeof(*seg)) {
-        dlog("%s: no segment-ranges on %s: its firmware memory is not known\n", what, nub_path);
-        (*missed)++;
-        return 0;
-    }
-    for (u32 i = 0; i < len / sizeof(*seg); i++) {
-        struct adt_segment_ranges r;
-        memcpy(&r, &seg[i], sizeof(r));
-        if (!r.size)
-            continue;
-        if (r.size > DCP6_SEG_MAX_SIZE || r.phys > UINT64_MAX - DCP6_SEG_MAX_SIZE - SZ_16K) {
-            (*missed)++; /* not a firmware segment's size or address */
-            continue;
-        }
-        pages += dcpext_keep_range(dt, r.phys, r.size, what, "firmware page", "dcpext-firmware",
-                                   false, missed);
-    }
-    return pages;
-}
-
-/*
- * Keep the memory of the external processor at ADT /arm-io child `child`, which is not handed
- * over, from the OS. Unless it and its pipe provably do not run
- * (dcpext_not_running()), it may still run, and its DARTs keep translating through their tables,
- * whatever the OS does: each of its firmware segments and the table pages of every DART it and its
- * pipe use (dcpext_keep_darts()) are reserved no-map where they are in the OS's RAM and nothing
- * holds them yet, each on its own. The DARTs are read only if it is powered as iBoot leaves a
- * running processor (dcpext_powered()); otherwise its tables cannot be known. Nothing about the
- * processor is published, so the kernel does not adopt it. Returns how many references could not
- * be followed or kept: 0 if all of its memory in the OS's RAM is kept.
- */
-static int dcpext_keep(void *dt, int child)
-{
-    const char *name = adt_get_name(adt, child);
-    struct dcpext_tables *t = &dcpext_run.keep_tables;
-    char what[DCP6_NAME_LEN + 8];
-    u64 darts[DCPEXT_DARTS_MAX];
-    int missed = 0, tables = 0;
-
-    if (!name) {
-        dlog("an ADT processor without a name: its memory is not known\n");
-        return 1;
-    }
-    snprintf(what, sizeof(what), "%s memory", name);
-    if (dcpext_not_running(name)) {
-        dlog("%s: not running, its pipe neither (its power domains are off): nothing to keep\n",
-             what);
-        return 0;
-    }
-    int ndarts = dcpext_keep_darts(child, darts, what, &missed);
-    t->n = 0;
-    if (ndarts && dcpext_powered(name, what)) {
-        dlog("%s: may run but is not powered as a running one: its %d DART(s) not read\n", what,
-             ndarts);
-        missed += ndarts;
-    } else {
-        for (int i = 0; i < ndarts; i++)
-            dcpext_keep_dart(darts[i], t, what, &missed);
-    }
-    int fw = dcpext_keep_segments(dt, name, what, &missed);
-    for (int i = 0; i < t->n; i++)
-        tables += dcpext_keep_range(dt, t->page[i], SZ_16K, what, "DART table page",
-                                    "dcpext-tables", true, &missed);
-    dlog("%s: not handed over, may run: %d firmware and %d DART table page(s) (of %d DART(s)) "
-         "reserved in the OS's RAM, %d reference(s) not followed or kept\n",
-         what, fw, tables, ndarts, missed);
-    return missed;
-}
-
-/* Whether the processor at `coproc` (its reg[0]) is handed over */
-static bool dcpext_is_handed(u64 coproc)
-{
-    for (int i = 0; i < dcpext_run.nhanded; i++)
-        if (dcpext_run.handed[i] == coproc)
-            return true;
-    return false;
-}
-
-/*
- * Withdraw from each device tree processor of a known block (dcpext_blocks[]) that is not handed
- * over what the input tree promised of it, by which the kernel would adopt it: the ready marker of
- * the firmware-ready path (older firmware), its image, firmware version and compatibility, the
- * firmware clock ids, and memory-region entries past those memory-region-names names (the ones
- * the firmware-ready path appends). The reservations they point at stay. One handed over loses
- * only the ready marker, which firmware given its clocks never gets. With none of these the
- * kernel leaves the processor and its DARTs as iBoot left them. Returns -1 if the tree cannot be
- * edited.
- */
-static int dcpext_withdraw(void *dt)
-{
-    static const char props[][36] = {
-        "apple,t8132-dcpext-firmware-ready",
-        "apple,firmware-uuid",
-        "apple,firmware-version",
-        "apple,firmware-compat",
-        "apple,clock-ids",
-    };
-
-    for (size_t b = 0; b < ARRAY_SIZE(dcpext_blocks); b++) {
-        int node = -1;
-        while ((node = fdt_node_offset_by_compatible(dt, node, dcpext_blocks[b].dcpext)) >= 0) {
-            int len, named = fdt_stringlist_count(dt, node, "memory-region-names");
-            const fdt32_t *mr = fdt_getprop(dt, node, "memory-region", &len);
-            u64 coproc;
-            bool handed = !dcpext_dt_reg(dt, node, &coproc) && dcpext_is_handed(coproc);
-            if (!handed && mr && named >= 0 && len > named * (int)sizeof(*mr)) {
-                fdt32_t keep[8];
-                if (named > (int)ARRAY_SIZE(keep))
-                    return -1;
-                memcpy(keep, mr, named * sizeof(*mr));
-                if (fdt_setprop(dt, node, "memory-region", keep, named * sizeof(*mr)))
-                    return -1;
-            }
-            for (size_t i = 0; i < (handed ? 1 : ARRAY_SIZE(props)); i++) {
-                int ret = fdt_delprop(dt, node, props[i]);
-                if (ret && ret != -FDT_ERR_NOTFOUND)
-                    return -1;
-            }
-        }
-        if (node != -FDT_ERR_NOTFOUND)
-            return -1;
-    }
-    return 0;
-}
-
-/*
- * What the input tree promised of every processor not handed over is withdrawn
- * (dcpext_withdraw()), and every external processor the ADT describes (an /arm-io child of
- * device_type dcp other than the internal /arm-io/dcp) that was not handed over keeps its memory
- * (dcpext_keep()), whatever the device tree says of it or why it was refused. Returns how many
- * references to memory one that may still run uses could not be followed or kept, or 1 more if
- * the withdrawal failed (logged): 0 if all of it is kept.
- */
-static int dcpext_keep_rest(void *dt)
-{
-    int io = adt_path_offset(adt, "/arm-io"), internal = adt_path_offset(adt, "/arm-io/dcp");
-    int child = io, missed = 0;
-
-    if (dcpext_withdraw(dt)) {
-        dlog("what the device tree promised of the external processors cannot be withdrawn\n");
-        missed++;
-    }
-    if (io < 0) {
-        dlog("no ADT /arm-io: the external processors cannot be found\n");
-        return 1;
-    }
-    ADT_FOREACH_CHILD(adt, child)
-    {
-        u64 addr;
-        if (child == internal || !dcpext_adt_is(child, "device_type", "dcp") ||
-            (!dcpext_adt_reg(child, &addr) && dcpext_is_handed(addr)))
-            continue;
-        missed += dcpext_keep(dt, child);
-    }
-    if (missed)
-        dlog("%d reference(s) to memory an external processor may still use not kept from the "
-             "OS\n",
-             missed);
-    return missed;
-}
-
 /*
  * Hand the external processors over (dt_set_dcpext_handoff(), firmware given its clocks). Each
- * processor handed over is recorded in dcpext_run.handed[]; every way out says why in one line.
+ * processor handed over is recorded in dcpext_kept.handed[]; every way out says why in one line.
  */
 static void dcpext_hand_over(void *dt, enum dcp_internal internal)
 {
@@ -4787,7 +4766,7 @@ static void dcpext_hand_over(void *dt, enum dcp_internal internal)
         if (!dcp6_commit(dt, scratch)) {
             dlog("%s handed over (image %s, stream %u, %u pipe clocks)\n", x->name, uuid, x->sid,
                  x->clk.n);
-            dcpext_run.handed[dcpext_run.nhanded++] = x->coproc;
+            dcpext_kept.handed[dcpext_kept.nhanded++] = x->coproc;
             display = display ?: x->display;
         }
     }
@@ -4834,14 +4813,14 @@ static void dcpext_hand_over(void *dt, enum dcp_internal internal)
  * over: an external processor must never cost the panel.
  *
  * Every processor that is not handed over, for any reason, then has what the input tree promised
- * of it withdrawn, and every one the ADT describes keeps its memory from the OS
- * (dcpext_keep_rest()): it may still run as iBoot left it. If that memory cannot all be kept, -1:
- * the OS must not start.
+ * of it withdrawn, and every one the ADT describes keeps its memory from the OS (dt_keep_dcpext()):
+ * it may still run as iBoot left it. If that memory cannot all be kept, -1: the OS must not start.
  */
 int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
 {
     memset(&dcp6, 0, sizeof(dcp6));
     memset(&dcpext_run, 0, sizeof(dcpext_run));
+    dcpext_kept.nhanded = 0;
     dcp6.soc = &dcp_soc_dcpext;
 
     if (!fw_clocks) {
@@ -4854,7 +4833,7 @@ int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
         return 0;
     }
     dcpext_hand_over(dt, internal);
-    return dcpext_keep_rest(dt) ? -1 : 1;
+    return dt_keep_dcpext(dt) ? -1 : 1;
 }
 #endif /* ESP_STAGE2 */
 

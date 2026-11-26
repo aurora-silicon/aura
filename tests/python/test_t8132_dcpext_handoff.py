@@ -217,7 +217,7 @@ def test_no_silent_early_return():
 
 
 def test_every_firmware_27_outcome_keeps_memory():
-    """Once the firmware is given its clocks, the handoff always ends in dcpext_keep_rest() (every
+    """Once the firmware is given its clocks, the handoff always ends in dt_keep_dcpext() (every
     processor not handed over has its promises withdrawn and keeps its memory) and returns 1, or -1
     if that memory could not all be kept: the only 0 (kboot.c's 26.6.2 firmware-ready path) is
     decided from fw_clocks before anything else."""
@@ -228,7 +228,7 @@ def test_every_firmware_27_outcome_keeps_memory():
     first, rest = tail.split("return 0;\n    }", 1)
     assert "return" not in first
     assert [line.strip() for line in rest.strip().splitlines()] == \
-        ["dcpext_hand_over(dt, internal);", "return dcpext_keep_rest(dt) ? -1 : 1;"]
+        ["dcpext_hand_over(dt, internal);", "return dt_keep_dcpext(dt) ? -1 : 1;"]
 
 
 @pytest.fixture(scope="module")
