@@ -3511,7 +3511,6 @@ static const struct {
 #define DCPEXT_MAX        8
 #define DCPEXT_TABLES_MAX 256
 #define DCPEXT_REFS_MAX   8
-#define DCPEXT_DARTS_MAX  8
 
 /* The page-table pages of the DARTs an external processor uses, as iBoot left them */
 struct dcpext_tables {
@@ -4341,50 +4340,6 @@ static int dcpext_match(void *dt, struct dcpext *x)
 }
 
 /*
- * The processor's display pipe: the one ADT ext-display-subsystem whose iommu-parent includes the
- * stream of the device tree's piodma child (iommus = <&dart sid>), under the ADT DART at that
- * DART's address.
- */
-static int dcpext_pipe(void *dt, struct dcpext *x)
-{
-    char path[sizeof(x->dt_path) + 8];
-    int len, io = adt_path_offset(adt, "/arm-io"), child = io, pipe = -1, n = 0;
-    u64 base, addr;
-
-    snprintf(path, sizeof(path), "%s/piodma", x->dt_path);
-    int piodma = fdt_path_offset(dt, path);
-    const fdt32_t *iommus = piodma < 0 ? NULL : fdt_getprop(dt, piodma, "iommus", &len);
-    int dart = !iommus || len != 2 * (int)sizeof(fdt32_t)
-                   ? -1
-                   : fdt_node_offset_by_phandle(dt, fdt32_ld(&iommus[0]));
-    if (dart < 0 || dcpext_dt_reg(dt, dart, &base) || io < 0)
-        bail("%s: no piodma child on a DART\n", x->name);
-    u32 cell = fdt32_ld(&iommus[1]);
-    ADT_FOREACH_CHILD(adt, child)
-    {
-        u32 plen = 0;
-        const u8 *phs = adt_getprop(adt, child, "iommu-parent", &plen);
-        if (!phs || plen % sizeof(u32) ||
-            !dcpext_adt_is(child, "device_type", "ext-display-subsystem"))
-            continue;
-        for (u32 i = 0; i < plen / sizeof(u32); i++) {
-            u32 ph, sid;
-            memcpy(&ph, phs + i * sizeof(u32), sizeof(ph));
-            int mdart = dcpext_adt_stream(ph, &sid);
-            if (mdart >= 0 && sid == cell && !dcpext_adt_reg(mdart, &addr) && addr == base) {
-                pipe = child;
-                n++;
-                break;
-            }
-        }
-    }
-    if (n != 1)
-        bail("%s: %d ADT display pipes use its piodma stream %u at 0x%lx\n", x->name, n, cell,
-             base);
-    return pipe;
-}
-
-/*
  * A DART stream as iBoot leaves a running device's: the DART's TTBR/TCR protection set (the
  * kernel then keeps its tables instead of resetting it), and the stream translating, not
  * bypassed, through a valid root. Only read, guarded, and only once the DART's power is checked.
@@ -4524,104 +4479,97 @@ static int dcpext_reserve_tables(void *dt, const struct dcpext_tables *t, const 
 }
 
 /*
- * Every DART the device tree node at `node` and its children (piodma) reference, by reg[0], each
- * once: each iommus must be a list of (DART, stream) pairs on apple,t8110-dart DARTs that take one
- * cell. Returns how many, -1 (logged) if the description cannot be read whole.
+ * Whether every stream the device tree node at `node` and its children use is one the ADT gives the
+ * processor or its pipe (refs[], n of them): each iommus must be a list of (DART, stream) pairs on
+ * apple,t8110-dart DARTs that take one cell, each at the address of an ADT DART with that stream.
+ * With `piodma`, the node must have a piodma child with one stream, its pipe's. Nothing is read
+ * from a register: this is checked before any DART is. -1 (logged) if not, or if the description
+ * cannot be read whole.
  */
-static int dcpext_node_darts(void *dt, int node, const char *what, u64 *darts)
+static int dcpext_node_check(void *dt, int node, const char *what, const struct dcpext_ref *refs,
+                             int n, bool piodma)
 {
-    int n = 0, depth = 0, dev = node;
+    int depth = 0, dev = node, pio = 0;
     if (node < 0)
         bail("%s: no device tree node\n", what);
     do {
         int len = 0;
+        const char *name = fdt_get_name(dt, dev, NULL);
         const fdt32_t *iommus = fdt_getprop(dt, dev, "iommus", &len);
+        bool is_pio = depth == 1 && name && !strcmp(name, "piodma");
         if (iommus && (len <= 0 || len % (2 * (int)sizeof(*iommus))))
-            bail("%s: %s iommus is not a list of (DART, stream) pairs\n", what,
-                 fdt_get_name(dt, dev, NULL));
+            bail("%s: %s iommus is not a list of (DART, stream) pairs\n", what, name);
         for (int i = 0; iommus && i + 1 < len / (int)sizeof(*iommus); i += 2) {
-            int dart = fdt_node_offset_by_phandle(dt, fdt32_ld(&iommus[i])), clen = 0;
+            int dart = fdt_node_offset_by_phandle(dt, fdt32_ld(&iommus[i])), clen = 0, k;
             const fdt32_t *cells = dart < 0 ? NULL : fdt_getprop(dt, dart, "#iommu-cells", &clen);
+            u32 sid = fdt32_ld(&iommus[i + 1]);
             u64 base;
             if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart") || !cells ||
                 clen != sizeof(*cells) || fdt32_ld(cells) != 1 || dcpext_dt_reg(dt, dart, &base))
-                bail("%s: %s iommus[%d] is not a one-cell apple,t8110-dart\n", what,
-                     fdt_get_name(dt, dev, NULL), i / 2);
-            int k;
-            for (k = 0; k < n && darts[k] != base; k++)
+                bail("%s: %s iommus[%d] is not a one-cell apple,t8110-dart\n", what, name, i / 2);
+            for (k = 0;
+                 k < n && (refs[k].dart != base || refs[k].sid != sid || (is_pio && !refs[k].pipe));
+                 k++)
                 ;
-            if (k < n)
-                continue;
-            if (n == DCPEXT_DARTS_MAX)
-                bail("%s: more than %d DARTs\n", what, DCPEXT_DARTS_MAX);
-            darts[n++] = base;
+            if (k == n)
+                bail("%s: %s stream %u on DART 0x%lx is not one the ADT gives it%s\n", what, name,
+                     sid, base, is_pio ? "s pipe" : " or its pipe");
+            pio += is_pio;
         }
         dev = fdt_next_node(dt, dev, &depth);
     } while (dev >= 0 && depth > 0);
     if (dev < 0 && dev != -FDT_ERR_NOTFOUND)
         bail("%s: the device tree cannot be walked\n", what);
-    return n;
+    if (piodma && pio != 1)
+        bail("%s: no piodma child with one stream\n", what);
+    return 0;
 }
 
-/* The tables of every DART the node at `node` and its children use, into `t` */
-static int dcpext_node_tables(void *dt, int node, const char *what, struct dcpext_tables *t)
+/* The tables of each DART of refs[] (n of them), into `t`: dcpext_dart_tables() */
+static int dcpext_ref_tables(const struct dcpext_ref *refs, int n, const char *what,
+                             struct dcpext_tables *t)
 {
-    u64 darts[DCPEXT_DARTS_MAX];
-    int n = dcpext_node_darts(dt, node, what, darts);
-    if (n < 0)
-        return -1;
-    if (!n)
-        bail("%s: no DART in the device tree\n", what);
+    u64 darts[DCPEXT_REFS_MAX];
+    int nd = dcpext_ref_darts(refs, n, darts);
+
     t->n = 0;
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < nd; i++)
         if (dcpext_dart_tables(darts[i], what, t))
             return -1;
     return 0;
 }
 
-/* How many ADT /arm-io dart,t8110 nodes are at `base` */
-static int dcpext_adt_darts_at(u64 base)
-{
-    int io = adt_path_offset(adt, "/arm-io"), child = io, n = 0;
-    u64 addr;
-
-    if (io < 0)
-        return 0;
-    ADT_FOREACH_CHILD(adt, child)
-    {
-        if (adt_is_compatible(adt, child, "dart,t8110") && !dcpext_adt_reg(child, &addr) &&
-            addr == base)
-            n++;
-    }
-    return n;
-}
-
 /*
  * With no panel, the display subsystem (alias disp0) is enabled with its DART, which the internal
- * DCP iBoot started and parked still uses: only if that DART is the ADT's dart,t8110 at its
- * address, the internal DCP is powered and the DART's scanout stream is locked, so that the kernel
- * keeps its tables and the boot console. The table pages of every stream set up on it (scanout and
- * piodma) are collected, to be reserved when the subsystem is enabled. Only read, guarded.
+ * DCP iBoot started and parked still uses: only if each stream disp0 and its children use is one
+ * the ADT gives the internal DCP's display subsystem (dcpext_adt_pipe(), dcpext_node_check()), the
+ * internal DCP is powered and disp0's scanout stream is locked, so that the kernel keeps its
+ * tables and the boot console. The table pages of every stream set up on the ADT display
+ * subsystem's DARTs (scanout and piodma) are collected, to be reserved when the subsystem is
+ * enabled. Only read, guarded, and no DART before those checks.
  */
 static int dcpext_display_locked(void *dt)
 {
-    const char *path = fdt_get_alias(dt, "disp0");
-    int disp = path ? fdt_path_offset(dt, path) : -1, len;
+    const char *path = fdt_get_alias(dt, "disp0"), *what = "the display subsystem";
+    int disp = path ? fdt_path_offset(dt, path) : -1, len, n = 0, missed = 0;
+    int dcp = adt_path_offset(adt, "/arm-io/dcp");
     const fdt32_t *iommus = disp < 0 ? NULL : fdt_getprop(dt, disp, "iommus", &len);
     int dart = !iommus || len != 2 * (int)sizeof(fdt32_t)
                    ? -1
                    : fdt_node_offset_by_phandle(dt, fdt32_ld(&iommus[0]));
+    struct dcpext_ref refs[DCPEXT_REFS_MAX];
     u64 base;
 
-    if (dart < 0 || dcpext_dt_reg(dt, dart, &base) || adt_path_offset(adt, "/arm-io") < 0)
+    if (dart < 0 || dcpext_dt_reg(dt, dart, &base) || dcp < 0)
         bail("the display subsystem has no DART\n");
-    int n = dcpext_adt_darts_at(base);
-    if (n != 1)
-        bail("%d ADT DARTs at the display subsystem's 0x%lx\n", n, base);
-    if (dcpext_powered("dcp", "dcp") ||
-        dcpext_stream_locked(base, fdt32_ld(&iommus[1]), "the display subsystem"))
+    int pipe = dcpext_adt_pipe(dcp, "display-subsystem", "dcp");
+    if (pipe < 0)
         return -1;
-    return dcpext_node_tables(dt, disp, "the display subsystem", &dcpext_run.disp_tables);
+    dcpext_adt_refs(pipe, refs, &n, true, what, &missed);
+    if (missed || dcpext_node_check(dt, disp, what, refs, n, false) ||
+        dcpext_powered("dcp", "dcp") || dcpext_stream_locked(base, fdt32_ld(&iommus[1]), what))
+        return -1;
+    return dcpext_ref_tables(refs, n, what, &dcpext_run.disp_tables);
 }
 
 /*
@@ -4631,15 +4579,23 @@ static int dcpext_display_locked(void *dt)
 static int dcpext_fill(void *dt, struct dcpext *x)
 {
     struct dcp6_seg segs[DCPEXT6_SEGS];
+    struct dcpext_ref refs[DCPEXT_REFS_MAX];
     u32 ph[3], len = 0;
+    int missed = 0, pipe;
 
-    if (dcpext_match(dt, x) || dcpext_powered(x->name, x->name) ||
-        dcpext_stream_locked(x->dart, x->sid, x->name))
+    if (dcpext_match(dt, x))
         return -1;
     int node = fdt_path_offset(dt, x->dt_path);
 
-    /* Every DART it and its children (piodma) use: tables to keep, or refused */
-    if (dcpext_node_tables(dt, node, x->name, &dcpext_run.tables))
+    /*
+     * The DARTs it and its pipe use come from the ADT. Each stream the device tree gives it and
+     * its piodma must be one of theirs before any DART is read, and they are read only once its
+     * power, and its pipe's above it, is checked: their tables to keep, or refused.
+     */
+    int nrefs = dcpext_adt_supply(x->adt, refs, &pipe, x->name, &missed);
+    if (missed || dcpext_node_check(dt, node, x->name, refs, nrefs, true) ||
+        dcpext_powered(x->name, x->name) || dcpext_stream_locked(x->dart, x->sid, x->name) ||
+        dcpext_ref_tables(refs, nrefs, x->name, &dcpext_run.tables))
         return -1;
     if (dcpext_placeholders(dt, node, x->name, ph))
         return -1;
@@ -4660,10 +4616,7 @@ static int dcpext_fill(void *dt, struct dcpext *x)
     if (fdt_getprop(dt, node, "clocks", NULL) || fdt_getprop(dt, node, "clock-names", NULL) ||
         fdt_getprop(dt, node, "apple,clock-ids", NULL))
         bail("%s: already has clocks\n", x->name);
-    int pipe = dcpext_pipe(dt, x);
     char pipe_what[2 * DCP6_NAME_LEN + 4];
-    if (pipe < 0)
-        return -1;
     snprintf(pipe_what, sizeof(pipe_what), "%s: %s", x->name, adt_get_name(adt, pipe));
     if (dcp6_read_clocks(pipe, pipe_what, &x->clk))
         return -1;

@@ -50,7 +50,14 @@ static const u32 pipe_clk[2][2] = {{369, 432}, {372, 433}};
 static const u32 clk_hz[2][2] = {{533333333, 400000000}, {600000000, 0}};
 
 /* ADT phandles, as in the T8132 ADTs' ranges */
-enum { APH_MAPPER_DCP = 300, APH_DART_EXT = 319, APH_MAPPER_EXT = 320, APH_MAPPER_DISP = 322 };
+enum {
+    APH_MAPPER_DCP = 300,
+    APH_MAPPER_DISP0,
+    APH_MAPPER_DISP0_PIODMA,
+    APH_DART_EXT = 319,
+    APH_MAPPER_EXT = 320,
+    APH_MAPPER_DISP = 322
+};
 static u32 aph_mapper_ext(int i)
 {
     return APH_MAPPER_EXT + 10 * i;
@@ -270,10 +277,23 @@ static void world_t8132(bool no_panel, const char *uuid)
     prop_u32("/arm-io/dart-dcp/mapper-dcp", "reg", 23);
     prop_u32("/arm-io/dart-dcp/mapper-dcp", "AAPL,phandle", APH_MAPPER_DCP);
     prop_str("/arm-io/disp0", "device_type", "display-subsystem");
+    /* As the T8132 ADT's: disp0's register ranges, the fourth holding dcp's; scanout and piodma */
+    reg_add("/arm-io/disp0", M4_DCP - 0x2e00000, 0xc20000);
+    reg_add("/arm-io/disp0", M4_DCP - 0x8d0000, 0x10000);
+    reg_add("/arm-io/disp0", M4_DCP - 0x868000, 0x4000);
+    reg_add("/arm-io/disp0", M4_DCP - 0x600000, 0x800000);
+    u32 disp0_parents[2] = {APH_MAPPER_DISP0, APH_MAPPER_DISP0_PIODMA};
+    prop_set("/arm-io/disp0", "iommu-parent", disp0_parents, sizeof(disp0_parents));
     u32 dcp_gate = PM_DISP0_CPU;
     prop_set("/arm-io/dcp", "clock-gates", &dcp_gate, sizeof(dcp_gate));
     prop_str("/arm-io/dart-disp0", "compatible", "dart,t8110");
     reg_add("/arm-io/dart-disp0", M4_DART_DISP, 0xc000);
+    prop_str("/arm-io/dart-disp0/mapper-disp0", "device_type", "dart-mapper");
+    prop_u32("/arm-io/dart-disp0/mapper-disp0", "reg", 0);
+    prop_u32("/arm-io/dart-disp0/mapper-disp0", "AAPL,phandle", APH_MAPPER_DISP0);
+    prop_str("/arm-io/dart-disp0/mapper-disp0-piodma", "device_type", "dart-mapper");
+    prop_u32("/arm-io/dart-disp0/mapper-disp0-piodma", "reg", 16);
+    prop_u32("/arm-io/dart-disp0/mapper-disp0-piodma", "AAPL,phandle", APH_MAPPER_DISP0_PIODMA);
     if (no_panel)
         prop_u32("/arm-io/disp0", "external", 1);
 
@@ -719,6 +739,9 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-pipe-no-mappers", "J713: dispext1 has no ADT iommu-parent: no boot, the rest kept"},
     {"j713-no-dt-ext-pipe-no-mappers", "J713: no DT external node, no dispext1 iommu-parent"},
     {"j713-ext-no-mappers", "J713: dcpext1 has no ADT iommu-parent: no boot, the rest kept"},
+    {"j713-piodma-other-pipe-off", "J713: dcpext0's piodma on dispext1's DART, dcpext1 off"},
+    {"j713-piodma-other-pipe-on", "J713: dcpext0's piodma on dispext1's DART, both running"},
+    {"j773g-disp-other-dart", "J773g: disp0 on dispext1's DART, dcpext1 off: not read"},
 };
 
 /*
@@ -1229,6 +1252,22 @@ int main(int argc, char **argv)
         prop_drop(is(s, "j713-ext-no-mappers") ? "/arm-io/dcpext1" : "/arm-io/dispext1",
                   "iommu-parent");
     }
+    /* The device tree puts dcpext0's piodma on the other pipe's DART */
+    if (is(s, "j713-piodma-other-pipe-off") || is(s, "j713-piodma-other-pipe-on")) {
+        char path[96];
+        ext_path(path, sizeof(path), 0);
+        strcat(path, "/piodma");
+        iommus(dt, OK(fdt_path_offset(dt, path)), PH_PIPE_DART + 1, 16);
+    }
+    if (is(s, "j713-piodma-other-pipe-off") || is(s, "j773g-disp-other-dart")) {
+        /* dcpext1 and its pipe are off: nothing answers at its pipe's DART */
+        ext_off(1);
+        region_of(pipe_dart[1])->base = 0x7e0100000ULL;
+    }
+    if (is(s, "j713-piodma-other-pipe-on"))
+        ext_tables_in_ram(0);
+    if (is(s, "j773g-disp-other-dart"))
+        iommus(dt, alias_node(dt, "disp0"), PH_PIPE_DART + 1, 0);
 
     memcpy(in, dt, fdt_totalsize(dt));
     mmio_reads = mmio_writes = 0;
@@ -1476,6 +1515,17 @@ int main(int argc, char **argv)
                   resv_page(dt, RAM_TABLES + 0x1c000) == !own && resv_tables(dt) == 6,
               "dcpext1's tables on the DART the ADT names are kept, not the unnamed one's (%d)",
               resv_tables(dt));
+    } else if (is(s, "j713-piodma-other-pipe-off") || is(s, "j773g-disp-other-dart")) {
+        check(!exc_count, "the off pipe's DART is never read (%d faults)", exc_count);
+        check(ext_untouched(in, dt, 0) && ext_untouched(in, dt, 1),
+              "neither processor is handed over");
+        check_display(in, dt, false);
+        check(!resv_count(dt, "dcpext-"), "the off dcpext1 keeps nothing, dcpext0 nothing in RAM");
+    } else if (is(s, "j713-piodma-other-pipe-on")) {
+        check(ext_untouched(in, dt, 0), "dcpext0 is not handed over: no clock ids of another pipe");
+        check_ext(in, dt, 1, false);
+        check(ext_tables_kept(dt, 0) && resv_tables(dt) == 4,
+              "dcpext0's firmware and own pipe DART table pages are kept (%d)", resv_tables(dt));
     } else if (is(s, "j713-26-6-2-no-uuid")) {
         check(fdt_totalsize(in) == fdt_totalsize(dt) && !memcmp(in, dt, fdt_totalsize(dt)),
               "the device tree is byte for byte unchanged");

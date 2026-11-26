@@ -7,12 +7,14 @@ tree's src/kboot_display_handoff.c and runs each scenario. The trees have the T8
   image's uuid on dcp and reserved its __TEXT as asc-firmware@), dcpext0 and dcpext1 are matched
   to their ADT nodes by address; their DART stream (23), DART address and window come from the
   ADT mapper and DART and must match the device tree; their pipe is the ADT ext-display-subsystem
-  on their piodma stream (16) and gives their firmware clocks; their image must be the internal
-  DCP's and share its __TEXT. Each processor is its own transaction; a refusal is one log line.
+  whose registers hold theirs and gives their firmware clocks; every stream the device tree gives
+  them must be one the ADT gives them or their pipe (their piodma's, the pipe's) before any DART is
+  read; their image must be the internal DCP's and share its __TEXT. Each processor is its own transaction; a refusal is one log line.
   Nothing external is handed over after an incomplete internal handoff (a failed SID0/SID16
   walk), and an image with no known external interface is not this code's at all (0 returned,
   the tree byte for byte unchanged: kboot.c keeps its firmware-ready path for it).
-- the J773g (Mac mini, ADT /arm-io/disp0 external): no panel, the same code; the processors must
+- the J773g (Mac mini, ADT /arm-io/disp0 external): no panel, the same code; disp0's streams must
+  be ones the ADT gives the display subsystem that holds dcp's registers; the processors must
   be disabled, share the internal nub's __TEXT (reserved once, as dcp-text@), and once one is
   handed over the display subsystem and its DART are enabled on the boot framebuffer.
 - a later board and SoC whose processor lists apple,t8132-dcpext as a fallback compatible.
@@ -77,9 +79,8 @@ REASONS = {
     "j713-stream-bypass": [H1, "dcpext0: DART 0x286340000 stream 23 is not translating through a root (TCR 0x3, TTBR "],
     "j713-dart-read-faults": [H0, "dcpext1: reading DART 0x48a340000 faulted", NB],
     "j713-no-mapper": [H0, "dcpext1: the ADT does not describe its DART stream", NB],
-    "j713-no-pipe": [H0, "dcpext1: 0 ADT display pipes use its piodma stream 16 at 0x48a300000",
-                     "dcpext1 memory: 0 ADT ext-display-subsystem nodes hold it: its pipe is not known", NB],
-    "j713-two-pipes": [H1, "dcpext0: 2 ADT display pipes use its piodma stream 16 at 0x286300000",
+    "j713-no-pipe": [H0, "dcpext1: 0 ADT ext-display-subsystem nodes hold it: its pipe is not known", "dcpext1 memory: 0 ADT ext-display-subsystem nodes hold it: its pipe is not known", NB],
+    "j713-two-pipes": [H1, "dcpext0: 2 ADT ext-display-subsystem nodes hold it",
                        "dcpext0 memory: 2 ADT ext-display-subsystem nodes hold it", NB],
     "j713-no-adt-node": [H0, "/soc/dcp@48ae00000: 0 ADT processors at 0x48ae00000",
                          "dcpext1 memory: 0 ADT ext-display-subsystem nodes hold it: its pipe is not known", NB],
@@ -120,14 +121,14 @@ REASONS = {
     "j713-table-small-memreserve": [H1, "dcpext0: DART table page 0x10100000000 straddles /memreserve/ 0x10100000000+0x2000", NB],
     "j713-tables-in-ram-refused": [H1, "dcpext0: already has clocks"],
     "j713-table-in-carveout": [H1, "dcpext0: DART 0x286340000 table page 0x103f0000000 is in a memory carveout, or past 256 pages to keep", NB],
-    "j713-extra-child-dart": [H0, "dcpext1: DART 0x48a380000 is not locked (PROTECT 0x1e0) and stream 3 is live (TCR 0x1)"],
+    "j713-extra-child-dart": [H0, "dcpext1: extra stream 3 on DART 0x48a380000 is not one the ADT gives it or its pipe"],
     "j713-iommu-cells-2": [H1, "dcpext0: piodma iommus[0] is not a one-cell apple,t8110-dart"],
     "j713-self-parent": [H0, H1],
     "j773g-tables-display-fails": [H0, H1, "display subsystem not enabled; the external processors stay disabled"],
     # A processor that is not handed over keeps its memory: K(n, firmware pages, table pages)
     "j713-refused-segs-kept": [H0, "dcpext1: segment 1 0x10121000000+0x8000 at 0x10051100000 is kernel RAM",
                                K(1, 6, 0)],
-    "j713-refused-pipe-kept": [H0, "dcpext1: 0 ADT display pipes use its piodma stream 16",
+    "j713-refused-pipe-kept": [H0, "dcpext1: 0 ADT ext-display-subsystem nodes hold it: its pipe is not known",
                                "dcpext1 memory: 0 ADT ext-display-subsystem nodes hold it: its pipe is not known", K(1, 0, 2), NB],
     "j713-refused-power-kept": [H0, "dcpext1: DISPEXT1_FE is not on (0xf)", "dcpext1 memory: DISPEXT1_FE is not on",
                                 "dcpext1 memory: may run but is not powered as a running one: its 2 DART(s) not read",
@@ -161,12 +162,21 @@ REASONS = {
     "j713-early-exit-ready": ["no image uuid on /arm-io/dcp/iop-dcp-nub", K(0, 6, 4), K(1, 6, 4)],
     "j713-handed-ready": [H0, H1],
     "j713-refused-ready": [H0, "dcpext1: no text, data and heap memory-region placeholders"],
-    "j713-pipe-no-mappers": [H0, "dcpext1: segment 1 0x10121000000+0x8000 at 0x10051100000 is kernel RAM",
+    "j713-pipe-no-mappers": [H0, "dcpext1: dispext1 has no iommu-parent list: its DARTs are not known",
                              "dcpext1 memory: dispext1 has no iommu-parent list", K(1, 6, 2), NB],
     "j713-no-dt-ext-pipe-no-mappers": ["dcpext1 memory: dispext1 has no iommu-parent list",
                                        K(0, 7, 4), K(1, 7, 2), NB],
     "j713-ext-no-mappers": [H0, "dcpext1: the ADT does not describe its DART stream",
                             "dcpext1 memory: dcpext1 has no iommu-parent list", K(1, 6, 2), NB],
+    "j713-piodma-other-pipe-off": [
+        "dcpext0: piodma stream 16 on DART 0x48a300000 is not one the ADT gives its pipe",
+        "dcpext1: DISPEXT1_CPU is not requested (0x0)", K(0, 0, 0)],
+    "j713-piodma-other-pipe-on": [
+        H1, "dcpext0: piodma stream 16 on DART 0x48a300000 is not one the ADT gives its pipe",
+        K(0, 0, 4)],
+    "j773g-disp-other-dart": [
+        "the display subsystem: display-subsystem stream 0 on DART 0x48a300000 is not one the ADT gives it or its pipe",
+        "no panel, and the display subsystem's DART is not as iBoot leaves it"],
     "j773g-disp-piodma-bypass": ["the display subsystem: DART 0x30a300000 stream 16 is not a two-level translation (TCR 0x3, ",
                                  "no panel, and the display subsystem's DART is not as iBoot leaves it"],
 }
