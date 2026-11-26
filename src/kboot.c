@@ -13926,6 +13926,7 @@ static int dt_ans_nvme_node(void)
 
 int kboot_prepare_dt(void *fdt)
 {
+    dt_ready = false; /* until this preparation succeeds */
     if (smp_has_pending_calls()) {
         next_stage.entry = NULL;
         bail("FDT: refusing preparation while secondary callbacks are pending\n");
@@ -13935,7 +13936,6 @@ int kboot_prepare_dt(void *fdt)
         dt = NULL;
     }
 
-    dt_ready = false;
     dt_retained_live_dcp = false;
     retained_rsv_count = 0;
 
@@ -14356,6 +14356,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
 
     dt_retained_live_dcp = local_dcp || inherited_dcp;
+    dt_ready = true;
     printf("FDT prepared at %p\n", dt);
 
     return 0;
@@ -14481,6 +14482,14 @@ int kboot_boot(void *kernel)
     if (chip_id == T8152)
         return kboot_boot_t8152(kernel);
 
+    /*
+     * Only a tree kboot_prepare_dt() finished: one it gave up on part way (a refused display
+     * handoff, say) is incomplete, and booting it would undo the refusal.
+     */
+    if (!dt_ready) {
+        next_stage.entry = NULL;
+        bail("kboot: no successfully prepared device tree: prepare it again\n");
+    }
     if (smp_has_pending_calls()) {
         next_stage.entry = NULL;
         bail("kboot: refusing handoff while secondary callbacks are pending\n");

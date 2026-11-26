@@ -40,6 +40,7 @@ typedef uint64_t u64; typedef uint32_t u32;
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 ''' + table + r'''
 static struct spin_table spin_table[MAX_CPUS];
+static bool dt_ready;
 static struct { void *entry; u64 args[5]; bool restore_logo; } next_stage;
 static void *dt = (void *)0x1000;
 static int dt_bufsize = 0x10000;
@@ -113,6 +114,7 @@ int main(void)
         }
         assert(!next_stage.entry && !memcmp(saved, spin_table, sizeof(saved)));
     }
+    dt_ready = true; /* a tree prepared before (test_kboot_prepared_dt.py has the rest) */
     int chips[] = {0x8103, 0x8112, 0x8122, 0x6030, T8140};
     for (unsigned i = 0; i < sizeof(chips) / sizeof(chips[0]); i++) {
         chip_id = chips[i];

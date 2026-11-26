@@ -443,6 +443,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 #else
             if (kboot_boot((void *)request->args[0]) == 0)
                 return 1;
+            reply->status = S_ERROR; /* refused: the caller sees it */
 #endif
             break;
         case P_KBOOT_SET_CHOSEN:
