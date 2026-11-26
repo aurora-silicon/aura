@@ -7,11 +7,14 @@
 
 #include "libfdt/libfdt.h"
 typedef uint32_t u32;
-#define ARRAY_SIZE(s) (sizeof(s) / sizeof((s)[0]))
-#define T6000 0x6000
-#define T8112 0x8112
-#define T8122 0x8122
-#define T6041 0x6041
+#define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
+#define SZ_16K         (1 << 14)
+#define TREE_SIZE      (2 * SZ_16K)
+#define ARRAY_SIZE(s)  (sizeof(s) / sizeof((s)[0]))
+#define T6000          0x6000
+#define T8112          0x8112
+#define T8122          0x8122
+#define T6041          0x6041
 #define bail(...)                                                                                  \
     do {                                                                                           \
         printf(__VA_ARGS__);                                                                       \
@@ -37,7 +40,7 @@ static struct adt_property props[] = {
     {"region-base", calibration, sizeof(calibration)},
 };
 #define ADT_FOREACH_PROPERTY(tree, node, prop)                                                     \
-    for (const struct adt_property *prop = props; prop < props + sizeof(props) / sizeof(*props);   \
+    for (const struct adt_property *prop = ((void)(node), props); prop < props + sizeof(props) / sizeof(*props);   \
          prop++)
 static int adt_path_offset(void *tree, const char *path)
 {
@@ -90,7 +93,7 @@ static int setup(char *tree, u32 chip, bool alias, const char *status)
     bdid_len = dvid_len = capacity_len = 4;
     chosen_present = nub_present = capacity_present = bdid_present = dvid_present = true;
     adt_reads = 0;
-    assert(!fdt_create_empty_tree(dt, 8192));
+    assert(!fdt_create_empty_tree(dt, TREE_SIZE));
     assert(fdt_add_subnode(dt, 0, "aliases") >= 0);
     int soc = fdt_add_subnode(dt, 0, "soc");
     assert(soc >= 0);
@@ -98,7 +101,8 @@ static int setup(char *tree, u32 chip, bool alias, const char *status)
     assert(pmp >= 0);
     assert(!fdt_setprop_string(dt, pmp, "compatible",
                                chip == T8112 ? "apple,t8112-pmp-v2" : "apple,t6000-pmp-v2"));
-    assert(!fdt_setprop_string(dt, pmp, "status", status));
+    if (status)
+        assert(!fdt_setprop_string(dt, pmp, "status", status));
     if (alias) {
         int aliases = fdt_path_offset(dt, "/aliases");
         assert(!fdt_setprop_string(dt, aliases, "pmp", "/soc/pmp@1000"));
@@ -128,10 +132,42 @@ static void check_data(int pmp, const char *status)
     assert(!fdt_getprop(dt, pmp, "apple,tunable-region-base", NULL));
     assert(!strcmp(fdt_getprop(dt, pmp, "status", NULL), status));
 }
+static void check_shortfall(char *tree)
+{
+    // Missing status also means enabled. Check both representations at the space limit.
+    const char *statuses[] = {"okay", NULL, "disabled"};
+    for (unsigned i = 0; i < ARRAY_SIZE(statuses); i++) {
+        for (unsigned room = 0; room < 2; room++) {
+            int pmp = setup(tree, T8112, true, statuses[i]);
+            assert(!fdt_pack(dt));
+            assert(!fdt_open_into(dt, dt, fdt_totalsize(dt) + room * 32));
+            assert(pmp_alias_space(2) > room * 32);
+
+            bool can_disable = room || i == 2;
+            int ret = dt_set_pmp();
+            if (can_disable) {
+                assert(!ret);
+                assert(!strcmp(fdt_getprop(dt, pmp, "status", NULL), "disabled"));
+            } else {
+                assert(ret < 0);
+            }
+            assert(!fdt_getprop(dt, pmp, "apple,board-id", NULL));
+            assert(!fdt_getprop(dt, pmp, "apple,tunable-soc-device", NULL));
+        }
+    }
+
+    int pmp = setup(tree, T8112, true, "okay");
+    int strings_size = fdt_size_dt_strings(dt);
+    fdt_set_size_dt_strings(dt, fdt_totalsize(dt));
+    assert(dt_set_pmp() < 0);
+    fdt_set_size_dt_strings(dt, strings_size);
+    assert(!fdt_getprop(dt, pmp, "apple,board-id", NULL));
+}
+
 int main(void)
 {
     (void)dt_fill_pmp; /* Also keep the helper used in the old-code control. */
-    char tree[8192];
+    char tree[TREE_SIZE];
     u32 chips[] = {T6000, T8112};
     const char *statuses[] = {"disabled", "okay"};
     for (unsigned c = 0; c < 2; c++) {
@@ -187,6 +223,28 @@ int main(void)
     int pmp = setup(tree, T6041, true, "disabled");
     assert(!dt_set_pmp());
     check_data(pmp, "okay");
+    // The flag must not change the size estimate or the bytes copied.
+    props[0].size |= 0x80000000U;
+    pmp = setup(tree, T6041, true, "disabled");
+    size_t need = 9 * sizeof(struct fdt_property) + 2 * 8 + 6 * 4 + 8 +
+                  sizeof("apple,tunable-soc-device") + sizeof("apple,tunable-ptd-range") +
+                  sizeof("apple,board-id") + sizeof("apple,dram-vendor-id") +
+                  sizeof("apple,dram-capacity") + sizeof("apple,dram-channel-disable") +
+                  sizeof("apple,pmc-msg-disabled") + sizeof("apple,soc-chip-variant") +
+                  sizeof("status");
+    assert(pmp_alias_space(2) == need);
+    assert(!fdt_pack(dt));
+    int packed = fdt_totalsize(dt);
+    assert(!fdt_open_into(dt, dt, packed + need - 1));
+    assert(!dt_set_pmp());
+    assert(!strcmp(fdt_getprop(dt, pmp, "status", NULL), "disabled"));
+    assert(!fdt_getprop(dt, pmp, "apple,board-id", NULL));
+    assert(!fdt_getprop(dt, pmp, "apple,tunable-soc-device", NULL));
+    assert(!fdt_getprop(dt, pmp, "apple,tunable-ptd-range", NULL));
+    assert(!fdt_open_into(dt, dt, packed + need));
+    assert(!dt_set_pmp());
+    check_data(pmp, "okay");
+    check_shortfall(tree);
     setup(tree, T6041, false, "disabled");
     assert(!dt_set_pmp() && !adt_reads);
     setup(tree, T8122, true, "disabled");

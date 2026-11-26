@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: MIT
-"""The T6050 display handoff refuses a framebuffer that starts past /vram and a bandwidth scratch
-in a PMC metadata block of under 4 bytes.
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
+"""The T6050 display handoff refuses an empty, overflowing or out-of-/vram boot framebuffer and a
+zero, unaligned or out-of-range bandwidth scratch, and the T6041 headless handoff refuses an empty
+or overflowing boot framebuffer.
 
 src/kboot_display_handoff.c is compiled unchanged into a host program with the stand-in headers of
 tests/t8122_display_host/ and aura's libfdt (ASan, UBSan). The ADT, the registers and the device
@@ -21,7 +22,7 @@ import sys
 
 import pytest
 
-from host_compiler import host_cc
+from host_compiler import display_handoff_sources, host_cc
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = Path(os.environ.get("AURA_T6050_SOURCE", ROOT / "src/kboot_display_handoff.c"))
@@ -185,6 +186,34 @@ int adt_get_property_count(const void *a, int n)
     return n < 1 || n > nnodes ? -1 : nodes[n - 1].nprops;
 }
 
+int adt_get_child_count(const void *a, int n)
+{
+    UNUSED(a);
+    UNUSED(n);
+    return 0;
+}
+
+int adt_first_child_offset(const void *a, int n)
+{
+    UNUSED(a);
+    UNUSED(n);
+    return -1;
+}
+
+int adt_next_sibling_offset(const void *a, int n)
+{
+    UNUSED(a);
+    UNUSED(n);
+    return -1;
+}
+
+const char *adt_get_name(const void *a, int n)
+{
+    UNUSED(a);
+    UNUSED(n);
+    return "";
+}
+
 int host_adt_nprops(int n)
 {
     return 0;
@@ -265,6 +294,11 @@ int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *gate)
 int pmgr_adt_is_powered(const char *path)
 {
     DIE("pmgr_adt_is_powered(%s)\n", path);
+}
+
+bool kboot_config_lost(void)
+{
+    return false;
 }
 
 u64 kboot_ram_base(void)
@@ -522,6 +556,46 @@ static int panel(int argc, char **argv)
     return 0;
 }
 
+static int t6041_headless_fb(void)
+{
+    static char dt[0x10000];
+    OK(fdt_create_empty_tree(dt, sizeof(dt)));
+    OK(fdt_setprop_u32(dt, 0, "#address-cells", 2));
+    OK(fdt_setprop_u32(dt, 0, "#size-cells", 2));
+    int aliases = fdt_add_subnode(dt, 0, "aliases");
+    OK(aliases);
+    OK(fdt_setprop_string(dt, aliases, "disp0", "/soc/display-subsystem"));
+    OK(fdt_add_subnode(dt, 0, "reserved-memory"));
+    int soc = fdt_add_subnode(dt, 0, "soc");
+    OK(soc);
+    OK(fdt_setprop_u32(dt, soc, "#address-cells", 2));
+    OK(fdt_setprop_u32(dt, soc, "#size-cells", 2));
+    int dart = fdt_dev(dt, soc, "iommu@389308000", DART_DISP, PH_DART_DISP);
+    OK(fdt_setprop_string(dt, dart, "compatible", "apple,t8110-dart"));
+    int disp = fdt_add_subnode(dt, soc, "display-subsystem");
+    OK(disp);
+    OK(fdt_setprop_string(dt, disp, "compatible", dcp_soc_t6041_max.disp_compat));
+    OK(fdt_setprop_string(dt, disp, "status", "disabled"));
+    fdt_u32s(dt, disp, "iommus", 2, PH_DART_DISP, 0, 0, 0);
+
+    memset(&dcp6, 0, sizeof(dcp6));
+    dcp6.soc = &dcp_soc_t6041_max;
+    int rc = t6041_headless_display(dt);
+    printf("result rc=%d\n", rc);
+    int len = 0, n, count = 0;
+    fdt_for_each_subnode(n, dt, fdt_path_offset(dt, "/reserved-memory"))
+    {
+        const fdt64_t *r = fdt_getprop(dt, n, "reg", &len);
+        if (!r || len != 16)
+            DIE("a reservation without reg\n");
+        printf("reserved %s 0x%llx 0x%llx\n", fdt_get_name(dt, n, NULL),
+               (unsigned long long)fdt64_ld(&r[0]), (unsigned long long)fdt64_ld(&r[1]));
+        count++;
+    }
+    printf("reservations %d\n", count);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2)
@@ -536,6 +610,8 @@ int main(int argc, char **argv)
         return headless(argc, argv);
     if (!strcmp(argv[1], "panel"))
         return panel(argc, argv);
+    if (!strcmp(argv[1], "t6041-headless"))
+        return t6041_headless_fb();
     return 2;
 }
 '''
@@ -555,6 +631,13 @@ def host(tmp_path_factory):
         # The host fixture has no aura ELF linker script; retain a dedicated Mach-O section.
         code = code.replace('section(".init.t6050")', 'section("__TEXT,__t6050_init")')
     (src / "kboot_display_handoff.c").write_text(code)
+    extra_srcs = [name for name in display_handoff_sources(ROOT)
+                  if name != "kboot_display_handoff.c"]
+    for name in extra_srcs:
+        shutil.copy(ROOT / "src" / name, src)
+        hdr = ROOT / "src" / name.replace(".c", ".h")
+        if hdr.exists():
+            shutil.copy(hdr, src)
     (src / "t6050_bounds_host.c").write_text(HOST)
     for header in (ROOT / "tests/t8122_display_host").glob("*.h"):
         shutil.copy(header, src)
@@ -564,7 +647,7 @@ def host(tmp_path_factory):
          "-Wno-unused-parameter", "-Wno-format", "-Wno-format-truncation",
          "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
          "-fno-sanitize-recover=undefined", "-I", str(src), "-I", str(ROOT / "src"),
-         str(src / "t6050_bounds_host.c"),
+         str(src / "t6050_bounds_host.c"), *(str(src / name) for name in extra_srcs),
          *(str(ROOT / "src/libfdt" / f) for f in LIBFDT), "-o", str(binary)],
         check=True,
     )
@@ -660,9 +743,9 @@ FRAMEBUFFERS = [
     (VRAM_END - SZ_16K, SZ_16K, True),
     (VRAM_END - 1, 1, True),
     (VRAM + 0x123000, 0x7e9000, True),
-    # a framebuffer of no size inside /vram is still inside it
-    (VRAM, 0, True),
-    (VRAM_END - 1, 0, True),
+    # an empty framebuffer is refused even when its base lies in /vram
+    (VRAM, 0, False),
+    (VRAM_END - 1, 0, False),
     # starting where /vram ends: nothing of it is in /vram, whatever its size
     (VRAM_END, 0, False),
     (VRAM_END, 1, False),
@@ -732,8 +815,55 @@ def test_headless_vram_must_be_whole_pages(host, vram, vsize):
 
 
 def framebuffer_in_vram(vram, vsize, fb, size):
-    """The rule, in whole numbers: a framebuffer that starts in /vram and does not leave it."""
-    return fb != 0 and vram <= fb < vram + vsize and fb + size <= vram + vsize
+    """The rule, in whole numbers: a non-empty framebuffer that starts in /vram and does not leave it."""
+    return fb != 0 and size != 0 and vram <= fb < vram + vsize and fb + size <= vram + vsize
+
+
+# (stride, height, taken): zero or overflowing stride * height must be refused even when the
+# wrapped 64-bit product would fit inside /vram
+FB_GEOMETRIES = [
+    # valid non-empty geometries inside /vram
+    (7680, 1080, True),
+    (SZ_16K, 1, True),
+    # zero stride, zero height, or both
+    (0, 1080, False),
+    (7680, 0, False),
+    (0, 0, False),
+    # stride * height overflows 64 bits and wraps to 0
+    (1 << 32, 1 << 32, False),
+    (1 << 63, 2, False),
+    # stride * height overflows 64 bits and wraps to a small non-zero value inside /vram
+    ((1 << 63) + 1, 2, False),
+    ((1 << 63) + SZ_16K // 2, 2, False),
+    ((1 << 62) + 0x1000, 4, False),
+    ((1 << 62) + 1, 4, False),
+    (U64 - 1, 2, False),
+]
+
+
+@pytest.mark.parametrize("stride,height,taken", FB_GEOMETRIES)
+def test_framebuffer_geometry_zero_and_overflow(host, stride, height, taken):
+    r = run(host, "headless", vram=VRAM, vsize=VRAM_SIZE, meta=META_SIZE, bw=BW,
+            fb=VRAM, stride=stride, height=height)
+    assert handed_off(r) if taken else refused(r, NO_VRAM)
+    r = run(host, "panel", vram=VRAM, vsize=VRAM_SIZE, fb=VRAM, stride=stride, height=height)
+    assert (r.state["rc"], r.said(NO_VRAM)) == (("0", False) if taken else ("-1", True))
+
+
+@pytest.mark.parametrize("stride,height,taken", [
+    *FB_GEOMETRIES,
+    # non-overflowing product whose ALIGN_UP(..., SZ_16K) wraps to 0
+    (U64 - SZ_16K + 1, 1, False),
+])
+def test_t6041_headless_framebuffer_zero_and_overflow(host, stride, height, taken):
+    r = run(host, "t6041-headless", fb=VRAM, stride=stride, height=height)
+    if taken:
+        aligned = (stride * height + SZ_16K - 1) & ~(SZ_16K - 1)
+        assert r.state == {"rc": "0"}
+        assert r.reserved == [(f"framebuffer@{VRAM:x}", VRAM, aligned)]
+    else:
+        assert r.state == {"rc": "-1"}
+        assert r.reserved == []
 
 
 @pytest.mark.parametrize("seed", range(12))
@@ -764,21 +894,34 @@ def test_seeded_framebuffers_match_the_rule(host, seed):
 
 # (size of dispext0's PMC metadata, scratch offset, taken)
 SCRATCHES = [
-    # the scratch word is the block's first, one in it, its last
-    (META_SIZE, 0, True),
+    # zero and unaligned offsets are refused even inside a large block
+    (META_SIZE, 0, False),
+    (META_SIZE, 1, False),
+    (META_SIZE, 2, False),
+    (META_SIZE, 3, False),
+    (META_SIZE, BW + 1, False),
+    (META_SIZE, BW + 2, False),
+    (META_SIZE, BW + 3, False),
+    # non-zero 32-bit aligned offsets inside the block: smallest, typical, last word
+    (META_SIZE, 4, True),
     (META_SIZE, BW, True),
     (META_SIZE, META_SIZE - 4, True),
     # its last byte, or more, is past the block
     (META_SIZE, META_SIZE - 3, False),
     (META_SIZE, META_SIZE, False),
     (META_SIZE, 0xffffffff, False),
-    # a block of one word holds one scratch, at offset 0
-    (4, 0, True),
+    # small blocks: offset 0 and unaligned offsets are refused; 8 bytes holds offset 4
+    (4, 0, False),
     (4, 1, False),
-    (5, 1, True),
+    (5, 1, False),
     (5, 2, False),
+    (7, 4, False),
+    (8, 4, True),
+    (9, 4, True),
+    (9, 5, False),
     # a block under a word holds none: `meta_size - 4` wrapped here, and any offset passed
     (3, 0, False),
+    (3, 4, False),
     (3, BW, False),
     (3, 0xffffffff, False),
     (2, 0, False),
@@ -787,8 +930,10 @@ SCRATCHES = [
     (0, 0, False),
     (0, BW, False),
     (0, 0xfffffffc, False),
-    # a block past 4 GiB holds every 32-bit offset
-    (0x100000004, 0xffffffff, True),
+    # a 4 GiB block holds the last aligned 32-bit offset; unaligned 0xffffffff is still refused
+    (0x100000000, 0xfffffffc, True),
+    (0xffffffff, 0xfffffffc, False),
+    (0x100000004, 0xffffffff, False),
     (0x100000002, 0xffffffff, False),
 ]
 
@@ -811,11 +956,13 @@ def test_seeded_scratches_match_the_rule(host, seed):
     rng = random.Random(0x264 + seed)
     taken = 0
     for _ in range(12):
-        meta = rng.choice([0, 1, 2, 3, 4, 5, 8, 0x4000, META_SIZE, rng.randrange(0, 1 << 33)])
-        bw = rng.choice([0, 1, 4, BW, 0xffffffff, 0xfffffffc, max(meta - 4, 0) % (1 << 32),
+        meta = rng.choice([0, 3, 4, 5, 8, 0x4000, META_SIZE, 0x100000000,
+                           rng.randrange(8, 1 << 33)])
+        bw = rng.choice([0, 1, 2, 3, 4, BW, 0xffffffff, 0xfffffffc,
+                         (max(meta - 4, 0) & ~3) % (1 << 32),
                          max(meta - 3, 0) % (1 << 32), rng.randrange(0, 1 << 32)])
-        # in whole numbers: the four bytes of the scratch end inside the block
-        want = bw + 4 <= meta
+        # in whole numbers: a non-zero 32-bit aligned word whose four bytes end inside the block
+        want = bw != 0 and (bw & 3) == 0 and bw + 4 <= meta
         taken += want
         r = headless(host, meta=meta, bw=bw)
         assert handed_off(r, bw=bw) if want else refused(r, NO_SCRATCH, bw=bw), (meta, bw)

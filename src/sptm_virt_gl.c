@@ -16,6 +16,7 @@
 #include "exception.h"
 #include "gxf.h"
 #include "heapblock.h"
+#include "iodev.h"
 #include "malloc.h"
 #include "memory.h"
 #include "nv2.h"
@@ -29,10 +30,10 @@
 /* A GEXIT from physical GL1 to SPTM's normal world, which GL1 cannot reach: EC 0x3f, ISS 0x22. */
 #define ESR_ISS_GEXIT_UP 0x22
 
-/* SPTM's static map of its own image (VA = PA + base) and its physmap of DRAM (25G83). */
-#define SPTM_IMAGE_VA_OFFSET 0xfffffd0000000000UL
-#define SPTM_PHYSMAP_VA      0xfffffe1000000000UL
-#define SPTM_PHYSMAP_VA_END  0xfffffe2000000000UL
+/* SPTM's physmap of DRAM (25G83); its static image map offset comes from
+ * sptm_virt_image_va_offset(). */
+#define SPTM_PHYSMAP_VA     0xfffffe1000000000UL
+#define SPTM_PHYSMAP_VA_END 0xfffffe2000000000UL
 
 /* ---- fault-tolerant reads ------------------------------------------------------------------ */
 
@@ -87,12 +88,13 @@ static bool sptm_virt_is_ram(u64 pa)
 /* A word of SPTM's memory by SPTM virtual address (its image map or its physmap). */
 static bool sptm_virt_guest_rd64(u64 va, u64 *out)
 {
+    u64 img_off = sptm_virt_image_va_offset();
     u64 pa;
 
     if (va >= SPTM_PHYSMAP_VA && va < SPTM_PHYSMAP_VA_END)
         pa = va - SPTM_PHYSMAP_VA + ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
-    else if (va >= SPTM_IMAGE_VA_OFFSET)
-        pa = va - SPTM_IMAGE_VA_OFFSET;
+    else if (va >= img_off)
+        pa = va - img_off;
     else
         return false;
     if (!sptm_virt_is_ram(pa))
@@ -333,28 +335,25 @@ void sptm_virt_ctrr_publish_rorgn(void)
 {
     if (!sptm_virt_xnu_rorgn[0])
         return;
-    /*
-     * A T8142 secondary whose CTRR_D iBoot locked: the write is undefined there and the guarded
-     * retry never ends (J813, cpus=2: the core spun here at its XNU entry). It keeps the locked
-     * pair; ten cores reached XNU and slept and woke with this skip in place.
-     */
-    if (chip_id == T8142 && !is_boot_cpu())
-        return;
 
-    int exc_before = exc_count;
-    exc_guard = GUARD_MARK | GUARD_SILENT;
-    msr(SYS_IMP_APL_CTRR_D_LWR_EL2, sptm_virt_xnu_rorgn[0]);
-    msr(SYS_IMP_APL_CTRR_D_UPR_EL2, sptm_virt_xnu_rorgn[1]);
+    /*
+     * Runs in GL2, where exc_guard writes ELR_EL2 rather than GL2's mirrored ELR_EL1 (causing an
+     * infinite retry on UNDEF). SAFE_MSR/SAFE_MRS (sptm_virt_peek_fault) handles UNDEFs cleanly
+     * in GL2 on both CTRR v1 CPUs without CTRR_D and CPUs whose CTRR_D is locked.
+     */
+    bool faulted = false;
+    faulted |= SAFE_MSR("s3_0_c11_c1_2", sptm_virt_xnu_rorgn[0]); /* SYS_IMP_APL_CTRR_D_LWR_EL2 */
+    faulted |= SAFE_MSR("s3_0_c11_c1_3", sptm_virt_xnu_rorgn[1]); /* SYS_IMP_APL_CTRR_D_UPR_EL2 */
     sysop("isb");
-    u64 lwr = mrs(SYS_IMP_APL_CTRR_D_LWR_EL2), upr = mrs(SYS_IMP_APL_CTRR_D_UPR_EL2);
-    exc_guard = GUARD_OFF;
+    u64 lwr = SAFE_MRS("s3_0_c11_c1_2");
+    u64 upr = SAFE_MRS("s3_0_c11_c1_3");
 
     if (!rorgn_logged) {
         rorgn_logged = true;
         printf("SPTM-virt[ctrr]: XNU's read-only region 0x%lx-0x%lx -> CTRR_D_*_EL2 reads "
                "0x%lx-0x%lx%s\n",
                sptm_virt_xnu_rorgn[0], sptm_virt_xnu_rorgn[1] | 0xfff, lwr, upr | 0xfff,
-               exc_count != exc_before ? " (the write faulted)" : "");
+               faulted ? " (the write faulted)" : "");
     }
 }
 
@@ -785,9 +784,11 @@ static bool sptm_virt_guarded_gexit(u64 *regs)
 static void sptm_virt_park_report(u64 *regs, u64 pc);
 static void sptm_virt_park_strings(u64 *regs)
 {
+    u64 img_off = sptm_virt_image_va_offset();
+
     for (int r = 0; r < 30; r++) {
-        u64 p = regs[r] - SPTM_IMAGE_VA_OFFSET, probe;
-        if (regs[r] < SPTM_IMAGE_VA_OFFSET || !sptm_virt_is_ram(p) || !sptm_virt_peek64(p, &probe))
+        u64 p = regs[r] - img_off, probe;
+        if (regs[r] < img_off || !sptm_virt_is_ram(p) || !sptm_virt_peek64(p & ~7UL, &probe))
             continue;
         dc_civac_range((void *)p, 0x100);
         sysop("dsb sy");
@@ -867,8 +868,11 @@ static void sptm_virt_park_report(u64 *regs, u64 pc)
         printf("SPTM-virt[park]: x%-2d-x%-2d: 0x%016lx 0x%016lx 0x%016lx 0x%016lx\n", r,
                r + 3 < 30 ? r + 3 : 30, regs[r], r + 1 < 31 ? regs[r + 1] : 0,
                r + 2 < 31 ? regs[r + 2] : 0, r + 3 < 31 ? regs[r + 3] : 0);
-    sptm_virt_park_diag();
+    iodev_console_flush();
     sptm_virt_park_strings(regs);
+    iodev_console_flush();
+    sptm_virt_park_diag();
+    iodev_console_flush();
 }
 
 /* A synchronous exception into aura's GL2 from SPTM (or cL4) at GL1. */
@@ -1142,6 +1146,7 @@ static bool sptm_virt_wfe_watched(u64 *regs, u64 esr)
         }
         n_last = n;
         t_last = now;
+        sptm_virt_usb_pump();
     }
     msr(ELR_EL2, pc + 4);
     return true;
@@ -1161,6 +1166,7 @@ static bool sptm_virt_wfi_watched(u64 esr)
                n - n_last, (now - t_last) / f, n, mrs(ELR_EL2));
         n_last = n;
         t_last = now;
+        sptm_virt_usb_pump();
     }
     sysop("dsb sy");
     sysop("wfi");
