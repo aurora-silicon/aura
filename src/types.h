@@ -66,6 +66,16 @@ typedef s64 ssize_t;
 #define ULONG(x)                         ((unsigned long)(x))
 #define sys_reg(op0, op1, CRn, CRm, op2) , _S, op0, op1, CRn, CRm, op2
 
+/*
+ * Code with no room left in .text or .init (each sits just under its next 64 KiB step). aura maps
+ * [_base, _rodata_end) executable (memory.c), so .rodata can hold it on freestanding ELF builds.
+ */
+#if defined(__ELF__) && !__STDC_HOSTED__
+#define AURA_XTEXT __attribute__((section(".rodata.xtext"), noinline))
+#else
+#define AURA_XTEXT
+#endif
+
 #endif
 
 #endif

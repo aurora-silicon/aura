@@ -59,12 +59,6 @@ struct sptm_virt_placement {
 #define S2R_CP_ANSX_AUS5  BIT(2) /* apcie0 reg[10-13], the AUS5 TOP/AON windows */
 #define S2R_CP_ANSX_QUIET BIT(3) /* with SART: don't record the NVMe per-I/O writes */
 
-/*
- * Code with no room left in .text or .init (each sits just under its next 64 KiB step). aura maps
- * [_base, _rodata_end) executable (memory.c), so .rodata can hold it.
- */
-#define AURA_XTEXT __attribute__((section(".rodata.xtext"), noinline))
-
 #ifdef SPTM_VIRT
 
 #ifdef SPTM_VIRT_ESP
