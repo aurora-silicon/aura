@@ -67,6 +67,8 @@ CASES = [
     (0, "DCP_INTERNAL_NONE", 1, 1, 0, 0, 0, False, False, False),       # 27.2, walk failed
     (-1, "DCP_INTERNAL_NONE", 1, 1, 0, 0, 0, False, False, False),      # refused internal handoff
     (-1, "DCP_INTERNAL_NO_PANEL", 1, 1, 0, 0, 0, False, False, False),  # J773g 27.2: headless
+    (0, "DCP_INTERNAL_COMPLETE", 1, -1, 0, 0, -1, False, False, False), # ESP Stage 2 cannot keep
+    (-1, "DCP_INTERNAL_NO_PANEL", 1, -1, 0, 0, -1, False, False, False),
     (0, "DCP_INTERNAL_COMPLETE", 1, 0, 2, 0, -1, True, False, False),   # Stage 1, both may run
     (0, "DCP_INTERNAL_COMPLETE", 1, 0, 0, 0, 0, True, True, False),     # Stage 1, none runs
     (0, "DCP_INTERNAL_COMPLETE", 1, 0, 0, -1, -1, True, True, False),   # withdrawal fails

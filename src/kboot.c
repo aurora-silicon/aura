@@ -9978,7 +9978,17 @@ static int dt_set_display(void)
          * firmware keep the firmware-ready path.
          */
         bool fw_clocks = dt_dcp_fw_clocks();
-        if (dt_set_dcpext_handoff(dt, internal, fw_clocks))
+        int claimed = dt_set_dcpext_handoff(dt, internal, fw_clocks);
+        if (claimed < 0) {
+            /*
+             * Fail closed: a processor or pipe that may still run uses its firmware segments and
+             * DART tables as iBoot left them, and the OS must not get that memory.
+             */
+            printf("FDT: external display memory that may still be in use could not all be kept "
+                   "from the OS (reasons in the DCP: dcpext lines above): not booting\n");
+            return -1;
+        }
+        if (claimed)
             return 0;
         if (!fw_clocks) {
             if (!refused)

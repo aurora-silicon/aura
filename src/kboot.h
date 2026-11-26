@@ -88,7 +88,8 @@ enum dcp_internal {
  * The handoff is built into the ESP Stage 2 only (kboot_display_handoff.c). A Stage 1 that boots
  * an OS itself declines it (0): kboot.c then keeps the firmware-ready path for the external
  * processors of older firmware. On firmware given its clocks it cannot keep their memory from the
- * OS, and boots only if none may still run (dcpext_may_run()).
+ * OS, and boots only if none may still run (dcpext_may_run()). The ESP Stage 2's returns 1 on such
+ * firmware, -1 if the memory of a processor it did not hand over could not all be kept.
  */
 #ifdef ESP_STAGE2
 int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks);

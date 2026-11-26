@@ -314,6 +314,11 @@ static void world_t8132(bool no_panel, const char *uuid)
         adt_path_of(p, sizeof(p), "/arm-io/dispext%d", i);
         prop_str(p, "device_type", "ext-display-subsystem");
         prop_u32(p, "external", 1);
+        /* As the T8132 ADT's: the subsystem's register ranges, the fourth holding its processor's */
+        reg_add(p, ext_coproc[i] - 0x2e00000, 0xc20000);
+        reg_add(p, ext_coproc[i] - 0x8d0000, 0x10000);
+        reg_add(p, ext_coproc[i] - 0x868000, 0x4000);
+        reg_add(p, ext_coproc[i] - 0x600000, 0x800000);
         u32 parents[2] = {aph_mapper_disp(i, 0), aph_mapper_disp(i, 1)};
         prop_set(p, "iommu-parent", parents, sizeof(parents));
         prop_set(p, "clock-ids", pipe_clk[i], sizeof(pipe_clk[i]));
@@ -704,8 +709,50 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-no-dt-ext-kept", "J713: the device tree has no external processor: the ADT's kept"},
     {"j713-no-adt-node-kept", "J713: dcpext1's DT address matches no ADT processor: ADT one kept"},
     {"j773g-refused-kept", "J773g: disp0's DART unlocked, nothing handed over: both kept"},
-    {"j713-pipe-left-on", "J713: DISPEXT1_CPU off, its FE and SYS on: may run, kept"},
+    {"j713-pipe-left-on", "J713: DISPEXT1_CPU off, its FE and SYS on: no boot"},
+    {"j713-keep-overlap", "J713: a dcpext1 heap page in a mappable reservation: no boot"},
+    {"j713-keep-fault-peer", "J713: dcpext1's DART faults: dcpext0's pages kept, no boot"},
 };
+
+/*
+ * The boots that must not start the OS: an external processor (or its pipe) may still run and
+ * some of its memory cannot be kept (dt_set_dcpext_handoff() returns -1).
+ */
+static const char *const t8132_no_boot[] = {
+    "j713-dart-reg-mismatch", /* the ADT's DART address of dcpext1 does not answer */
+    "j713-no-mapper",         /* dcpext1's ADT stream does not resolve */
+    "j713-ext-unpowered",     /* its DARTs cannot be read: power not as a running one */
+    "j713-cpu-not-requested", /* CPU off, but FE and SYS on: the pipe may run */
+    "j713-no-clock-gates",    /* power unknown */
+    "j713-dart-read-faults",  /* a guarded DART read faulted */
+    "j713-no-pipe",           /* no ADT pipe holds dcpext1 */
+    "j713-no-adt-node",       /* no ADT pipe holds dcpext1 at its new address */
+    "j713-dt-full",           /* no room to reserve */
+    "j713-four-level",        /* lower levels not followed */
+    "j713-l2-outside-dram",   /* an L2 page that cannot be kept */
+    "j713-pipe-dart-faults",  /* a guarded DART read faulted */
+    "j713-second-parent-off", /* CPU under an off device, FE on: the pipe may run */
+    "j713-too-many-tables",   /* more than 256 table pages */
+    "j713-table-partial-reservation",
+    "j713-table-small-reservation",
+    "j713-table-small-memreserve", /* a root page held in part */
+    "j713-table-in-carveout",      /* a root whose entries are not read */
+    "j713-refused-pipe-kept",      /* no ADT pipe holds dcpext1 */
+    "j713-refused-power-kept",
+    "j713-auto-off-kept",    /* DARTs not readable */
+    "j713-no-adt-node-kept", /* no ADT pipe holds dcpext1 */
+    "j713-pipe-left-on",
+    "j713-keep-overlap",
+    "j713-keep-fault-peer",
+};
+
+static bool no_boot(const char *s)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(t8132_no_boot); i++)
+        if (!strcmp(s, t8132_no_boot[i]))
+            return true;
+    return false;
+}
 
 /* iBoot left external processor i off, with its pipe: CPU, FE and SYS power-gated, targeted so */
 static void ext_off(int i)
@@ -713,6 +760,7 @@ static void ext_off(int i)
     for (int k = 0; k < 3; k++)
         poke32(ps_reg(pm_sys(i) + k), 0x0);
 }
+
 
 /* A page of usable RAM for the scenarios that put tables there */
 #define RAM_TABLES (TB + 0x100000000ULL)
@@ -868,7 +916,8 @@ int main(int argc, char **argv)
     enum dcp_internal internal = j773g ? DCP_INTERNAL_NO_PANEL : DCP_INTERNAL_COMPLETE;
     if (!j773g && !is(s, "j713-dcp-uuid-missing"))
         m4_handoff(dt, image, !unknown && !is(s, "j713-dcp-no-clocks"));
-    if (is(s, "j713-internal-walk-failed") || is(s, "j713-internal-incomplete-kept"))
+    if (is(s, "j713-internal-walk-failed") || is(s, "j713-internal-incomplete-kept") ||
+        is(s, "j713-keep-overlap") || is(s, "j713-keep-fault-peer"))
         internal = DCP_INTERNAL_NONE;
 
     /* ADT changes */
@@ -1091,6 +1140,19 @@ int main(int argc, char **argv)
         region_of(ext_dart[1])->base = 0x7e0000000ULL;
         region_of(pipe_dart[1])->base = 0x7e0100000ULL;
     }
+    if (is(s, "j713-keep-overlap") || is(s, "j713-keep-fault-peer")) {
+        for (int i = 0; i < 2; i++) {
+            ext_segs_in_ram(i);
+            ext_tables_in_ram(i);
+        }
+    }
+    if (is(s, "j713-keep-overlap")) {
+        /* A reservation the OS may map over the second page of dcpext1's heap */
+        int node = OK(fdt_add_subnode(dt, fdt_path_offset(dt, "/reserved-memory"), "other@0"));
+        reg2(dt, node, RAM_SEGS + 0x1000000ULL + 0x100000 + 0x4000, 0x4000);
+    }
+    if (is(s, "j713-keep-fault-peer"))
+        region_of(ext_dart[1])->base = 0x7e0000000ULL; /* dcpext1's firmware DART faults */
 
     memcpy(in, dt, fdt_totalsize(dt));
     mmio_reads = mmio_writes = 0;
@@ -1106,7 +1168,11 @@ int main(int argc, char **argv)
 
     check(!mmio_writes, "no register written (%d reads, %d writes)", mmio_reads, mmio_writes);
     check(fdt_check_header(dt) == 0, "the device tree is valid");
-    check(ret == !unknown, "returns %d (%s)", ret, unknown ? "not ours" : "ours");
+    int want = unknown ? 0 : no_boot(s) ? -1 : 1;
+    check(ret == want, "returns %d (%s)", ret,
+          unknown    ? "not ours"
+          : want < 0 ? "ours, the OS must not start"
+                     : "ours");
 
     if (is(s, "j713-both") || is(s, "j713-repeat") || layout272 || is(s, "j713-other-image")) {
         check(!resv_tables(dt), "tables outside usable RAM are not reserved (%d)", resv_tables(dt));
@@ -1242,9 +1308,14 @@ int main(int argc, char **argv)
         else
             check(!resv_count(dt, "dcpext-firmware@"), "no firmware page is reserved (%d)",
                   resv_count(dt, "dcpext-firmware@"));
-        if (is(s, "j713-refused-pipe-kept") || is(s, "j713-refused-image-kept"))
+        if (is(s, "j713-refused-image-kept"))
             check(ext_tables_kept(dt, 1) && resv_tables(dt) == 4,
                   "dcpext1's four DART table pages in RAM are reserved (%d)", resv_tables(dt));
+        else if (is(s, "j713-refused-pipe-kept")) /* no ADT pipe: its pipe's DART is not known */
+            check(resv_page(dt, RAM_TABLES + 0x10000) && resv_page(dt, RAM_TABLES + 0x14000) &&
+                      resv_tables(dt) == 2,
+                  "dcpext1's firmware DART table pages in RAM are reserved all the same (%d)",
+                  resv_tables(dt));
         else /* not running, or not fully powered: its DARTs are not read */
             check(!resv_tables(dt), "no table page is reserved (%d)", resv_tables(dt));
         if (off)
@@ -1265,12 +1336,9 @@ int main(int argc, char **argv)
                   resv_count(dt, "dcpext-firmware@") == fw_nodes,
               "both processors' __DATA and heap in RAM are reserved (%d)",
               resv_count(dt, "dcpext-firmware@"));
-        bool tables = !is(s, "j713-no-dt-ext-kept");
-        check(tables ? ext_tables_kept(dt, 0) && ext_tables_kept(dt, 1) && resv_tables(dt) == 8
-                     : resv_page(dt, RAM_TABLES) && resv_page(dt, RAM_TABLES + 0x10000) &&
-                           resv_tables(dt) == 4,
-              "their DART table pages in RAM are reserved (%d; with no device tree node, the ADT "
-              "DART's only)",
+        check(ext_tables_kept(dt, 0) && ext_tables_kept(dt, 1) && resv_tables(dt) == 8,
+              "their firmware and pipe DART table pages in RAM are reserved, from the ADT whatever "
+              "the device tree has (%d)",
               resv_tables(dt));
         if (!is(s, "j773g-refused-kept"))
             check_internal_untouched(in, dt);
@@ -1280,7 +1348,21 @@ int main(int argc, char **argv)
         check(!exc_count, "no DART of the processor is read (%d faults)", exc_count);
         check(ext_untouched(in, dt, 1), "dcpext1 is not published");
         check(ext_segs_kept(dt, 1) && !resv_tables(dt),
-              "it may run: its firmware segments are kept, its tables cannot be read (%d)",
+              "its firmware segments are kept all the same, its tables cannot be (%d)",
+              resv_tables(dt));
+    } else if (is(s, "j713-keep-overlap")) {
+        u64 heap = RAM_SEGS + 0x1000000ULL + 0x100000;
+        check(ext_segs_kept(dt, 0) && ext_tables_kept(dt, 0) && ext_tables_kept(dt, 1),
+              "dcpext0's memory and dcpext1's tables are kept");
+        check(resv_firmware(dt, RAM_SEGS + 0x1000000ULL, 0x8000) &&
+                  resv_firmware(dt, heap, 0x4000) && resv_firmware(dt, heap + 0x8000, 0x8000),
+              "dcpext1's __DATA and the heap pages around the mappable one are kept");
+    } else if (is(s, "j713-keep-fault-peer")) {
+        check(ext_segs_kept(dt, 0) && ext_tables_kept(dt, 0) && ext_segs_kept(dt, 1),
+              "dcpext0's memory and dcpext1's segments are kept");
+        check(resv_page(dt, RAM_TABLES + 0x18000) && resv_page(dt, RAM_TABLES + 0x1c000) &&
+                  resv_tables(dt) == 6,
+              "dcpext1's pipe DART tables are kept, not its faulting DART's (%d)",
               resv_tables(dt));
     } else if (is(s, "j713-26-6-2-no-uuid")) {
         check(fdt_totalsize(in) == fdt_totalsize(dt) && !memcmp(in, dt, fdt_totalsize(dt)),

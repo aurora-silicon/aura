@@ -25,7 +25,10 @@ tree's src/kboot_display_handoff.c and runs each scenario. The trees have the T8
   keeps its memory: its firmware segments and the table pages of its DARTs in usable RAM are
   reserved no-map and nothing is published for it (no uuid, clocks or 26.6.2 marker), unless its
   clock-gates show that it and its pipe are not running (its CPU domain and every domain above it,
-  the pipe's FE and SYS, power-gated, not under auto power).
+  the pipe's FE and SYS, power-gated, not under auto power). Its DARTs, found from the ADT whatever
+  the device tree has (its own stream and its pipe's), are read only once its power shows it
+  running. Each page is kept on its own; if one cannot be kept (a DART that cannot be read, a page
+  a mappable reservation holds, no room), the handoff returns -1 and the OS must not start.
 Registers are only read (the fake MMIO counts writes: none in any scenario).
 """
 import re
@@ -45,6 +48,10 @@ def K(n, firmware, tables):
             "page(s)")
 
 
+# The memory of a processor that may still run could not all be kept: the OS must not start
+NB = "reference(s) to memory an external processor may still use not kept from the OS"
+
+
 REASONS = {
     "j713-both": [H0, H1],
     "j713-adt272-layout": [H0, H1],
@@ -57,26 +64,31 @@ REASONS = {
     "j713-pipe-no-clocks": [H0, "dcpext1: dispext1 clock metadata is missing or invalid"],
     "j713-dcp-uuid-missing": ["dcp was not handed over with image B3BA603C-"],
     "j713-sid-mismatch": [H1, "dcpext0: iommus is not <&dart 22>, the ADT's stream"],
-    "j713-dart-reg-mismatch": [H0, "dcpext1: its DART is not the ADT's apple,t8110-dart at 0x48a440000"],
+    "j713-dart-reg-mismatch": [H0, "dcpext1: its DART is not the ADT's apple,t8110-dart at 0x48a440000",
+                               "dcpext1 memory: reading DART 0x48a440000 or its tables faulted", NB],
     "j713-dma-range-mismatch": [H1, "dcpext0: DART apple,dma-range is not the ADT window <0x10000000000 0x800000000>"],
     "j713-window-too-small": [H1, "dcpext0: segment 0 0x10280000000+0x10000 at 0x10040000000 is kernel RAM or outside the DVA window"],
-    "j713-ext-unpowered": [H0, "dcpext1: DISPEXT1_FE is not on (0xf)"],
-    "j713-cpu-not-requested": [H1, "dcpext0: DISPEXT0_CPU is not requested (0x0)"],
-    "j713-no-clock-gates": [H0, "dcpext1: no ADT clock-gates to check its power by"],
+    "j713-ext-unpowered": [H0, "dcpext1: DISPEXT1_FE is not on (0xf)", NB],
+    "j713-cpu-not-requested": [H1, "dcpext0: DISPEXT0_CPU is not requested (0x0)",
+                               "dcpext0 memory: may run but is not powered as a running one", NB],
+    "j713-no-clock-gates": [H0, "dcpext1: no ADT clock-gates to check its power by", NB],
     "j713-dart-unlocked": [H1, "dcpext0: DART 0x286340000 is not locked (PROTECT 0x1e0)"],
     "j713-stream-no-root": [H0, "dcpext1: DART 0x48a340000 stream 23 is not translating through a root (TCR 0x1, TTBR 0x40000)"],
     "j713-stream-bypass": [H1, "dcpext0: DART 0x286340000 stream 23 is not translating through a root (TCR 0x3, TTBR "],
-    "j713-dart-read-faults": [H0, "dcpext1: reading DART 0x48a340000 faulted"],
-    "j713-no-mapper": [H0, "dcpext1: the ADT does not describe its DART stream"],
-    "j713-no-pipe": [H0, "dcpext1: 0 ADT display pipes use its piodma stream 16 at 0x48a300000"],
+    "j713-dart-read-faults": [H0, "dcpext1: reading DART 0x48a340000 faulted", NB],
+    "j713-no-mapper": [H0, "dcpext1: the ADT does not describe its DART stream", NB],
+    "j713-no-pipe": [H0, "dcpext1: 0 ADT display pipes use its piodma stream 16 at 0x48a300000",
+                     "dcpext1 memory: no ADT pipe holds it", NB],
     "j713-two-pipes": [H1, "dcpext0: 2 ADT display pipes use its piodma stream 16 at 0x286300000"],
-    "j713-no-adt-node": [H0, "/soc/dcp@48ae00000: 0 ADT processors at 0x48ae00000"],
+    "j713-no-adt-node": [H0, "/soc/dcp@48ae00000: 0 ADT processors at 0x48ae00000",
+                         "dcpext1 memory: no ADT pipe holds it", NB],
     "j713-text-not-shared": [H0, "dcpext1: __TEXT 0x10284000000+0x10000 is not the internal DCP's"],
     "j713-bad-layout": [H1, "dcpext0: iBoot did not leave its four-segment firmware loaded and running"],
     "j713-has-clocks": [H1, "dcpext0: already has clocks"],
     "j713-repeat": [H0, H1, "dcpext0: the text placeholder is not an empty, disabled apple,asc-mem"],
     "j713-dt-full": ["dcpext0: no room in the device tree for its handoff",
-                     "dcpext1: no room in the device tree for its handoff"],
+                     "dcpext1: no room in the device tree for its handoff",
+                     "dcpext0 memory: cannot reserve firmware page", NB],
     "j773g-headless": [H0, "dcpext1: no text, data and heap memory-region placeholders",
                        "no panel: display subsystem and its DART enabled for the external processors"],
     "j773g-both": [H0, H1, "no panel: display subsystem and its DART enabled"],
@@ -90,23 +102,23 @@ REASONS = {
                            "dcpext1: DART 0x48a300000 locked, 2 translating stream(s), 4 table page(s)"],
     "j713-pipe-dart-idle": [H0, H1, "dcpext1: DART 0x48a300000 unlocked and idle, 0 translating stream(s), 0 table page(s)"],
     "j713-pipe-dart-live": [H0, "dcpext1: DART 0x48a300000 is not locked (PROTECT 0x1e0) and stream 16 is live (TCR 0x1)"],
-    "j713-four-level": [H1, "dcpext0: DART 0x286340000 stream 23 is not a two-level translation (TCR 0x9, "],
-    "j713-l2-outside-dram": [H0, "dcpext1: DART 0x48a300000 stream 0 L2 table 0x7f0000000 is not in DRAM"],
-    "j713-pipe-dart-faults": [H1, "dcpext0: reading DART 0x286300000 or its tables faulted"],
-    "j713-second-parent-off": [H0, "dcpext1: DISPEXT1_AUX is not on (0x0)"],
+    "j713-four-level": [H1, "dcpext0: DART 0x286340000 stream 23 is not a two-level translation (TCR 0x9, ", NB],
+    "j713-l2-outside-dram": [H0, "dcpext1: DART 0x48a300000 stream 0 L2 table 0x7f0000000 is not in DRAM", NB],
+    "j713-pipe-dart-faults": [H1, "dcpext0: reading DART 0x286300000 or its tables faulted", NB],
+    "j713-second-parent-off": [H0, "dcpext1: DISPEXT1_AUX is not on (0x0)", NB],
     "j773g-disp-tables-in-ram": [H0, H1, "the display subsystem: DART 0x30a300000 locked, 2 translating stream(s), 4 table page(s)",
                                  "no panel: display subsystem and its DART enabled"],
     "j713-stream-word1": [H0, H1, "dcpext1: DART 0x48a300000 locked, 3 translating stream(s), 6 table page(s)"],
     "j713-disabled-live": [H0, H1, "dcpext0: DART 0x286340000 locked, 1 translating stream(s), 2 table page(s)"],
     "j713-zero-streams": [H0, "dcpext1: DART 0x48a340000 reports 0 streams"],
-    "j713-too-many-tables": [H1, "dcpext0: DART 0x286340000 table page 0x103f8400000 is in a memory carveout, or past 256 pages to keep"],
+    "j713-too-many-tables": [H1, "dcpext0: DART 0x286340000 table page 0x103f8400000 is in a memory carveout, or past 256 pages to keep", NB],
     "j713-shared-table": [H0, H1, "dcpext1: DART 0x48a300000 locked, 2 translating stream(s), 2 table page(s)"],
     "j713-table-in-reservation": [H0, H1],
-    "j713-table-partial-reservation": [H1, "dcpext0: DART table page 0x10100000000 overlaps /reserved-memory/fw-test@10100002000"],
-    "j713-table-small-reservation": [H1, "dcpext0: DART table page 0x10100000000 overlaps /reserved-memory/fw-test@10100000000"],
-    "j713-table-small-memreserve": [H1, "dcpext0: DART table page 0x10100000000 straddles /memreserve/ 0x10100000000+0x2000"],
+    "j713-table-partial-reservation": [H1, "dcpext0: DART table page 0x10100000000 overlaps /reserved-memory/fw-test@10100002000", NB],
+    "j713-table-small-reservation": [H1, "dcpext0: DART table page 0x10100000000 overlaps /reserved-memory/fw-test@10100000000", NB],
+    "j713-table-small-memreserve": [H1, "dcpext0: DART table page 0x10100000000 straddles /memreserve/ 0x10100000000+0x2000", NB],
     "j713-tables-in-ram-refused": [H1, "dcpext0: already has clocks"],
-    "j713-table-in-carveout": [H1, "dcpext0: DART 0x286340000 table page 0x103f0000000 is in a memory carveout, or past 256 pages to keep"],
+    "j713-table-in-carveout": [H1, "dcpext0: DART 0x286340000 table page 0x103f0000000 is in a memory carveout, or past 256 pages to keep", NB],
     "j713-extra-child-dart": [H0, "dcpext1: DART 0x48a380000 is not locked (PROTECT 0x1e0) and stream 3 is live (TCR 0x1)"],
     "j713-iommu-cells-2": [H1, "dcpext0: piodma iommus[0] is not a one-cell apple,t8110-dart"],
     "j713-self-parent": [H0, H1],
@@ -114,27 +126,36 @@ REASONS = {
     # A processor that is not handed over keeps its memory: K(n, firmware pages, table pages)
     "j713-refused-segs-kept": [H0, "dcpext1: segment 1 0x10121000000+0x8000 at 0x10051100000 is kernel RAM",
                                K(1, 6, 0)],
-    "j713-refused-pipe-kept": [H0, "dcpext1: 0 ADT display pipes use its piodma stream 16", K(1, 0, 4)],
+    "j713-refused-pipe-kept": [H0, "dcpext1: 0 ADT display pipes use its piodma stream 16",
+                               "dcpext1 memory: no ADT pipe holds it", K(1, 0, 2), NB],
     "j713-refused-power-kept": [H0, "dcpext1: DISPEXT1_FE is not on (0xf)", "dcpext1 memory: DISPEXT1_FE is not on",
-                                "dcpext1 memory: not fully powered: its 2 DART(s) not read", K(1, 6, 0)],
+                                "dcpext1 memory: may run but is not powered as a running one: its 2 DART(s) not read",
+                                K(1, 6, 0), NB],
     "j713-refused-image-kept": [H0, "dcpext1: does not run the internal DCP's image B3BA603C-", K(1, 6, 4)],
     "j713-refused-unlocked-kept": [H1, "dcpext0: DART 0x286340000 is not locked (PROTECT 0x1e0)", K(0, 0, 4)],
     "j713-off-nothing-kept": [H0, "dcpext1: DISPEXT1_CPU is not requested (0x0)",
                               "dcpext1 memory: not running, its pipe neither (its power domains are off): "
                               "nothing to keep"],
-    "j713-auto-off-kept": [H0, "dcpext1: DISPEXT1_CPU is not requested (0x10000000)", K(1, 6, 0)],
+    "j713-auto-off-kept": [H0, "dcpext1: DISPEXT1_CPU is not requested (0x10000000)", K(1, 6, 0), NB],
     "j713-internal-incomplete-kept": ["internal DCP handoff not complete: external processors not handed over",
                                       K(0, 6, 4), K(1, 6, 4)],
     "j713-fw27-no-uuid": ["no image uuid on /arm-io/dcp/iop-dcp-nub: external processors not handed over",
                           K(0, 6, 4), K(1, 6, 4)],
     "j713-26-6-2-no-uuid": ["image (none) is not given its clocks by the OS: external processors left to the "
                             "firmware-ready path"],
-    "j713-no-dt-ext-kept": ["the device tree describes no external processor", K(0, 7, 2), K(1, 7, 2)],
-    "j713-no-adt-node-kept": [H0, "/soc/dcp@48ae00000: 0 ADT processors at 0x48ae00000", K(1, 7, 0)],
+    "j713-no-dt-ext-kept": ["the device tree describes no external processor", K(0, 7, 4), K(1, 7, 4)],
+    "j713-no-adt-node-kept": [H0, "/soc/dcp@48ae00000: 0 ADT processors at 0x48ae00000",
+                              "dcpext1 memory: no ADT pipe holds it", K(1, 7, 0), NB],
     "j773g-refused-kept": ["no panel, and the display subsystem's DART is not as iBoot leaves it",
                            K(0, 6, 4), K(1, 6, 4)],
     "j713-pipe-left-on": [H0, "dcpext1: DISPEXT1_CPU is not requested (0x0)",
-                          "dcpext1 memory: not fully powered: its 2 DART(s) not read", K(1, 6, 0)],
+                             "dcpext1 memory: may run but is not powered as a running one: its 2 DART(s) not read",
+                             K(1, 6, 0), NB],
+    "j713-keep-overlap": ["internal DCP handoff not complete", K(0, 6, 4),
+                          "dcpext1 memory: firmware page 0x10121104000 overlaps /reserved-memory/other@0",
+                          K(1, 5, 4), NB],
+    "j713-keep-fault-peer": ["internal DCP handoff not complete", K(0, 6, 4),
+                             "dcpext1 memory: reading DART 0x48a340000 or its tables faulted", K(1, 6, 2), NB],
     "j773g-disp-piodma-bypass": ["the display subsystem: DART 0x30a300000 stream 16 is not a two-level translation (TCR 0x3, ",
                                  "no panel, and the display subsystem's DART is not as iBoot leaves it"],
 }
@@ -187,14 +208,15 @@ def test_no_silent_early_return():
             if line.strip() not in ("return;", "return 0;", "return 1;"):
                 continue
             before = "\n".join(body[max(0, n - 6):n])
-            assert "dlog(" in before or "dcp6_scratch(dt)" in before or "display" in before or \
-                "dcpext_keep_rest(dt);" in before, (signature, n, before)
+            assert "dlog(" in before or "dcp6_scratch(dt)" in before or "display" in before, \
+                (signature, n, before)
 
 
 def test_every_firmware_27_outcome_keeps_memory():
     """Once the firmware is given its clocks, the handoff always ends in dcpext_keep_rest() (every
-    processor not handed over keeps its memory) and returns 1: the only 0 (kboot.c's 26.6.2
-    firmware-ready path) is decided from fw_clocks before anything else."""
+    processor not handed over keeps its memory) and returns 1, or -1 if that memory could not all
+    be kept: the only 0 (kboot.c's 26.6.2 firmware-ready path) is decided from fw_clocks before
+    anything else."""
     code = re.sub(r"/\*.*?\*/", "", (ROOT / "src/kboot_display_handoff.c").read_text(), flags=re.S)
     body = function_body(code, "int dt_set_dcpext_handoff(void *dt")
     head, tail = body.split("if (!fw_clocks) {", 1)
@@ -202,7 +224,7 @@ def test_every_firmware_27_outcome_keeps_memory():
     first, rest = tail.split("return 0;\n    }", 1)
     assert "return" not in first
     assert [line.strip() for line in rest.strip().splitlines()] == \
-        ["dcpext_hand_over(dt, internal);", "dcpext_keep_rest(dt);", "return 1;"]
+        ["dcpext_hand_over(dt, internal);", "return dcpext_keep_rest(dt) ? -1 : 1;"]
 
 
 @pytest.fixture(scope="module")
@@ -224,5 +246,5 @@ def test_t8132_dcpext_handoff(host, scenario):
         refusals = [line for line in result.stdout.splitlines()
                     if line.startswith("DCP: dcpext: ") and "handed over" not in line
                     and "__OS_LOG" not in line and " translating stream(s), " not in line
-                    and " memory: " not in line]
+                    and " memory: " not in line and not line.endswith(NB)]
         assert len(refusals) == 1, refusals
