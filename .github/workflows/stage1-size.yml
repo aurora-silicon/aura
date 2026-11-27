@@ -39,24 +39,6 @@ jobs:
           sh tools/stage1_size.sh gcc ARCH=aarch64-linux-gnu- BUILTIN_LOGO=aurora
           EXTRA_CFLAGS='-Wstack-usage=2048 -Os'
 
-  clang-macos:
-    # As a Mac builds aura.
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install LLVM, LLD, GNU make and the Rust target
-        run: |
-          brew install llvm lld make
-          rustup target install aarch64-unknown-none-softfloat
-      - name: Stage 1 room
-        run: |
-          export MAKE=gmake NM="$(brew --prefix llvm)/bin/llvm-nm"
-          sh tools/stage1_size.sh clang-macos BUILTIN_LOGO=aurora
-      - name: Link the ESP Stage 2
-        run: |
-          gmake clean
-          gmake -j3 RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1 BUILTIN_LOGO=aurora
-
   fedora:
     # As fedora-aurora's aura.spec builds it: Fedora clang and Rust, core built from rust-src.
     runs-on: ubuntu-24.04-arm

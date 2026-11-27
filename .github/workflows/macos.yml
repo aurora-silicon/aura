@@ -1,0 +1,89 @@
+name: macos
+
+# The jobs that need a macOS runner: link Stage 1 and the ESP Stage 2 with Homebrew clang as a
+# Mac builds aura, check Stage 1 room with that toolchain, and run pytest on macOS.
+#
+# The organisation has few macOS runners, and running these on every pull request push left
+# pull requests queued for hours. They run on every push to main and on demand. On a pull
+# request they run only when it carries the `ci-macos` label: adding the label starts them,
+# and later pushes to a labelled pull request run them again. Without the label the jobs are
+# skipped and take no runner.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened, labeled ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to main supersedes the run for the older main head. PR heads, tags and manual
+# runs get a group of their own and are never cancelled: the merge train needs CI on the exact
+# PR head.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main-push' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+jobs:
+  stage1-size-clang-macos:
+    # stage1-size's room check (tools/stage1_size.sh) with the Mac toolchain.
+    # Any event on a labelled pull request runs the jobs (also an unrelated label being added), so a
+    # later event never replaces an earlier macOS result with a skipped one.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'ci-macos')
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install LLVM, LLD, GNU make and the Rust target
+        run: |
+          brew install llvm lld make
+          rustup target install aarch64-unknown-none-softfloat
+      - name: Stage 1 room
+        run: |
+          export MAKE=gmake NM="$(brew --prefix llvm)/bin/llvm-nm"
+          sh tools/stage1_size.sh clang-macos BUILTIN_LOGO=aurora
+      - name: Link the ESP Stage 2
+        run: |
+          gmake clean
+          gmake -j3 RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1 BUILTIN_LOGO=aurora
+
+  pytest:
+    name: Pytest (${{ matrix.os }} + llvm-brew)
+    # Any event on a labelled pull request runs the jobs (also an unrelated label being added), so a
+    # later event never replaces an earlier macOS result with a skipped one.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'ci-macos')
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ macos-26, macos-15 ]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest==9.1.1
+
+      - name: Install Clang w/ brew
+        run: brew install llvm lld
+
+      - name: Test PMP boot data fixups
+        run: sh tests/run-pmp-boot-data.sh
+
+      - name: Run pytest
+        run: pytest tests/python tests/test_t8122_gpu_reader.py tests/test_t8122_gpu_resources.py
