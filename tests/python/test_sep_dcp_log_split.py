@@ -43,11 +43,6 @@ static u32 chip_id __attribute__((unused)) = T6040;
 static u32 board_id __attribute__((unused)) = 6;
 __attribute__((unused)) static bool adt_is_compatible(const void *tree, int node, const char *compat)
 { (void)tree; (void)node; return !strcmp(compat, "J616sAP"); }
-/* run_c() links libfdt without fdt_addresses.c */
-int fdt_address_cells(const void *fdt, int node)
-{ const fdt32_t *v = fdt_getprop(fdt, node, "#address-cells", NULL); return v ? (int)fdt32_ld(v) : 2; }
-int fdt_size_cells(const void *fdt, int node)
-{ const fdt32_t *v = fdt_getprop(fdt, node, "#size-cells", NULL); return v ? (int)fdt32_ld(v) : 1; }
 ''' + split + r'''
 static int prepare(void)
 {
