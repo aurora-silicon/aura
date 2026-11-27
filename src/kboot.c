@@ -13852,6 +13852,10 @@ static int dt_set_dcp_state_t8152(void)
 
 static int dt_prepare_t8152(void)
 {
+    if (dt_set_speaker_safety())
+        return -1;
+    kboot_audio_amp_config(dt, adt);
+    kboot_audio_speaker_id(dt, adt);
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
         int aic = fdt_path_offset(dt, "/soc/interrupt-controller@301000000");
         if (aic < 0 || fdt_node_check_compatible(dt, aic, "apple,t8152-aic3") ||
