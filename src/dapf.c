@@ -738,7 +738,8 @@ bool dapf_ave_filter_inherited(const char *path)
 
     int node = adt_path_offset(adt, path);
     if (node >= 0 &&
-        (adt_is_compatible(adt, node, "dart,t8020") || adt_is_compatible(adt, node, "dart,t6000")) &&
+        (adt_is_compatible(adt, node, "dart,t8020") ||
+         adt_is_compatible(adt, node, "dart,t6000")) &&
         adt_getprop(adt, node, "filter-data-instance-0", NULL))
         return false;
     return true;
