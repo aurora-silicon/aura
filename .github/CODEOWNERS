@@ -1,0 +1,7 @@
+# Reviews go to the teams that review and merge here: Core, Omarchy Mac or Aurora
+# Maintainers. Any one approval from a listed owner satisfies code-owner review
+# (https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/access-tiers.md).
+* @aurora-silicon/core @aurora-silicon/omarchy-mac @aurora-silicon/aurora-maintainers
+
+# Workflows and repository configuration need an Owner's review.
+/.github/ @RyanTheTide @DjDeveloperr

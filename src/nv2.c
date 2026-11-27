@@ -413,6 +413,12 @@ static void nv2_bank_load(const u64 *b)
  */
 static u64 nv2_child_hcr(u64 vhcr);
 static void nv2_timers_enter(struct nv2_cpu *c, bool guarded);
+/* HCRX_EL2 exists only with FEAT_HCX (ID_AA64MMFR1_EL1.HCX); without it, accessing it UNDEFs. */
+static bool nv2_has_hcx(void)
+{
+    return FIELD_GET(ID_AA64MMFR1_HCX, mrs(SYS_ID_AA64MMFR1_EL1)) != 0;
+}
+
 static bool nv2_timers_exit(struct nv2_cpu *c, bool guarded);
 
 /* cL4 is SPTM's nested guest, so it runs under the HCR_EL2 SPTM programmed for it (its VNCR
@@ -730,7 +736,8 @@ static bool nv2_child_enter(struct nv2_cpu *c, u64 spsr, u64 elr)
         msr(SYS_HFGWTR_EL2, VN(c, V_HFGWTR));
         msr(SYS_HDFGRTR_EL2, VN(c, V_HDFGRTR));
         msr(SYS_HDFGWTR_EL2, VN(c, V_HDFGWTR));
-        msr(SYS_HCRX_EL2, VN(c, V_HCRX));
+        if (nv2_has_hcx())
+            msr(SYS_HCRX_EL2, VN(c, V_HCRX));
         nv2_timers_enter(c, false);
         nv2_gic_enter(c);
         /* Apple banks PMCR1 by EL: L1 sets its guest's PMC filters through
@@ -805,7 +812,8 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
         msr(SYS_HFGWTR_EL2, c->l1_hfgwtr);
         msr(SYS_HDFGRTR_EL2, c->l1_hdfgrtr);
         msr(SYS_HDFGWTR_EL2, c->l1_hdfgwtr);
-        msr(SYS_HCRX_EL2, c->l1_hcrx);
+        if (nv2_has_hcx())
+            msr(SYS_HCRX_EL2, c->l1_hcrx);
     }
 
     if (c->nested) {
@@ -1693,7 +1701,7 @@ static void nv2_cpu_arm(struct nv2_cpu *c, u64 vncr, u64 avncr, u64 hcr)
     c->l1_hfgitr = HFGITR_VMALLE1_ALL;
     c->l1_hdfgrtr = mrs(SYS_HDFGRTR_EL2);
     c->l1_hdfgwtr = mrs(SYS_HDFGWTR_EL2);
-    c->l1_hcrx = mrs(SYS_HCRX_EL2);
+    c->l1_hcrx = nv2_has_hcx() ? mrs(SYS_HCRX_EL2) : 0;
     c->l1_cptr = mrs(SYS_CPTR_EL2);
     c->l1_cnthctl = mrs(CNTHCTL_EL2);
     nv2_ich_lrs = (mrs(SYS_ICH_VTR) & 0x1f) + 1;
