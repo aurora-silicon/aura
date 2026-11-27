@@ -33,9 +33,17 @@ bool proxy_fallback(const char *why)
             printf("%s; no boot watchdog, staying in the proxy\n", why);
             return false;
         }
-        /* Shown on the panel */
-        printf("\n%s. Without a host, this Mac restarts by itself within %u s to try again.\n", why,
-               WDT_BOOT_SECONDS);
+        /*
+         * Shown on the panel. Like Stage 1's own stop, this repeats on every boot that fails the
+         * same way: no count survives the reset for this stage to read (the failed storage holds
+         * none and Stage 1 clears iBoot's failed-boot count), so the owner ends it with a host
+         * or the power button.
+         */
+        printf("\n%s. Without a host, this Mac restarts by itself within %u s to try again.\n"
+               "  A host that sends a proxy request in that time stops the restarts.\n"
+               "  Hold the power button to shut down, then hold it again to choose another "
+               "system.\n",
+               why, WDT_BOOT_SECONDS);
 #endif
         return false;
     }
