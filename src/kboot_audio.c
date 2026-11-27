@@ -47,6 +47,7 @@ struct amp_family {
     const struct amp_prop *props;
     size_t nr_props;
     bool exact_rows;
+    bool require_member_compatible;
 };
 
 static const struct amp_prop sn012776_props[] = {
@@ -61,8 +62,20 @@ static const struct amp_prop tas5770_props[] = {
 };
 
 static const struct amp_family amp_families[] = {
-    {"audio-control,sn012776", "ti,sn012776", sn012776_props, ARRAY_SIZE(sn012776_props), false},
-    {"audio-control,tas5770", "ti,tas5770l", tas5770_props, ARRAY_SIZE(tas5770_props), true},
+    {
+        .adt_compat = "audio-control,sn012776",
+        .dt_compat = "ti,sn012776",
+        .props = sn012776_props,
+        .nr_props = ARRAY_SIZE(sn012776_props),
+    },
+    {
+        .adt_compat = "audio-control,tas5770",
+        .dt_compat = "ti,tas5770l",
+        .props = tas5770_props,
+        .nr_props = ARRAY_SIZE(tas5770_props),
+        .exact_rows = true,
+        .require_member_compatible = true,
+    },
 };
 
 /* The I2C address of an ADT amp node: the first word of its reg */
@@ -165,8 +178,12 @@ static int setup_amp_group(void *dt, const void *adt, int arm_io, int group,
             return -1;
         }
         amp = adt_amp_by_phandle(adt, arm_io, phandle);
-        if (amp < 0 || adt_amp_addr(adt, amp, &addrs[n])) {
-            printf("kboot: audio: %s: %s is not an amp, group left alone\n", name, prop);
+        if (amp < 0 ||
+            (family->require_member_compatible &&
+             !adt_is_compatible(adt, amp, family->adt_compat)) ||
+            adt_amp_addr(adt, amp, &addrs[n])) {
+            printf("kboot: audio: %s: %s does not resolve to a matching amp, group left alone\n",
+                   name, prop);
             return -1;
         }
         n++;
