@@ -795,6 +795,45 @@ int main(void)
     assert(!fdt_setprop_string(dt, node(GPU_PATH), "compatible", "apple,agx-g17s"));
     assert(dt_set_gpu(dt) == -2);
     puts("PASS dispatch: dt_set_gpu skips G17C when compatible is not apple,agx-g17c");
+
+    /* Ambiguous unaliased G17C trees disable or remove every candidate instead of leaving them on. */
+    world(COMPATIBLE);
+    start_enabled(false);
+    int gpu2 = add("/soc", "graphics@2700000");
+    assert(!fdt_setprop_string(dt, gpu2, "compatible", "apple,agx-g17c"));
+    chip_id = T6050;
+    assert(dt_set_gpu(dt) == 0);
+    assert(!strcmp(status(GPU_PATH), "disabled"));
+    assert(!strcmp(status("/soc/graphics@2700000"), "disabled"));
+    expect_untouched("two enabled G17C nodes without alias");
+    assert(!fdt_getprop(dt, node(GPU_PATH), "apple,firmware-version", NULL));
+    assert(!fdt_getprop(dt, node(GPU_PATH), "apple,leakage-calibration-words", NULL));
+    puts("PASS ambiguous: dt_set_gpu disables two enabled G17C nodes without alias");
+
+    world(COMPATIBLE);
+    start_enabled(true);
+    gpu2 = add("/soc", "graphics@2700000");
+    assert(!fdt_setprop_string(dt, gpu2, "compatible", "apple,agx-g17c"));
+    assert(!fdt_setprop_string(dt, gpu2, "status", "okay"));
+    room(0);
+    chip_id = T6050;
+    assert(dt_set_gpu(dt) == 0);
+    for (int off = -1; (off = fdt_node_offset_by_compatible(dt, off, "apple,agx-g17c")) >= 0;) {
+        const char *s = fdt_getprop(dt, off, "status", NULL);
+        assert(s && !strcmp(s, "disabled"));
+    }
+    expect_untouched("two enabled G17C nodes without alias, no room");
+    puts("PASS ambiguous: dt_set_gpu leaves no enabled G17C node when two lack alias and room");
+
+    world(COMPATIBLE);
+    start_enabled(false);
+    assert(!fdt_setprop_string(dt, node("/pm@0/other"), "compatible", "apple,agx-g17c"));
+    assert(!fdt_setprop_string(dt, node("/pm@0/other"), "status", "okay"));
+    assert(dt_set_gpu_g17c(dt) == 0);
+    assert(!strcmp(status(GPU_PATH), "disabled"));
+    assert(!strcmp(status("/pm@0/other"), "disabled"));
+    expect_untouched("dt_set_gpu_g17c with two enabled G17C nodes without alias");
+    puts("PASS ambiguous: dt_set_gpu_g17c disables all G17C candidates without alias");
     return 0;
 }
 '''
@@ -837,4 +876,4 @@ def test_t6050_g17c_fill(tmp_path):
     assert built.returncode == 0, built.stdout + built.stderr
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 82, result.stdout
+    assert result.stdout.count("PASS") == 85, result.stdout

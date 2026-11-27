@@ -4649,6 +4649,13 @@ static AURA_XTEXT int t6050_g17c_node(void *dt)
     return gpu < 0 || fdt_node_offset_by_compatible(dt, gpu, "apple,agx-g17c") >= 0 ? -1 : gpu;
 }
 
+static AURA_XTEXT bool t6050_g17c_applies(void *dt)
+{
+    return t6050_g17c_node(dt) >= 0 ||
+           (!fdt_get_alias(dt, "gpu") &&
+            fdt_node_offset_by_compatible(dt, -1, "apple,agx-g17c") >= 0);
+}
+
 /*
  * Keeps the GPU node from the OS until the fill has succeeded: marks it disabled in the tree before
  * anything else, so that no later failure needs room. A node already disabled needs no write. In
@@ -4670,7 +4677,26 @@ static AURA_XTEXT int t6050_g17c_hold(void *dt, int gpu)
 static AURA_XTEXT int dt_set_gpu_g17c(void *dt)
 {
     int gpu = t6050_g17c_node(dt);
-    int held = gpu < 0 ? 1 : t6050_g17c_hold(dt, gpu);
+    if (gpu < 0) {
+        /* An unaliased tree with multiple G17C nodes is ambiguous: keep every candidate off. */
+        if (!fdt_get_alias(dt, "gpu")) {
+            bool any = false;
+            for (int off = -1;
+                 (off = fdt_node_offset_by_compatible(dt, off, "apple,agx-g17c")) >= 0;) {
+                int r = t6050_g17c_hold(dt, off);
+                if (r < 0)
+                    return -1;
+                any = true;
+                if (r > 0)
+                    off = -1;
+            }
+            if (any)
+                printf("FDT: GPU: T6050 multiple apple,agx-g17c nodes without gpu alias: left "
+                       "disabled\n");
+        }
+        return 0;
+    }
+    int held = t6050_g17c_hold(dt, gpu);
     if (held)
         return held < 0 ? -1 : 0;
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
@@ -4958,7 +4984,7 @@ static void gpu_log_leakage(const char *label, const float *values, u32 count)
 int dt_set_gpu(void *dt)
 {
     /* Select G17C by its block compatible; dt_set_gpu_g17c() validates the ADT layout. */
-    if (t6050_g17c_node(dt) >= 0)
+    if (t6050_g17c_applies(dt))
         return dt_set_gpu_g17c(dt);
 
     if (chip_id == T8152) {
