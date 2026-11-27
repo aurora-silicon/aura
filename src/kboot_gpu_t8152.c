@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* Read-only 26A428 G18G firmware admission; never starts either GPU ASC. */
+/* Read-only G18G firmware admission (26A428, 26B123); never starts either GPU ASC. */
 #include "adt.h"
 #include "kboot.h"
 #include "malloc.h"
@@ -16,6 +16,11 @@ struct gpu_profile {
     const char *role, *uuid;
     u32 text_size, patchbay;
     u8 digest[32];
+};
+struct gpu_build {
+    /* /chosen receipt the Linux driver maps to this build's InitData layout. */
+    const char *receipt;
+    struct gpu_profile profiles[2];
 };
 struct gpu_tlv {
     char tag[5];
@@ -69,10 +74,10 @@ static bool overlaps(u64 a, u64 n, u64 b, u64 m)
     return a < b + m && b < a + n;
 }
 
-static bool qualify_text(unsigned role, const struct adt_segment_ranges *seg, const u64 base[8],
-                         const u64 size[8], u64 vm)
+static bool qualify_text(const struct gpu_profile *profile, unsigned role,
+                         const struct adt_segment_ranges *seg, const u64 base[8], const u64 size[8],
+                         u64 vm)
 {
-    const struct gpu_profile *profile = &profiles[role];
     u8 *copy = malloc(profile->text_size);
     if (!copy)
         return false;
@@ -186,6 +191,16 @@ int dt_set_gpu_t8152(void *dt)
     if (size[1] < 0x44000 || (size[1] & 0x7fff))
         goto refused;
 
+    /* The iop nub uuids name the images iBoot loaded; both must be one build's. */
+    const struct gpu_build *build = NULL;
+    int nub = adt_path_offset(adt, "/arm-io/gfx-asc/iop-gfx-nub");
+    for (size_t b = 0; nub >= 0 && b < ARRAY_SIZE(builds); b++)
+        if (string_is(nub, "uuid", builds[b].profiles[0].uuid))
+            build = &builds[b];
+    if (!build)
+        goto refused;
+    const struct gpu_profile *profiles = build->profiles;
+
     const struct adt_segment_ranges *segments[2];
     for (unsigned r = 0; r < 2; r++) {
         char path[80];
@@ -236,7 +251,7 @@ int dt_set_gpu_t8152(void *dt)
                  segments[1][0].size))
         goto refused;
     for (unsigned r = 0; r < 2; r++)
-        if (!qualify_text(r, segments[r], base, size, vm))
+        if (!qualify_text(&profiles[r], r, segments[r], base, size, vm))
             goto refused;
 
     /* Publish only after all regions, identities and boot-local TLVs pass. */
@@ -252,10 +267,10 @@ int dt_set_gpu_t8152(void *dt)
     for (unsigned r = 0; r < 2; r++)
         if (fdt_setprop_string(dt, fdt_path_offset(dt, mailboxes[r]), "status", "okay"))
             goto refused;
-    if (fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), receipt,
-                           "G18G-RTKit-3514.0.15.release"))
+    if (fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), receipt, build->receipt))
         goto refused;
-    printf("FDT: G18G eight regions and both firmware TEXT identities verified\n");
+    printf("FDT: G18G eight regions and both firmware TEXT identities verified (%s)\n",
+           build->receipt);
     return 0;
 
 refused:

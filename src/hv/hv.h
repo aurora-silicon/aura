@@ -63,6 +63,8 @@ bool hv_pt_is_ram(u64 ipa);
 int hv_pt_set_writable(u64 ipa, bool writable);
 u64 hv_translate(u64 addr, bool s1only, bool w, u64 *par_out);
 u64 hv_pt_walk(u64 addr);
+u64 hv_pt_checksum(u32 *ntables);
+void hv_pt_split_block(u64 addr);
 bool hv_emulate_pt_store(struct exc_info *ctx, u64 far, u64 ipa, u64 *bytes);
 bool hv_handle_dabort(struct exc_info *ctx);
 bool hv_pa_write(struct exc_info *ctx, u64 addr, u64 *val, int width);
@@ -75,6 +77,8 @@ bool hv_trace_irq(u32 type, u32 num, u32 count, u32 flags);
 /* Virtual peripherals */
 void hv_vuart_poll(void);
 void hv_map_vuart(u64 base, int irq, iodev_id_t iodev);
+void hv_vuart_sleep_commit(iodev_id_t tx);
+void hv_vuart_usb_back(iodev_id_t iodev);
 struct virtio_conf;
 void hv_map_virtio(u64 base, struct virtio_conf *conf);
 void virtio_put_buffer(u64 base, int qu, u32 id, u32 len);

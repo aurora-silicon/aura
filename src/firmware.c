@@ -215,6 +215,12 @@ const struct fw_version_info fw_versions[NUM_FW_VERSIONS] = {
     // Same iBoot string as 27.0: detect_firmware() always picks V27_0. Verified from the J575D
     // (M3 Ultra) 27.0.1 iBoot (26A434): both report "mBoot-20457.1.29", so no V27_0_1 exists.
     [V27_0]      = {V27_0,      "27.0",        {27, 0, 0},     3, "mBoot-20457.1.29"},
+    // macOS 27.2 (26B123), read from a J813 stub booted by it (system and OS iBoot alike).
+    [V27_2]      = {V27_2,      "27.2",        {27, 2, 0},     3, "mBoot-20457.41.3"},
+    // macOS 27.3 beta (26C5035r), read from a K114c (M5 Max): system and OS iBoot alike. The numbers
+    // follow the beta rows above (N.M beta = {N, M-1, 98, k}, as 26.3 beta = {26, 2, 98, 1}); the
+    // beta index k = 1 is assumed, the iBoot string does not say which beta it is.
+    [V27_3B]     = {V27_3B,     "27.3 beta",   {27, 2, 98, 1}, 4, "mBoot-20457.60.65.0.1"},
     // clang-format on
 };
 
@@ -244,6 +250,28 @@ void firmware_parse_version(const char *s, u32 *out)
         while (*s >= '0' && *s <= '9')
             s++;
     }
+}
+
+/*
+ * The release whose coprocessor firmware (DCP, GPU, ISP images) the OS iBoot loads. Apple's later
+ * iBoots of a train keep its version and add a suffix. A J616s (T6040) installed from Recovery runs
+ * macOS 26.7.1 25G241 (SystemVersion and Preboot cryptex1 read from its disk) with the OS iBoot
+ * "mBoot-18000.161.10.701.1", which the table above lists as 26.7: the 26.6.2 iBoot
+ * "mBoot-18000.161.10" plus ".701.1". Booted by it, the GPU driver admits the loaded GPU firmware
+ * only by its text SHA-256, and it matched 25G83, the 26.6.2 image; our earlier aura ran its DCP
+ * and ISP handoffs there as 26.6.2. So for the handoffs, an iBoot of the 18000.161.10 train counts
+ * as 26.6.2. The OS version published in the device tree stays the detected one, and the kernel
+ * still checks each image it takes over.
+ */
+enum fw_version firmware_os_components(void)
+{
+    static const char train[] = "mBoot-18000.161.10.";
+
+    if (os_firmware.version == V26_6_2)
+        return V26_6_2;
+    if (os_firmware.iboot && !strncmp(os_firmware.iboot, train, sizeof(train) - 1))
+        return V26_6_2;
+    return os_firmware.version;
 }
 
 static void detect_firmware(struct fw_version_info *info, const char *ver)
@@ -312,8 +340,14 @@ bool firmware_sfw_in_range(enum fw_version lower_bound, enum fw_version upper_bo
  *
  * Only an exact match of the whole identifying part of the header (branch, magic, version, UUID,
  * patchbay offset/size, text size) against the table below counts as a positive identification.
- * Anything else (no header, unknown image, read fault, odd ADT) makes firmware_gfx_version() return
- * NULL, and the caller must then leave the GPU disabled.
+ *
+ * Images without that header (G14G on 27.2) are identified by the ADT instead: the uuid string
+ * iBoot publishes in /arm-io/gfx-asc/iop-gfx-nub for the image it loaded, together with the size
+ * of the image's __TEXT segment. Such rows have nub_uuid set and are matched only when no
+ * segment carries a header.
+ *
+ * Anything else (no header and no matching nub uuid, unknown image, read fault, odd ADT) makes
+ * firmware_gfx_version() return NULL, and the caller must then leave the GPU disabled.
  */
 // clang-format on
 struct gfx_fw_image {
@@ -324,7 +358,8 @@ struct gfx_fw_image {
     u32 patchbay_off;
     u32 patchbay_size;
     u32 text_size;
-    bool experimental; /* identified only by firmware_gfx_version_ex(chip, true) */
+    bool experimental;    /* identified only by firmware_gfx_version_ex(chip, true) */
+    const char *nub_uuid; /* headerless image: the iop-gfx-nub uuid; text_size is __TEXT's size */
 };
 
 // clang-format off
@@ -336,6 +371,9 @@ static const struct gfx_fw_image gfx_fw_images[] = {
     {T6030, V14_8_3, "g15s build b0", {0xdb, 0xf3, 0x7c, 0x40, 0xea, 0xd5, 0x37, 0x60,
                                        0x94, 0x41, 0x99, 0x50, 0x18, 0x78, 0x29, 0x55},
      0x58e88, 0x1e8, 0x5c000},
+    /* 27.2 (26B123) G15S images, identified by the loaded TEXT size and the nub UUID. */
+    {T6030, V27_2, "g15s 27.2 a000", {0}, 0, 0, 0x60000, false, "3FC79C19-5D8B-3EE9-80FF-0F49FC416C00"},
+    {T6030, V27_2, "g15s 27.2 b000", {0}, 0, 0, 0x60000, false, "A0EA5119-604D-3372-B38F-528F9E967970"},
     /*
      * T8122 (M3, G15G): the image iBoot loads on the M3 Air (J613, chip revision C0, RTKit
      * 2419.140.12). Experimental: its ABI is taken to be the 14.8.3 G15S one and is not validated,
@@ -345,6 +383,16 @@ static const struct gfx_fw_image gfx_fw_images[] = {
     {T8122, V14_8_3, "g15g build c0", {0xdf, 0x69, 0x7f, 0x05, 0xf6, 0xb5, 0x33, 0xef,
                                        0xa1, 0x37, 0x61, 0xc4, 0xa7, 0x3d, 0x66, 0x6a},
      0x5d54a, 0x1e8, 0x64000, true},
+    /*
+     * T8103 (M1, G13G): the headerless image iBoot loads on macOS 27.2 (26B131), seen on the
+     * MacBook Air (J313). Linux's g14_v27_2 backend starts it.
+     */
+    {T8103, V27_2, "g13g 27.2", {0}, 0, 0, 0x50000, false, "2FF15E57-6B75-3421-922F-EE7EE927AC22"},
+    /*
+     * T8112 (M2, G14G): the headerless image iBoot loads on macOS 27.2 (26B123), seen on the
+     * MacBook Air (J413). Linux's g14_v27_2 backend starts it.
+     */
+    {T8112, V27_2, "g14g 27.2", {0}, 0, 0, 0x60000, false, "EEFD8A47-3273-3387-868A-F1E0585A978E"},
 };
 // clang-format on
 
@@ -518,7 +566,7 @@ const struct fw_version_info *firmware_gfx_version_ex(u32 chip, bool experimenta
         for (size_t j = 0; j < ARRAY_SIZE(gfx_fw_images); j++) {
             const struct gfx_fw_image *img = &gfx_fw_images[j];
 
-            if (img->chip != chip || (img->experimental && !experimental))
+            if (img->chip != chip || img->nub_uuid || (img->experimental && !experimental))
                 continue;
             if (memcmp(uuid, img->uuid, sizeof(img->uuid)) || hdr[11] != img->patchbay_off ||
                 hdr[12] != img->patchbay_size || hdr[13] != img->text_size)
@@ -534,6 +582,25 @@ const struct fw_version_info *firmware_gfx_version_ex(u32 chip, bool experimenta
 
         printf("FW: GFX: unknown GPU firmware image, not identified\n");
         return NULL;
+    }
+
+    /* No header in any segment: a headerless image, named by the uuid in the ADT. */
+    int nub = adt_path_offset(adt, "/arm-io/gfx-asc/iop-gfx-nub");
+    u32 uuid_len = 0;
+    const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &uuid_len);
+    for (size_t j = 0; uuid && j < ARRAY_SIZE(gfx_fw_images); j++) {
+        const struct gfx_fw_image *img = &gfx_fw_images[j];
+
+        if (img->chip != chip || !img->nub_uuid || (img->experimental && !experimental))
+            continue;
+        if (uuid_len != strlen(img->nub_uuid) + 1 || memcmp(uuid, img->nub_uuid, uuid_len) ||
+            seg[0].size != img->text_size)
+            continue;
+
+        const struct fw_version_info *ver = &fw_versions[img->version];
+        printf("FW: GFX: identified image %s (iop-gfx-nub uuid %s), firmware %s\n", img->image,
+               img->nub_uuid, ver->string);
+        return ver;
     }
 
     printf("FW: GFX: no image-info header found, GPU firmware not identified\n");

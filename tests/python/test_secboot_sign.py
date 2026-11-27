@@ -66,3 +66,54 @@ def test_fill_keys(tmp_path):
     assert struct.unpack_from("<IIII", body) == (1, 1, 0, 1)
     src.write_bytes(b"no block here")
     assert run("fill-keys", "--pub", PUB, src, tmp_path / "y").returncode != 0
+
+
+def aura_stage2(footprint=0x20000):
+    """An aura image as the build lays it out: the load header's footprint is the file's size, the
+    stack's STACKBOT quad ends it, and its code holds the measure line format string."""
+    import struct
+    image = bytearray(footprint)
+    image[0x808:0x810] = b"AURALOAD"
+    struct.pack_into("<IIQ", image, 0x810, 1, 1, footprint)
+    fmt = b"chosen.aurora,measure-%d=%s;%s;%s;%s;%s;%u;%s\0"
+    image[0x9000:0x9000 + len(fmt)] = fmt
+    image[-8:] = b"STACKBOT"
+    return bytes(image)
+
+
+def composed(image, lines=b"chosen.aurora,stage1-flavour=secure\nmitigations=auto\n"):
+    # update-m1n1's order: aura, DTBs, gzip'd U-Boot, then the config lines with no separator.
+    return image + b"\xd0\x0d\xfe\xed" + bytes(60) + b"\x1f\x8b\x08" + bytes(29) + lines
+
+
+def test_an_aura_stage2_signs_although_its_code_names_measure_lines(tmp_path):
+    src = tmp_path / "boot.bin"
+    src.write_bytes(composed(aura_stage2()))
+    out = tmp_path / "signed.bin"
+    r = run("sign-image", "--key", KEY, src, out)
+    assert r.returncode == 0, r.stderr
+    assert run("verify", "--pub", PUB, out).returncode == 0
+
+
+def test_an_appended_measure_line_is_refused(tmp_path):
+    image = aura_stage2()
+    src = tmp_path / "boot.bin"
+    # First line right after U-Boot (no newline before it), and a later line.
+    for lines in (b"chosen.aurora,measure-0=stage1;audit;next-stage;verified;;0;" + b"0" * 64 + b"\n",
+                  b"mitigations=auto\nchosen.aurora,measure-3=x\n"):
+        src.write_bytes(composed(image, lines))
+        r = run("sign-image", "--key", KEY, src, tmp_path / "out.bin")
+        assert r.returncode != 0 and "measure-" in r.stderr
+    # Data that is not an aura image is searched whole.
+    src.write_bytes(b"\0" * 0x100 + b"chosen.aurora,measure-0=x\n")
+    assert run("sign-image", "--key", KEY, src, tmp_path / "out.bin").returncode != 0
+
+
+def test_a_built_stage2_signs(tmp_path):
+    import pytest
+    built = ROOT / "build/aura.bin"
+    if not built.exists() or b"chosen.aurora,measure-" not in built.read_bytes():
+        pytest.skip("needs a SECBOOT-era build/aura.bin")
+    src = tmp_path / "boot.bin"
+    src.write_bytes(composed(built.read_bytes()))
+    assert run("sign-image", "--key", KEY, src, tmp_path / "out.bin").returncode == 0

@@ -15,6 +15,7 @@
 #include "malloc.h"
 #include "memory.h"
 #include "ringbuffer.h"
+#include "smp.h"
 #include "string.h"
 #include "types.h"
 #include "usb_cdc.h"
@@ -122,9 +123,7 @@ typedef struct dwc3_dev {
     dart_dev_t *dart;
 
     enum ep0_state ep0_state;
-#if USB_DWC3_SUPERSPEED
-    bool ep0_three_stage;
-#endif
+    bool ep0_three_stage; /* the control transfer has a data stage (wLength != 0) */
     const void *ep0_buffer;
     u32 ep0_buffer_len;
     void *ep0_read_buffer;
@@ -134,6 +133,8 @@ typedef struct dwc3_dev {
     u32 evt_buffer_offset;
     bool failed;
     bool dma_unsafe;
+    /* usb_dwc3_shutdown() is retiring transfers: only their completions are handled */
+    bool shutting_down;
 #if USB_DWC3_SUPERSPEED
     bool reset_in_progress;
     bool ep0_progressed_during_reset;
@@ -148,6 +149,8 @@ typedef struct dwc3_dev {
 
     struct {
         bool xfer_in_progress;
+        /* a shutdown ENDTRANSFER waits for its command completion */
+        bool end_cmd_pending;
         bool zlp_pending;
         bool stalled;
         u8 resource_index;
@@ -179,6 +182,9 @@ typedef struct dwc3_dev {
     struct usb_cdc_recovery recovery;
 #endif
 
+    /* CPU (smp_id + 1) inside usb_dwc3_handle_events, 0 = none: event handling never nests or
+     * overlaps */
+    int events_owner;
 } dwc3_dev_t;
 
 static const struct usb_string_descriptor str_manufacturer =
@@ -480,6 +486,39 @@ static int usb_dwc3_end_transfer(dwc3_dev_t *dev, u8 ep)
     return 0;
 }
 
+/* The databook allows ENDTRANSFER up to 100 ms; the controller usually answers in microseconds. */
+#define USB_DWC3_RETIRE_TIMEOUT_US 100000
+
+/*
+ * Shutdown retires each active transfer before its memory is released: a
+ * forced ENDTRANSFER (no wait for the host) with an interrupt on completion,
+ * then its command-complete event, bounded. Unlike usb_dwc3_end_transfer(),
+ * this may wait on events: during shutdown usb_dwc3_handle_event() handles
+ * only completions, so no EP0 request is re-entered. A transfer that
+ * completes while another one is retired needs no ENDTRANSFER of its own.
+ */
+static int usb_dwc3_retire_transfer(dwc3_dev_t *dev, u8 ep)
+{
+    dev->endpoints[ep].end_cmd_pending = true;
+    if (usb_dwc3_ep_command(dev, ep,
+                            DWC3_DEPCMD_ENDTRANSFER | DWC3_DEPCMD_CMDIOC |
+                                DWC3_DEPCMD_HIPRI_FORCERM |
+                                DWC3_DEPCMD_PARAM(dev->endpoints[ep].resource_index),
+                            0, 0, 0)) {
+        dev->endpoints[ep].end_cmd_pending = false;
+        return -1;
+    }
+    u64 deadline = timeout_calculate(USB_DWC3_RETIRE_TIMEOUT_US);
+    while (dev->endpoints[ep].end_cmd_pending && !dev->failed && !timeout_expired(deadline))
+        usb_dwc3_handle_events(dev);
+    if (dev->failed || dev->endpoints[ep].end_cmd_pending) {
+        dev->endpoints[ep].end_cmd_pending = false;
+        return -1;
+    }
+    dev->endpoints[ep].xfer_in_progress = false;
+    return 0;
+}
+
 static int usb_dwc3_ep_configure(dwc3_dev_t *dev, u8 ep, u8 type, u32 max_packet_len)
 {
     u32 param0, param1;
@@ -605,11 +644,9 @@ static int usb_dwc3_start_status_phase(dwc3_dev_t *dev, u8 ep)
     struct dwc3_trb *trb;
     uintptr_t trb_iova = usb_dwc3_init_trb(dev, ep, &trb);
 
-#if USB_DWC3_SUPERSPEED
+    /* The status stage of a transfer with a data stage is CONTROL_STATUS3, at every speed;
+     * CONTROL_STATUS2 is only for a two-stage transfer. */
     trb->ctrl |= dev->ep0_three_stage ? DWC3_TRBCTL_CONTROL_STATUS3 : DWC3_TRBCTL_CONTROL_STATUS2;
-#else
-    trb->ctrl |= DWC3_TRBCTL_CONTROL_STATUS2;
-#endif
     trb->size = DWC3_TRB_SIZE_LENGTH(0);
 #if USB_DWC3_SUPERSPEED
     trb->bpl = trb_iova;
@@ -1056,9 +1093,7 @@ static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_pac
 static void usb_dwc3_ep0_handle_setup(dwc3_dev_t *dev)
 {
     const union usb_setup_packet *setup = dev->endpoints[0].xfer_buffer;
-#if USB_DWC3_SUPERSPEED
     dev->ep0_three_stage = !!setup->raw.wLength;
-#endif
 
     switch (setup->raw.bmRequestType & USB_REQUEST_TYPE_MASK) {
         case USB_REQUEST_TYPE_STANDARD:
@@ -1613,9 +1648,25 @@ static void usb_dwc3_handle_event_dev(dwc3_dev_t *dev, const struct dwc3_event_d
     }
 }
 
+/* During shutdown: the ENDTRANSFER completions, and transfers that completed on their own. */
+static void usb_dwc3_handle_shutdown_event(dwc3_dev_t *dev, const union dwc3_event event)
+{
+    const struct dwc3_event_depevt ep = event.depevt;
+
+    if (event.type.is_devspec || ep.endpoint_number >= MAX_ENDPOINTS)
+        return;
+    if (ep.endpoint_event == DWC3_DEPEVT_EPCMDCMPLT &&
+        ((ep.parameters >> 8) & 0xf) == DWC3_DEPCMD_ENDTRANSFER)
+        dev->endpoints[ep.endpoint_number].end_cmd_pending = false;
+    else if (ep.endpoint_event == DWC3_DEPEVT_XFERCOMPLETE && !(ep.status & DEPEVT_STATUS_BUSERR))
+        dev->endpoints[ep.endpoint_number].xfer_in_progress = false;
+}
+
 static void usb_dwc3_handle_event(dwc3_dev_t *dev, const union dwc3_event event)
 {
-    if (!event.type.is_devspec)
+    if (dev->shutting_down)
+        usb_dwc3_handle_shutdown_event(dev, event);
+    else if (!event.type.is_devspec)
         usb_dwc3_handle_event_ep(dev, event.depevt);
     else if (event.type.type == DWC3_EVENT_TYPE_DEV)
         usb_dwc3_handle_event_dev(dev, event.devt);
@@ -1703,7 +1754,7 @@ static int usb_dwc3_reannounce(dwc3_dev_t *dev)
 
 static void usb_dwc3_maybe_reannounce(dwc3_dev_t *dev)
 {
-    if (dev->failed)
+    if (dev->failed || dev->shutting_down)
         return;
     if (!usb_cdc_recovery_due(&dev->recovery, ticks_to_msecs(get_ticks())))
         return;
@@ -1716,11 +1767,41 @@ static void usb_dwc3_maybe_reannounce(dwc3_dev_t *dev)
 }
 #endif
 
+/*
+ * The EP0 class handler logs "ACM device opened/closed" with debug_printf. Reached from the proxy's
+ * read or write loop (iodev_read/iodev_write do not set in_iodev), that printf goes to the console,
+ * whose iodevs include USB pipe 0, and usb_dwc3_queue() calls usb_dwc3_handle_events() again until
+ * the text and the console backlog (up to 8 KiB) fit in the ring. That nested call can take the
+ * host's NEXT setup packet while the first one's status stage has not started, so the host times
+ * the first one out (5 s) and EP0 may never take a setup again. A host that opens and closes both
+ * ports within milliseconds of enumeration (an stty on each, for example) then finds the gadget
+ * silent. So event handling never nests: a CPU already inside it returns at once, and the loops
+ * that would spin on it (queue, putbyte, getbyte, read, flush) return short instead of waiting. A
+ * second CPU's call made while one is inside returns at once as well, and its caller polls again
+ * until the owner has released; the owner services the events.
+ */
+static inline bool usb_dwc3_in_events(dwc3_dev_t *dev)
+{
+    return dev && __atomic_load_n(&dev->events_owner, __ATOMIC_ACQUIRE) == (int)smp_id() + 1;
+}
+
+static void usb_dwc3_handle_events_once(dwc3_dev_t *dev);
+
 void usb_dwc3_handle_events(dwc3_dev_t *dev)
 {
+    int none = 0;
+
     if (!dev || dev->failed)
         return;
+    if (!__atomic_compare_exchange_n(&dev->events_owner, &none, (int)smp_id() + 1, false,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return;
+    usb_dwc3_handle_events_once(dev);
+    __atomic_store_n(&dev->events_owner, 0, __ATOMIC_RELEASE);
+}
 
+static void usb_dwc3_handle_events_once(dwc3_dev_t *dev)
+{
     u32 count = read32(dev->regs + DWC3_GEVNTCOUNT(0)) & DWC3_GEVNTCOUNT_MASK;
     if (!count) {
 #if USB_DWC3_SUPERSPEED
@@ -1856,12 +1937,12 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
     set32(dev->regs + DWC3_GCTL, DWC3_GCTL_CORESOFTRESET);
     set32(dev->regs + DWC3_GUSB3PIPECTL(0), DWC3_GUSB3PIPECTL_PHYSOFTRST);
     set32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_PHYSOFTRST);
-    mdelay(100);
+    usb_cdc_wait_us(100000);
     clear32(dev->regs + DWC3_GUSB3PIPECTL(0), DWC3_GUSB3PIPECTL_PHYSOFTRST);
     clear32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_PHYSOFTRST);
-    mdelay(100);
+    usb_cdc_wait_us(100000);
     clear32(dev->regs + DWC3_GCTL, DWC3_GCTL_CORESOFTRESET);
-    mdelay(100);
+    usb_cdc_wait_us(100000);
 
 #if USB_DWC3_SUPERSPEED
     clear32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_SUSPHY);
@@ -1974,30 +2055,52 @@ error:
     return NULL;
 }
 
-void usb_dwc3_shutdown(dwc3_dev_t *dev)
+/* Hand the memory the controller and its DART may still reach to the next stage as reserved. */
+static void usb_dwc3_retain(dwc3_dev_t *dev)
+{
+    if (!usb_dwc3_retain_dma((u64)dev->evtbuffer, max(DWC3_EVENT_BUFFERS_SIZE, SZ_16K)) ||
+        !usb_dwc3_retain_dma((u64)dev->scratchpad, max(DWC3_SCRATCHPAD_SIZE, SZ_16K)) ||
+        !usb_dwc3_retain_dma((u64)dev->trbs, TRB_BUFFER_SIZE) ||
+        !usb_dwc3_retain_dma((u64)dev->xferbuffer, XFER_BUFFER_SIZE) ||
+        !usb_dwc3_retain_dart(dev->dart))
+        usb_debug_printf("too many retained DMA ranges to describe\n");
+}
+
+/*
+ * Returns false when the controller may still reach its DMA buffers: they
+ * then stay allocated, the device stays retained and usb_dwc3_retain()
+ * records them for the handoff (kboot reserves them in the kernel's tree).
+ */
+bool usb_dwc3_shutdown(dwc3_dev_t *dev)
 {
     if (!dev)
-        return;
+        return true;
+    /* A controller reset already failed: record its memory, touch nothing else. */
+    if (dev->dma_unsafe) {
+        usb_dwc3_retain(dev);
+        return false;
+    }
+    dev->shutting_down = true;
     for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
         dev->pipe[i].ready = false;
 
-    /* stop all ongoing transfers */
-#if USB_DWC3_SUPERSPEED
-    for (int i = 0; i < MAX_ENDPOINTS && !dev->failed; ++i) {
-#else
-    for (int i = 1; i < MAX_ENDPOINTS; ++i) {
-#endif
+    /*
+     * Retire every active transfer, EP0 included. A failed session already
+     * reset the controller, which retired its DMA.
+     */
+    int retired = 0;
+    for (int i = 0; i < MAX_ENDPOINTS && !dev->failed && !dev->dma_unsafe; ++i) {
         if (!dev->endpoints[i].xfer_in_progress)
             continue;
-
-#if USB_DWC3_SUPERSPEED
-        if (usb_dwc3_end_transfer(dev, i))
-            usb_dwc3_fail_session(dev);
-#else
-        if (usb_dwc3_ep_command(dev, i, DWC3_DEPCMD_ENDTRANSFER, 0, 0, 0))
-            usb_debug_printf("ENDTRANSFER failed for EP %d during shutdown\n", i);
-#endif
+        if (usb_dwc3_retire_transfer(dev, i)) {
+            dev->dma_unsafe = true;
+            printf("usb-dwc3@%lx: EP %d transfer not retired at shutdown\n", dev->regs, i);
+        } else {
+            retired++;
+        }
     }
+    if (retired)
+        printf("usb-dwc3@%lx: %d transfer(s) retired at shutdown\n", dev->regs, retired);
 
     /* disable events and all endpoints and stop the device controller */
     write32(dev->regs + DWC3_DEVTEN, 0);
@@ -2005,8 +2108,11 @@ void usb_dwc3_shutdown(dwc3_dev_t *dev)
     clear32(dev->regs + DWC3_DCTL, DWC3_DCTL_RUN_STOP);
 
     /* wait until the controller is shut down */
-    if (poll32(dev->regs + DWC3_DSTS, DWC3_DSTS_DEVCTRLHLT, DWC3_DSTS_DEVCTRLHLT, 1000))
+    if (poll32(dev->regs + DWC3_DSTS, DWC3_DSTS_DEVCTRLHLT, DWC3_DSTS_DEVCTRLHLT, 1000)) {
+        /* A controller that did not halt may still be moving data. */
+        dev->dma_unsafe = true;
         usb_debug_printf("timeout while waiting for DWC3_DSTS_DEVCTRLHLT during shutdown.\n");
+    }
 
     /* reset the device side of the controller just to be safe */
     set32(dev->regs + DWC3_DCTL, DWC3_DCTL_CSFTRST);
@@ -2014,14 +2120,22 @@ void usb_dwc3_shutdown(dwc3_dev_t *dev)
         dev->dma_unsafe = true;
         usb_debug_printf("controller reset failed during shutdown; preserving DMA mappings\n");
     }
-    if (dev->dma_unsafe)
-        return;
+    if (dev->dma_unsafe) {
+        usb_dwc3_retain(dev);
+        return false;
+    }
 
-    /* unmap and free dma buffers */
-    dart_unmap(dev->dart, TRB_BUFFER_IOVA, TRB_BUFFER_SIZE);
-    dart_unmap(dev->dart, XFER_BUFFER_IOVA, XFER_BUFFER_SIZE);
-    dart_unmap(dev->dart, SCRATCHPAD_IOVA, max(DWC3_SCRATCHPAD_SIZE, SZ_16K));
-    dart_unmap(dev->dart, EVENT_BUFFER_IOVA, max(DWC3_EVENT_BUFFERS_SIZE, SZ_16K));
+    /* Free the buffers only once the DART confirmed it no longer maps them. */
+    if (!dart_unmap_checked(dev->dart, TRB_BUFFER_IOVA, TRB_BUFFER_SIZE) ||
+        !dart_unmap_checked(dev->dart, XFER_BUFFER_IOVA, XFER_BUFFER_SIZE) ||
+        !dart_unmap_checked(dev->dart, SCRATCHPAD_IOVA, max(DWC3_SCRATCHPAD_SIZE, SZ_16K)) ||
+        !dart_unmap_checked(dev->dart, EVENT_BUFFER_IOVA, max(DWC3_EVENT_BUFFERS_SIZE, SZ_16K)) ||
+        !dart_shutdown_checked(dev->dart)) {
+        dev->dma_unsafe = true;
+        usb_debug_printf("DART unmap failed during shutdown; preserving DMA buffers\n");
+        usb_dwc3_retain(dev);
+        return false;
+    }
 
     free(dev->evtbuffer);
     free(dev->scratchpad);
@@ -2032,9 +2146,8 @@ void usb_dwc3_shutdown(dwc3_dev_t *dev)
         ringbuffer_free(dev->pipe[i].host2device);
     }
 
-    if (dev->dart)
-        dart_shutdown(dev->dart);
     free(dev);
+    return true;
 }
 
 u8 usb_dwc3_getbyte(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
@@ -2047,6 +2160,12 @@ u8 usb_dwc3_getbyte(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
 
     u8 c;
     while (ringbuffer_read(&c, 1, host2device) < 1) {
+        /* The 0 here cannot be told apart from a NUL byte. Nothing reachable from event handling
+         * reads through getbyte: the iodev read path uses usb_dwc3_read(), which returns a short
+         * count, and nothing else in the firmware calls usb_dwc3_getbyte(). Use usb_dwc3_read() if
+         * that ever changes. */
+        if (usb_dwc3_in_events(dev))
+            return 0;
 #if USB_DWC3_SUPERSPEED
         if (!dev->pipe[pipe].ready)
             return 0;
@@ -2066,6 +2185,8 @@ void usb_dwc3_putbyte(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, u8 byte)
     u8 ep = dev->pipe[pipe].ep_in;
 
     while (ringbuffer_write(&byte, 1, device2host) < 1) {
+        if (usb_dwc3_in_events(dev))
+            return;
 #if USB_DWC3_SUPERSPEED
         if (!dev->pipe[pipe].ready)
             return;
@@ -2102,6 +2223,8 @@ size_t usb_dwc3_queue(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, 
         count -= wrote;
         p += wrote;
         sent += wrote;
+        if (count && usb_dwc3_in_events(dev))
+            break; /* inside event handling: what fits, never wait */
         if (count) {
 #if USB_DWC3_SUPERSPEED
             if (ticks_to_msecs(get_ticks() - last_progress) >= CDC_IO_TIMEOUT_MS)
@@ -2155,6 +2278,8 @@ size_t usb_dwc3_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t 
         count -= read;
         p += read;
         recvd += read;
+        if (count && usb_dwc3_in_events(dev))
+            break;
 #if USB_DWC3_SUPERSPEED
         if (count && recvd && ticks_to_msecs(get_ticks() - last_progress) >= CDC_IO_TIMEOUT_MS)
             break;
@@ -2202,15 +2327,24 @@ void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
         return;
 
     u8 ep = dev->pipe[pipe].ep_in;
-    /* After the host restores KIS, USB2 may retain an open pipe with TX
-     * pending. Console flushing must not block a guarded RAM handoff. */
-    bool bounded = USB_DWC3_SUPERSPEED || chip_id == T8122 || chip_id == T8142 ||
-                   chip_id == T8152 || chip_id == T6050;
-    u64 start = get_ticks();
+    /* A host that keeps the pipe open but stops reading (one that restored KIS
+     * leaves USB2 that way, a hung or detached one too) would hold the flush,
+     * and with it a guarded RAM handoff, forever. Give up once the ring has not
+     * drained for CDC_IO_TIMEOUT_MS; a host that is reading keeps it going. */
+    u64 last_progress = get_ticks();
+    size_t pending = ringbuffer_get_used(device2host);
 
     while (CDC_LOOP_READY(dev, pipe) &&
            (ringbuffer_get_used(device2host) != 0 || dev->endpoints[ep].xfer_in_progress)) {
-        if (bounded && ticks_to_msecs(get_ticks() - start) >= 3000)
+        size_t used = ringbuffer_get_used(device2host);
+        if (used < pending) {
+            pending = used;
+            last_progress = get_ticks();
+        } else if (ticks_to_msecs(get_ticks() - last_progress) >= CDC_IO_TIMEOUT_MS) {
+            /* No printf: the console may be this pipe. */
+            return;
+        }
+        if (usb_dwc3_in_events(dev))
             return;
         usb_dwc3_handle_events(dev);
 #if !USB_DWC3_SUPERSPEED

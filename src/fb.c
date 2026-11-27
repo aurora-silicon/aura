@@ -476,14 +476,25 @@ void fb_init(bool clear)
      * Copy what is on screen through a cacheable mapping: reading the 30 MB of a 5K panel through
      * the non-cacheable one takes over a second. Nothing holds a cached copy of the framebuffer
      * here, and the lines this copy brings in are invalidated before the mapping changes.
+     *
+     * Not in an ESP stage 2 that a proxy vectored in place over a running aura (stage 1 moves
+     * every one it starts, start.S): there the cacheable copy can take an SError on T6050.
      */
-    mmu_rm_mapping(fb_base, fb_map_size);
-    mmu_add_mapping(fb_base, fb_base, fb_map_size, MAIR_IDX_NORMAL, PERM_RW);
-    dc_ivac_range(fb.hwptr, fb_map_size);
-    memcpy(fb.ptr, fb.hwptr, fb.size);
-    dc_ivac_range(fb.hwptr, fb_map_size);
-    mmu_rm_mapping(fb_base, fb_map_size);
+    bool cached = true;
+#ifdef ESP_STAGE2
+    cached = relocated_from != 0;
+#endif
+    if (cached) {
+        mmu_rm_mapping(fb_base, fb_map_size);
+        mmu_add_mapping(fb_base, fb_base, fb_map_size, MAIR_IDX_NORMAL, PERM_RW);
+        dc_ivac_range(fb.hwptr, fb_map_size);
+        memcpy(fb.ptr, fb.hwptr, fb.size);
+        dc_ivac_range(fb.hwptr, fb_map_size);
+        mmu_rm_mapping(fb_base, fb_map_size);
+    }
     mmu_add_mapping(fb_base, fb_base, fb_map_size, MAIR_IDX_NORMAL_NC, PERM_RW);
+    if (!cached)
+        memcpy(fb.ptr, fb.hwptr, fb.size);
 
     // This is the touchbar, make everything tiny
     if (chip_id == T8012) {

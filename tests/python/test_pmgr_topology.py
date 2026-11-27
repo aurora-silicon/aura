@@ -7,6 +7,11 @@ names parent 81 on base M1 (J274, J293, J313, J456, J457), and ISP_CPU_CORE0/1
 pmgr_init() must still succeed on those tables, as upstream does, while a
 duplicate ID, a parent cycle or a real device without an address still fails
 the whole table.
+
+Its cleanup raises the off parents of active devices in dependency order: after
+a T8142 stage powered ANS off through its storage gates, APCIE_PHY_SW is still
+on under an off APCIE_SYS_ST whose own parents (ANS, APCIE_ST) are off, and
+raising APCIE_SYS_ST before them hung the next stage.
 """
 
 from pathlib import Path
@@ -67,9 +72,27 @@ static int adt_get_reg(const void *a, const int *path, const char *prop, int idx
     *addr = 0x2d0000000;
     return 0;
 }
-static u32 read32(uintptr_t addr) { return 0; }
+/* Power-state registers, one per table entry (addr_offset = index): target 3:0, actual 7:4. */
+#define PS_BASE 0x2d0000000UL
+static u32 ps[8];
+static void (*on_raise)(int index);
+static u32 *ps_reg(uintptr_t addr)
+{
+    assert(addr >= PS_BASE && (addr - PS_BASE) / 8 < ARRAY_SIZE(ps));
+    return &ps[(addr - PS_BASE) / 8];
+}
+static u32 read32(uintptr_t addr) { return *ps_reg(addr); }
 static void write32(uintptr_t addr, u32 v) {}
-static u32 mask32(uintptr_t addr, u32 clear, u32 set) { return 0; }
+static u32 mask32(uintptr_t addr, u32 clear, u32 set)
+{
+    u32 *r = ps_reg(addr);
+    *r = (*r & ~clear) | set;
+    if ((*r & 0xf) == 0xf && on_raise)
+        on_raise((int)(r - ps));
+    /* The domain follows its target at once. */
+    *r = (*r & ~0xf0u) | (*r & 0xf) << 4;
+    return *r;
+}
 static u32 set32(uintptr_t addr, u32 set) { return 0; }
 static u32 clear32(uintptr_t addr, u32 clear) { return 0; }
 static int poll32(uintptr_t addr, u32 mask, u32 target, u32 timeout) { return 0; }
@@ -87,6 +110,25 @@ static void device(int i, u16 id, u16 parent, u8 flags, const char *name)
     table[i].u16id.parent[0] = parent;
     table[i].addr_offset = (u8)i;
     strncpy((char *)table[i].name, name, sizeof(table[i].name));
+}
+
+static void parents(int i, u16 p0, u16 p1)
+{
+    table[i].u16id.parent[0] = p0;
+    table[i].u16id.parent[1] = p1;
+}
+
+/* Every raise must find its listed parents on already. */
+static int raised[8], raises;
+static void check_raise(int index)
+{
+    for (int j = 0; j < 2; j++) {
+        u16 parent = table[index].u16id.parent[j];
+        for (int k = 0; parent && k < 8; k++)
+            if (table[k].id2 == parent && !(table[k].flags & 0x10))
+                assert((ps[k] & 0xf) == 0xf);
+    }
+    raised[raises++] = index;
 }
 
 static int init(int n)
@@ -126,6 +168,29 @@ int main(void)
     device(0, 0, 0, 0, "ZERO");
     device(1, 2, 0, 0, "B");
     assert(init(2) == -1);
+
+    /*
+     * T8142 after a stage powered ANS off through its storage gates (pcie_ans_power_off()):
+     * ANS, APCIE_ST and APCIE_SYS_ST off, the GP side and APCIE_PHY_SW (N1) left on.
+     */
+    device(0, 60, 0, 0, "AFISOCNI4");
+    device(1, 76, 60, 0, "ANS");
+    device(2, 110, 76, 0, "APCIE_ST");
+    device(3, 144, 0, 0, "APCIE_SYS_ST");
+    parents(3, 76, 110);
+    device(4, 74, 60, 0, "APCIE_GP");
+    device(5, 109, 74, 0, "APCIE_SYS_GP");
+    device(6, 152, 0, 0, "APCIE_PHY_SW");
+    parents(6, 144, 109);
+    memset(ps, 0, sizeof(ps));
+    ps[0] = ps[4] = ps[5] = ps[6] = 0xff;
+    on_raise = check_raise;
+    assert(init(7) == 0);
+    /* Each one's parents first: ANS, APCIE_ST, then APCIE_SYS_ST. */
+    assert(raises == 3 && raised[0] == 1 && raised[1] == 2 && raised[2] == 3);
+    for (int i = 0; i < 7; i++)
+        assert((ps[i] & 0xf) == 0xf);
+    on_raise = NULL;
     return 0;
 }
 """

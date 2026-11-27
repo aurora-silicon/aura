@@ -15,5 +15,9 @@ int usb_cdc_cancel(void);
 void usb_cdc_cleanup(void);
 void usb_cdc_primary_opened(void);
 void usb_cdc_link_failed(void);
+/* Bring-up waits: a plain delay and poll, except when the link is taken again on a running OS
+ * (sptm_virt_s2r.c), where they give the core back to it. */
+void usb_cdc_wait_us(u32 us);
+int usb_cdc_poll32(u64 addr, u32 mask, u32 target, u32 timeout_us);
 
 #endif

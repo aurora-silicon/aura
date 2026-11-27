@@ -8,7 +8,7 @@ from test_siliconforest_handoff import run_c
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_j713_dcpext_ready_is_opt_in_complete_and_reads_pmgr_only(tmp_path):
+def test_t8132_dcpext_ready_defaults_on_complete_and_reads_pmgr_only(tmp_path):
     kboot = (ROOT / "src/kboot.c").read_text()
     pmgr = (ROOT / "src/pmgr.c").read_text()
 
@@ -56,8 +56,10 @@ typedef uint8_t u8;
 #define FIELD_GET(mask, v) (((v) & (mask)) >> __builtin_ctz(mask))
 #define T8132_DCPEXT_READY "apple,t8132-dcpext-firmware-ready"
 #define bail(...) do { return -1; } while (0)
+static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits) { (void)fdt_node; (void)adt_node; (void)bits; return -1; }
 ''' + pmgr_bits + r'''
 static void *dt, *adt;
+static bool chosen_lost;
 static u32 chip_id = T8132;
 /* fault applies to the controllers in victims (bit n = dcpextn). */
 static int fault, victims, reservations, attempts[2];
@@ -184,12 +186,13 @@ __attribute__((unused)) static u32 clear32(uintptr_t addr, u32 clear) { return p
         function(pmgr, "pmgr_power_is_on", "int ") +
         function(pmgr, "pmgr_power_is_requested", "int ") +
         function(kboot, "dt_device_set_reserved_mem") +
-        function(kboot, "dt_device_add_mem_region") +
-        function(kboot, "dt_reserve_asc_segments") + function(kboot, "dt_reserve_asc_firmware") +
+        function(kboot, "dt_reserve_asc_segments_at") + function(kboot, "dt_reserve_asc_segments") + function(kboot, "dt_reserve_asc_firmware") +
         aliases + "\n" + function(kboot, "dt_display_transaction") +
         # The native26 path is T8122-only; J713 must never reach it.
         "static int dt_ext26_snapshot(const char *alias) { assert(0); return -1; }\n"
         "static int dt_ext26_reserve(const char *alias) { assert(0); return -1; }\n"
+        "static int dt_dcpext_inherited_darts(const char *alias) { assert(0); return -1; }\n"
+        "static int dt_t8122_dcpext_reserve(const char *nub, const char *alias) { assert(0); return -1; }\n"
         "static void dt_ext26_step(const char *step) { assert(0); }\n"
         "static int dt_ext26_retain_cpu(const char *alias) { assert(0); return -1; }\n" +
         function(kboot, "dt_reserve_dcpext_ready") +
@@ -201,6 +204,7 @@ __attribute__((unused)) static u32 clear32(uintptr_t addr, u32 clear) { return p
 static void world(void)
 {
     fault = victims = reservations = attempts[0] = attempts[1] = 0;
+    chosen_lost = false;
     expected_status[0] = expected_status[1] = "disabled";
     pmgr_reads = pmgr_writes = 0;
     chip_id = T8132; pmgr_devices_len = ARRAY_SIZE(devices);
@@ -331,9 +335,35 @@ int main(void)
         assert(!pmgr_writes);
     }
 
-    /* Opt-in, and only after the internal DCP was handed over. */
+    /*
+     * Without the line (or without /chosen) it is on wherever the tree describes the
+     * controllers, whatever the board: the checks below are the hardware's, not a board list.
+     */
+    const char *boards[] = {NULL, "apple,j713", "apple,j613"};
+    for (unsigned b = 0; b < ARRAY_SIZE(boards); b++) {
+        for (int mode = 0; mode < 2; mode++) {
+            world(); stale_markers();
+            if (boards[b])
+                assert(!fdt_setprop_string(dt, 0, "compatible", boards[b]));
+            if (mode == 0)
+                assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext"));
+            else
+                assert(!fdt_del_node(dt, fdt_path_offset(dt, "/chosen")));
+            dt_reserve_j713_dcpext();
+            published(0);
+            published(1);
+            assert(!pmgr_writes);
+        }
+    }
+    /* A lost config line may have been the owner's =0: no default. */
     world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext"));
+    chosen_lost = true;
     unarmed();
+    /* Only after the internal DCP was handed over. */
+    world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/soc/dcp"), "apple,firmware-uuid"));
+    assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext"));
+    unarmed();
+    /* With the line, any value but "1" keeps it off. */
     const char *values[] = {"0", "", "11", "yes"};
     for (unsigned i = 0; i < ARRAY_SIZE(values); i++) {
         world();
@@ -343,8 +373,8 @@ int main(void)
     }
     world(); assert(!fdt_setprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext", "1", 1));
     unarmed(); /* "1" without its NUL */
-    world(); assert(!fdt_del_node(dt, fdt_path_offset(dt, "/chosen")));
-    unarmed();
+    world(); assert(!fdt_setprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext", NULL, 0));
+    unarmed(); /* present but empty */
     world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/soc/dcp"), "apple,firmware-uuid"));
     unarmed();
     world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/aliases"), "dcp"));
@@ -380,11 +410,9 @@ int main(void)
                         assert(!fdt_delprop(dt, ext(n), "status"));
                 }
                 if (mode == 1) { fault = 9; victims = 2; }
-                if (mode == 2) {
+                /* Without the line: the default, the same as "1". */
+                if (mode == 2)
                     assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext"));
-                    unarmed();
-                    continue;
-                }
                 dt_reserve_j713_dcpext();
                 published(0);
                 if (mode == 1) untouched(1); else published(1);

@@ -10,6 +10,7 @@
 #include "boot_options.h"
 #include "chainload.h"
 #include "cpufreq.h"
+#include "debugport.h"
 #include "display.h"
 #include "dockchannel_uart.h"
 #include "exception.h"
@@ -18,6 +19,7 @@
 #include "gxf.h"
 #include "heapblock.h"
 #include "j873.h"
+#include "kboot.h"
 #include "mcc.h"
 #include "memory.h"
 #include "nvme.h"
@@ -25,6 +27,7 @@
 #include "pcie.h"
 #include "pmgr.h"
 #include "pmu_counter.h"
+#include "proxy_fallback.h"
 #include "secboot.h"
 #include "sep.h"
 #include "smp.h"
@@ -194,6 +197,9 @@ void run_actions(void)
         window_ms < STAGE1_PROXY_REQUEST_MS) {
         printf("aura-proxy: waiting %u s for a host\n", STAGE1_PROXY_REQUEST_MS / 1000);
         window_ms = STAGE1_PROXY_REQUEST_MS;
+    } else if (window_ms) {
+        /* Announced as aura-proxy's window is: host tools claim the window on this line */
+        printf("Stage 1: waiting %u s for a host\n", window_ms / 1000);
     }
     if (window_ms) {
         window_result = stage1_window_result = uartproxy_wait_stage1(window_ms);
@@ -262,18 +268,6 @@ void run_actions(void)
     fb_set_active(true);
 
     printf("No valid payload found\n");
-    /*
-     * An aura-try trial that cannot start its payload must not stop here: nobody may be at the
-     * Mac, and the proxy below is not guaranteed to keep the trial watchdog running. The trial
-     * marker was spent before this image was read, so a reboot lands on the configured Stage 2.
-     * Leave the error on the panel for a few seconds first.
-     */
-    if (aura_trial_enabled()) {
-        printf("\naura-try: the trial could not start its payload; rebooting to the configured "
-               "Stage 2 in 10 s\n");
-        mdelay(10000);
-        flush_and_reboot();
-    }
     if (stage1_config_target())
         /* Shown on the panel: this is where a user without a USB host ends up. */
         printf("\nStage 1: could not start the configured Stage 2 from the EFI partition.\n"
@@ -301,9 +295,21 @@ void run_actions(void)
         flush_and_reboot();
     }
 
+    /*
+     * An aura-try trial reboots after a bounded wait for a host instead of stopping here
+     * (proxy_fallback.c). It listens on the carriers already up and decides before USB is brought
+     * up below: that bring-up may reset a port controller and arm a watchdog of its own, which a
+     * stage on its way to a reboot must not do.
+     */
+    bool host_attached = proxy_fallback("no payload could be started");
+
 #ifndef BRINGUP
-    /* A proxy window brought USB up already; a second bring-up would register its ports twice. */
-    if (!usb_up && !aura_debug_enabled() && !(stage1_window_done && chip_id != T8140)) {
+    /*
+     * A proxy window brought USB up already; a second bring-up would register its ports twice. A
+     * host that attached in the fallback window has its carrier: bringing USB up could drop it.
+     */
+    if (!host_attached && !usb_up && !aura_debug_enabled() &&
+        !(stage1_window_done && chip_id != T8140)) {
         usb_init();
         usb_iodev_init();
     }
@@ -312,6 +318,16 @@ void run_actions(void)
     printf("Running proxy...\n");
 
     uartproxy_run(NULL);
+}
+
+/*
+ * Late, on the way out: loading a payload covers the port controllers' settle time. The check
+ * leaves every port controller asleep, so wake the USB hosts' ones again, as j873_usb_prep() did.
+ */
+static void j873g_debugport_check(void)
+{
+    debugport_check();
+    j873_usb_wake_hpms();
 }
 
 static void j873g_run_proxy(void)
@@ -332,6 +348,8 @@ static void j873g_run_proxy(void)
     wdt_disable();
     if (smp_init() < 0)
         panic("Unsupported T8152 CPU topology\n");
+    /* Its SPMI port controllers need time in S0 before j873g_debugport_check() reads them. */
+    debugport_powerup();
     /* The DCPEXT0/DPTX_PHY power gates are PMGR2 devices; without this the
      * HDMI phy stays gated and the first register access aborts. */
     pmgr_init();
@@ -349,16 +367,31 @@ static void j873g_run_proxy(void)
     printf("Initialization complete.\n");
 
     /* An appended payload (or boot= from storage) boots directly. */
-    if (!aura_proxy_enabled()) {
+#ifdef SECBOOT_SECURE_FLAVOUR
+    /* The secure flavour has no proxy (secboot_host_proxy_allowed()): always boot the payload. */
+    const bool check_payloads = true;
+#else
+    const bool check_payloads = !aura_proxy_enabled();
+#endif
+    if (check_payloads) {
         printf("Checking for payloads...\n");
         if (payload_run() == 0) {
             printf("Valid payload found\n");
+            j873g_debugport_check();
             return;
         }
         printf("No valid payload found\n");
     }
+#ifdef SECBOOT_SECURE_FLAVOUR
+    printf("\nSecure boot: no verified next stage could be started, and this build gives\n"
+           "  no USB host a proxy. Rebooting in 10 s.\n");
+    mdelay(10000);
+    flush_and_reboot();
+#else
+    j873g_debugport_check();
     printf("Running proxy...\n");
     uartproxy_run(NULL);
+#endif
 }
 
 void aura_main(void)
@@ -381,7 +414,16 @@ void aura_main(void)
 #ifndef BRINGUP
     if (supports_gxf())
         gxf_init();
-    if (mcc_init() && (chip_id == T8140 || chip_id == T6040))
+    /*
+     * This runs before the trial watchdog is armed, so a failure here resets the Mac with no
+     * trial fallback. No MCC driver fails on what the ADT says: an unknown revision, an ADT that
+     * does not give a driver its counts (4 or 8 bytes) or register windows, or that contradicts
+     * itself, and a firmware-owned cache in a state aura does not know leave the MCC alone
+     * (MCC_UNSUPPORTED), as does a SoC with no MCC in the ADT (MCC_ABSENT).
+     * mcc_unmap_carveouts() then takes the carveouts from the ADT list, which it requires, and
+     * kboot_boot() refuses a T8140 whose MCC was left alone.
+     */
+    if (mcc_init() < 0)
         panic("MCC initialization failed\n");
     mmu_init();
     aic_init();
@@ -426,9 +468,14 @@ void aura_main(void)
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
     stage1_read_boot_record();
 #endif
-    /* T6040, T8140: nothing else in an aura tether chain clears iBoot's failed-boot count. */
-    if (chip_id == T6040 || chip_id == T8140)
-        pmu_clear_panic_counter();
+    /*
+     * Nothing else in an aura chain clears iBoot's failed-boot count, on any chip: a test kernel
+     * that hangs, or a proxy session that ends in a reset, counts as a failed boot, and enough of
+     * them end in recoveryOS. The primary PMU's info-leg_scrpad in the ADT locates the count on
+     * every SoC; one without it is left alone, and the Stage 1 recovery window has already read
+     * the record.
+     */
+    pmu_clear_panic_counter();
 
     printf("Initialization complete.\n");
 
@@ -446,9 +493,12 @@ next_stage:
     printf("Preparing to run next stage at %p...\n", next_stage.entry);
 
     if (!nvme_shutdown()) {
+        /* Shown on the panel, like the other proxy stops */
+        fb_set_active(true);
         printf("NVMe handoff failed; returning to proxy\n");
         if (!secboot_host_proxy_allowed())
             flush_and_reboot();
+        proxy_fallback("NVMe handoff failed");
         uartproxy_run(NULL);
         panic("NVMe handoff failed\n");
     }
@@ -457,11 +507,19 @@ next_stage:
 #ifndef BRINGUP
     if (chip_id != T8152) {
         usb_iodev_shutdown();
+        /*
+         * A controller that could not be stopped keeps its buffers: boot on with
+         * them reserved, so the kernel never hands out memory it may still write.
+         */
+        if (kboot_reserve_usb_dma())
+            printf("USB: retained DMA not fully reserved; booting on\n");
         /* Its firmware may still use memory the next stage will reuse. */
         if (display_shutdown(DCP_SLEEP_IF_EXTERNAL) < 0) {
+            fb_set_active(true);
             printf("Display handoff failed; returning to proxy\n");
             if (!secboot_host_proxy_allowed())
                 flush_and_reboot();
+            proxy_fallback("Display handoff failed");
             uartproxy_run(NULL);
             panic("Display handoff failed\n");
         }

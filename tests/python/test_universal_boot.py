@@ -79,7 +79,7 @@ struct dwc3_{speed}_dev {{ int marker; }};
 static struct dwc3_{speed}_dev {speed}_instance = {{{marker}}};
 static int {speed}_shutdown;
 dwc3_{speed}_dev_t *usb_dwc3_{speed}_init(uintptr_t regs, dart_dev_t *dart) {{ (void)dart; return regs ? &{speed}_instance : NULL; }}
-void usb_dwc3_{speed}_shutdown(dwc3_{speed}_dev_t *d) {{ assert(d==&{speed}_instance);{speed}_shutdown++; }}
+bool usb_dwc3_{speed}_shutdown(dwc3_{speed}_dev_t *d) {{ assert(d==&{speed}_instance);{speed}_shutdown++; return {speed}_shutdown == 1; }}
 void usb_dwc3_{speed}_handle_events(dwc3_{speed}_dev_t *d) {{assert(d->marker=={marker});}}
 ssize_t usb_dwc3_{speed}_can_read(dwc3_{speed}_dev_t *d,int p) {{return d->marker+p;}}
 bool usb_dwc3_{speed}_can_write(dwc3_{speed}_dev_t *d,int p) {{return d->marker=={marker} && p==1;}}
@@ -105,7 +105,7 @@ int main(void) {
   assert(usb_dwc3_write(d,1,NULL,5)==(size_t)v+6);
   assert(usb_dwc3_queue(d,1,NULL,5)==(size_t)v+6);
  }
- usb_dwc3_shutdown(hs);usb_dwc3_shutdown(ss);usb_dwc3_shutdown(NULL);
+ assert(usb_dwc3_shutdown(hs) && usb_dwc3_shutdown(ss) && usb_dwc3_shutdown(NULL));
  assert(hs_shutdown==1 && ss_shutdown==1);
  return 0;
 }

@@ -192,6 +192,8 @@ enum fw_version {
     V26_7,
     V26_7_1,
     V27_0,
+    V27_2,
+    V27_3B,
     NUM_FW_VERSIONS,
 };
 
@@ -218,6 +220,8 @@ int firmware_set_fdt(void *fdt, int node, const char *prop, const struct fw_vers
 bool firmware_iboot_in_range(u32 min[IBOOT_VER_COMP], u32 max[IBOOT_VER_COMP],
                              u32 this[IBOOT_VER_COMP]);
 bool firmware_sfw_in_range(enum fw_version lower_bound, enum fw_version upper_bound);
+/* The release whose coprocessor firmware the OS iBoot loads (see firmware.c). */
+enum fw_version firmware_os_components(void);
 void firmware_parse_version(const char *s, u32 *out);
 /*
  * GPU firmware ABI of the image loaded in gfx-asc, or NULL if it is not positively identified as

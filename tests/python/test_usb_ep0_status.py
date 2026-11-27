@@ -73,8 +73,9 @@ typedef struct {
     u32 ep0_read_buffer_len;
     struct {void *xfer_buffer;} endpoints[MAX_ENDPOINTS];
     struct {bool ready; u8 cdc_line_coding[7];} pipe[CDC_ACM_PIPE_MAX];
+    bool ep0_three_stage; /* both engines: the status TRB is STATUS3 after a data stage */
 #if USB_DWC3_SUPERSPEED
-    bool ep0_three_stage, primary_dtr_pending, primary_was_open;
+    bool primary_dtr_pending, primary_was_open;
     struct usb_cdc_recovery {int connected;} recovery;
 #endif
 } dwc3_dev_t;
@@ -139,6 +140,7 @@ static void deliver_setup(u8 type, u8 request, u16 value, u16 index) {
 /* The SETUP completion leaves the status stage to XferNotReady; XferComplete re-arms SETUP. */
 static void status_stage(void) {
     assert(!status_starts[0] && !status_starts[1] && !setup_starts);
+    assert(!d.ep0_three_stage); /* wLength == 0: CONTROL_STATUS2 */
     assert(d.ep0_state == USB_DWC3_EP0_STATE_DATA_SEND_STATUS);
     status_not_ready[USB_LEP_CTRL_IN] = true;
     usb_dwc3_ep0_handle_xfer_not_ready(&d, (struct dwc3_event_depevt){.endpoint_number = 1});

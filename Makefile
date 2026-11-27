@@ -87,11 +87,25 @@ endif
 
 # Required for no_std + alloc for now
 export RUSTC_BOOTSTRAP=1
+# aura's Rust codegen comes from rust/Cargo.toml: opt-level "z" for aura's own crate and the
+# signature code, so Stage 1 stays below the DCP log buffer (aura-raw.ld). A packager's
+# RUSTFLAGS would override those profiles for this bare-metal image: rpmbuild's %build exports
+# -Copt-level=3 -Cforce-frame-pointers=yes -Cdebuginfo=2, which grows Stage 1 by ~16 KiB and
+# no longer links. Keep the environment's flags out of cargo.
+unexport RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
 RUST_LIB := librust.a
 ifeq ($(BUILDSTD),1)
 CARGO_FLAGS := -Z build-std=alloc,core
 else
 CARGO_FLAGS :=
+endif
+
+# Bring-up: skip MMU, MCC, AIC, SMP, PMGR, display and USB init and go
+# straight to the proxy on the boot console. A BRINGUP build never hands
+# off to a kernel payload (secondary CPUs are not started and carveouts are
+# not unmapped): it prints why and stays in the proxy.
+ifeq ($(BRINGUP),1)
+CFG += BRINGUP
 endif
 
 ifeq ($(CHAINLOADING),1)
@@ -137,6 +151,41 @@ ifeq ($(DEBUGUSB_PROXY),1)
 CFG += DEBUGUSB_PROXY
 endif
 
+# Development builds only: run macOS's stock SPTM, secure kernel and XNU as a FEAT_NV2
+# guest on T8140 (docs/sptm-nv2-virt.md). The image must stay at stage 1's base.
+ifeq ($(SPTM_VIRT),1)
+ifneq ($(CHAINLOADING),1)
+$(error SPTM_VIRT requires CHAINLOADING=1)
+endif
+CFG += SPTM_VIRT
+# Log the first FEAT_NV2 guest entries and exits.
+ifeq ($(NV2_TRACE),1)
+CFG += NV2_TRACE
+endif
+ifeq ($(NV2_TRACE_PRINT),1)
+CFG += NV2_TRACE_PRINT
+endif
+endif
+
+# Development builds only: the SPTM-virt guest's kernel controls aura's stage-2 MMIO trace
+# through an HVC (src/sptm_virt_ctl.c, src/auractl_abi.h, docs/auractl.md). Never in Stage 1.
+ifeq ($(AURACTL),1)
+ifneq ($(SPTM_VIRT),1)
+$(error AURACTL requires SPTM_VIRT=1)
+endif
+CFG += AURACTL
+endif
+
+
+# Trace builds only: an ESP Stage 2 that boots macOS under SPTM-virt from files on the ESP (the
+# macos= line, src/sptm_virt_esp.c, tools/esp-macos) instead of a Linux boot= or chainload=.
+ifeq ($(SPTM_VIRT_ESP),1)
+ifneq ($(ESP_STAGE2)$(SPTM_VIRT),11)
+$(error SPTM_VIRT_ESP requires ESP_STAGE2=1 and SPTM_VIRT=1)
+endif
+CFG += SPTM_VIRT_ESP
+CARGO_FLAGS += --features sptm_virt_esp
+endif
 
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
@@ -188,6 +237,7 @@ HV_OBJECTS := $(patsubst %,hv/%, \
 OBJECTS := \
 	boot_storage.o \
 	adt.o \
+	adt_gpio.o \
 	afk.o \
 	aic.o \
 	asc.o \
@@ -197,16 +247,17 @@ OBJECTS := \
 	chickens.o \
 	clk.o \
 	cpufreq.o \
-	cpufreq_t6040.o \
 	dapf.o \
 	dart.o \
 	dcp.o \
 	dcp_iboot.o \
+	debugport.o \
 	devicetree.o \
 	display.o \
 	dockchannel_uart.o \
 	exception.o exception_asm.o \
 	fb.o font.o font_retina.o \
+	fdt_disable.o \
 	firmware.o \
 	gxf.o gxf_asm.o \
 	heapblock.o \
@@ -215,9 +266,9 @@ OBJECTS := \
 	iova.o \
 	isp.o \
 	j873.o \
-	kboot.o kboot_atc.o kboot_audio.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp_t8122.o \
+	kboot.o kboot_atc.o kboot_audio.o kboot_mte.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp.o kboot_pmp_t8122.o \
 	kboot_t6020_compat.o \
-	kboot_display_handoff.o kboot_display_facts.o kboot_gpu26.o kboot_gpu_t6031.o kboot_t6031.o \
+	kboot_display_handoff.o kboot_display_routes.o kboot_display_facts.o kboot_gpu26.o kboot_gpu_t6031.o kboot_t6031.o \
 	main.o boot_options.o \
 	mitigations.o \
 	mcc.o \
@@ -238,7 +289,7 @@ OBJECTS := \
 	smc.o \
 	ctxr_exec.o \
 	smp.o \
-	spmi.o pmu_counter.o ace3.o \
+	spmi.o pmu_counter.o proxy_fallback.o ace3.o \
 	start.o \
 	startup.o \
 	string.o \
@@ -246,7 +297,7 @@ OBJECTS := \
 	tps6598x.o tps6598x_command_core.o \
 	uart.o \
 	uartproxy.o \
-	usb.o usb_t8152.o usb_dwc3.o usb_dwc3_hs.o usb_dwc3_ss.o usb_cdc.o usb_cdc_atc.o usb_cdc_bulk.o usb_cdc_ss_desc.o usb_cdc_state.o \
+	usb.o usb_t8152.o usb_dwc3.o usb_dwc3_hs.o usb_dwc3_ss.o usb_dwc3_retain.o usb_cdc.o usb_cdc_atc.o usb_cdc_bulk.o usb_cdc_ss_desc.o usb_cdc_state.o \
 	utils.o utils_asm.o \
 	vsprintf.o \
 	wdt.o \
@@ -254,6 +305,16 @@ OBJECTS := \
 	$(DCP_OBJECTS) \
 	$(HV_OBJECTS) \
 	$(MINILZLIB_OBJECTS) $(TINF_OBJECTS) $(DLMALLOC_OBJECTS) $(LIBFDT_OBJECTS)
+
+ifeq ($(SPTM_VIRT),1)
+OBJECTS += nv2.o nv2_asm.o sptm_virt.o sptm_virt_cl4.o sptm_virt_gl.o sptm_virt_s2.o sptm_virt_s2r.o sptm_virt_s2r_soc.o sptm_virt_gpu.o sptm_virt_sep.o s2r_dcp_pkt.o
+endif
+ifeq ($(AURACTL),1)
+OBJECTS += sptm_virt_ctl.o
+endif
+ifeq ($(SPTM_VIRT_ESP),1)
+OBJECTS += sptm_virt_esp.o sptm_virt_esp_plan.o sha256.o
+endif
 
 FP_OBJECTS := \
 	kboot_gpu.o kboot_gpu_t8152.o kboot_gpu_m4.o \
@@ -307,11 +368,14 @@ $(BUILD_FP_OBJS): build/%.o: src/%.c
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)$(CC) -c $(BASE_CFLAGS) -MMD -MF $(DEPDIR)/$(*F).d -MQ "$@" -MP -o $@ $<
 
-# Guest-only code in .init (aura.ld): its cL4 register switches are 5 KiB smaller at -Oz, which
-# leaves room in .init for more of the guest-only objects.
-build/sptm_virt_cl4.o: CFLAGS += -Oz
-# Run-once OS handoff code: -Oz keeps .text within its 64 KiB steps (see _file_limit).
+# Size matters more than speed in these, for the 64 KiB steps below _file_limit (aura-raw.ld).
+# The virtualized SPTM's objects, a development tool, share the read-only segment with .rodata.
+build/sptm_virt.o: CFLAGS += -Oz
+build/sptm_virt_%.o: CFLAGS += -Oz
+# Run-once OS handoff code. kboot_gpu.o, kboot_gpu_t8152.o and kboot_gpu_m4.o use BASE_CFLAGS.
 build/kboot.o: CFLAGS += -Oz
+build/kboot_%.o: CFLAGS += -Oz
+build/kboot_%.o: BASE_CFLAGS += -Oz
 
 build/%.o: src/%.c build-tag build-cfg
 	$(QUIET)echo "  CC    $@"
@@ -367,14 +431,18 @@ build-cfg src/../build/build_cfg.h &:
 	$(QUIET)python3 tools/secboot_sign.py c-header $(SECBOOT_PUBKEY) > build/secboot_key.tmp
 	$(QUIET)cmp -s build/secboot_key.h build/secboot_key.tmp 2>/dev/null || \
 	( mv -f build/secboot_key.tmp build/secboot_key.h && echo "  KEY   build/secboot_key.h" )
+	$(QUIET)python3 tools/execute_window.py c-header > build/execute_window.tmp
+	$(QUIET)cmp -s build/execute_window.h build/execute_window.tmp 2>/dev/null || \
+	( mv -f build/execute_window.tmp build/execute_window.h && echo "  XWIN  build/execute_window.h" )
 	$(QUIET)for i in $(CFG); do echo "#define $$i"; done > build/build_cfg.tmp
 	$(QUIET)echo "#define BUILTIN_LOGO $(BUILTIN_LOGO)" >> build/build_cfg.tmp
 	$(QUIET)cmp -s build/build_cfg.h build/build_cfg.tmp 2>/dev/null || \
 	( mv -f build/build_cfg.tmp build/build_cfg.h && echo "  CFG   build/build_cfg.h" )
 
 # The built-in boot logos are linked gzip-compressed; fb.c inflates them on first use.
-# They are only read, so they go in .rodata: its 64 KiB alignment padding has room for them,
-# while .data counts towards the file part limit in aura-raw.ld.
+# They are only read, so they go in .rodata. aura-raw.ld links them with the fonts past
+# _file_vital_end instead, where the DCP log buffer may overwrite them: fb.c then finds a bad gzip
+# CRC and leaves the logo blank.
 LOGO_OBJCOPY_FLAGS := --rename-section .data=.rodata,alloc,load,readonly,data,contents
 build/$(BUILTIN_LOGO)_%.bin.gz: $(LOGO_DIR)/$(BUILTIN_LOGO)_%.bin
 	$(QUIET)echo "  GZIP  $@"

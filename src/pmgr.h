@@ -5,6 +5,7 @@
 
 #include "types.h"
 
+/* Die-to-die MMIO stride when the ADT has no /arm-io/pmgr die-stride (T6002, T6022). */
 #define PMGR_DIE_OFFSET 0x2000000000
 
 #define PMGR_DEVICE_ID GENMASK(15, 0)
@@ -17,6 +18,7 @@
 extern const char *pmgr_name;
 
 int pmgr_init(void);
+u64 pmgr_die_stride(void);
 
 int pmgr_power_enable(u32 id);
 int pmgr_power_disable(u32 id);
@@ -26,6 +28,8 @@ int pmgr_adt_path_offset_trace(const void *adt_ptr, int *path);
 int pmgr_adt_collect_psregs(const char *path, u64 *out, u8 *flags, int max);
 int pmgr_adt_is_powered(const char *path);
 int pmgr_adt_power_enable(const char *path);
+int pmgr_adt_collect_psregs(const char *path, u64 *out, u8 *flags, int max);
+extern bool pmgr_keep_configured;
 int pmgr_adt_power_disable(const char *path);
 int pmgr_adt_power_disable_recursive(const char *path);
 int pmgr_adt_power_disable_under(const char *path, const char *name);
@@ -65,6 +69,7 @@ int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *gate);
 
 int pmgr_reset(int die, const char *name);
 int pmgr_power_on(int die, const char *name);
+int pmgr_reset_held(int die, const char *name);
 int pmgr_power_is_on(int die, const char *name);
 int pmgr_power_is_requested(int die, const char *name);
 /* Power state register of the real (not virtual) device `name`, 0 if none */

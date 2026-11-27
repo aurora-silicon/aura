@@ -99,6 +99,13 @@ struct tz_regs t8142_tz_regs = {
 #define T8142_CACHE_STATUS_DATA_COUNT GENMASK(30, 24)
 #define T8142_CACHE_STATUS_TAG_COUNT  GENMASK(14, 8)
 
+/*
+ * The mcc,t6041 plane cache status (at T8142_PLANE_CACHE_STATUS) as iBoot leaves it, 12 data and
+ * 12 tag ways, on every plane of the J616s, J614s and J773s.
+ */
+#define T6041_CACHE_STATUS_MASK   0x1f001f00
+#define T6041_CACHE_STATUS_EXPECT 0x0c000c00
+
 #define T8103_CACHE_STATUS_DATA_COUNT GENMASK(14, 10)
 #define T8103_CACHE_STATUS_TAG_COUNT  GENMASK(9, 5)
 
@@ -199,6 +206,35 @@ static int mcc_get_count(int node, const char *name, u64 *value)
     return 0;
 }
 
+/*
+ * A count an MCC driver takes from the ADT, which stores it in 4 or 8 bytes depending on the
+ * board: the J773g (T8132) stores amcc_aperture_count in 4. Returns 0 with the value in
+ * min..INT32_MAX, or -1 when the property is missing, of another width, or out of range.
+ */
+static int mcc_get_driver_count(int node, const char *name, u32 min, u32 *value)
+{
+    u64 count;
+
+    if (mcc_get_count(node, name, &count) || count < min || count > INT32_MAX) {
+        printf("MCC: ADT %s is missing, not 4 or 8 bytes, or out of range\n", name);
+        return -1;
+    }
+    *value = count;
+    return 0;
+}
+
+/*
+ * The ADT does not give the counts or register windows this MCC driver needs. Like a revision
+ * with no driver here, this is not fatal: the MCC is left alone (no cache control, no TZ
+ * registers) and mcc_unmap_carveouts() takes the carveouts from the ADT list, which it then
+ * requires. That list, not the MCC driver, is what keeps firmware memory out of aura's map.
+ */
+static int mcc_undriven(void)
+{
+    printf("MCC: the ADT does not describe this MCC fully; going on without it\n");
+    return MCC_UNSUPPORTED;
+}
+
 static u32 plane_read32(int mcc, int plane, u64 offset)
 {
     return read32(mcc_regs[mcc].plane_base + plane * mcc_regs[mcc].plane_stride + offset);
@@ -250,11 +286,109 @@ int mcc_enable_cache(void)
     return ret;
 }
 
+static const char *const mcc_adt_carveout_names[] = {"region-id-4", "region-id-2"};
+
+/*
+ * One range of /chosen/carveout-memory-map, which iBoot fills in: 0 with it when it is 16 bytes,
+ * inside RAM and page aligned, -1 otherwise.
+ */
+static int mcc_adt_carveout(int node, const char *name, u64 *start, u64 *size)
+{
+    u32 len;
+    const u64 *range = adt_getprop(adt, node, name, &len);
+
+    if (!range || len != 2 * sizeof(u64) || mem_size_actual > UINT64_MAX - ram_base)
+        return -1;
+    memcpy(start, range, sizeof(*start));
+    memcpy(size, range + 1, sizeof(*size));
+    if (!*size || *start < ram_base || *start > UINT64_MAX - *size ||
+        *start + *size > ram_base + mem_size_actual || ((*start | *size) & (get_page_size() - 1)))
+        return -1;
+    return 0;
+}
+
+static void mcc_unmap_range(u64 start, u64 size)
+{
+    mmu_rm_mapping(start, size);
+    mmu_rm_mapping(start | REGION_RWX_EL0, size);
+    mmu_rm_mapping(start | REGION_RW_EL0, size);
+    mmu_rm_mapping(start | REGION_RX_EL1, size);
+    mcc_carveouts[mcc_carveout_count].base = start;
+    mcc_carveouts[mcc_carveout_count].size = size;
+    mcc_carveout_count++;
+}
+
+static int mcc_unmap_adt_carveouts(void)
+{
+    /*
+     * The ADT list is required only where the SoC has an MCC. Every Apple Silicon Mac ADT has
+     * /arm-io/mcc and a /chosen/carveout-memory-map with region-id-2/-4 filled in by iBoot.
+     * Older SoCs that aura also boots (A7-A11, T2) have no /arm-io/mcc node; their carveout
+     * list, if any, is used as far as it goes, and nothing missing there is fatal.
+     */
+    bool required = adt_path_offset(adt, "/arm-io/mcc") >= 0;
+    int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
+
+    if (node < 0) {
+        if (!required) {
+            printf("MMU: no MCC and no ADT carveout-memory-map; no carveouts to unmap\n");
+            return 0;
+        }
+        /*
+         * An MCC without usable TZ registers and no ADT list: aura cannot tell where the
+         * firmware-owned TZ memory is, so it cannot keep it out of its own RWX map.
+         */
+        printf("MMU: no MCC TZ registers and no ADT carveout-memory-map\n");
+        return -1;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(mcc_adt_carveout_names); i++) {
+        const char *name = mcc_adt_carveout_names[i];
+        u64 start, size;
+
+        if (mcc_adt_carveout(node, name, &start, &size) ||
+            mcc_carveout_count >= ARRAY_SIZE(mcc_carveouts) - 1) {
+            printf("MMU: ADT carveout-memory-map has no usable %s (missing, outside RAM or "
+                   "unaligned)%s\n",
+                   name, required ? "" : " (no MCC; skipped)");
+            if (required)
+                return -1;
+            continue;
+        }
+        printf("MMU: Unmapping %s at 0x%lx..0x%lx\n", name, start, start + size);
+        mcc_unmap_range(start, size);
+    }
+    return 0;
+}
+
+/*
+ * Whether the TZ windows read from the MCC agree with iBoot's ADT list: every window inside RAM,
+ * and region-id-4 and region-id-2 each inside one window. With no usable ADT list there is
+ * nothing to compare, and the windows are taken as read.
+ */
+static bool mcc_tz_windows_agree(const struct mcc_carveout *tz, size_t count, bool in_ram)
+{
+    int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
+    u64 start[ARRAY_SIZE(mcc_adt_carveout_names)], size[ARRAY_SIZE(mcc_adt_carveout_names)];
+
+    if (node < 0)
+        return true;
+    for (size_t i = 0; i < ARRAY_SIZE(mcc_adt_carveout_names); i++)
+        if (mcc_adt_carveout(node, mcc_adt_carveout_names[i], &start[i], &size[i]))
+            return true;
+    if (!in_ram)
+        return false;
+    for (size_t i = 0; i < ARRAY_SIZE(mcc_adt_carveout_names); i++) {
+        bool covered = false;
+        for (size_t j = 0; j < count && !covered; j++)
+            covered = start[i] >= tz[j].base && start[i] + size[i] <= tz[j].base + tz[j].size;
+        if (!covered)
+            return false;
+    }
+    return true;
+}
+
 int mcc_unmap_carveouts(void)
 {
-    if (!mcc_initialized)
-        return -1;
-
     mcc_carveout_count = 0;
     memset(mcc_carveouts, 0, sizeof mcc_carveouts);
 
@@ -263,67 +397,61 @@ int mcc_unmap_carveouts(void)
     // region-id-2 and region-id-4 on a booted macos, in the /chosen/carveout-memory-map DT node.
     // This can be used along with dumping the mcc reg space to find the correct start/end/enable
     // above.
-    if (!mcc_regs[0].tz || !mcc_regs[0].tz->count) {
-        static const char *const names[] = {"region-id-4", "region-id-2"};
-        int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
+    // The ADT list does not need the MCC driver, so use it whenever the TZ registers are unknown,
+    // including when the MCC is unsupported (T6050): returning early there left the TZ carveouts
+    // mapped as normal memory.
+    if (!mcc_initialized || !mcc_regs[0].tz || !mcc_regs[0].tz->count)
+        return mcc_unmap_adt_carveouts();
 
-        if (node < 0)
-            return -1;
-        if (mem_size_actual > UINT64_MAX - ram_base)
-            return -1;
-        for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
-            u32 len;
-            const u64 *range = adt_getprop(adt, node, names[i], &len);
-            u64 start, size;
+    struct mcc_carveout tz[PLANE_TZ_MAX_REGS];
+    u32 tz_index[PLANE_TZ_MAX_REGS];
+    size_t tz_count = 0;
+    bool in_ram = mem_size_actual <= UINT64_MAX - ram_base;
 
-            if (!range || len != 2 * sizeof(u64))
-                return -1;
-            memcpy(&start, range, sizeof(start));
-            memcpy(&size, range + 1, sizeof(size));
-            if (!size || start < ram_base || start > UINT64_MAX - size ||
-                start + size > ram_base + mem_size_actual ||
-                ((start | size) & (get_page_size() - 1)) ||
-                mcc_carveout_count >= ARRAY_SIZE(mcc_carveouts) - 1)
-                return -1;
-
-            printf("MMU: Unmapping %s at 0x%lx..0x%lx\n", names[i], start, start + size);
-            mmu_rm_mapping(start, size);
-            mmu_rm_mapping(start | REGION_RWX_EL0, size);
-            mmu_rm_mapping(start | REGION_RW_EL0, size);
-            mmu_rm_mapping(start | REGION_RX_EL1, size);
-            mcc_carveouts[mcc_carveout_count].base = start;
-            mcc_carveouts[mcc_carveout_count].size = size;
-            mcc_carveout_count++;
-        }
-        return 0;
-    }
-
-    for (u32 i = 0; i < mcc_regs[0].tz->count; i++) {
+    for (u32 i = 0; i < mcc_regs[0].tz->count && i < PLANE_TZ_MAX_REGS; i++) {
         uint64_t off = mcc_regs[0].tz->stride * i;
         uint64_t start = plane_read32(0, 0, mcc_regs[0].tz->start + off);
         uint64_t end = plane_read32(0, 0, mcc_regs[0].tz->end + off);
         bool enabled = plane_read32(0, 0, mcc_regs[0].tz->enable + off);
 
-        if (enabled) {
-            if (!start || start == end) {
-                printf("MMU: TZ%d region has bad bounds 0x%lx..0x%lx (iBoot bug?)\n", i, start,
-                       end);
-                continue;
-            }
-
-            start = start << 12;
-            end = (end + 1) << 12;
-            start |= ram_base;
-            end |= ram_base;
-            printf("MMU: Unmapping TZ%d region at 0x%lx..0x%lx\n", i, start, end);
-            mmu_rm_mapping(start, end - start);
-            mmu_rm_mapping(start | REGION_RWX_EL0, end - start);
-            mmu_rm_mapping(start | REGION_RW_EL0, end - start);
-            mmu_rm_mapping(start | REGION_RX_EL1, end - start);
-            mcc_carveouts[mcc_carveout_count].base = start;
-            mcc_carveouts[mcc_carveout_count].size = end - start;
-            mcc_carveout_count++;
+        if (!enabled)
+            continue;
+        if (!start || start == end) {
+            printf("MMU: TZ%d region has bad bounds 0x%lx..0x%lx (iBoot bug?)\n", i, start, end);
+            continue;
         }
+
+        start = start << 12;
+        end = (end + 1) << 12;
+        start |= ram_base;
+        end |= ram_base;
+        if (!in_ram || end <= start || start < ram_base || end > ram_base + mem_size_actual) {
+            printf("MMU: TZ%d region 0x%lx..0x%lx is outside RAM\n", i, start, end);
+            in_ram = false;
+            continue;
+        }
+        tz[tz_count].base = start;
+        tz[tz_count].size = end - start;
+        tz_index[tz_count++] = i;
+    }
+
+    /*
+     * A TZ register layout that is wrong for this MCC (T8132 reuses the T6030 one) reads windows
+     * that miss iBoot's carveouts or fall outside RAM. Then the MCC is not driven any further (no
+     * cache writes to a layout that reads wrong) and the ADT list is used, as when the MCC is not
+     * driven at all, instead of leaving a carveout mapped or unmapping memory that is not one.
+     */
+    if (!mcc_tz_windows_agree(tz, tz_count, in_ram)) {
+        printf("MMU: MCC TZ windows do not cover the ADT carveouts; using the ADT list and "
+               "leaving the MCC alone\n");
+        mcc_initialized = false;
+        return mcc_unmap_adt_carveouts();
+    }
+
+    for (size_t i = 0; i < tz_count; i++) {
+        printf("MMU: Unmapping TZ%d region at 0x%lx..0x%lx\n", tz_index[i], tz[i].base,
+               tz[i].base + tz[i].size);
+        mcc_unmap_range(tz[i].base, tz[i].size);
     }
 
     return 0;
@@ -340,26 +468,16 @@ int mcc_init_t8103(int node, int *path, bool t8112)
     mcc_regs[0].plane_count = T8103_PLANES;
     mcc_regs[0].dcs_stride = T8103_DCS_STRIDE;
 
-    if (adt_get_reg(adt, path, "reg", 0, &mcc_regs[0].global_base, NULL)) {
-        printf("MCC: Failed to get reg property 0!\n");
-        return -1;
-    }
-
-    if (adt_get_reg(adt, path, "reg", 1, &mcc_regs[0].plane_base, NULL)) {
-        printf("MCC: Failed to get reg property 1!\n");
-        return -1;
-    }
-
-    if (adt_get_reg(adt, path, "reg", 2, &mcc_regs[0].dcs_base, NULL)) {
-        printf("MCC: Failed to get reg property 2!\n");
-        return -1;
+    if (adt_get_reg(adt, path, "reg", 0, &mcc_regs[0].global_base, NULL) ||
+        adt_get_reg(adt, path, "reg", 1, &mcc_regs[0].plane_base, NULL) ||
+        adt_get_reg(adt, path, "reg", 2, &mcc_regs[0].dcs_base, NULL)) {
+        printf("MCC: Failed to get reg properties 0-2!\n");
+        return mcc_undriven();
     }
 
     u32 val;
-    if (ADT_GETPROP(adt, node, "dcs_num_channels", &val) < 0) {
-        printf("MCC: Failed to get dcs_num_channels property!\n");
-        return -1;
-    }
+    if (mcc_get_driver_count(node, "dcs_num_channels", 0, &val))
+        return mcc_undriven();
 
     mcc_regs[0].dcs_count = val;
     mcc_regs[0].cache_enable_val = T8103_CACHE_WAYS;
@@ -384,7 +502,7 @@ int mcc_init_t6000(int node, int *path, bool t602x)
 
     if (!adt_getprop(adt, node, "reg", &reg_len)) {
         printf("MCC: Failed to get reg property!\n");
-        return -1;
+        return mcc_undriven();
     }
 
     mcc_count = reg_len / 16 - reg_offset;
@@ -400,7 +518,7 @@ int mcc_init_t6000(int node, int *path, bool t602x)
         u64 base;
         if (adt_get_reg(adt, path, "reg", i + reg_offset, &base, NULL)) {
             printf("MCC: Failed to get reg index %d!\n", i + reg_offset);
-            return -1;
+            return mcc_undriven();
         }
 
         mcc_regs[i].plane_base = base + T6000_PLANE_OFFSET;
@@ -437,7 +555,7 @@ int mcc_init_t6031(int *path, u32 reg_offset, u32 plane_count, u32 dcs_count)
         u64 base;
         if (adt_get_reg(adt, path, "reg", i + reg_offset, &base, NULL)) {
             printf("MCC: Failed to get reg index %d!\n", i + reg_offset);
-            return -1;
+            return mcc_undriven();
         }
 
         mcc_regs[i].plane_base = base + T6031_PLANE_OFFSET;
@@ -470,7 +588,7 @@ int mcc_init_t8122(int *path, u32 reg_offset, u32 plane_count, u32 dcs_count,
         u64 base;
         if (adt_get_reg(adt, path, "reg", i + reg_offset, &base, NULL)) {
             printf("MCC: Failed to get reg index %d!\n", i + reg_offset);
-            return -1;
+            return mcc_undriven();
         }
 
         mcc_regs[i].plane_base = base + T6031_PLANE_OFFSET;
@@ -504,7 +622,7 @@ int mcc_init_m3(int node, int *path)
 
     if (!adt_getprop(adt, node, "reg", &reg_len)) {
         printf("MCC: Failed to get reg property!\n");
-        return -1;
+        return mcc_undriven();
     }
 
     mcc_count = reg_len / 16 - reg_offset;
@@ -516,18 +634,11 @@ int mcc_init_m3(int node, int *path)
         mcc_count = MAX_MCC_INSTANCES;
     }
 
-    u32 plane_count = 0;
-    u32 dcs_count = 0;
+    u32 plane_count, dcs_count;
 
-    if (!ADT_GETPROP(adt, node, "dcs-count-per-amcc", &dcs_count)) {
-        printf("MCC: Failed to get dcs count!\n");
-        return -1;
-    }
-
-    if (!ADT_GETPROP(adt, node, "plane-count-per-amcc", &plane_count)) {
-        printf("MCC: Failed to get plane count!\n");
-        return -1;
-    }
+    if (mcc_get_driver_count(node, "dcs-count-per-amcc", 0, &dcs_count) ||
+        mcc_get_driver_count(node, "plane-count-per-amcc", 1, &plane_count))
+        return mcc_undriven();
 
     int ret = -1;
     if (adt_is_compatible(adt, node, "mcc,t8122"))
@@ -552,31 +663,21 @@ int mcc_init_m3(int node, int *path)
 
 int mcc_init_m4(int node, int *path)
 {
-    u64 amcc_count;
-    if (ADT_GETPROP(adt, node, "amcc_aperture_count", &amcc_count) < 0 &&
-        ADT_GETPROP(adt, node, "amcc-count", &amcc_count) < 0) {
-        printf("MCC: Failed to get mcc count!\n");
-        return -1;
-    }
+    u32 amcc_count, plane_count, dcs_count;
+    /* amcc-count is the older name; it is read only when amcc_aperture_count is absent. */
+    const char *count_name =
+        adt_getprop(adt, node, "amcc_aperture_count", NULL) ? "amcc_aperture_count" : "amcc-count";
+
+    if (mcc_get_driver_count(node, count_name, 1, &amcc_count) ||
+        mcc_get_driver_count(node, "dcs-count-per-amcc", 0, &dcs_count) ||
+        mcc_get_driver_count(node, "plane-count-per-amcc", 1, &plane_count))
+        return mcc_undriven();
 
     if (amcc_count > MAX_MCC_INSTANCES) {
         printf("MCC: Too many instances, increase MAX_MCC_INSTANCES!\n");
         mcc_count = MAX_MCC_INSTANCES;
     } else {
         mcc_count = amcc_count;
-    }
-
-    u32 plane_count = 0;
-    u32 dcs_count = 0;
-
-    if (!ADT_GETPROP(adt, node, "dcs-count-per-amcc", &dcs_count)) {
-        printf("MCC: Failed to get dcs count!\n");
-        return -1;
-    }
-
-    if (!ADT_GETPROP(adt, node, "plane-count-per-amcc", &plane_count)) {
-        printf("MCC: Failed to get plane count!\n");
-        return -1;
     }
 
     printf("MCC: Initializing T%x MCCs (%d instances)...\n", chip_id, mcc_count);
@@ -600,20 +701,26 @@ int mcc_init_m4(int node, int *path)
     return 0;
 }
 
+/* The AMCC planes of one instance, for a caller that watches them (sptm_virt_s2.c). */
+int mcc_plane_info(int mcc, u64 *base, u64 *stride, int *count)
+{
+    if (!mcc_initialized || mcc < 0 || mcc >= mcc_count)
+        return -1;
+    *base = mcc_regs[mcc].plane_base;
+    *stride = mcc_regs[mcc].plane_stride;
+    *count = mcc_regs[mcc].plane_count;
+    return 0;
+}
+
 /* T8142 (M5): the T8122 plane layout with the DCS block at +16 MiB, four planes per AMCC and
  * the plane cache controls at 0x2800. */
 static int mcc_init_m5(int node, int *path)
 {
-    u64 amcc_count, dcs_count;
+    u32 amcc_count, dcs_count;
 
-    if (mcc_get_count(node, "amcc-count", &amcc_count) || !amcc_count) {
-        printf("MCC: Failed to get mcc count!\n");
-        return -1;
-    }
-    if (mcc_get_count(node, "dcs-count-per-amcc", &dcs_count) || dcs_count > INT32_MAX) {
-        printf("MCC: Failed to get dcs count!\n");
-        return -1;
-    }
+    if (mcc_get_driver_count(node, "amcc-count", 1, &amcc_count) ||
+        mcc_get_driver_count(node, "dcs-count-per-amcc", 0, &dcs_count))
+        return mcc_undriven();
 
     if (amcc_count > MAX_MCC_INSTANCES) {
         printf("MCC: Too many instances, increase MAX_MCC_INSTANCES!\n");
@@ -647,75 +754,174 @@ static int mcc_init_m5(int node, int *path)
     return 0;
 }
 
+/*
+ * A firmware-cache MCC (mcc,t8140, mcc,t6041) is set up by iBoot, which owns its cache: aura only
+ * records its AMCCs and, for mcc,t6041, checks the cache status iBoot left. Everything comes from
+ * the ADT: the AMCC count and register index in /arm-io/mcc, which AMCCs and channels are enabled
+ * there (a binned M4 Max has 8 AMCCs with 6 enabled), the planes and their stride in
+ * /chosen/lock-regs/amcc, and each enabled AMCC's register window, which lock-regs lists too.
+ *
+ * None of these stops the boot; each leaves the MCC alone (MCC_UNSUPPORTED), as for a revision
+ * with no driver here:
+ * - an ADT that contradicts itself, found before any register is read: a mask that names no AMCC
+ *   or one past amcc-count, a channel on an AMCC the mask leaves out, an enabled AMCC without a
+ *   window large enough for its planes, a window lock-regs does not list;
+ * - an ADT that does not give what this needs: a missing property or one of another width, more
+ *   AMCCs or channels than aura tracks, and for the status reads a plane stride from lock-regs;
+ * - a cache status other than the one iBoot leaves on the M4 Pro.
+ * This path writes no register and its carveouts come from the ADT list either way, so failing
+ * here would add nothing but a reset: aura_main() panics on mcc_init() < 0 before the trial
+ * watchdog is armed, which loops a trial Stage 1 with no fallback. A T8140 left alone is still
+ * refused at kboot_boot(), which needs its MCC.
+ *
+ * Only the enabled AMCCs are recorded and read: a fused-off AMCC's window is never touched.
+ */
+static int mcc_firmware_cache_inconsistent(const char *what)
+{
+    printf("MCC: the ADT contradicts itself: %s; going on without the MCC\n", what);
+    return MCC_UNSUPPORTED;
+}
+
 static int mcc_init_firmware_cache(int node, int *path)
 {
-    u32 reg_idx;
-    u64 count = 1, channels = 0, planes = 4, stride = T8103_PLANE_STRIDE;
+    u32 reg_idx, len;
+    u64 count = 1, channels = 0, planes = 4, stride = T8103_PLANE_STRIDE, amcc_mask, aperture_size;
     int lock_node = adt_path_offset(adt, "/chosen/lock-regs/amcc");
     bool t6041 = adt_is_compatible(adt, node, "mcc,t6041");
+    bool lock_stride = false;
+    const u64 *apertures = NULL;
+    u32 aperture_count = 0;
+    int amcc_index[MAX_MCC_INSTANCES];
 
     if (ADT_GETPROP(adt, node, "amcc-reg-idx", &reg_idx) < 0)
-        return -1;
+        return mcc_undriven();
     if (adt_getprop(adt, node, "amcc-count", NULL) && mcc_get_count(node, "amcc-count", &count))
-        return -1;
+        return mcc_undriven();
     if (adt_getprop(adt, node, "dcs-count-per-amcc", NULL) &&
         mcc_get_count(node, "dcs-count-per-amcc", &channels))
-        return -1;
-    if (!count || count > MAX_MCC_INSTANCES || channels > INT32_MAX)
-        return -1;
+        return mcc_undriven();
+    if (!count)
+        return mcc_firmware_cache_inconsistent("amcc-count is 0");
+    if (count > MAX_MCC_INSTANCES || channels > INT32_MAX)
+        return mcc_undriven();
+
+    amcc_mask = BIT(count) - 1;
+    if (adt_getprop(adt, node, "amcc-enable-mask", NULL)) {
+        u64 mask;
+        if (mcc_get_count(node, "amcc-enable-mask", &mask))
+            return mcc_undriven();
+        if (!mask || (mask & ~amcc_mask))
+            return mcc_firmware_cache_inconsistent("amcc-enable-mask is empty or past amcc-count");
+        amcc_mask = mask;
+    }
+    if (adt_getprop(adt, node, "dcs-channel-enable-mask", NULL)) {
+        u64 mask;
+        if (mcc_get_count(node, "dcs-channel-enable-mask", &mask))
+            return mcc_undriven();
+        if (!channels)
+            return mcc_firmware_cache_inconsistent("dcs-channel-enable-mask without channels");
+        if (channels > 64 / count)
+            return mcc_undriven();
+        u64 all = count * channels == 64 ? ~0ULL : BIT(count * channels) - 1;
+        if (!mask || (mask & ~all))
+            return mcc_firmware_cache_inconsistent(
+                "dcs-channel-enable-mask is empty or past the channels");
+        /* The mask has dcs-count-per-amcc bits per AMCC, AMCC 0 lowest (0x3f / 0xffffff). */
+        for (u64 b = 0; b < count * channels; b++)
+            if ((mask & BIT(b)) && !(amcc_mask & BIT(b / channels)))
+                return mcc_firmware_cache_inconsistent(
+                    "dcs-channel-enable-mask enables a channel of an AMCC amcc-enable-mask leaves "
+                    "out");
+    }
 
     if (lock_node >= 0 && adt_getprop(adt, lock_node, "plane-count", NULL)) {
         if (mcc_get_count(lock_node, "plane-count", &planes))
-            return -1;
+            return mcc_undriven();
     } else if (adt_getprop(adt, node, "amcc-plane-enable-mask", NULL)) {
         u64 mask;
         if (mcc_get_count(node, "amcc-plane-enable-mask", &mask))
-            return -1;
+            return mcc_undriven();
         planes = __builtin_popcountll(mask);
     }
-    if (lock_node >= 0 && adt_getprop(adt, lock_node, "plane-stride", NULL) &&
-        mcc_get_count(lock_node, "plane-stride", &stride))
-        return -1;
-    if (!planes || planes > INT32_MAX || !stride || (stride & 3))
-        return -1;
+    if (lock_node >= 0 && adt_getprop(adt, lock_node, "plane-stride", NULL)) {
+        if (mcc_get_count(lock_node, "plane-stride", &stride))
+            return mcc_undriven();
+        lock_stride = true;
+    }
+    if (planes > INT32_MAX)
+        return mcc_undriven();
+    if (!planes || !stride || (stride & 3))
+        return mcc_firmware_cache_inconsistent("no planes, or a plane stride that is not aligned");
+    if (t6041 && !lock_stride) {
+        printf("MCC: no plane stride in lock-regs to read the cache status at\n");
+        return mcc_undriven();
+    }
+    /* The highest register read in a window: the last plane's cache status (mcc,t6041). */
+    u64 reach = t6041 ? T8142_PLANE_CACHE_STATUS + 4 : 4;
+    if ((planes - 1) > (UINT64_MAX - reach) / stride)
+        return mcc_firmware_cache_inconsistent("plane stride past the address space");
+    reach += (planes - 1) * stride;
 
-    /* Restrict this path to the observed J616s and J614s layouts. */
-    if (t6041 && (chip_id != T6040 ||
-                  !(board_id == 6 || (board_id == 4 && adt_is_compatible(adt, 0, "J614sAP"))) ||
-                  reg_idx != 12 || count != 4 || channels != 4 || planes != 4 || stride != 0x40000))
-        return -1;
+    /* lock-regs lists the AMCC windows again; where it does, each enabled one must be in it. */
+    aperture_size = 0;
+    if (lock_node >= 0 && (apertures = adt_getprop(adt, lock_node, "aperture-phys-addr", &len))) {
+        u64 listed = 0;
+        aperture_count = len / sizeof(u64);
+        if ((adt_getprop(adt, lock_node, "aperture-count", NULL) &&
+             mcc_get_count(lock_node, "aperture-count", &listed)) ||
+            (adt_getprop(adt, lock_node, "aperture-size", NULL) &&
+             mcc_get_count(lock_node, "aperture-size", &aperture_size)))
+            return mcc_undriven();
+        if (!len || len % sizeof(u64) ||
+            (adt_getprop(adt, lock_node, "aperture-count", NULL) && listed != aperture_count))
+            return mcc_firmware_cache_inconsistent("the lock-regs aperture list");
+    }
 
-    mcc_count = count;
-    for (int i = 0; i < mcc_count; i++) {
+    int enabled = 0;
+    for (int i = 0; i < (int)count; i++) {
         u64 base, size;
+        if (!(amcc_mask & BIT(i)))
+            continue;
         if (reg_idx > (u32)(INT32_MAX - i) ||
-            adt_get_reg(adt, path, "reg", reg_idx + i, &base, &size) || !base ||
-            (planes - 1) > (UINT64_MAX - 4) / stride || (planes - 1) * stride + 4 > size ||
-            (t6041 && (base != 0x220000000 + (u64)i * 0x2000000 || size != 0x200000)))
-            return -1;
-        mcc_regs[i].plane_base = base;
-        mcc_regs[i].plane_stride = stride;
-        mcc_regs[i].plane_count = planes;
-        mcc_regs[i].dcs_count = channels;
-        mcc_regs[i].tz = NULL;
-        mcc_regs[i].has_cache_control = false;
+            adt_get_reg(adt, path, "reg", reg_idx + i, &base, &size) || !base || reach > size)
+            return mcc_firmware_cache_inconsistent("an enabled AMCC without a window for its "
+                                                   "planes");
+        if (apertures) {
+            bool listed = false;
+            for (u32 j = 0; j < aperture_count && !listed; j++) {
+                u64 ap;
+                memcpy(&ap, &apertures[j], sizeof(ap));
+                listed = ap == base;
+            }
+            if (!listed || (aperture_size && size != aperture_size))
+                return mcc_firmware_cache_inconsistent("an AMCC window lock-regs does not list");
+        }
+        mcc_regs[enabled] = (struct mcc_regs){
+            .plane_base = base,
+            .plane_stride = stride,
+            .plane_count = planes,
+            .dcs_count = channels,
+        };
+        amcc_index[enabled++] = i;
     }
 
     if (t6041) {
-        for (int i = 0; i < mcc_count; i++) {
+        for (int i = 0; i < enabled; i++) {
             for (int plane = 0; plane < mcc_regs[i].plane_count; plane++) {
-                u32 status = plane_read32(i, plane, 0x2804);
-                if ((status & 0x1f001f00) != 0x0c000c00) {
-                    printf("MCC: Unexpected cache status on MCC %d plane %d: 0x%x\n", i, plane,
-                           status);
-                    return -1;
+                u32 status = plane_read32(i, plane, T8142_PLANE_CACHE_STATUS);
+                if ((status & T6041_CACHE_STATUS_MASK) != T6041_CACHE_STATUS_EXPECT) {
+                    printf("MCC: cache status 0x%x on AMCC %d plane %d is not the one iBoot "
+                           "leaves; leaving the firmware-owned MCC alone\n",
+                           status, amcc_index[i], plane);
+                    return MCC_UNSUPPORTED;
                 }
             }
         }
     }
 
-    printf("MCC: Initialized T%x MCCs (%d instances, %d planes, %d channels)\n", chip_id, mcc_count,
-           mcc_regs[0].plane_count, mcc_regs[0].dcs_count);
+    mcc_count = enabled;
+    printf("MCC: Initialized T%x MCCs (%d of %d instances, %d planes, %d channels)\n", chip_id,
+           mcc_count, (int)count, mcc_regs[0].plane_count, mcc_regs[0].dcs_count);
     mcc_initialized = true;
     return 0;
 }
@@ -726,8 +932,12 @@ int mcc_init(void)
     int node = adt_path_offset_trace(adt, "/arm-io/mcc", path);
 
     if (node < 0) {
-        printf("MCC: MCC node not found!\n");
-        return -1;
+        /*
+         * No MCC in the ADT (A7-A11, T2): nothing to initialize here. mcc_unmap_carveouts() then
+         * uses whatever carveout list the ADT has, without requiring one.
+         */
+        printf("MCC: no /arm-io/mcc in the ADT; no MCC on this SoC\n");
+        return MCC_ABSENT;
     }
 
     if (adt_is_compatible(adt, node, "mcc,t8103")) {
@@ -753,7 +963,12 @@ int mcc_init(void)
     } else if (adt_is_compatible(adt, node, "mcc,t6031")) {
         return mcc_init_m3(node, path);
     } else {
+        /*
+         * An MCC revision aura has no driver for: no cache control and no TZ registers. This is
+         * not a failure of a known block; carveouts then come from the ADT list, which
+         * mcc_unmap_carveouts() requires.
+         */
         printf("MCC: Unsupported version:%s\n", adt_get_property(adt, node, "compatible")->value);
-        return -1;
+        return MCC_UNSUPPORTED;
     }
 }

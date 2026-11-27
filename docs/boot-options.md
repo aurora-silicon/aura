@@ -54,6 +54,39 @@ and the display. The mailbox sits in aura's image, which kboot reserves anyway, 
 takes no memory of its own. On A7 to M3 RVBAR isn't locked, so nothing is published,
 and a guest at EL1 gets nothing.
 
+## Hibernation layout (`hib=1`, T6040)
+
+A hibernation image restores every page the OS saved to the frame it came from, so the
+boot that resumes it must give the OS the same RAM and keep the same ranges from it.
+The payload line `hib=1`, in Stage 2's own lines (Stage 1 does not hand it on), asks
+kboot for a fixed layout on T6040:
+
+- the CTXR exec window is the part of CTXR_D that every placement of the boot object
+  arms above aura's slot, at the same address on every boot (on the J616s with the
+  installer's padding: 96 MiB at 0x10008200000);
+- everything from the start of RAM up to a fixed end is kept from the OS, except that
+  window;
+- the device tree the OS is started with is copied, last, into a 2 MiB slot 320 MiB
+  above the 32 MiB aligned start of RAM, and the heap restarts right above the slot;
+- `/chosen/aura,hibernate-layout` holds the start of RAM and the fixed end,
+  `/chosen/aura,hibernate-dt` the slot.
+
+iBoot loads the boot object at a different address on every boot, anywhere from 16 to
+48 MiB above the 32 MiB aligned start of RAM, and the window above aura's slot moves
+with it. The fixed window does not: a kernel that a loader places at its lowest free
+2 MiB lands at the same address on every boot. Each boot checks the fixed window
+against what CTXR_D arms; when it does not fit, the OS gets the window above aura's
+slot and kboot gives no layout. aura's own image, with its spin tables and its S2R
+mailbox, still moves with the object, inside the kept range: Linux uses the release
+addresses only when it starts, and a restored kernel reads this boot's mailbox from the
+tree in the slot.
+
+kboot refuses the layout, says why, and boots without it when the window is not the
+fixed one or is not below the slot, or when aura, the boot arguments, what iBoot and
+Stage 1 placed, or the heap reach the slot, or when the fixed range meets a carveout or
+a firmware range. Without the properties Linux refuses to hibernate. Without `hib=1`
+nothing changes, the window included.
+
 ## DebugUSB interception (development builds)
 
 A build made with `DEBUGUSB_PROXY=1` also opens the 15 second `aura-proxy`
@@ -103,27 +136,43 @@ boot)` or `FDT: keeping chosen.stdout-path on the debug UART (<reason>)`. A
 `stdout-path` to any other node is left alone. The J616s and J614s device trees
 set none.
 
-## External displays on the M4 MacBook Air (J713)
+## External displays on the M4 (T8132)
 
 On the J713, iBoot starts both external display coprocessors, dcpext0 and
 dcpext1, and leaves them quiesced with their DARTs set up. A kernel that drives
-external displays adopts them as they are. With `chosen.asahi,j713-dcpext=1`
-in the aura configuration, kboot hands each one over: it reserves its firmware
-memory (the OS log segment by physical address, as for the internal DCP),
-publishes the firmware UUID and marks the node
-`apple,t8132-dcpext-firmware-ready`. The node stays disabled.
+external displays adopts them as they are. kboot hands each controller over by
+default, on any T8132 machine, when it passes the checks below; the board is not
+checked (`chosen.asahi,j713-dcpext=0` in the aura configuration turns that off).
+On a T8132 other than the J713, the internal display handoff it needs is itself
+limited (firmware 26.6.2 and an internal panel). To hand a controller over, kboot
+reserves its firmware memory (the OS log segment by physical address, as for the
+internal DCP), publishes the firmware UUID and marks the node
+`apple,t8132-dcpext-firmware-ready`. The node's status is left as the kernel's
+tree has it (current J713 trees mark it `okay`).
+
+The marker is meant for a kernel that has the T8132 external display driver
+(`CONFIG_DRM_APPLE_DCP_T8132`). A kernel with the Apple display gate but without
+that driver still enables the controllers' Type-C routes from the marker, and
+nothing then adopts them, so its USB-C port controller can wait for them; turn the
+handoff off with `=0` for such a kernel.
 
 A controller is handed over only when:
 
 - the internal display was handed over too, so an external display never costs
   the panel;
-- its device-tree node is a disabled `apple,t8132-dcpext`;
+- its device-tree node is an `apple,t8132-dcpext` with status absent, `okay`,
+  `ok` or `disabled`;
 - iBoot left it powered: DISPEXTn SYS and FE on, and its CPU domain on or
   targeted on with hardware gating it while idle.
 
 PMGR is only read. The CPU domain and the controller are left to the kernel.
-The value must be exactly `1`. Without it, or when any check fails, nothing is
-reserved for that controller and a marker already in the tree is removed.
+With the line present the value must be exactly `1`; any other value turns the
+handoff off. Without the line, the handoff is on. When it is off, or when
+any check fails, nothing is reserved for that controller and a marker already
+in the tree is removed. When a config line was lost (for example, the config had
+too many `chosen` lines), the default does not apply, since an owner's `=0` may have
+been the line lost.
+
 kboot logs `FDT: 'dcpext0' firmware reserved, left to the kernel`, or the
 reason followed by `kernel gate remains closed`.
 

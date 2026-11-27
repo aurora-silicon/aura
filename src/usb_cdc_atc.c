@@ -4,6 +4,7 @@
 #include "adt.h"
 #include "string.h"
 #include "tunables.h"
+#include "usb_cdc.h"
 #include "utils.h"
 
 /* T8130 ATC register facts from public Asahi Linux atc.c and the J700 ADT. */
@@ -73,8 +74,16 @@ void usb_cdc_atc_force_swapped(bool enable)
     force_swapped = enable;
 }
 
+/* The lane the last bring-up used. A re-take asks for the same one, in case ATC_MISC's orientation
+ * bit doesn't come back with the domain. */
+bool usb_cdc_atc_lane(void)
+{
+    return active_lane;
+}
+
 static int validate_group(int node, const struct atc_tuning_group *group)
 {
+    usb_cdc_wait_us(0);
     u32 length;
     const u8 *records = adt_getprop(adt, node, group->name, &length);
     if (!records)
@@ -90,6 +99,7 @@ static int validate_group(int node, const struct atc_tuning_group *group)
 
 static int apply_group(int node, const struct atc_tuning_group *group)
 {
+    usb_cdc_wait_us(0);
     if (!adt_getprop(adt, node, group->name, NULL))
         return group->required ? -1 : 0;
     if (validate_group(node, group))
@@ -149,7 +159,7 @@ int usb_cdc_atc_power_on(uintptr_t pipehandler)
     udelay(10);
     clear32(usb2 + USB2_MISCTUNE, BIT(29) | BIT(30));
     /* T8140's eUSB2 repeater needs to settle after reset release (Linux atc.c). */
-    mdelay(5);
+    usb_cdc_wait_us(5000);
     write32(usb2 + USB2_USBCTL, 2); /* RUN */
 
     /* Park the upstream DWC3 PIPE on the dummy PHY until DWC3 is ready. */
@@ -159,10 +169,10 @@ int usb_cdc_atc_power_on(uintptr_t pipehandler)
 
     set32(power + ATC_MISC, BIT(0));
     set32(power + ATC_POWER_CTRL, BIT(0));
-    if (poll32(power + ATC_POWER_STAT, BIT(0), BIT(0), 100000))
+    if (usb_cdc_poll32(power + ATC_POWER_STAT, BIT(0), BIT(0), 100000))
         return -1;
     set32(power + ATC_POWER_CTRL, BIT(1));
-    if (poll32(power + ATC_POWER_STAT, BIT(1), BIT(1), 100000))
+    if (usb_cdc_poll32(power + ATC_POWER_STAT, BIT(1), BIT(1), 100000))
         return -1;
     clear32(power + ATC_POWER_CTRL, BIT(2));
     set32(power + ATC_POWER_CTRL, BIT(3));
@@ -200,7 +210,7 @@ int usb_cdc_atc_power_on(uintptr_t pipehandler)
     write32(core + ATC_LANE_MODE, lane_mode);
     write32(core + ATC_CROSSBAR, crossbar);
     set32(power + ATC_POWER_CTRL, BIT(4));
-    if (poll32(rcal + ATC_RCAL, BIT(0), BIT(0), 100000))
+    if (usb_cdc_poll32(rcal + ATC_RCAL, BIT(0), BIT(0), 100000))
         return -1;
 
     phy_ready = true;

@@ -69,6 +69,7 @@ static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
     return NULL;
 }
 static int display_configure(const char *config) { (void)config; configures++; return 0; }
+static bool display_inherited_live_heap(u64 *start) { (void)start; return false; }
 static int display_init_t8152(void) { t8152_inits++; return 0; }
 static void fb_clear_direct(void) {}
 static bool firmware_sfw_in_range(enum fw_version lo, enum fw_version hi) { (void)lo; (void)hi; return false; }
@@ -118,7 +119,7 @@ int main(void)
 def test_t8140_t8132_return_before_the_dart_path(tmp_path):
     display = (SOURCE / "src/display.c").read_text()
     soc = (SOURCE / "src/soc.h").read_text()
-    chips = "\n".join(re.findall(r"^#define (?:T8140|T8132|T8152|T6000|T6040|S5L8960X)\s+0x[0-9a-fA-F]+\s*$",
+    chips = "\n".join(re.findall(r"^#define (?:T8140|T8132|T8152|T6000|T6040|T6041|S5L8960X)\s+0x[0-9a-fA-F]+\s*$",
                                  soc, re.M))
     panel = function(display, "static bool display_internal_panel_absent(")
     init = function(display, "int display_init(void)")

@@ -8,7 +8,7 @@ display_configure, display_swap_state and display_configure_second. The iBoot
 types come from dcp_iboot.h.
 
 Host models:
-- Each DCP has two DARTs (disp, dcp) that record every mapping. dart_unmap()
+- Each DCP has two DARTs (disp, dcp) that record every mapping. dart_unmap_checked()
   must match a live mapping exactly; dart_find_iova() returns the first gap.
 - iova_alloc()/iova_free() track live allocations; a free must match one.
 - The iBoot calls are scripted: one connected sink with a mode list and one
@@ -64,7 +64,9 @@ def unit():
         function(disp, "static void display_choose_timing_mode("),
         function(disp, "static void display_choose_color_mode("),
         function(disp, "static bool display_t6030_hands_off("),
+        function(disp, "static bool display_unmap_fb("),
         function(disp, "static uintptr_t display_map_fb("),
+        function(disp, "static void display_stop_failed_dcp("),
         function(disp, "int display_start_dcp("),
         block(disp, disp.index("struct display_options {")) + ";\n",
         function(disp, "int display_parse_mode("),
@@ -159,12 +161,14 @@ static int dart_map(dart_dev_t *d, u64 iova, void *pa, size_t size)
     add_map(d, iova, (u64)pa, size);
     return 0;
 }
-static void dart_unmap(dart_dev_t *d, u64 iova, size_t size)
+static bool dart_unmap_checked(dart_dev_t *d, u64 iova, size_t size)
 {
     struct mapping *m = find_map(d, iova);
     assert(m && m->size == size && "unmap of a range that is not mapped");
     m->live = false;
+    return true;
 }
+static bool dart_has_failed(dart_dev_t *d) { return !d; }
 static u64 dart_vm_base(dart_dev_t *d) { (void)d; return 0x10000000; }
 static u64 dart_find_iova(dart_dev_t *d, s64 start, size_t size)
 {
@@ -235,10 +239,20 @@ static void iova_free(void *d, u64 dva, size_t size)
 /* DCP lifecycle */
 static bool has_dcp_left_running;
 static bool dcp_left_running(void) { return has_dcp_left_running; }
+static bool has_dcp_init_left_quiesced;
+static bool dcp_init_left_quiesced(void) { return has_dcp_init_left_quiesced; }
+/* display.c: the AFK hand-off bookkeeping (test_display_afk_live.py) is out of scope here. */
+static void display_afk_restart(const char *path) { (void)path; }
 static const display_config_t *display_get_config(void) { has_dcp = true; return t8152_config; }
+static bool fail_dcp_init, dcp_init_leaves_running;
 static dcp_dev_t *dcp_init(const display_config_t *cfg)
 {
     (void)cfg;
+    if (fail_dcp_init) {
+        /* A failed init that could not quiesce the RTKit it booted. */
+        has_dcp_left_running = dcp_init_leaves_running;
+        return NULL;
+    }
     assert(dcps_started < 4);
     dcp_dev_t *d = &dcps[dcps_started];
     d->dart_disp = &darts[2 * dcps_started];
@@ -251,7 +265,7 @@ static dcp_dev_t *dcp_init(const display_config_t *cfg)
     dcps_started++;
     return d;
 }
-static void dcp_shutdown(dcp_dev_t *d, bool sleep) { (void)d; (void)sleep; assert(!"DCP start failed"); }
+static int dcp_shutdown(dcp_dev_t *d, bool sleep) { (void)d; (void)sleep; assert(!"DCP start failed"); return 0; }
 static dcp_iboot_if_t *dcp_ib_init(dcp_dev_t *d) { iboots[d - dcps].id = d - dcps; return &iboots[d - dcps]; }
 static int display_get_vram(u64 *pa, u64 *size) { *pa = vram_pa; *size = vram_size; return 0; }
 static int display_shutdown(dcp_shutdown_mode mode)
@@ -262,12 +276,20 @@ static int display_shutdown(dcp_shutdown_mode mode)
     return 0;
 }
 static int dcp_connect_dptx(dcp_dev_t *d) { (void)d; return 0; }
-static int dcp_dptx_hpd(void *ep, u32 port, bool hpd) { (void)ep; (void)port; assert(hpd); hpd_pokes++; return 0; }
+/* The converter's HPD pin level (-1: unreadable, the old always-asserted report) and what was
+ * reported to the dptx-port. */
+static int hpd_pin = -1, hpd_queries;
+static bool hpd_reported;
+static int dcp_hdmi_hpd_level(dcp_dev_t *d) { (void)d; return hpd_pin; }
+static int dcp_dptx_hpd(void *ep, u32 port, bool hpd) { (void)ep; (void)port; hpd_reported = hpd; hpd_pokes++; return 0; }
+/* The J873g ADT gives dp2hdmi-gpio0 function-hdmi_hpd and its dptx-port speaks AFKv2. */
+static bool dcp_dptx_needs_ap_hpd(dcp_dev_t *d) { (void)d; return chip_id == T8152; }
 static int dcp_work(dcp_dev_t *d) { (void)d; return 0; }
 static void mdelay(unsigned ms) { (void)ms; }
 static u64 get_ticks(void) { return 0; }
 static u64 ticks_to_msecs(u64 t) { return t; }
 static void mmu_map_framebuffer(u64 a, u64 s) { (void)a; (void)s; }
+static bool display_inherited_live_heap(u64 *start) { (void)start; return false; }
 static int adt_path_offset(void *a, const char *p) { (void)a; (void)p; return -1; }
 static int adt_setprop(void *a, int n, const char *p, void *v, size_t s) { (void)a; (void)n; (void)p; (void)v; (void)s; assert(0); return -1; }
 static bool adt_is_compatible(void *a, int n, const char *c) { (void)a; assert(!n && !strcmp(c, "J873gAP")); return is_j873g; }
@@ -290,6 +312,7 @@ static int dcp_ib_set_power(dcp_iboot_if_t *ib, bool on) { (void)ib; (void)on; r
 static int dcp_ib_get_hpd(dcp_iboot_if_t *ib, int *timing_cnt, int *color_cnt)
 {
     (void)ib;
+    hpd_queries++;
     *timing_cnt = nmodes;
     *color_cnt = 1;
     return 1;
@@ -356,6 +379,8 @@ static void t8152_growth_keeps_scanout(void)
     assert(!find_map(dcp->dart_disp, BOOT_DVA) && !find_map(dcp->dart_dcp, BOOT_DVA));
     assert(cur_boot_args.video.base != vram_pa && cur_boot_args.video.width == 1280);
     assert_scanout_owned(1);
+    /* The internal DCP is running at the hand-off. */
+    assert(display_dcp_handoff_state() == 1);
     u64 grown = fb_dva;
 
     /* A later modeset that fits swaps the same framebuffer again. */
@@ -381,6 +406,8 @@ static void other_chip_growth_remaps(void)
     assert(display_configure("1280x720@60") == 1);
     assert(fb_dva == BOOT_DVA && !live_iovas());
     assert_scanout_owned(1);
+    /* The hand-off state is T8152 only. */
+    assert(display_dcp_handoff_state() == -1);
     /* The HPD poke is T8152 only, also on a DPTX route. */
     assert(display_is_dptx && !hpd_pokes);
 }
@@ -406,6 +433,8 @@ static void second_display_failure_restores_first(void)
                    sizeof(first_video)));
     assert(fb_reinits == 1 && live_maps(first->dart_disp) == first_maps);
     assert(!display_second_video.base);
+    /* The second display's failure is not the internal DCP's state. */
+    assert(display_dcp_handoff_state() == 1);
 
     /* A retry reuses the framebuffer allocated for the failed attempt. */
     u64 second_fb = display_other.video.base;
@@ -434,11 +463,53 @@ static void second_display_identity(void)
     assert(!allocations && !dcps_started && !fb_reinits && !display_other.video.base);
 }
 
+static void t8152_failed_start_state(void)
+{
+    boot(T8152);
+    /* dcp_init() failed and left the internal DCP quiesced. */
+    fail_dcp_init = has_dcp_init_left_quiesced = true;
+    assert(display_configure("1280x720@60") < 0);
+    assert(display_dcp_handoff_state() == 0);
+    /* A failure that left it running reports it running. */
+    has_dcp_init_left_quiesced = false;
+    dcp_init_leaves_running = true;
+    assert(display_configure("1280x720@60") < 0);
+    assert(display_dcp_handoff_state() == 1);
+    assert(!dcps_started && !allocations);
+}
+
+static void t8152_hpd_pin_decides(void)
+{
+    /* An unreadable pin keeps the asserted report and the status wait. */
+    boot(T8152);
+    t8152_config = &display_config_j873_hdmi;
+    assert(display_configure("1280x720@60") == 1);
+    assert(hpd_pokes == 1 && hpd_reported && hpd_queries == 1);
+}
+
+static void t8152_hpd_low_skips_status_wait(void)
+{
+    /* No sink drives HPD: the firmware is told so and never asked for a display. */
+    boot(T8152);
+    t8152_config = &display_config_j873_hdmi;
+    hpd_pin = 0;
+    assert(display_configure("1280x720@60") == 0);
+    assert(hpd_pokes == 1 && !hpd_reported && !hpd_queries);
+    assert(!allocations && !scanout && !fb_reinits);
+    /* A sink that drives it gets the normal modeset. */
+    hpd_pin = 1;
+    assert(display_configure("1280x720@60") == 1);
+    assert(hpd_pokes == 2 && hpd_reported && hpd_queries == 1);
+}
+
 static const struct { const char *name; void (*run)(void); } cases[] = {
     {"t8152-growth-keeps-scanout", t8152_growth_keeps_scanout},
     {"other-chip-growth-remaps", other_chip_growth_remaps},
     {"second-display-failure-restores-first", second_display_failure_restores_first},
     {"second-display-identity", second_display_identity},
+    {"t8152-failed-start-state", t8152_failed_start_state},
+    {"t8152-hpd-pin-decides", t8152_hpd_pin_decides},
+    {"t8152-hpd-low-skips-status-wait", t8152_hpd_low_skips_status_wait},
 };
 
 int main(int argc, char **argv)
@@ -462,7 +533,9 @@ int main(int argc, char **argv)
 '''
 
 CASES_LIST = ("t8152-growth-keeps-scanout", "other-chip-growth-remaps",
-              "second-display-failure-restores-first", "second-display-identity")
+              "second-display-failure-restores-first", "second-display-identity",
+              "t8152-failed-start-state", "t8152-hpd-pin-decides",
+              "t8152-hpd-low-skips-status-wait")
 
 
 @pytest.fixture(scope="module")

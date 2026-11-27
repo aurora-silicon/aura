@@ -9,7 +9,9 @@
 #include "i2c.h"
 #include "iodev.h"
 #include "malloc.h"
+#include "memory.h"
 #include "pmgr.h"
+#include "sptm_virt.h"
 #include "string.h"
 #include "tps6598x.h"
 #include "tunables.h"
@@ -91,17 +93,33 @@ static bool usb_is_initialized = false;
 #define PIPEHANDLER_DUMMY_PHY_EN         BIT(15)
 #define PIPEHANDLER_NATIVE_POWER_DOWN    GENMASK(3, 0)
 
+/*
+ * Resolve the ADT path of a USB port node. Most ADTs number every port's nodes
+ * (usb-drd0, dart-usb0/mapper-usb0), but an ADT with a single port may name them
+ * without an index (J700: usb-drd, dart-usb/mapper-usb). Use the numbered node
+ * whenever it exists; for port 0 only, fall back to the unnumbered name when the
+ * numbered node is missing and the unnumbered one exists. An unnumbered node can
+ * only stand for the one port, so other indices never fall back.
+ */
+static void usb_adt_node_path(char *path, size_t size, const char *fmt, const char *unindexed,
+                              u32 idx)
+{
+    snprintf(path, size, fmt, idx, idx);
+    if (idx != 0 || adt_path_offset(adt, path) >= 0)
+        return;
+    if (adt_path_offset(adt, unindexed) >= 0) {
+        printf("usb: %s missing, using %s\n", path, unindexed);
+        snprintf(path, size, "%s", unindexed);
+    }
+}
+
 static dart_dev_t *usb_dart_init(u32 idx)
 {
     int mapper_offset;
     char path[sizeof(FMT_DART_MAPPER_PATH)];
 
-    snprintf(path, sizeof(path), FMT_DART_MAPPER_PATH, idx, idx);
+    usb_adt_node_path(path, sizeof(path), FMT_DART_MAPPER_PATH, "/arm-io/dart-usb/mapper-usb", idx);
     mapper_offset = adt_path_offset(adt, path);
-    if (mapper_offset < 0 && chip_id == T8140 && idx == 0) {
-        snprintf(path, sizeof(path), "/arm-io/dart-usb/mapper-usb");
-        mapper_offset = adt_path_offset(adt, path);
-    }
     if (mapper_offset < 0) {
         // Device not present
         return NULL;
@@ -113,21 +131,14 @@ static dart_dev_t *usb_dart_init(u32 idx)
         return NULL;
     }
 
-    snprintf(path, sizeof(path), FMT_DART_PATH, idx);
-    if (chip_id == T8140 && idx == 0 && adt_path_offset(adt, path) < 0)
-        snprintf(path, sizeof(path), "/arm-io/dart-usb");
+    usb_adt_node_path(path, sizeof(path), FMT_DART_PATH, "/arm-io/dart-usb", idx);
     return dart_init_adt(path, 1, dart_idx, false);
 }
 
 static int usb_drd_adt_offset(u32 idx, char drd_path[sizeof(FMT_DRD_PATH)], int *adt_drd_path)
 {
-    snprintf(drd_path, sizeof(FMT_DRD_PATH), FMT_DRD_PATH, idx);
-    int offset = adt_path_offset_trace(adt, drd_path, adt_drd_path);
-    if (offset < 0 && chip_id == T8140 && idx == 0) {
-        snprintf(drd_path, sizeof(FMT_DRD_PATH), "/arm-io/usb-drd");
-        offset = adt_path_offset_trace(adt, drd_path, adt_drd_path);
-    }
-    return offset;
+    usb_adt_node_path(drd_path, sizeof(FMT_DRD_PATH), FMT_DRD_PATH, "/arm-io/usb-drd", idx);
+    return adt_path_offset_trace(adt, drd_path, adt_drd_path);
 }
 
 /* T6050 has a different PIPE clock field. Never run the older automatic
@@ -140,7 +151,12 @@ bool usb_cdc_deferred_usb2(void)
     /* This is also queried on every proxy poll; the firmware ADT is fixed. */
     if (deferred < 0) {
         int node = adt_path_offset(adt, "/arm-io/atc-phy0");
-        deferred = node >= 0 && adt_is_compatible(adt, node, "atc-phy,t6050");
+        /*
+         * The J714c (M5 Max) enumerates through the generic gadget path on every port, as the
+         * omacom m1n1 Stage 1 does there; the explicit port-0 setup never comes up on it.
+         */
+        deferred = node >= 0 && adt_is_compatible(adt, node, "atc-phy,t6050") &&
+                   !adt_is_compatible(adt, 0, "J714cAP");
     }
     return deferred;
 }
@@ -298,9 +314,19 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
 /*
  * The ADT marks ports that must never run as a USB device with usb-device-disable, for
  * example the J773 front ports, whose hub prohibits device mode. Leave those alone.
+ *
+ * The T8140 CDC handoff (usb_cdc_link_start) is the exception: J700's ATC0 usb-drd carries
+ * the property too, yet that port is the debug port. The handoff has already cold-reset its
+ * HPM and taken the carrier over, and explicitly asks for device mode on it, so it bypasses
+ * the property. Every other bring-up still honours it.
  */
+static bool usb_cdc_device_override;
+
 static bool usb_device_mode_disabled(u32 idx)
 {
+    if (usb_cdc_device_override && chip_id == T8140 && idx == 0)
+        return false;
+
     int adt_drd_path[8];
     char drd_path[sizeof(FMT_DRD_PATH)];
     int node = usb_drd_adt_offset(idx, drd_path, adt_drd_path);
@@ -369,15 +395,11 @@ int usb_phy_bringup(u32 idx)
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
 
-    snprintf(path, sizeof(path), FMT_DART_PATH, idx);
-    if (chip_id == T8140 && idx == 0)
-        snprintf(path, sizeof(path), "/arm-io/dart-usb");
+    usb_adt_node_path(path, sizeof(path), FMT_DART_PATH, "/arm-io/dart-usb", idx);
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
 
-    snprintf(path, sizeof(path), FMT_DRD_PATH, idx);
-    if (chip_id == T8140 && idx == 0)
-        snprintf(path, sizeof(path), "/arm-io/usb-drd");
+    usb_adt_node_path(path, sizeof(path), FMT_DRD_PATH, "/arm-io/usb-drd", idx);
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
 
@@ -416,6 +438,122 @@ dwc3_dev_t *usb_iodev_bringup(u32 idx)
     return usb_dwc3_init_mode(usb_reg.drd_regs, usb_dart, chip_id == T8140);
 }
 
+#ifdef SPTM_VIRT
+/*
+ * IODEV_USB0 (CDC pipe 0) and IODEV_USB_VUART (CDC pipe 1) share one dwc3_dev_t with separate
+ * iodev->locks. Under SMP SPTM-virt guests, serialize all DWC3 operations across both pipes once
+ * the MMU is up, and keep console prints inside DWC3 error paths off console_lock to avoid a
+ * cross-CPU ABBA with iodev_console_write() -> USB0.
+ */
+static DECLARE_SPINLOCK(usb_dwc3_lock);
+
+static __attribute__((noinline)) bool usb_dwc3_lock_enter(void)
+{
+    if (!mmu_active())
+        return false;
+    spin_lock(&usb_dwc3_lock);
+    iodev_console_enter_nolock();
+    return true;
+}
+
+static __attribute__((noinline)) void usb_dwc3_lock_leave(bool lk)
+{
+    if (!lk)
+        return;
+    iodev_console_leave_nolock();
+    spin_unlock(&usb_dwc3_lock);
+}
+
+static ssize_t usb_pipe_can_read(void *dev, cdc_acm_pipe_id_t pipe)
+{
+    bool lk = usb_dwc3_lock_enter();
+    ssize_t r = usb_dwc3_can_read(dev, pipe);
+    usb_dwc3_lock_leave(lk);
+    return r;
+}
+
+static bool usb_pipe_can_write(void *dev, cdc_acm_pipe_id_t pipe)
+{
+    bool lk = usb_dwc3_lock_enter();
+    bool r = usb_dwc3_can_write(dev, pipe);
+    usb_dwc3_lock_leave(lk);
+    return r;
+}
+
+static ssize_t usb_pipe_read(void *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t count)
+{
+    bool lk = usb_dwc3_lock_enter();
+    ssize_t r = usb_dwc3_read(dev, pipe, buf, count);
+    usb_dwc3_lock_leave(lk);
+    return r;
+}
+
+static ssize_t usb_pipe_write(void *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
+{
+    bool lk = usb_dwc3_lock_enter();
+    ssize_t r = usb_dwc3_write(dev, pipe, buf, count);
+    usb_dwc3_lock_leave(lk);
+    return r;
+}
+
+static ssize_t usb_pipe_queue(void *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
+{
+    bool lk = usb_dwc3_lock_enter();
+    ssize_t r = usb_dwc3_queue(dev, pipe, buf, count);
+    usb_dwc3_lock_leave(lk);
+    return r;
+}
+
+static void usb_pipe_handle_events(void *dev)
+{
+    bool lk = usb_dwc3_lock_enter();
+    usb_dwc3_handle_events(dev);
+    usb_dwc3_lock_leave(lk);
+}
+
+static void usb_pipe_flush(void *dev, cdc_acm_pipe_id_t pipe)
+{
+    bool lk = usb_dwc3_lock_enter();
+    usb_dwc3_flush(dev, pipe);
+    usb_dwc3_lock_leave(lk);
+}
+
+#define USB_IODEV_WRAPPER(name, pipe)                                                              \
+    static ssize_t usb_##name##_can_read(void *dev)                                                \
+    {                                                                                              \
+        return usb_pipe_can_read(dev, pipe);                                                       \
+    }                                                                                              \
+                                                                                                   \
+    static bool usb_##name##_can_write(void *dev)                                                  \
+    {                                                                                              \
+        return usb_pipe_can_write(dev, pipe);                                                      \
+    }                                                                                              \
+                                                                                                   \
+    static ssize_t usb_##name##_read(void *dev, void *buf, size_t count)                           \
+    {                                                                                              \
+        return usb_pipe_read(dev, pipe, buf, count);                                               \
+    }                                                                                              \
+                                                                                                   \
+    static ssize_t usb_##name##_write(void *dev, const void *buf, size_t count)                    \
+    {                                                                                              \
+        return usb_pipe_write(dev, pipe, buf, count);                                              \
+    }                                                                                              \
+                                                                                                   \
+    static ssize_t usb_##name##_queue(void *dev, const void *buf, size_t count)                    \
+    {                                                                                              \
+        return usb_pipe_queue(dev, pipe, buf, count);                                              \
+    }                                                                                              \
+                                                                                                   \
+    static void usb_##name##_handle_events(void *dev)                                              \
+    {                                                                                              \
+        usb_pipe_handle_events(dev);                                                               \
+    }                                                                                              \
+                                                                                                   \
+    static void usb_##name##_flush(void *dev)                                                      \
+    {                                                                                              \
+        usb_pipe_flush(dev, pipe);                                                                 \
+    }
+#else
 #define USB_IODEV_WRAPPER(name, pipe)                                                              \
     static ssize_t usb_##name##_can_read(void *dev)                                                \
     {                                                                                              \
@@ -451,11 +589,12 @@ dwc3_dev_t *usb_iodev_bringup(u32 idx)
     {                                                                                              \
         usb_dwc3_flush(dev, pipe);                                                                 \
     }
+#endif
 
 USB_IODEV_WRAPPER(0, CDC_ACM_PIPE_0)
 USB_IODEV_WRAPPER(1, CDC_ACM_PIPE_1)
 
-static struct iodev_ops iodev_usb_ops = {
+struct iodev_ops iodev_usb_ops = {
     .can_read = usb_0_can_read,
     .can_write = usb_0_can_write,
     .read = usb_0_read,
@@ -530,9 +669,13 @@ void usb_init(void)
         return;
 
     /* This PHY requires a deferred carrier transition; normal boots never
-     * enter this fallback path before handing over to the OS. */
+     * enter this fallback path before handing over to the OS. The schedule
+     * takes 1 to 15 s (usb_cdc_state_schedule()); a shorter delay is refused,
+     * which left a host-less proxy here with no carrier and without the CDC
+     * watchdog (usb_cdc_arm_watchdog()) that resets a proxy nobody opens. */
     if (chip_id == T8140) {
-        if (!usb_cdc_ready() && !usb_cdc_owns_carrier() && usb_cdc_schedule(0, 0, BIT(1) | BIT(2)))
+        if (!usb_cdc_ready() && !usb_cdc_owns_carrier() &&
+            usb_cdc_schedule(1000, 0, BIT(1) | BIT(2)))
             printf("usb: unable to schedule proxy transport\n");
         return;
     }
@@ -594,6 +737,41 @@ void usb_hpm_restore_irqs(bool force)
     tps6598x_foreach_hpm(usb_hpm_restore_irqs_match, usb_hpm_restore_irqs_one, &force);
 }
 
+/*
+ * Hand a guest the USB-C ports it owns as a power-on would: cold reset each one's controller, then
+ * give back the interrupt masks usb_init() saved. A port keeps its PD contract and alternate mode
+ * across a SoC reset, so without this the guest's port is still in whatever DisplayPort state the
+ * previous OS left (mode, lanes, HPD), and macOS reconfigures it while its display coprocessor is
+ * already reading the sink. After the reset the port attaches from scratch under the guest's own
+ * driver, as on a cold boot. Ports aura still uses are skipped, like usb_hpm_restore_irqs(false).
+ */
+static int usb_hpm_fresh_attach_one(char *hpm_path, tps6598x_dev_t *tps, void *unused)
+{
+    (void)unused;
+    int idx = hpm_idx(hpm_path);
+
+    if (tps6598x_cold_reset(tps) || tps6598x_wait_app(tps, 2000)) {
+        printf("usb: %s did not come back from a cold reset\n", hpm_path);
+        return 0;
+    }
+    if (tps6598x_powerup(tps) < 0)
+        printf("usb: tps6598x_powerup failed for %s\n", hpm_path);
+    if (tps6598x_restore_irqs(tps, &tps6598x_irq_state[idx]))
+        printf("usb: unable to restore IRQ masks for %s\n", hpm_path);
+    printf("usb: %s cold reset for the guest\n", hpm_path);
+    return 0;
+}
+
+void usb_hpm_fresh_attach(void)
+{
+    if (adt_path_offset(adt, "/arm-io/otgphyctrl") > 0 &&
+        adt_path_offset(adt, "/arm-io/usb-complex") > 0)
+        return;
+
+    bool force = false;
+    tps6598x_foreach_hpm(usb_hpm_restore_irqs_match, usb_hpm_fresh_attach_one, &force);
+}
+
 void usb_iodev_init(void)
 {
     /* Preserve the debug carrier; normal USB initialization can retire it. */
@@ -626,17 +804,32 @@ void usb_iodev_init(void)
     }
 }
 
-void usb_iodev_shutdown(void)
+/* False when a controller may still reach its DMA buffers (they are retained, see usb_dwc3.h). */
+bool usb_iodev_shutdown(void)
 {
+    return usb_iodev_shutdown_except(IODEV_MAX);
+}
+
+/* usb_iodev_shutdown(), but the controller behind keep stays up. */
+bool usb_iodev_shutdown_except(iodev_id_t keep)
+{
+    bool stopped = true;
+
     for (int i = FIRST_USB_IODEV; i < USB_IODEV_COUNT; i++) {
+        if ((iodev_id_t)(IODEV_USB0 + i) == keep)
+            continue;
         struct iodev *usb_iodev = iodev_unregister_device(IODEV_USB0 + i);
         if (!usb_iodev)
             continue;
 
         printf("USB%d: shutdown\n", i);
-        usb_dwc3_shutdown(usb_iodev->opaque);
+        if (!usb_dwc3_shutdown(usb_iodev->opaque)) {
+            printf("USB%d: controller not stopped, its DMA buffers are retained\n", i);
+            stopped = false;
+        }
         free(usb_iodev);
     }
+    return stopped;
 }
 
 void usb_iodev_vuart_setup(iodev_id_t iodev)
@@ -645,6 +838,30 @@ void usb_iodev_vuart_setup(iodev_id_t iodev)
         return;
 
     iodev_usb_vuart.opaque = iodev_get_opaque(iodev);
+}
+
+/*
+ * The waits of the CDC link's bring-up. Under the virtualized SPTM the link can come back on a
+ * running macOS, where the bring-up runs on a coroutine and these give the core back to the guest
+ * instead of spinning.
+ */
+void usb_cdc_wait_us(u32 us)
+{
+    if (!sptm_virt_s2r_usb_yield(us) && us)
+        udelay(us);
+}
+
+int usb_cdc_poll32(u64 addr, u32 mask, u32 target, u32 timeout_us)
+{
+    if (!sptm_virt_s2r_usb_yieldable())
+        return poll32(addr, mask, target, timeout_us);
+    u64 end = mrs(CNTPCT_EL0) + (u64)timeout_us * mrs(CNTFRQ_EL0) / 1000000;
+    while ((read32(addr) & mask) != target) {
+        if (mrs(CNTPCT_EL0) >= end)
+            return -1;
+        usb_cdc_wait_us(0);
+    }
+    return 0;
 }
 
 int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
@@ -677,11 +894,16 @@ int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
         return -1;
     set_step(3);
     usb_cdc_atc_force_swapped(force_swapped);
-    if (usb_phy_bringup(0))
+    usb_cdc_device_override = true;
+    int phy = usb_phy_bringup(0);
+    if (phy) {
+        usb_cdc_device_override = false;
         return -1;
+    }
 
     set_step(4);
     dwc3_dev_t *dwc = usb_iodev_bringup(0);
+    usb_cdc_device_override = false;
     if (!dwc)
         return -1;
 

@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_sdreader_power(tmp_path):
     smc = (ROOT / "src/smc.c").read_text()
     pcie = (ROOT / "src/pcie_t6050.c").read_text()
-    decoder = smc[smc.index("struct smc_adt_function {"):]
+    decoder = smc[smc.index("struct smc_adt_function_prop {"):]
     helper = pcie[pcie.index("static int sdreader_power("):pcie.index("/* B-G for one port")]
     port_up = pcie[pcie.index("static int port_up("):pcie.index("/* Renumber the up ports")]
     assert "TRY(sdreader_power(pp));\n    if (read32" in port_up
@@ -32,6 +32,7 @@ def test_sdreader_power(tmp_path):
 typedef uint32_t u32;
 typedef uint64_t u64;
 typedef int smc_dev_t;
+struct smc_adt_function { u32 key, lo, hi; bool wide; };
 struct port_regs { char bridge[40]; };
 static void *adt;
 static int opens, writes, closes, delays, bits;
@@ -41,18 +42,28 @@ static u64 values[2];
 
 #define BRIDGE "/arm-io/apcie0/pci-bridge3"
 #define FAIL(...) do { return -1; } while (0)
+#define min(a, b) ((a) < (b) ? (a) : (b))
 #define ADT_GETPROP(a,n,p,v) get_phandle(n, p, v)
-#define ADT_FOREACH_CHILD(a,n) for ((n) = 3; (n) <= 4; (n)++)
+static int next_child(int parent, int cur)
+{
+    if (parent == 1) return cur == 1 ? 5 : -1;
+    if (parent == 2) return cur == 2 ? 3 : (cur == 3 ? 4 : -1);
+    return -1;
+}
+#define ADT_FOREACH_CHILD(a,n) for (int _p = (n); ((n) = next_child(_p, (n))) >= 0; )
 static int get_phandle(int n, const char *p, u32 *v)
 {
-    assert(n == 1 && !strcmp(p, "AAPL,phandle"));
-    *v = 42;
-    return provider ? 4 : -1;
+    assert(!strcmp(p, "AAPL,phandle"));
+    if (n == 5 && provider) {
+        *v = 42;
+        return 4;
+    }
+    return -1;
 }
 static int adt_path_offset(void *a, const char *path)
 {
     (void)a;
-    if (!strcmp(path, "/arm-io/smc/iop-smc-nub/smc-pmu")) return provider ? 1 : -1;
+    if (!strcmp(path, "/arm-io/smc")) return provider ? 1 : -1;
     if (!strcmp(path, BRIDGE)) return 2;
     if (!strcmp(path, BRIDGE "/card-reader")) return 4;
     return -1;

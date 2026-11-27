@@ -200,6 +200,16 @@ int j873_usb_prep(void)
     return ret;
 }
 
+/* Wake the USB hosts' port controllers again after something sent them back to sleep. */
+void j873_usb_wake_hpms(void)
+{
+    if (chip_id != T8152 || board_id != 0x24)
+        return;
+    for (size_t i = 0; i < ARRAY_SIZE(j873_usb); i++)
+        if (j873_usb[i].hpm)
+            j873_hpm_wake(j873_usb[i].hpm);
+}
+
 /*
  * Internal PCIe (apcie): iBoot leaves the root complex enabled, but the AUS5
  * PHY gated and RC reg 4 (lane configuration) at 0x103, which gives every

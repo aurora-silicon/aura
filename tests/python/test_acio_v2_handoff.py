@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: MIT
-"""USB4 router (ACIO) and PCIe-C DART handoff by router generation.
+"""USB4 router (ACIO) handoff by router generation.
 
-Runs kboot.c's ACIO helpers, dt_set_acio_tunables(), dt_append_acio_tunable() and
-dt_copy_pciec_dart_tunables() as they are, against a mock ADT and real FDTs:
+Runs kboot.c's ACIO helpers and dt_set_acio_tunables() as they are against a
+mock ADT and real FDTs:
 
 - v2 routers ("acio,v2") keep their cio@ node: its root complex is ADT reg 1, not reg 2;
 - v2 routers take the NHI table whose per-direction fabric lists are optional;
-- a PCIe-C DART whose ADT node has no table gets an empty apple,tunable, and one with
-  a table gets it converted;
-- a v2 router's own DART (the NHI's first iommus entry) gets its ADT table converted.
+- the router AP firmware table goes only to a router whose reg names that
+  window, and each row must fall inside it.
 """
 
 from pathlib import Path
@@ -25,13 +24,11 @@ def between(source, start, end):
 def test_acio_generation_handoff(tmp_path):
     source = (ROOT / "src/kboot.c").read_text()
     assert 'dt_disable_missing_devs("acio", "cio@", 8, adt_acio_rc_regnum())' in source
-    assert ("if (adt_acio_is_v2(adt_node))\n            dt_copy_usb4_dart_tunables(i, fdt_alias);"
-            in source)
+    assert "dt_copy_usb4_dart_tunables" not in source
     tables = between(source, "struct adt_tunable_info {", "struct acio_tunable {")
-    append = between(source, "struct acio_tunable {", "static u8 crc8(")
+    append = between(source, "struct acio_tunable {", "static int dt_append_dart_tunable(")
     acio = between(source, "/* The router generation is in the ADT",
                    "static const struct adt_tunable_info pciec_tunables[]")
-    dart = between(source, "/* Copy calibration at boot", "static int dt_set_pcie_tunables(void)")
 
     run_c(tmp_path, "acio-v2-handoff", r'''
 #include <assert.h>
@@ -93,7 +90,7 @@ static const void *nhi_table[MAX_CIO_DEVS];
 static size_t nhi_count[MAX_CIO_DEVS];
 static int rc_calls;
 
-''' + tables + r'''
+''' + tables + append + r'''
 static int dt_copy_acio_tunables(const char *adt_path, const char *dt_alias,
                                  const struct adt_tunable_info *tunables, size_t n_tunables)
 {
@@ -115,7 +112,7 @@ static int dt_copy_usb4_drom(const char *adt_path, const char *dt_alias, u64 uui
     return 0;
 }
 
-''' + append + acio + dart + r'''
+''' + acio + r'''
 
 static const struct mnode v1[] = {
     {"/arm-io/acio0", "acio", {{0}}},
@@ -128,79 +125,9 @@ static const struct mnode v2[] = {
     {"/arm-io/acio3", "acio,v2", {{0}}},
 };
 
-/* offset, size (bytes), mask, value: one 24-byte ADT tunable entry. */
-static const u32 dart_table[] = {0x20c, 4, 0xff000007, 0, 0xec000007, 0};
-
-static const struct mnode pciec[] = {
-    {"/arm-io/dart-apciec0", "dart,t8110", {{0}}},
-    {"/arm-io/dart-apciec1", "dart,t8110",
-     {{"dart-tunables-instance-0", dart_table, sizeof(dart_table)}}},
-};
-
-static const struct mnode routers[] = {
-    {"/arm-io/dart-acio0", "dart,t8110",
-     {{"dart-tunables-instance-0", dart_table, sizeof(dart_table)}}},
-    {"/arm-io/dart-acio1", "dart,t8110", {{0}}},
-    {"/arm-io/dart-acio5", "dart,t8110",
-     {{"dart-tunables-instance-0", dart_table, sizeof(dart_table)}}},
-};
-
-/* A router's NHI with its DART as the first iommus entry, or none. */
-static void add_router(int index, u32 dart_phandle, bool iommus)
-{
-    char name[32], alias[32], path[40];
-    u32 refs[4] = {cpu_to_fdt32(dart_phandle), 0, cpu_to_fdt32(dart_phandle), cpu_to_fdt32(1)};
-
-    snprintf(name, sizeof(name), "dart@%d", index);
-    int node = fdt_add_subnode(dt, 0, name);
-    assert(node >= 0);
-    assert(fdt_setprop_string(dt, node, "compatible", "apple,t8110-dart") == 0);
-    assert(fdt_setprop_u32(dt, node, "phandle", dart_phandle) == 0);
-
-    snprintf(name, sizeof(name), "nhi@%d", index);
-    node = fdt_add_subnode(dt, 0, name);
-    assert(node >= 0);
-    if (iommus)
-        assert(fdt_setprop(dt, node, "iommus", refs, sizeof(refs)) == 0);
-
-    snprintf(alias, sizeof(alias), "usb4_%d_nhi", index);
-    snprintf(path, sizeof(path), "/nhi@%d", index);
-    int aliases = fdt_path_offset(dt, "/aliases");
-    if (aliases < 0)
-        aliases = fdt_add_subnode(dt, 0, "aliases");
-    assert(aliases >= 0);
-    assert(fdt_setprop_string(dt, aliases, alias, path) == 0);
-}
-
-static void add_host(int index, u32 dart_phandle)
-{
-    char name[32], alias[32], path[40];
-    u32 map[4] = {0, cpu_to_fdt32(dart_phandle), 0, cpu_to_fdt32(0x40)};
-
-    snprintf(name, sizeof(name), "iommu@%d", index);
-    int node = fdt_add_subnode(dt, 0, name);
-    assert(node >= 0);
-    assert(fdt_setprop_string(dt, node, "compatible", "apple,t8110-dart") == 0);
-    assert(fdt_setprop_u32(dt, node, "phandle", dart_phandle) == 0);
-
-    snprintf(name, sizeof(name), "pcie@%d", index);
-    node = fdt_add_subnode(dt, 0, name);
-    assert(node >= 0);
-    assert(fdt_setprop(dt, node, "iommu-map", map, sizeof(map)) == 0);
-
-    snprintf(alias, sizeof(alias), "usb4_%d_pcie", index);
-    snprintf(path, sizeof(path), "/pcie@%d", index);
-    int aliases = fdt_path_offset(dt, "/aliases");
-    if (aliases < 0)
-        aliases = fdt_add_subnode(dt, 0, "aliases");
-    assert(aliases >= 0);
-    assert(fdt_setprop_string(dt, aliases, alias, path) == 0);
-}
-
 int main(void)
 {
     static unsigned char blob[16384];
-    int len;
 
     dt = blob;
     assert(fdt_create_empty_tree(dt, sizeof(blob)) == 0);
@@ -231,68 +158,75 @@ int main(void)
         assert(usb4_v2_nhi_tunables[i].required == published);
     }
 
+    /* The AP firmware table: only into a router whose reg names its window, bounded by it. */
+    static const struct acio_tunable inside[] = {{8, 4, 0xff2, 0x482}};
+    static const struct acio_tunable outside[] = {{8, 4, 0xff2, 0x482}, {0x4000, 4, 1, 1}};
+    static const struct mnode apfw[] = {
+        {"/arm-io/acio0", "acio,v2", {{"pcie_router_ap_fw", inside, sizeof(inside)}}},
+        {"/arm-io/acio1", "acio,v2", {{"pcie_router_ap_fw", outside, sizeof(outside)}}},
+    };
+    static const fdt32_t one[] = {0, 0x1000, 0, 0xc000};
+    static const fdt32_t two[] = {0, 0x1000, 0, 0xc000, 0, 0x2000, 0, 0x4000};
+    const fdt32_t two_be[] = {
+        cpu_to_fdt32(two[0]), cpu_to_fdt32(two[1]), cpu_to_fdt32(two[2]), cpu_to_fdt32(two[3]),
+        cpu_to_fdt32(two[4]), cpu_to_fdt32(two[5]), cpu_to_fdt32(two[6]), cpu_to_fdt32(two[7]),
+    };
+    const fdt32_t one_be[] = {
+        cpu_to_fdt32(one[0]), cpu_to_fdt32(one[1]), cpu_to_fdt32(one[2]), cpu_to_fdt32(one[3]),
+    };
+    static const char names[] = "rc\0router-ap-fw";
+    int soc, aliases, len;
+    const fdt32_t *got;
+
+    nodes = apfw;
+    nnodes = ARRAY_SIZE(apfw);
+    assert(fdt_create_empty_tree(dt, sizeof(blob)) == 0);
+    soc = fdt_add_subnode(dt, 0, "soc");
+    assert(soc >= 0);
+    assert(!fdt_setprop_u32(dt, soc, "#address-cells", 2));
+    assert(!fdt_setprop_u32(dt, soc, "#size-cells", 2));
+    const char *routers[] = {"acio@0", "acio@1", "acio@2", "acio@3"};
+    for (int r = 0; r < 4; r++) {
+        int n = fdt_add_subnode(dt, fdt_path_offset(dt, "/soc"), routers[r]);
+        assert(n >= 0);
+        if (r == 2) {
+            /* No router-ap-fw window */
+            assert(!fdt_setprop(dt, n, "reg", one_be, sizeof(one_be)));
+            assert(!fdt_setprop_string(dt, n, "reg-names", "rc"));
+        } else {
+            assert(!fdt_setprop(dt, n, "reg", two_be, sizeof(two_be)));
+            assert(!fdt_setprop(dt, n, "reg-names", names, sizeof(names)));
+        }
+        if (r == 3)
+            assert(!fdt_setprop_u32(dt, n, "apple,tunable-router-ap-fw", 0x1234));
+    }
+    aliases = fdt_add_subnode(dt, 0, "aliases");
+    assert(aliases >= 0);
+    for (int r = 0; r < 4; r++) {
+        char alias[16], path[16];
+        snprintf(alias, sizeof(alias), "usb4-%d-acio", r);
+        snprintf(path, sizeof(path), "/soc/%s", routers[r]);
+        assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/aliases"), alias, path));
+    }
+
+    dt_copy_router_ap_fw_tunable(0, "usb4-0-acio");
+    got = fdt_getprop(dt, fdt_path_offset(dt, "/soc/acio@0"), "apple,tunable-router-ap-fw", &len);
+    assert(got && len == 12 && fdt32_to_cpu(got[0]) == 8 && fdt32_to_cpu(got[1]) == 0xff2 &&
+           fdt32_to_cpu(got[2]) == 0x482);
+    /* A row past the 0x4000 window: nothing is left behind. */
+    dt_copy_router_ap_fw_tunable(1, "usb4-1-acio");
+    assert(!fdt_getprop(dt, fdt_path_offset(dt, "/soc/acio@1"), "apple,tunable-router-ap-fw", NULL));
+    /* No router-ap-fw reg-name: the kernel would ignore the table, so it is not copied. */
+    dt_copy_router_ap_fw_tunable(0, "usb4-2-acio");
+    assert(!fdt_getprop(dt, fdt_path_offset(dt, "/soc/acio@2"), "apple,tunable-router-ap-fw", NULL));
+    /* A tree's own table wins. */
+    dt_copy_router_ap_fw_tunable(0, "usb4-3-acio");
+    got = fdt_getprop(dt, fdt_path_offset(dt, "/soc/acio@3"), "apple,tunable-router-ap-fw", &len);
+    assert(got && len == 4 && fdt32_to_cpu(got[0]) == 0x1234);
+
     /* No router at all (T8140): nothing to do, generation defaults to v1. */
     nnodes = 0;
     assert(adt_acio_rc_regnum() == 2);
-
-    /* PCIe-C DARTs: no ADT table -> empty list; ADT table -> converted. */
-    assert(fdt_create_empty_tree(dt, sizeof(blob)) == 0);
-    add_host(0, 10);
-    add_host(1, 11);
-    nodes = pciec;
-    nnodes = ARRAY_SIZE(pciec);
-
-    assert(dt_copy_pciec_dart_tunables("/arm-io/dart-apciec0", "usb4_0_pcie") == 0);
-    const void *prop = fdt_getprop(dt, fdt_path_offset(dt, "/iommu@0"), "apple,tunable", &len);
-    assert(prop && len == 0);
-
-    assert(dt_copy_pciec_dart_tunables("/arm-io/dart-apciec1", "usb4_1_pcie") == 0);
-    const fdt32_t *cells = fdt_getprop(dt, fdt_path_offset(dt, "/iommu@1"), "apple,tunable", &len);
-    assert(cells && len == 3 * 4);
-    assert(fdt32_to_cpu(cells[0]) == 0x20c);
-    assert(fdt32_to_cpu(cells[1]) == 0xff000007);
-    assert(fdt32_to_cpu(cells[2]) == 0xec000007);
-
-    /* A board table is kept as it is. */
-    assert(dt_copy_pciec_dart_tunables("/arm-io/dart-apciec0", "usb4_0_pcie") == 0);
-    prop = fdt_getprop(dt, fdt_path_offset(dt, "/iommu@0"), "apple,tunable", &len);
-    assert(prop && len == 0);
-
-    /* No ADT node: refused and nothing written. */
-    add_host(2, 12);
-    assert(dt_copy_pciec_dart_tunables("/arm-io/dart-apciec2", "usb4_2_pcie") == -1);
-    assert(!fdt_getprop(dt, fdt_path_offset(dt, "/iommu@2"), "apple,tunable", NULL));
-
-    /* v2 router DARTs: the ADT table is converted onto the NHI's DART. */
-    assert(fdt_create_empty_tree(dt, sizeof(blob)) == 0);
-    add_router(0, 20, true);
-    add_router(1, 21, true);
-    add_router(2, 22, true);
-    add_router(5, 25, false);
-    nodes = routers;
-    nnodes = ARRAY_SIZE(routers);
-
-    assert(dt_copy_usb4_dart_tunables(0, "usb4_0_nhi") == 0);
-    cells = fdt_getprop(dt, fdt_path_offset(dt, "/dart@0"), "apple,tunable", &len);
-    assert(cells && len == 3 * 4);
-    assert(fdt32_to_cpu(cells[0]) == 0x20c);
-    assert(fdt32_to_cpu(cells[1]) == 0xff000007);
-    assert(fdt32_to_cpu(cells[2]) == 0xec000007);
-
-    /* Run again: the table already there is kept, not doubled. */
-    assert(dt_copy_usb4_dart_tunables(0, "usb4_0_nhi") == 0);
-    cells = fdt_getprop(dt, fdt_path_offset(dt, "/dart@0"), "apple,tunable", &len);
-    assert(cells && len == 3 * 4);
-
-    /* ADT DART without a table, or no ADT DART at all: nothing written. */
-    assert(dt_copy_usb4_dart_tunables(1, "usb4_1_nhi") == 0);
-    assert(!fdt_getprop(dt, fdt_path_offset(dt, "/dart@1"), "apple,tunable", NULL));
-    assert(dt_copy_usb4_dart_tunables(2, "usb4_2_nhi") == 0);
-    assert(!fdt_getprop(dt, fdt_path_offset(dt, "/dart@2"), "apple,tunable", NULL));
-
-    /* An NHI that names no DART: refused, nothing written. */
-    assert(dt_copy_usb4_dart_tunables(5, "usb4_5_nhi") == -1);
-    assert(!fdt_getprop(dt, fdt_path_offset(dt, "/dart@5"), "apple,tunable", NULL));
     return 0;
 }
 ''')

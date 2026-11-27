@@ -17,6 +17,7 @@
 #define TPS_REG_INT_EVENT1  0x14
 #define TPS_REG_INT_MASK1   0x16
 #define TPS_REG_INT_CLEAR1  0x18
+#define TPS_REG_STATUS      0x1a
 #define TPS_REG_POWER_STATE 0x20
 #define TPS_MODE_DBMA       ((u32)'D' | ((u32)'B' << 8) | ((u32)'M' << 16) | ((u32)'a' << 24))
 
@@ -204,6 +205,26 @@ int tps6598x_cold_reset(tps6598x_dev_t *dev)
     return 0;
 }
 
+/* After tps6598x_cold_reset(): wait until the controller runs its application firmware again. */
+int tps6598x_wait_app(tps6598x_dev_t *dev, unsigned timeout_ms)
+{
+    u64 start = get_ticks();
+
+    do {
+        u8 mode[4];
+        if (dev->spmi)
+            spmi_send_wakeup(dev->spmi, dev->addr);
+        if (tps6598x_read_reg(dev, TPS_REG_MODE, mode, sizeof(mode)) == sizeof(mode) &&
+            !memcmp(mode, "APP ", sizeof(mode))) {
+            dev->resetting = false;
+            return 0;
+        }
+        mdelay(10);
+    } while (ticks_to_msecs(get_ticks() - start) < timeout_ms);
+
+    return -1;
+}
+
 int tps6598x_cmd_status(tps6598x_dev_t *dev, const char *cmd)
 {
     u32 cmd_status;
@@ -290,6 +311,19 @@ int tps6598x_restore_irqs(tps6598x_dev_t *dev, tps6598x_irq_state_t *state)
     }
 #endif
 
+    return 0;
+}
+
+int tps6598x_read_status(tps6598x_dev_t *dev, u32 *status, u32 *data_status)
+{
+    u8 buf[4];
+
+    if (tps6598x_read_reg(dev, TPS_REG_STATUS, buf, sizeof(buf)) != sizeof(buf))
+        return -1;
+    memcpy(status, buf, sizeof(buf));
+    if (tps6598x_read_reg(dev, TPS6598X_REG_DATA_STATUS, buf, sizeof(buf)) != sizeof(buf))
+        return -1;
+    memcpy(data_status, buf, sizeof(buf));
     return 0;
 }
 

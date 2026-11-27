@@ -74,6 +74,7 @@ def prepare(args, s, raw):
         print("RAM_UPLOAD_VERIFIED", name, len(data), hashes[name], time.monotonic() - start, flush=True)
     payloads = state["payloads"]
     p = s.p
+    # kboot_prepare_dt reserves the MTE tag store, or appends arm64.nomte.
     bootargs = ("earlycon=dockchannel,0x38812c000 console=tty0 console=ttyDC0 keep_bootcon "
                 "maxcpus=1 nokaslr rdinit=/init panic=0")
     # Success is the chosen-table slot index, not necessarily zero.

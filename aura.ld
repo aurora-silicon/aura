@@ -131,7 +131,6 @@ SECTIONS {
          * it pushes .text past its next 64 KiB step, and .data past _file_limit.
          */
         *hv/hv_vm.o(.text .text.*)
-        *hv/hv_sprr.o(.text .text.*)
         *hv/hv_virtio.o(.text .text.*)
         *hv/hv_vuart.o(.text .text.*)
         *hv/hv_wdt.o(.text .text.*)
@@ -142,14 +141,15 @@ SECTIONS {
         *librust.a:*ed25519_compact*(.text .text.*)
     } :text
     .text : ALIGN(0x10000) {
-        *(.text)
-        *(.text.*)
+        *(EXCLUDE_FILE(*sptm_virt*.o) .text .text.*)
         . = ALIGN(8);
         *(.got.plt)
         . = ALIGN(0x10000);
     } :text
     _text_size = . - _text_start;
     .rodata : ALIGN(0x10000) {
+        /* Guest-only code uses the existing executable read-only region. */
+        *sptm_virt*.o(.text .text.*)
         *(.rodata)
         *(.rodata.*)
         . = ALIGN(8);

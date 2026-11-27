@@ -169,9 +169,29 @@ def read_seed(path):
     return seed
 
 
+LOAD_HEADER = 0x808  # start.S: "AURALOAD", version, flags, _image_footprint
+
+
+def payload_region(data):
+    """The bytes after the aura image, where payloads and config lines are appended.
+
+    An aura image runs from _base to _end, the end of its stack (the "STACKBOT" quad), and
+    _payload_start is _end: the load header's footprint is the image's own size. The image itself
+    holds the "chosen.aurora,measure-%d=" format string, so only what follows it is searched. Data
+    that is not an aura image is searched whole.
+    """
+    if data[LOAD_HEADER:LOAD_HEADER + 8] == b"AURALOAD" and len(data) >= LOAD_HEADER + 24:
+        (footprint,) = struct.unpack_from("<Q", data, LOAD_HEADER + 16)
+        if LOAD_HEADER + 24 <= footprint <= len(data) and data[footprint - 8:footprint] == b"STACKBOT":
+            return data[footprint:]
+    return data
+
+
 def forbid_measure_lines(data):
-    # An image must not carry lines that only an earlier stage may append.
-    if b"chosen.aurora,measure-" in data:
+    # An image must not carry lines that only an earlier stage may append. A config line starts
+    # wherever the payload before it ends (the first one follows the compressed U-Boot with no
+    # newline), so the whole appended region is searched, not just line starts.
+    if b"chosen.aurora,measure-" in payload_region(data):
         sys.exit("refusing to sign: the image carries chosen.aurora,measure- lines")
 
 

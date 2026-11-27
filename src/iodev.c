@@ -2,8 +2,13 @@
 
 // #define DEBUG_IODEV
 
+#include "../build/build_cfg.h"
+
 #include "iodev.h"
 #include "memory.h"
+#ifdef SPTM_VIRT
+#include "smp.h"
+#endif
 #include "string.h"
 
 #ifdef DEBUG_IODEV
@@ -40,6 +45,7 @@ void iodev_register_device(iodev_id_t id, struct iodev *dev)
 {
     if (id >= IODEV_MAX)
         return;
+    sysop("dmb ish"); /* a re-take registers it with other cores running (sptm_virt_s2r.c) */
     iodevs[id] = dev;
 }
 
@@ -181,6 +187,25 @@ void iodev_unlock(iodev_id_t id)
 int in_iodev = 0;
 
 static DECLARE_SPINLOCK(console_lock);
+#ifdef SPTM_VIRT
+static int console_nolock[MAX_CPUS];
+
+void iodev_console_enter_nolock(void)
+{
+    int cpu = smp_id();
+
+    if (cpu >= 0 && cpu < MAX_CPUS)
+        console_nolock[cpu]++;
+}
+
+void iodev_console_leave_nolock(void)
+{
+    int cpu = smp_id();
+
+    if (cpu >= 0 && cpu < MAX_CPUS && console_nolock[cpu] > 0)
+        console_nolock[cpu]--;
+}
+#endif
 
 static void _iodev_console_write_helper(iodev_id_t iod, char prefix, const void *buf, size_t length)
 {
@@ -206,8 +231,17 @@ void iodev_console_write(const void *buf, size_t length)
         return;
     }
 
-    if (do_lock)
+    if (do_lock) {
+#ifdef SPTM_VIRT
+        int cpu = smp_id();
+        if (cpu >= 0 && cpu < MAX_CPUS && console_nolock[cpu]) {
+            _iodev_console_write_helper(IODEV_UART, '+', buf, length);
+            _iodev_console_write_helper(IODEV_DOCKCHANNEL_UART, '+', buf, length);
+            return;
+        }
+#endif
         spin_lock(&console_lock);
+    }
 
     if (in_iodev) {
         _iodev_console_write_helper(IODEV_UART, '+', buf, length);

@@ -112,8 +112,7 @@ _gxf_vectors:
     mov x9, '5'
     b _gxf_exc_unk
     .align 7
-    mov x9, '6'
-    b _gxf_exc_unk
+    b _gxf_fiq
     .align 7
     b _gxf_serr
     .align 7
@@ -122,8 +121,7 @@ _gxf_vectors:
     mov x9, '9'
     b _gxf_exc_unk
     .align 7
-    mov x9, 'a'
-    b _gxf_exc_unk
+    b _gxf_fiq
     .align 7
     b _gxf_serr
     .align 7
@@ -146,6 +144,15 @@ _gxf_exc_sync:
     str x30, [sp, #-16]!
     bl _gxf_exc_entry
     bl exc_sync
+    b _gxf_exc_return
+
+/* A FIQ taken into GL2: one for the virtualized SPTM's secure kernel while it runs at GL1. */
+_gxf_fiq:
+    msr pan, #0
+    sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
+    str x30, [sp, #-16]!
+    bl _gxf_exc_entry
+    bl exc_fiq
     b _gxf_exc_return
 
 _gxf_serr:

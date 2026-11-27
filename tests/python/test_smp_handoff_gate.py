@@ -45,11 +45,16 @@ static void *dt = (void *)0x1000;
 static int dt_bufsize = 0x10000;
 static int chip_id, mode, hardware_calls;
 static int kboot_move_to_exec_window(void **kernel) { return 0; }
+/* Without hib=1 the tree is handed over where it is: test_t6040_hibernate_layout.py has the slot */
+static void *kboot_hibernate_handoff_dt(void) { return dt; }
 static bool ctxr_exec_os_may_start(void) { return true; }
 static jmp_buf refused;
 static _Noreturn void panic(const char *format, ...) { longjmp(refused, 1); }
 /* The T8152 handoff has its own path and is not modelled here. */
 static int kboot_boot_t8152(void *kernel) { return -1; }
+static bool dt_retained_live_dcp;
+static int display_prepare_live_handoff(void) { return 0; }
+static bool display_needs_live_receiver(void) { return false; }
 static int mcc_enable_cache(void) { hardware_calls++; return 0; }
 static void tunables_apply_static(void) {}
 static void clk_init(void) { if (mode == 2) spin_table[1].target = 0x1234; }
@@ -61,6 +66,7 @@ static int pcie_handoff_fdt(void *p) { return 0; }
 /* No modelled chip takes the T6050 PCIe handoff. */
 static int pcie_t6050_handoff_fdt(void *p) { abort(); }
 static int pcie_apcie_tables_fdt(void *p, int capacity) { return 0; }
+static void pcie_set_os_restores_apcie(bool restores) {}
 static int fdt_node_check_compatible(void *p, int node, const char *compatible) { return 1; }
 static int dt_disable_j713_pcie(void) { return 0; }
 static int dt_disable_t8140_pcie(void) { return 0; }
@@ -68,6 +74,7 @@ static int fdt_pack(void *p) { return 0; }
 static u32 fdt_totalsize(void *p) { return 0x8000; }
 static int dapf_init_fdt(void *p) { return 0; }
 static int dapf_init_all(void) { return 0; }
+static int dt_set_ave_dapf(void) { return 0; }
 static void pcie_shutdown(void) {}
 static void smp_set_wfe_mode(bool value) {}
 /* The J614s AOP/ISP handoff is gated on the board; no modelled chip is a J614s. */

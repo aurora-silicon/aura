@@ -36,7 +36,8 @@ VERSION_MAP = {
     "iBoot-8422.100.650": "V13_3",
     "iBoot-8422.140.50.0.2": "V13_5B4",
     "iBoot-8422.141.2": "V13_5",
-    "iBoot-10151.140.19.700.2": "V14_7"
+    "iBoot-10151.140.19.700.2": "V14_7",
+    "mBoot-20457.60.65.0.1": "V27_3B"
 }
 
 class ProxyUtils(Reloadable):
@@ -60,7 +61,13 @@ class ProxyUtils(Reloadable):
         elif  self.ba_rev == 3:
             self.ba = self.iface.readstruct(self.ba_addr, BootArgs_r3)
 
-        # We allocate a 128MB heap, 128MB after the aura heap, without telling it about it.
+        self.adt_data = None
+        self.adt = LazyADT(self)
+        # Resolve platform-specific reservations before changing the target heap limit.
+        if callable(aura_heap):
+            aura_heap = aura_heap(self.adt)
+
+        # We put the Python heap after the reservation for aura's own heap.
         # This frees up from having to coordinate memory management or free stuff after a Python
         # script runs, at the expense that if aura ever uses more than 128MB of heap it will
         # clash with Python (aura will normally not use *any* heap when running proxy ops though,
@@ -91,9 +98,6 @@ class ProxyUtils(Reloadable):
         self.free = self.heap.free
 
         self.code_buffer = self.malloc(self.CODE_BUFFER_SIZE)
-
-        self.adt_data = None
-        self.adt = LazyADT(self)
 
         self.simd_buf = self.malloc(32 * 16)
         self.simd_type = None
@@ -562,9 +566,14 @@ class GuardedHeap:
             self._free(ptr)
         self.ptrs = set()
 
+# How long bootstrap_port() waits for the first reply. Links that bridge the
+# console through USB (KIS/DockChannel via kisd) can take well over 150 ms to
+# answer the first request. Override with AURA_BOOTSTRAP_TIMEOUT (seconds).
+BOOTSTRAP_TIMEOUT = 3.0
+
 def bootstrap_port(iface, proxy):
     to = iface.dev.timeout
-    iface.dev.timeout = 0.15
+    iface.dev.timeout = float(os.environ.get("AURA_BOOTSTRAP_TIMEOUT", BOOTSTRAP_TIMEOUT))
     try:
         do_baud = proxy.iodev_whoami() == IODEV.UART
     except ProxyCommandError:
