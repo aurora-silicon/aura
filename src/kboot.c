@@ -11613,8 +11613,8 @@ t6050_isp_segments_valid(const struct adt_segment_ranges *seg, u32 len, u64 ram,
  * T6050 firmware lives below Linux RAM. Publish current ADT ranges, not
  * snapshot physical addresses. The kernel allocates the small main-memory
  * tail and owns all power, DART and firmware-start operations. J716c (0x75)
- * and J714s (0x74) on 27.0, K114c (0xb9) on 27.3 beta and K116s (0xbc) on
- * 27.2 use the same two segment names.
+ * and J714s (0x74) on 27.0, K114c (0xb9) on 27.3 beta, K116s (0xbc) and K114s
+ * (0xba) on 27.2 use the same two segment names.
  */
 __attribute__((section(".init.t6050_isp"))) static int t6050_isp_add_mem_region(uint32_t phandle,
                                                                                 const char *name)
@@ -11641,6 +11641,11 @@ static const struct {
      * the IPSW's isp_bni/adc-nyx-sck11pm; its K116 connection table has one FrontRGB IMX958.
      */
     {"apple,k116s", 0xbc, V27_2},
+    /*
+     * K114s (14-inch M5 Pro OLED, Mac17,13): ADT isp0 of 27.2 (26B8125). The same firmware uuid,
+     * connection scheme and two segments as the K116s; only the sensor type differs.
+     */
+    {"apple,k114s", 0xba, V27_2},
 };
 
 static int dt_set_t6050_isp(const char **why)
