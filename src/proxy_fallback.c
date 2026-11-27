@@ -17,13 +17,16 @@
  * its payload stayed in the proxy until someone held the power button or reset it over USB-C (on
  * the M4 MacBook Air: an ANS that a warm boot's start from off could not bring up, about one
  * warm boot in eight; a later boot brings it up). Such a stop arms the boot watchdog again, unless
- * a host has attached already or this is a debug boot, and then stops in the proxy as before.
- * The first host request turns it off (wdt_host_attached()), so a debugging session is never
- * reset under it; without a host the Mac restarts and the next boot tries again.
+ * a host has attached already, this is a debug boot or a BRINGUP build (which never hands off and
+ * stays in the proxy by design), and then stops in the proxy as before. The first proxy request
+ * from a host turns it off (wdt_host_attached()); a host that only holds the port open and sends
+ * nothing for that long is reset like an absent one. Without a host the Mac restarts and the
+ * next boot tries again.
  */
 bool proxy_fallback(const char *why)
 {
     if (!aura_trial_enabled()) {
+#ifndef BRINGUP
         if (wdt_boot_watchdog_armed() || wdt_host_was_attached() || aura_debug_enabled())
             return false;
         if (wdt_arm_boot()) {
@@ -33,6 +36,7 @@ bool proxy_fallback(const char *why)
         /* Shown on the panel */
         printf("\n%s. Without a host, this Mac restarts by itself within %u s to try again.\n", why,
                WDT_BOOT_SECONDS);
+#endif
         return false;
     }
 

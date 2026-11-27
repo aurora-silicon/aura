@@ -345,3 +345,55 @@ def test_cdc_cleanup_cancels_a_scheduled_transition():
     # usb_cdc_poll() only runs a transition that is still scheduled.
     poll = _body(cdc, "void usb_cdc_poll(void)")
     assert poll.count("usb_cdc_state_due(&cdc,") == 2
+
+
+def test_bringup_builds_keep_the_proxy():
+    """A BRINGUP build never hands off and stays in the proxy by design: no boot watchdog."""
+    fn = _body((ROOT / "src/proxy_fallback.c").read_text(), "bool proxy_fallback(const char *why)")
+    plain = fn[:fn.index("\n    }\n")]
+    guard = plain.index("#ifndef BRINGUP")
+    assert guard < plain.index("wdt_arm_boot()") < plain.index("#endif")
+
+
+WDT_HANDOVER = r'''
+#include <stdbool.h>
+#include <stdio.h>
+#define WDT_BOOT_SECONDS 178
+static int disables, arms;
+static int wdt_arm(unsigned s) { (void)s; arms++; return 0; }
+static void wdt_disable(void) { disables++; }
+@WDT@
+int main(void)
+{
+    /* plain Stage 2 stop: boot watchdog, then usb_cdc's own (T8140), then a KIS host request */
+    wdt_arm_boot();
+    wdt_arm_seconds(170);
+    wdt_host_attached();
+    printf("%d %d %d %d\n", arms, disables, wdt_boot_watchdog_armed(), wdt_host_was_attached());
+    /* a boot watchdog that nothing replaced is turned off by the first host */
+    wdt_arm_boot();
+    wdt_host_attached();
+    printf("%d %d %d\n", arms, disables, wdt_boot_watchdog_armed());
+    return 0;
+}
+'''
+
+
+def test_another_watchdog_takes_over_from_the_boot_watchdog(tmp_path):
+    """usb_cdc's CDC transition watchdog (and a host's P_WDT_ARM) reprogram the same hardware:
+    a later host must not turn that one off as if it were the boot watchdog."""
+    wdt = (ROOT / "src/wdt.c").read_text()
+    parts = ["static bool wdt_boot_armed;", "static bool wdt_host_seen;"]
+    for sig in ("int wdt_arm_seconds(unsigned seconds)", "int wdt_arm_boot(void)",
+                "bool wdt_boot_watchdog_armed(void)", "bool wdt_host_was_attached(void)",
+                "void wdt_host_attached(void)"):
+        parts.append(_body(wdt, sig))
+    src = tmp_path / "h.c"
+    src.write_text(WDT_HANDOVER.replace("@WDT@", "\n".join(parts)).replace("printf(\"WDT: host attached",
+                                                                          "(void)0; //"))
+    exe = tmp_path / "h"
+    subprocess.run([*host_cc(), "-std=gnu11", "-Wall", "-Werror", "-Wno-unused-function",
+                    str(src), "-o", str(exe)], check=True)
+    out = subprocess.run([str(exe)], check=True, capture_output=True, text=True).stdout.split("\n")
+    assert out[0] == "2 0 0 1"
+    assert out[1] == "3 1 0"
