@@ -74,7 +74,7 @@ uintptr_t heapblock_high_water(void)
  */
 #define HEAPBLOCK_MALLOC_SLACK (256 * 1024)
 
-bool heapblock_malloc_fits(size_t size)
+AURA_XTEXT bool heapblock_malloc_fits(size_t size)
 {
     uintptr_t base = (uintptr_t)heap_base, limit = (uintptr_t)heap_limit;
     if (!heap_limit)

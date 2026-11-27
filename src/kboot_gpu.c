@@ -4407,7 +4407,7 @@ static T6050_GPU_INIT bool t6050_gpu_enable(void *dt)
 #define T6050_GPU_LEAK_WINDOW 0x88300000
 #define T6050_GPU_LEAK_OFFSET 0x74198
 
-static T6050_GPU_TEXT_FN int t6050_gpu_leakage(void *dt, int gpu)
+static AURA_XTEXT int t6050_gpu_leakage(void *dt, int gpu)
 {
     int path[8];
     u64 die, base, size;

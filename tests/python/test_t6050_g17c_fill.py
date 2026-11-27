@@ -859,7 +859,7 @@ def test_t6050_g17c_fill(tmp_path):
                 "    return -2;\n}\n")
     code = (HARNESS + function(kboot, "int kboot_fdt_path_exact(") + ADT + leak + aux +
             max_states + function(source, "static int dt_set_resvmem(") +
-            function(source, "static T6050_GPU_TEXT_FN int t6050_gpu_leakage(") + g17c +
+            function(source, "static AURA_XTEXT int t6050_gpu_leakage(") + g17c +
             dispatch + MAIN)
     cfile = tmp_path / "t6050-g17c-fill.c"
     cfile.write_text(code)
