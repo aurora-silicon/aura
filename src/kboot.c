@@ -29,6 +29,7 @@
 #include "kboot_display_t8142.h"
 #include "kboot_gpu_t8122.h"
 #include "kboot_mte.h"
+#include "kboot_pmp.h"
 #include "kboot_pmp_t8122.h"
 #include "kboot_t6031.h"
 #include "malloc.h"
@@ -5315,24 +5316,6 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
         crcs[i] = tinf_crc32((void *)seg[i].phys, seg[i].size);
 
     /*
-     * The driver checks every encoder's firmware against the one set of CRCs in /chosen. An
-     * encoder whose preloaded copy differs from that of an encoder already handed over is left
-     * off rather than overwrite them.
-     */
-    int crc_node = fdt_path_offset(dt, "/chosen");
-    for (size_t i = 0; crc_node >= 0 && i < count; i++) {
-        char prop[48], value[9];
-        int len;
-        snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
-        snprintf(value, sizeof(value), "%08x", crcs[i]);
-        const char *have = fdt_getprop(dt, crc_node, prop, &len);
-        if (have && (len != sizeof(value) || memcmp(have, value, sizeof(value)))) {
-            reason = "firmware differs from the encoder already handed over";
-            goto disable;
-        }
-    }
-
-    /*
      * The firmware runs where iBoot left it: TEXT at the start of the encoder's DART window,
      * the DART's ADT vm-base, and each segment at vm-base plus its offset (the ADT iova-offset).
      * That is 0 on the M1 family (vm-base 0), 0x800000000 on the M2, and 0x10000000000 on the M2
@@ -5405,14 +5388,42 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
         reason = "firmware reservation failed";
         goto disable;
     }
+    /*
+     * Export each encoder's preloaded segment CRCs on its own DT node: multi-encoder SoCs
+     * (e.g. M4 Max / T6041) preload independent copies whose DATA (or per-load TEXT) differs
+     * between instances. Mirror the first handed-over encoder's CRCs into /chosen for SMBIOS
+     * firmware inventory and kernels that only read /chosen, without overwriting them when a
+     * later encoder differs.
+     */
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0) {
+        reason = "CRC export failed";
+        goto disable;
+    }
+    bool export_chosen = true;
+    for (size_t i = 0; i < count; i++) {
+        char prop[48];
+        snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
+        if (fdt_getprop(dt, chosen, prop, NULL)) {
+            export_chosen = false;
+            break;
+        }
+    }
     for (size_t i = 0; i < count; i++) {
         char prop[48], value[9];
         snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
         snprintf(value, sizeof(value), "%08x", crcs[i]);
-        int chosen = fdt_path_offset(dt, "/chosen");
-        if (chosen < 0 || fdt_setprop_string(dt, chosen, prop, value)) {
+        node = phandle ? fdt_node_offset_by_phandle(dt, phandle) : dt_ave_next(-1, compat);
+        if (node < 0 || fdt_setprop_string(dt, node, prop, value)) {
             reason = "CRC export failed";
             goto disable;
+        }
+        if (export_chosen) {
+            chosen = fdt_path_offset(dt, "/chosen");
+            if (chosen < 0 || fdt_setprop_string(dt, chosen, prop, value)) {
+                reason = "CRC export failed";
+                goto disable;
+            }
         }
     }
     /* The qualified T8112 AVE AXI2AF list is explicitly empty. */
@@ -10447,18 +10458,15 @@ static int adt_get_u32_exact(int node, const char *name, u32 *val)
 }
 
 /*
- * Copies this Mac's PMP values from the ADT onto the FDT node @pmp_node. Used for
- * T6000/T8112 and by dt_pass_pmp() on T6030 and T8122. Scalar values must be
+ * Copies this Mac's PMP values from the ADT onto the FDT node @pmp_node: /chosen's board-id and
+ * dram-vendor-id, and the properties of the PMP nub node @pmp_iop_anode. Scalar values must be
  * exactly a u32; calibration tables stay in their original byte order.
  */
-static int dt_fill_pmp(int pmp_node)
+static int dt_fill_pmp_from_node(int pmp_node, int pmp_iop_anode)
 {
     int chosen_anode = adt_path_offset(adt, "/chosen");
     if (chosen_anode < 0)
         bail("ADT: /chosen not found \n");
-    int pmp_iop_anode = adt_path_offset(adt, "/arm-io/pmp/iop-pmp-nub");
-    if (pmp_iop_anode < 0)
-        bail("ADT: /arm-io/pmp/iop-pmp-nub not found \n");
 
     u32 board_id, dram_vendor_id, dram_capacity = 0xFFFFFFFF;
     if (adt_get_u32_exact(chosen_anode, "board-id", &board_id))
@@ -10489,6 +10497,127 @@ static int dt_fill_pmp(int pmp_node)
     return 0;
 }
 
+static int dt_fill_pmp_from(int pmp_node, const char *nub_path)
+{
+    int pmp_iop_anode = adt_path_offset(adt, nub_path);
+    if (pmp_iop_anode < 0)
+        bail("ADT: %s not found \n", nub_path);
+    return dt_fill_pmp_from_node(pmp_node, pmp_iop_anode);
+}
+
+/* T6000/T8112, and dt_pass_pmp() on T6030 and T8122: the ADT's one PMP */
+static int dt_fill_pmp(int pmp_node)
+{
+    return dt_fill_pmp_from(pmp_node, "/arm-io/pmp/iop-pmp-nub");
+}
+
+/*
+ * Copies each optional u32 @names[i] of the ADT node @anode onto @pmp_node as apple,<name>.
+ * Absent properties are skipped. When @strict is set, a present property that is not a u32 fails
+ * the copy; otherwise it is skipped so legacy alias-based boots keep their prior behavior.
+ */
+static int dt_copy_pmp_u32s(int pmp_node, int anode, const char *const *names, size_t count,
+                            bool strict)
+{
+    for (size_t i = 0; i < count; i++) {
+        u32 val;
+        char prop_name[64];
+
+        if (!adt_getprop(adt, anode, names[i], NULL))
+            continue;
+        if (adt_get_u32_exact(anode, names[i], &val)) {
+            if (strict)
+                bail("ADT: pmp %s is not a u32\n", names[i]);
+            continue;
+        }
+        snprintf(prop_name, sizeof(prop_name), "apple,%s", names[i]);
+        if (fdt_setprop_u32(dt, pmp_node, prop_name, val))
+            bail("FDT: failed to set pmp %s\n", prop_name);
+        printf("FDT: pmp %s = 0x%x\n", names[i], val);
+    }
+    return 0;
+}
+
+/*
+ * The boot arguments the PMP driver patches into the firmware from an optional apple,<name>; the
+ * firmware's default for each is 0.
+ */
+static int dt_set_pmp_bootargs(int pmp_node, int pmp_iop_anode, bool strict)
+{
+    return dt_copy_pmp_u32s(pmp_node, pmp_iop_anode, pmp_bootargs, ARRAY_SIZE(pmp_bootargs),
+                            strict);
+}
+
+/*
+ * Copies /arm-io/pmgr's optional pmc and pmc-pmgr u32s onto @pmp_node when
+ * /arm-io/pmgr is present in the ADT. Pre-existing values are cleared up front
+ * by dt_clear_pmp_props() so a missing /arm-io/pmgr never leaves stale PMC
+ * properties behind. A present property that is not a u32 fails the copy.
+ */
+static int dt_set_pmp_pmgr(int pmp_node)
+{
+    static const char *const pmgr_props[] = {"pmc", "pmc-pmgr"};
+    int pmgr_anode = adt_path_offset(adt, "/arm-io/pmgr");
+
+    if (pmgr_anode < 0)
+        return 0;
+    return dt_copy_pmp_u32s(pmp_node, pmgr_anode, pmgr_props, ARRAY_SIZE(pmgr_props), true);
+}
+
+/*
+ * Drops pre-existing per-unit tunables, PMC fields and optional boot arguments
+ * from @pmp_node inside the atomic snapshot transaction so omitted ADT
+ * properties (or an absent /arm-io/pmgr) never leave another unit's DT values
+ * behind.
+ */
+static int dt_clear_pmp_props(int pmp_node)
+{
+    static const char *const optional_props[] = {
+        "apple,dram-capacity", "apple,dram-channel-disable", "apple,pmc", "apple,pmc-msg-disabled",
+        "apple,pmc-pmgr",      "apple,soc-chip-variant",
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(optional_props); i++) {
+        int err = fdt_delprop(dt, pmp_node, optional_props[i]);
+        if (err && err != -FDT_ERR_NOTFOUND)
+            return err;
+    }
+
+    for (;;) {
+        int prop = fdt_first_property_offset(dt, pmp_node);
+        char drop[128] = {0};
+
+        while (prop >= 0) {
+            const char *name = NULL;
+            if (!fdt_getprop_by_offset(dt, prop, &name, NULL))
+                return -FDT_ERR_BADSTRUCTURE;
+            if (name && !strncmp(name, "apple,tunable-", sizeof("apple,tunable-") - 1)) {
+                snprintf(drop, sizeof(drop), "%s", name);
+                break;
+            }
+            prop = fdt_next_property_offset(dt, prop);
+        }
+        if (prop < 0 && prop != -FDT_ERR_NOTFOUND)
+            return prop;
+        if (!drop[0])
+            return 0;
+        int err = fdt_delprop(dt, pmp_node, drop);
+        if (err)
+            return err;
+    }
+}
+
+/*
+ * One PMP of a DT without the pmp alias, once kboot_pmp.c has paired it with its ADT node and
+ * nub: drop the DT's per-unit values, then copy this Mac's, failing on any malformed value.
+ * kboot_pmp.c restores the whole DT when this fails.
+ */
+static int dt_fill_pmp_unit(int pmp_node, int nub_anode)
+{
+    return dt_clear_pmp_props(pmp_node) || dt_fill_pmp_from_node(pmp_node, nub_anode) ||
+           dt_set_pmp_bootargs(pmp_node, nub_anode, true) || dt_set_pmp_pmgr(pmp_node);
+}
+
 /* The device tree's pmp node (M1 Pro/Max/Ultra, M2, M2 Pro/Max/Ultra): as upstream has it */
 static int dt_set_pmp(void)
 {
@@ -10510,10 +10639,8 @@ static int dt_set_pmp(void)
             return 0;
         return dt_fill_pmp(pmp_node);
     }
-    if (pmp_node < 0) {
-        printf("FDT: pmp not found in devtree\n");
-        return 0;
-    }
+    if (pmp_node < 0)
+        return kboot_pmp_set_by_window(dt, dt_bufsize, dt_fill_pmp_unit);
     int chosen_anode = adt_path_offset(adt, "/chosen");
     if (chosen_anode < 0)
         bail("ADT: /chosen not found \n");
@@ -10569,23 +10696,8 @@ static int dt_set_pmp(void)
             bail("FDT: failed to transfer pmp tunable");
     }
 
-    /*
-     * The boot arguments the PMP driver patches into the firmware from an optional
-     * apple,<name>; the firmware's default for each is 0. iBoot sets them where they
-     * apply, e.g. a J616s has dram-channel-disable 0xffff0000.
-     */
-    for (size_t i = 0; i < ARRAY_SIZE(pmp_bootargs); i++) {
-        u32 val;
-        char arg_name[64];
-
-        if (adt_get_u32_exact(pmp_iop_anode, pmp_bootargs[i], &val))
-            continue;
-        snprintf(arg_name, sizeof(arg_name), "apple,%s", pmp_bootargs[i]);
-        pmp_node = fdt_path_offset(dt, "pmp");
-        if (fdt_setprop_u32(dt, pmp_node, arg_name, val))
-            bail("FDT: failed to set pmp boot argument %s\n", pmp_bootargs[i]);
-        printf("FDT: pmp %s = 0x%x\n", pmp_bootargs[i], val);
-    }
+    if (dt_set_pmp_bootargs(fdt_path_offset(dt, "pmp"), pmp_iop_anode, false))
+        return -1;
 
     pmp_node = fdt_path_offset(dt, "pmp");
     if (fdt_setprop_string(dt, pmp_node, "status", "okay"))
@@ -11693,7 +11805,7 @@ t6050_isp_segments_valid(const struct adt_segment_ranges *seg, u32 len, u64 ram,
  * T6050 firmware lives below Linux RAM. Publish current ADT ranges, not
  * snapshot physical addresses. The kernel allocates the small main-memory
  * tail and owns all power, DART and firmware-start operations. J716c (0x75)
- * and J714s (0x74) on 27.0, K114c (0xb9) on 27.3 beta and K116s (0xbc) on
+ * and J714s (0x74) on 27.0, K114c (0xb9) on 27.2 and K116s (0xbc) on
  * 27.2 use the same two segment names.
  */
 __attribute__((section(".init.t6050_isp"))) static int t6050_isp_add_mem_region(uint32_t phandle,
@@ -11715,7 +11827,9 @@ static const struct {
 } t6050_isp_boards[] = {
     {"apple,j716c", 0x75, V27_0},
     {"apple,j714s", 0x74, V27_0},
-    {"apple,k114c", 0xb9, V27_3B},
+    /* K114c: sensor type and segment ranges identify the hand-off; any
+     * firmware version is accepted (V_UNKNOWN = no gate). */
+    {"apple,k114c", 0xb9, V_UNKNOWN},
     /*
      * K116s: ADT isp0 of 27.2 (26B8125). Firmware uuid 980F533B-34EA-3FBA-878C-809F6AF57345,
      * the IPSW's isp_bni/adc-nyx-sck11pm; its K116 connection table has one FrontRGB IMX958.
@@ -11736,7 +11850,7 @@ static int dt_set_t6050_isp(const char **why)
     for (unsigned int i = 0; i < ARRAY_SIZE(t6050_isp_boards); i++) {
         if (fdt_node_check_compatible(dt, 0, t6050_isp_boards[i].compat))
             continue;
-        if (os_firmware.version != t6050_isp_boards[i].fw)
+        if (t6050_isp_boards[i].fw != V_UNKNOWN && os_firmware.version != t6050_isp_boards[i].fw)
             return -1;
         want = t6050_isp_boards[i].sensor_type;
     }
