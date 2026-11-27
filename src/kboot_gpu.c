@@ -4091,7 +4091,7 @@ static int dt_set_gpu_t6041(void *dt)
             goto disable;
         memcpy(&base_pstate, base_prop, sizeof(base_pstate));
     }
-    if (base_pstate != 1) {
+    if (base_pstate < 1 || base_pstate >= count - 1) {
         printf("FDT: GPU: invalid T6041 gpu-perf-base-pstate\n");
         goto disable;
     }
@@ -4144,7 +4144,7 @@ static int dt_set_gpu_t6041(void *dt)
     int n = read_failed ? -1 : t6040_perf_map(sgx_base + 0xe01400, index_a);
     int n_b = n < 0 ? -1 : t6040_perf_map(sgx_base + 0xe01480, index_b);
     pmgr_restore_modes(&sgx_power);
-    if (n < 0 || n_b != n)
+    if (n < 2 || n_b != n || base_pstate >= (u32)(n - 1))
         goto disable;
 
     if (masks[2] || (masks[1] >> (T6041_CLUSTERS * T6040_CORES - 32)))

@@ -513,10 +513,34 @@ int main(void)
     expect_refused("missing r0TR in ptd_data_table", 0);
     world(); ptd_table[0] = ptd_table[3];
     expect_refused("duplicate g0TR in ptd_data_table", 0);
+    /* J575c: 40-core (8-MCC) topology whose ADT sets gpu-perf-base-pstate = 3. */
+    world();
+    active_mcc = 0xff;
+    sgx_masks[0] = 0xffffffff; sgx_masks[1] = 0xff; sgx_masks[2] = 0;
+    have_base_pstate = true; base_pstate = 3;
+    assert(dt_set_gpu_t6041(dt) == 0 && !strcmp(status("gpu"), "okay"));
+    gpu = fdt_path_offset(dt, "gpu");
+    cmask = fdt_getprop(dt, gpu, "apple,core-mask", &len);
+    assert(cmask && len == 8 && fdt64_ld(cmask) == 0xffffffffffULL);
+    bp = fdt_getprop(dt, gpu, "apple,perf-base-pstate", &len);
+    assert(bp && len == 4 && fdt32_ld(bp) == 3);
+    rb = fdt_getprop(dt, gpu, "apple,perf-relative-b", &len);
+    assert(rb && len == 16 * 4);
+    const u32 want_rel_b_base3[16] = {0, 0, 0, 0, 16, 33, 49, 65, 74, 86, 100};
+    for (int i = 0; i < 16; i++)
+        assert(fdt32_ld(&rb[i]) == want_rel_b_base3[i]);
+    puts("PASS accepted: 40-core T6041 with gpu-perf-base-pstate = 3");
+
     world(); have_base_pstate = true; base_length = 0;
     expect_refused("empty present base property", 0);
-    world(); have_base_pstate = true; base_pstate = 2;
-    expect_refused("base state differs from supported policy", 0);
+    world(); have_base_pstate = true; base_pstate = 0;
+    expect_refused("zero gpu-perf-base-pstate", 0);
+    world(); have_base_pstate = true; base_pstate = 15;
+    expect_refused("gpu-perf-base-pstate at top raw OPP", 0);
+    world(); have_base_pstate = true; base_pstate = 10;
+    expect_refused("gpu-perf-base-pstate at top logical state", 1);
+    world(); have_base_pstate = true; base_pstate = 11;
+    expect_refused("gpu-perf-base-pstate past logical states", 1);
     world(); states[0].freq = 100000000;
     expect_refused("off operating point has a clock", 0);
     world(); states[2 * 16 + 5].freq += 1000000;
@@ -658,4 +682,4 @@ def test_t6041_gpu_fill(tmp_path):
                     str(cfile), *sources, "-o", str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 55, result.stdout
+    assert result.stdout.count("PASS") == 59, result.stdout
