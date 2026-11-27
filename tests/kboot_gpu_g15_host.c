@@ -315,6 +315,17 @@ const void *adt_getprop(const void *tree, int node, const char *name, u32 *lenp)
     return NULL;
 }
 
+/* As adt.c: whether any string of the node's NUL-separated "compatible" list is @compat. */
+bool adt_is_compatible(const void *tree, int node, const char *compat)
+{
+    u32 len;
+    const char *list = adt_getprop(tree, node, "compatible", &len);
+    for (u32 off = 0; list && off < len; off += strnlen(list + off, len - off) + 1)
+        if (!strncmp(list + off, compat, len - off))
+            return true;
+    return false;
+}
+
 int adt_getprop_copy(const void *tree, int node, const char *name, void *out, size_t len)
 {
     u32 plen;
@@ -2749,12 +2760,21 @@ static void t8122_25_handoff_v1(void)
  */
 static u32 t8142_count = 13, t8142_num_states = 12, t8142_opps = 13;
 static bool t8142_j704_states;
+/*
+ * apple,sram-microvolt in the GPU node: -1 leaves it out (every G17 SoC but T8142), otherwise
+ * that many 0 cells. With t8142_sram_overflow the ADT's top SRAM state cannot be given in uV.
+ */
+static int t8142_sram_cells = -1;
+static bool t8142_sram_overflow;
 
 /* J704 ADT perf-states (MHz, mV): 0 first, as on the J813 */
 static const u32 t8142_j704_mhz[14] = {0,   338, 486,  636,  796,  888,  988,
                                        1084, 1182, 1278, 1374, 1470, 1578, 1620};
 static const u32 t8142_j704_mv[14] = {0,   610, 625, 655, 700, 725, 745,
                                       775, 805, 840, 885, 940, 1010, 1030};
+/* J704 ADT perf-states-sram (mV): a 770 mV floor, then the core voltage */
+static const u32 t8142_j704_sram_mv[14] = {770, 770, 770, 770, 770, 770, 770,
+                                           775, 805, 840, 885, 940, 1010, 1030};
 
 static void t8142_shape(u32 count, u32 num_states, u32 opps, bool j704_states)
 {
@@ -2785,7 +2805,15 @@ static void t8142_setup(bool shared_ro, u64 ro0_base, bool fw_data_node)
     hset_u32(sgx, "gpu-num-perf-states", t8142_num_states);
     hset_u32(sgx, "perf-state-table-count", 1);
     hset(sgx, "perf-states", states, t8142_count * sizeof(states[0]));
-    hset(sgx, "perf-states-sram", states, t8142_count * sizeof(states[0]));
+    struct perf_state sram[G17_MAX_PERF_STATES + 1];
+    for (u32 i = 0; i < t8142_count; i++) {
+        sram[i] = states[i];
+        if (t8142_j704_states)
+            sram[i].volt = t8142_j704_sram_mv[i];
+    }
+    if (t8142_sram_overflow)
+        sram[t8142_count - 1].volt = UINT32_MAX / 1000 + 1;
+    hset(sgx, "perf-states-sram", sram, t8142_count * sizeof(sram[0]));
     static const struct {
         const char *name;
         u64 base, size;
@@ -2850,6 +2878,11 @@ static void t8142_setup(bool shared_ro, u64 ro0_base, bool fw_data_node)
     CHK(gpu);
     CHK(fdt_setprop_string(dt, gpu, "compatible", "apple,agx-t8142"));
     CHK(fdt_setprop_u32(dt, gpu, "operating-points-v2", 0x40));
+    if (t8142_sram_cells >= 0) {
+        static const fdt32_t zero[G17_MAX_PERF_STATES + 1];
+        assert(t8142_sram_cells <= (int)ARRAY_SIZE(zero));
+        CHK(fdt_setprop(dt, gpu, "apple,sram-microvolt", zero, t8142_sram_cells * sizeof(zero[0])));
+    }
 }
 
 static void t8142_reg(const char *path, u64 *base, u64 *size)
@@ -2981,6 +3014,74 @@ static void t8142_one_state(void)
     t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
     CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
     assert(!strcmp(status_of(dtbuf, "/soc/gpu@582600000"), "disabled"));
+}
+
+/* J704 with apple,sram-microvolt: every 0 cell becomes the ADT's perf-states-sram, in uV. */
+static void t8142_j704_sram(void)
+{
+    t8142_shape(14, 13, 14, true);
+    t8142_sram_cells = 14;
+    t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    t8142_expect_gpu_on();
+    int gpu = fdt_path_offset(dtbuf, "/soc/gpu@582600000"), len;
+    const fdt32_t *uv = fdt_getprop(dtbuf, gpu, "apple,sram-microvolt", &len);
+    assert(uv && len == 14 * 4);
+    for (int i = 0; i < 14; i++)
+        assert(fdt32_ld(&uv[i]) == t8142_j704_sram_mv[i] * 1000u);
+    assert(!log_has("disabling GPU"));
+}
+
+/*
+ * A node without apple,sram-microvolt neither gains it nor has its SRAM table checked: an
+ * ADT SRAM state that does not fit in uV leaves the GPU on.
+ */
+static void t8142_sram_absent(void)
+{
+    t8142_shape(14, 13, 14, true);
+    t8142_sram_overflow = true;
+    t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    t8142_expect_gpu_on();
+    assert(prop_len(dtbuf, "/soc/gpu@582600000", "apple,sram-microvolt") < 0);
+    assert(!log_has("disabling GPU"));
+}
+
+/* One cell short of the ADT's perf states: the GPU is disabled and the cells stay 0. */
+static void t8142_sram_wrong_len(void)
+{
+    t8142_shape(14, 13, 14, true);
+    t8142_sram_cells = 13;
+    t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@582600000"), "disabled"));
+    int gpu = fdt_path_offset(dtbuf, "/soc/gpu@582600000"), len;
+    const fdt32_t *uv = fdt_getprop(dtbuf, gpu, "apple,sram-microvolt", &len);
+    assert(uv && len == 13 * 4);
+    for (int i = 0; i < 13; i++)
+        assert(fdt32_ld(&uv[i]) == 0);
+}
+
+/* An ADT SRAM state that does not fit in uV, with the property: disabled, nothing written. */
+static void t8142_sram_overflow_refused(void)
+{
+    t8142_shape(14, 13, 14, true);
+    t8142_sram_cells = 14;
+    t8142_sram_overflow = true;
+    t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@582600000"), "disabled"));
+    int gpu = fdt_path_offset(dtbuf, "/soc/gpu@582600000"), len;
+    const fdt32_t *uv = fdt_getprop(dtbuf, gpu, "apple,sram-microvolt", &len);
+    assert(uv && len == 14 * 4);
+    for (int i = 0; i < 14; i++)
+        assert(fdt32_ld(&uv[i]) == 0);
+    int opps = fdt_path_offset(dtbuf, "/opp-table"), opp;
+    fdt_for_each_subnode(opp, dtbuf, opps)
+    {
+        const fdt32_t *core = fdt_getprop(dtbuf, opp, "opp-microvolt", &len);
+        assert(core && fdt32_ld(core) == 0);
+    }
 }
 
 /* ---------- T8140 (A18 Pro, G17P): both roles' __DATA as gpu-fw-data ---------- */
@@ -3309,6 +3410,10 @@ static const struct {
     {"t8142-mixed-shape", t8142_mixed_shape},
     {"t8142-too-many-states", t8142_too_many_states},
     {"t8142-one-state", t8142_one_state},
+    {"t8142-j704-sram", t8142_j704_sram},
+    {"t8142-sram-absent", t8142_sram_absent},
+    {"t8142-sram-wrong-len", t8142_sram_wrong_len},
+    {"t8142-sram-overflow", t8142_sram_overflow_refused},
     {"t8140-fw-data", t8140_fw_data},
     {"t8140-fw-data-apart", t8140_fw_data_apart},
     {"t8140-fw-data-no-gfx1", t8140_fw_data_no_gfx1},

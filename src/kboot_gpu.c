@@ -3334,18 +3334,22 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
     if (!sram || len != tables * count * sizeof(*sram))
         goto disable;
     for (u32 i = 0; i < count; i++)
-        if (states[i].volt > UINT32_MAX / 1000 || sram[i].volt > UINT32_MAX / 1000)
+        if (states[i].volt > UINT32_MAX / 1000)
             goto disable;
 
     int ph_len;
     /*
      * A DT that states each OPP's SRAM voltage (T8142) gets the machine's own, from
      * perf-states-sram, as its core voltages come from perf-states: the SRAM table
-     * tracks the chip's bin, so a board-wide one would not hold on every Mac.
+     * tracks the chip's bin, so a board-wide one would not hold on every Mac. Only
+     * such a node's SRAM table is checked; the others do not use it.
      */
     bool sram_uv = fdt_getprop(dt, gpu, "apple,sram-microvolt", &ph_len) != NULL;
     if (sram_uv && ph_len != (int)(count * sizeof(fdt32_t)))
         goto disable;
+    for (u32 i = 0; sram_uv && i < count; i++)
+        if (sram[i].volt > UINT32_MAX / 1000)
+            goto disable;
     const fdt32_t *opp_ph = fdt_getprop(dt, gpu, "operating-points-v2", &ph_len);
     if (!opp_ph || ph_len != sizeof(*opp_ph))
         goto disable;
