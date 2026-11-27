@@ -581,6 +581,16 @@ static int display_swap(u64 iova, u32 stride, u32 width, u32 height)
     return 0;
 }
 
+static int display_service_dcp(u32 usec)
+{
+    u64 deadline = timeout_calculate(usec);
+    do {
+        if (dcp_work(dcp) < 0)
+            return -1;
+    } while (get_ticks() < deadline);
+    return 0;
+}
+
 int display_configure(const char *config)
 {
     dcp_timing_mode_t want;
@@ -639,9 +649,10 @@ int display_configure(const char *config)
     int timing_cnt, color_cnt;
     int hpd = 0, retries = 0;
 
-    /* After boot DCP does not immediately report a connected display. Retry getting display
-     * information for 2 seconds.
+    /* Keep processing firmware requests between queries. Link training can require the
+     * AP to service DPTX callbacks before the firmware reports a mode.
      */
+    u64 status_start = get_ticks();
     while (retries++ < (DISPLAY_STATUS_RETRIES(display_is_dptx))) {
         dcp_work(dcp);
         hpd = dcp_ib_get_hpd(iboot, &timing_cnt, &color_cnt);
@@ -650,10 +661,14 @@ int display_configure(const char *config)
         ret = hpd < 0 ? hpd : 0;
         if (hpd > 0 && timing_cnt && color_cnt)
             break;
-        if (retries < DISPLAY_STATUS_RETRIES(display_is_dptx))
-            mdelay(DISPLAY_STATUS_DELAY);
+        if (retries < DISPLAY_STATUS_RETRIES(display_is_dptx) &&
+            display_service_dcp(DISPLAY_STATUS_DELAY * 1000) < 0) {
+            printf("display: failed to service DCP during status wait\n");
+            return 0;
+        }
     }
-    printf("display: waited %d ms for display status\n", (retries - 1) * DISPLAY_STATUS_DELAY);
+    printf("display: waited %ld ms for display status\n",
+           ticks_to_msecs(get_ticks() - status_start));
     if (ret < 0) {
         printf("display: failed to get display status\n");
         return 0;
@@ -841,16 +856,6 @@ int display_configure(const char *config)
     printf("display: Modeset took %ld ms\n", msecs);
 
     return 1;
-}
-
-static int display_t8152_work(u32 usec)
-{
-    u64 deadline = timeout_calculate(usec);
-    do {
-        if (dcp_work(dcp) < 0)
-            return -1;
-    } while (get_ticks() < deadline);
-    return 0;
 }
 
 static int display_init_t8152_hdmi(void)
@@ -1063,12 +1068,12 @@ static int display_init_t8152(void)
 
     /* Service firmware continuously while the qualified direct-DP route
      * trains. Host round trips and idle delays interrupt this exchange. */
-    if (display_t8152_work(8000000) < 0)
+    if (display_service_dcp(8000000) < 0)
         goto fail;
     int timing_cnt = 0, color_cnt = 0;
     if (dcp_ib_get_hpd(iboot, &timing_cnt, &color_cnt) != 1 || !timing_cnt || !color_cnt)
         goto fail;
-    if (dcp_ib_set_power(iboot, true) < 0 || display_t8152_work(8000000) < 0)
+    if (dcp_ib_set_power(iboot, true) < 0 || display_service_dcp(8000000) < 0)
         goto fail;
 
     /* Start with the mode qualified for this route. Subsequent modesets use
