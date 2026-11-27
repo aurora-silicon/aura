@@ -688,6 +688,7 @@ struct entry dapf_entries[] = {
     {"/arm-io/dart-isp", 5, "isp"},
     {"/arm-io/dart-isp0", 5, "isp"},
     {"/arm-io/dart-ave0", 3, "ave"},
+    {"/arm-io/dart-ave1", 3, "ave1"},
     {NULL, -1, NULL},
 };
 
@@ -696,7 +697,7 @@ struct entry dapf_entries[] = {
  * boot. An entry it skipped (its DT alias absent or disabled, its DART not in the ADT) is in
  * neither.
  */
-static const char *dapf_programmed_paths[8], *dapf_failed_paths[8];
+static const char *dapf_programmed_paths[16], *dapf_failed_paths[16];
 static unsigned int dapf_nprogrammed, dapf_nfailed;
 
 static bool dapf_listed(const char *const *paths, unsigned int n, const char *path)

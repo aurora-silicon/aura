@@ -36,12 +36,24 @@
 
 #define DBI_RO_WR 0x8bc
 
-/* SMC function-reset level hold: assert, then release (smc_adt_function_reset()) */
+/* SMC endpoint reset level hold, per level (j813_endpoint_reset()) */
 #define N1_RESET_SETTLE_MS 50
 
 /* function-perst pad: output (bits 3:1 = 1), data bit 0 high releases PERST# */
 #define GPIO_PERST_MODE_MASK 0xf
 #define GPIO_PERST_RELEASE   0x3
+
+/* ADT GPIO(pin, flags) function: the GPIO controller's phandle, 'GPIO', then its arguments */
+#define GPIO_FOURCC_GPIO 0x4750494f /* "OIPG" in ADT byte order */
+
+/*
+ * What the ADT names for the endpoint behind a port: its SMC reset (pKW4/pKW8, released level 0
+ * then 1) and its PERST# pin on /arm-io/gpio0 (driven high as output to release it).
+ */
+struct j813_endpoint {
+    struct smc_adt_function reset;
+    u64 perst;
+};
 
 static int j813_reg(int *path, int idx, u64 *addr)
 {
@@ -70,10 +82,80 @@ static int j813_tunables(const char *path, const char *prop, u64 base)
     return 0;
 }
 
+/* A bridge's function-perst = GPIO(pin, flags) of /arm-io/gpio0: the pin's register. */
+static int j813_perst(const char *bridge, u64 *addr)
+{
+    struct {
+        u32 phandle, fourcc, pin, flags;
+    } perst;
+    int path[8];
+    u32 phandle;
+    u64 base, span;
+    int node = adt_path_offset(adt, bridge);
+    int gpio = adt_path_offset_trace(adt, "/arm-io/gpio0", path);
+
+    if (node < 0 || gpio < 0 ||
+        adt_getprop_copy(adt, node, "function-perst", &perst, sizeof(perst)) < 0 ||
+        perst.fourcc != GPIO_FOURCC_GPIO || ADT_GETPROP(adt, gpio, "AAPL,phandle", &phandle) < 0 ||
+        phandle != perst.phandle || adt_get_reg(adt, path, "reg", 0, &base, &span) ||
+        span < 4 * ((u64)perst.pin + 1)) {
+        printf("j813-n1: cannot resolve %s function-perst\n", bridge);
+        return -1;
+    }
+    *addr = base + 4 * perst.pin;
+    printf("j813-n1: %s PERST# GPIO %u (flags 0x%x)\n", bridge, perst.pin, perst.flags);
+    return 0;
+}
+
+/*
+ * Port 0's endpoint. J813/J815's N1 has its reset as pci-bridge0 function-reset =
+ * pKW4('gP13', 0x800000); J704's BCM4388 has none there, and the same action is
+ * /amfm function-reg_on (as on J713, see pcie_fdt.c). Anything else is refused,
+ * and the port is left off.
+ */
+static int j813_port0_endpoint(struct j813_endpoint *ep)
+{
+    const char *path = APCIE_PORT, *prop = "function-reset";
+    int ret = smc_adt_function_get(path, prop, &ep->reset);
+
+    /* A function-reset aimed elsewhere (logged by smc_adt_function_get()) is a mismatch with
+     * what this code expects of J813/J815: leave the port off rather than try /amfm. */
+    if (ret < 0)
+        return -1;
+    if (ret) {
+        path = "/amfm";
+        prop = "function-reg_on";
+        ret = smc_adt_function_get(path, prop, &ep->reset);
+        if (ret > 0)
+            printf("j813-n1: no SMC %s function-reset or /amfm function-reg_on\n", APCIE_PORT);
+        if (ret)
+            return -1;
+    }
+    printf("j813-n1: radio reset %s %s = %c%c%c%c 0x%x\n", path, prop, ep->reset.key >> 24,
+           ep->reset.key >> 16, ep->reset.key >> 8, ep->reset.key, ep->reset.lo);
+    return j813_perst(APCIE_PORT, &ep->perst);
+}
+
+static int j813_endpoint_reset(const struct j813_endpoint *ep)
+{
+    smc_dev_t *smc = smc_init();
+    int ret = 0;
+
+    if (!smc)
+        return -1;
+    for (u32 level = 0; level < 2 && !ret; level++) {
+        ret = smc_adt_function_write(smc, &ep->reset, level);
+        mdelay(N1_RESET_SETTLE_MS);
+    }
+    smc_shutdown(smc);
+    return ret;
+}
+
 static int j813_n1_link(void)
 {
     int path[8];
     u64 ecam, rc, phy, phyphy, phyip, axi, port, lane;
+    struct j813_endpoint ep;
 
     if (adt_path_offset_trace(adt, APCIE, path) < 0)
         return -1;
@@ -81,17 +163,17 @@ static int j813_n1_link(void)
         j813_reg(path, 3, &phyphy) || j813_reg(path, 4, &phyip) || j813_reg(path, 5, &axi) ||
         j813_reg(path, 8, &port) || j813_reg(path, 10, &lane))
         return -1;
+    /* Before touching the hardware: what the ADT says drives the endpoint. */
+    if (j813_port0_endpoint(&ep))
+        return -1;
     u64 phycommon = phy + PHY_COMMON_OFF;
 
     int bridge = adt_path_offset(adt, APCIE_PORT);
     u32 refclk_to_perst_us;
-    u64 perst;
     if (bridge < 0 || ADT_GETPROP(adt, bridge, "t-refclk-to-perst", &refclk_to_perst_us) < 0) {
         printf("j813-n1: %s has no t-refclk-to-perst\n", APCIE_PORT);
         return -1;
     }
-    if (pcie_adt_perst_gpio(APCIE_PORT, &perst))
-        return -1;
 
     if (pmgr_adt_power_enable(APCIE))
         return -1;
@@ -131,9 +213,8 @@ static int j813_n1_link(void)
     if (j813_wait(rc + 0x58, BIT(0), BIT(0), 250000, "gtb_initialized"))
         return -1;
 
-    /* The SMC holds the N1 in reset: pci-bridge0 function-reset (pKW4 gP13). */
-    if (smc_adt_function_reset(APCIE_PORT, N1_RESET_SETTLE_MS)) {
-        printf("j813-n1: SMC N1 reset release failed\n");
+    if (j813_endpoint_reset(&ep)) {
+        printf("j813-n1: SMC radio reset release failed\n");
         return -1;
     }
     /* The N1 is out of its SMC reset: T_PVPERL before PERST# is released below. */
@@ -167,7 +248,7 @@ static int j813_n1_link(void)
     udelay(max(refclk_to_perst_us, (u32)APCIE_REFCLK_TO_PERST_MIN_US));
 
     set32(port + PORT_PERST, BIT(0));
-    mask32(perst, GPIO_PERST_MODE_MASK, GPIO_PERST_RELEASE);
+    mask32(ep.perst, GPIO_PERST_MODE_MASK, GPIO_PERST_RELEASE);
     if (j813_wait(port + PORT_PIPE_STS, BIT(0), BIT(0), 100000, "lane pipe reset") ||
         j813_wait(port + PORT_STATUS, BIT(0), BIT(0), 250000, "port RUN") ||
         j813_wait(port + PORT_LINKSTS, BIT(2), 0, 500000, "port idle"))
@@ -184,15 +265,19 @@ static int j813_n1_link(void)
     if (j813_wait(port + PORT_LINKSTS, BIT(0), BIT(0), 1000000, "link up"))
         return -1;
 
-    /* Root port bus numbers, then check the endpoint. */
+    /*
+     * Root port bus numbers, then check the endpoint: the link still up and something answering
+     * config space (J813/J815: Apple's N1, 106b; J704: a Broadcom BCM4388, 14e4).
+     */
     write32(ecam + 0x18, 0x00010100);
     mdelay(pcie_adt_perst_to_config_ms(APCIE_PORT));
     u32 ident;
     if (pcie_wait_config_ready(ecam + 0x100000, &ident))
         return -1;
-    printf("j813-n1: link up (0x%x), endpoint %04x:%04x\n", read32(port + PORT_LINKSTS),
-           ident & 0xffff, ident >> 16);
-    return (ident & 0xffff) == 0x106b ? 0 : -1;
+    u32 linksts = read32(port + PORT_LINKSTS);
+    u16 vendor = ident & 0xffff;
+    printf("j813-n1: link up (0x%x), endpoint %04x:%04x\n", linksts, vendor, ident >> 16);
+    return ((linksts & BIT(0)) && vendor != 0xffff && vendor != 0x0000) ? 0 : -1;
 }
 
 int j813_n1_prepare(void *dt)
@@ -213,6 +298,6 @@ int j813_n1_prepare(void *dt)
         return 0;
 
     /* An untrained link would hang Linux's first config access. */
-    printf("j813-n1: N1 PCIe bring-up failed; disabling the ECAM host\n");
+    printf("j813-n1: radio PCIe bring-up failed; disabling the ECAM host\n");
     return fdt_setprop_string(dt, node, "status", "disabled") ? -1 : 0;
 }
