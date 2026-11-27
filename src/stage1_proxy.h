@@ -39,7 +39,6 @@ enum stage1_proxy_result stage1_proxy_window_step(struct stage1_proxy_window *wi
 enum stage1_payload_action stage1_proxy_payload_action(enum stage1_proxy_result window_result,
                                                        bool payload_valid, bool cdc_live,
                                                        bool kis_live);
-bool stage1_proxy_action_needs_cleanup(enum stage1_payload_action action);
 
 /*
  * iBoot's record of the previous boot in the PMU scratchpad: the counts byte (failed boots in the

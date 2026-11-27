@@ -157,19 +157,18 @@ fn check_ptr(ptr: usize) -> Result<(), AdtError> {
     }
 }
 
-/// Determine if an ADT node's name is equal to some string bounded by a length.
-/// This is required to match the semantics expected when doing a full ADT path
-/// trace.
-fn node_names_equal(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
+/// Determine if an ADT node's name matches one element of a lookup path.
+///
+/// The names must be equal, except that a path element without a unit
+/// address ("dcp") also matches a node name that carries one ("dcp@0").
+/// Lookups take the first matching child in ADT order, so if a node has
+/// both "dcp" and "dcp@0" children, "dcp" resolves to whichever comes first.
+fn node_names_equal(name: &str, query: &str) -> bool {
+    match name.strip_prefix(query) {
+        Some("") => true,
+        Some(rest) => !query.contains('@') && rest.starts_with('@'),
+        None => false,
     }
-
-    if b.contains('@') && a.as_bytes().get(b.len()) == Some(&b'@') {
-        return true;
-    }
-
-    false
 }
 
 fn get_cells(src: &[u32]) -> u64 {
@@ -246,8 +245,17 @@ pub fn get_reg_container(
     }
 
     // Check that the reg property is big enough to contain a reg
-    // container at index i.
-    if reg.size < (i as u32 + 1) * (addr_cells + size_cells) * 4 {
+    // container at index i. A huge index must not wrap the check.
+    let cells = addr_cells + size_cells;
+    let first_cell = u32::try_from(i)
+        .ok()
+        .and_then(|i| i.checked_mul(cells))
+        .ok_or(AdtError::BadValue)?;
+    let end = first_cell
+        .checked_add(cells)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(AdtError::BadValue)?;
+    if reg.size < end {
         return Err(AdtError::BadValue);
     }
 
@@ -257,8 +265,7 @@ pub fn get_reg_container(
     // SAFETY: For a reg property, this pointer arithmetic is always true,
     // as we check above that i is within bounds.
     unsafe {
-        let aref_ptr: *const u32 =
-            (reg.value.as_ptr() as *const u32).add((i as u32 * (addr_cells + size_cells)) as usize);
+        let aref_ptr: *const u32 = (reg.value.as_ptr() as *const u32).add(first_cell as usize);
 
         let sref_ptr = aref_ptr.add((addr_cells) as usize);
 
@@ -533,12 +540,16 @@ impl ADTNode {
     pub fn subnode_by_name(&self, name: &str) -> Result<&'static ADTNode, AdtError> {
         let mut c = self.first_child()?;
 
-        for _ in 0..self.child_count {
+        for idx in 0..self.child_count {
             let prop = c.named_prop("name")?;
             if node_names_equal(prop.str()?, name) {
                 return Ok(c);
             }
-            c = c.next_sibling()?;
+            // Do not step past the last child: for the last node in the ADT
+            // there is nothing after it, and a miss must stay NotFound.
+            if idx + 1 < self.child_count {
+                c = c.next_sibling()?;
+            }
         }
         Err(AdtError::NotFound)
     }
@@ -969,7 +980,8 @@ pub unsafe extern "C" fn adt_is_compatible_at(
 ) -> bool {
     let strcompat: &str = unsafe { CStr::from_ptr(compat).to_str().unwrap() };
     let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr).unwrap().compatible(index).unwrap() == strcompat
+    // A node without that many compatible entries is simply not compatible.
+    ADTNode::from_ptr(ptr).unwrap().compatible(index) == Some(strcompat)
 }
 
 #[no_mangle]

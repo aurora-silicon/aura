@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 # Shows that the T6031 handoff leaves the other SoCs' handoff results as they were.
 #
 #   sh tests/run-t6031-unchanged.sh <base-ref>     (e.g. the integration/aurora tip it is built on)
@@ -10,7 +11,7 @@
 #     with both (some T8122 stand-in scenarios fail on <base-ref> already; they are listed).
 #  2. tests/t8122_display_host.c, the internal display handoff: every J613 scenario, its 25G83
 #     ones, and the same scenarios in its T6030 world: the output device tree, byte for byte, and
-#     the log.
+#     the log, allowing the T6030 ADT segment summaries.
 set -eu
 cd "$(dirname "$0")/.."
 root=$(pwd)
@@ -86,13 +87,26 @@ echo "G15 GPU setup: $same scenarios identical to $base (DT, bus and PMGR traces
 build_disp() { # build_disp <tree> <out>
     tree=$1 out=$2
     mkdir -p "$out/src"
-    cp "$tree/src/kboot_display_handoff.c" tests/t8122_display_host.c \
-        tests/t8122_display_host/*.h "$out/src/"
+    disp_srcs=""
+    if [ -f "$tree/tests/display-handoff-sources.txt" ]; then
+        while IFS= read -r f; do
+            case "$f" in ""|"#"*) continue ;; esac
+            cp "$tree/src/$f" "$out/src/"
+            h="${f%.c}.h"
+            [ -f "$tree/src/$h" ] && cp "$tree/src/$h" "$out/src/"
+            disp_srcs="$disp_srcs $out/src/$f"
+        done < "$tree/tests/display-handoff-sources.txt"
+    else
+        cp "$tree/src/kboot_display_handoff.c" "$out/src/"
+        disp_srcs="$out/src/kboot_display_handoff.c"
+    fi
+    cp tests/t8122_display_host.c tests/t8122_display_host/*.h "$out/src/"
+    # shellcheck disable=SC2086
     ${CC:-cc} -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-function \
         -Wno-unused-parameter -Wno-sign-compare -Wno-format-truncation \
         -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
         -I"$out/src" -I"$tree/src" \
-        "$out/src/t8122_display_host.c" "$out/src/kboot_display_handoff.c" \
+        "$out/src/t8122_display_host.c" $disp_srcs \
         "$tree"/src/libfdt/fdt.c "$tree"/src/libfdt/fdt_ro.c "$tree"/src/libfdt/fdt_rw.c \
         "$tree"/src/libfdt/fdt_wip.c "$tree"/src/libfdt/fdt_sw.c \
         "$tree"/src/libfdt/fdt_empty_tree.c "$tree"/src/libfdt/fdt_strerror.c \
@@ -110,12 +124,18 @@ for mode in j613 j613-25g83 t6030; do
     j613) dtb=$tmp/j613.dtb list="$plain contract-selftest" pre= env= ;;
     j613-25g83) dtb=$tmp/j613.dtb list="$plain missing-clock wrong-os missing-profile" pre= \
         env=J613_25G83=1 ;;
-    t6030) dtb=$tmp/j516s.dtb list=$plain pre=t6030- env= ;;
+    t6030) dtb=$tmp/j516s.dtb list="$plain 14_7-panel-dcpext" pre=t6030- env= ;;
     esac
     for s in $list; do
         for b in base new; do
-            run "$tmp/disp-$b/$mode-$s.out" env $env "$tmp/disp-$b/display-host" "$dtb" "$pre$s" \
+            out="$tmp/disp-$b/$mode-$s.out"
+            run "$out" env $env "$tmp/disp-$b/display-host" "$dtb" "$pre$s" \
                 "$tmp/disp-$b/$mode-$s.dtb"
+            if [ "$mode" = t6030 ]; then
+                sed -E '/^DCP: T6030: dcp segment [0-9]+: .+, (region-id-[0-9]+|physical buffer)$/d' \
+                    "$out" > "$out.filtered"
+                mv "$out.filtered" "$out"
+            fi
         done
         if ! cmp -s "$tmp/disp-base/$mode-$s.out" "$tmp/disp-new/$mode-$s.out" ||
             ! cmp -s "$tmp/disp-base/$mode-$s.dtb" "$tmp/disp-new/$mode-$s.dtb"; then

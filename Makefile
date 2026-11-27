@@ -87,6 +87,12 @@ endif
 
 # Required for no_std + alloc for now
 export RUSTC_BOOTSTRAP=1
+# aura's Rust codegen comes from rust/Cargo.toml: opt-level "z" for aura's own crate and the
+# signature code, so Stage 1 stays below the DCP log buffer (aura-raw.ld). A packager's
+# RUSTFLAGS would override those profiles for this bare-metal image: rpmbuild's %build exports
+# -Copt-level=3 -Cforce-frame-pointers=yes -Cdebuginfo=2, which grows Stage 1 by ~16 KiB and
+# no longer links. Keep the environment's flags out of cargo.
+unexport RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
 RUST_LIB := librust.a
 ifeq ($(BUILDSTD),1)
 CARGO_FLAGS := -Z build-std=alloc,core
@@ -95,7 +101,9 @@ CARGO_FLAGS :=
 endif
 
 # Bring-up: skip MMU, MCC, AIC, SMP, PMGR, display and USB init and go
-# straight to the proxy on the boot console.
+# straight to the proxy on the boot console. A BRINGUP build never hands
+# off to a kernel payload (secondary CPUs are not started and carveouts are
+# not unmapped): it prints why and stays in the proxy.
 ifeq ($(BRINGUP),1)
 CFG += BRINGUP
 endif
@@ -229,6 +237,7 @@ HV_OBJECTS := $(patsubst %,hv/%, \
 OBJECTS := \
 	boot_storage.o \
 	adt.o \
+	adt_gpio.o \
 	afk.o \
 	aic.o \
 	asc.o \
@@ -248,6 +257,7 @@ OBJECTS := \
 	dockchannel_uart.o \
 	exception.o exception_asm.o \
 	fb.o font.o font_retina.o \
+	fdt_disable.o \
 	firmware.o \
 	gxf.o gxf_asm.o \
 	heapblock.o \
@@ -256,9 +266,9 @@ OBJECTS := \
 	iova.o \
 	isp.o \
 	j873.o \
-	kboot.o kboot_atc.o kboot_audio.o kboot_mte.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp_t8122.o \
+	kboot.o kboot_atc.o kboot_audio.o kboot_mte.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp.o kboot_pmp_t8122.o \
 	kboot_t6020_compat.o \
-	kboot_display_handoff.o kboot_display_facts.o kboot_gpu26.o kboot_gpu_t6031.o kboot_t6031.o \
+	kboot_display_handoff.o kboot_display_routes.o kboot_display_facts.o kboot_gpu26.o kboot_gpu_t6031.o kboot_t6031.o \
 	main.o boot_options.o \
 	mitigations.o \
 	mcc.o \
@@ -279,7 +289,7 @@ OBJECTS := \
 	smc.o \
 	ctxr_exec.o \
 	smp.o \
-	spmi.o pmu_counter.o ace3.o \
+	spmi.o pmu_counter.o proxy_fallback.o ace3.o \
 	start.o \
 	startup.o \
 	string.o \
@@ -297,7 +307,7 @@ OBJECTS := \
 	$(MINILZLIB_OBJECTS) $(TINF_OBJECTS) $(DLMALLOC_OBJECTS) $(LIBFDT_OBJECTS)
 
 ifeq ($(SPTM_VIRT),1)
-OBJECTS += nv2.o nv2_asm.o sptm_virt.o sptm_virt_cl4.o sptm_virt_gl.o sptm_virt_s2.o sptm_virt_s2r.o sptm_virt_s2r_soc.o sptm_virt_gpu.o s2r_dcp_pkt.o
+OBJECTS += nv2.o nv2_asm.o sptm_virt.o sptm_virt_cl4.o sptm_virt_gl.o sptm_virt_s2.o sptm_virt_s2r.o sptm_virt_s2r_soc.o sptm_virt_gpu.o sptm_virt_sep.o s2r_dcp_pkt.o
 endif
 ifeq ($(AURACTL),1)
 OBJECTS += sptm_virt_ctl.o
@@ -421,6 +431,9 @@ build-cfg src/../build/build_cfg.h &:
 	$(QUIET)python3 tools/secboot_sign.py c-header $(SECBOOT_PUBKEY) > build/secboot_key.tmp
 	$(QUIET)cmp -s build/secboot_key.h build/secboot_key.tmp 2>/dev/null || \
 	( mv -f build/secboot_key.tmp build/secboot_key.h && echo "  KEY   build/secboot_key.h" )
+	$(QUIET)python3 tools/execute_window.py c-header > build/execute_window.tmp
+	$(QUIET)cmp -s build/execute_window.h build/execute_window.tmp 2>/dev/null || \
+	( mv -f build/execute_window.tmp build/execute_window.h && echo "  XWIN  build/execute_window.h" )
 	$(QUIET)for i in $(CFG); do echo "#define $$i"; done > build/build_cfg.tmp
 	$(QUIET)echo "#define BUILTIN_LOGO $(BUILTIN_LOGO)" >> build/build_cfg.tmp
 	$(QUIET)cmp -s build/build_cfg.h build/build_cfg.tmp 2>/dev/null || \

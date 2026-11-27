@@ -6,13 +6,16 @@
 #include "aic_regs.h"
 #include "cpu_regs.h"
 #include "dockchannel_uart.h"
+#include "iodev.h"
 #include "malloc.h"
 #include "memory.h"
+#include "pcie.h"
 #include "pmgr.h"
 #include "soc.h"
 #include "string.h"
 #include "types.h"
 #include "utils.h"
+#include "wdt.h"
 #include "xnuboot.h"
 
 #define CPU_START_OFF_S5L8960X 0x30000
@@ -59,12 +62,12 @@ u8 dummy_stack_el1[DUMMY_STACK_SIZE]; // EL1 stack if EL3 exists
  * it takes them from the heap as m1n1 v1.6 did. The pointers are shared like smp_reset_stacks: a
  * T8152 core reads its own in cpu_reset with the MMU off.
  */
-u8 *secondary_stacks[MAX_CPUS] SMP_SHARED;
+u8 *secondary_stacks[SECONDARY_STACKS] SMP_SHARED;
 u8 *secondary_stacks_el3[MAX_EL3_CPUS] SMP_SHARED;
 
 static int smp_alloc_stacks(void)
 {
-    for (int i = 0; i < MAX_CPUS; i++) {
+    for (int i = 0; i < SECONDARY_STACKS; i++) {
         if (!secondary_stacks[i])
             secondary_stacks[i] = memalign(SZ_16K, SECONDARY_STACK_SIZE);
         if (!secondary_stacks[i])
@@ -79,7 +82,7 @@ static int smp_alloc_stacks(void)
     return 0;
 }
 #else
-u8 secondary_stacks[MAX_CPUS][SECONDARY_STACK_SIZE] ALIGNED(0x4000);
+u8 secondary_stacks[SECONDARY_STACKS][SECONDARY_STACK_SIZE] ALIGNED(0x4000);
 u8 secondary_stacks_el3[MAX_EL3_CPUS][SECONDARY_STACK_SIZE] ALIGNED(0x4000);
 
 static int smp_alloc_stacks(void)
@@ -101,6 +104,7 @@ struct cpu_info {
     u8 die;
     u8 cluster;
     u8 core;
+    u32 reg;
     u64 impl_reg;
 };
 
@@ -158,11 +162,40 @@ extern u8 _vectors_start[0];
 static u8 *t8142_block SMP_SHARED;
 static size_t t8142_block_size;
 
+/*
+ * A CPU's secondary stack is its place among the CPUs present, in cpu-id order, not its cpu-id:
+ * T6050 Ultra numbers its 30 CPUs 0 to 34 (18 per die), and a stack per cpu-id would add 2 MiB
+ * to every image's .bss. Shared like smp_reset_stacks: a secondary reads its own with the MMU off.
+ */
+static u8 stack_slot[MAX_CPUS] SMP_SHARED;
+
+static u8 *cpu_stack(int index)
+{
+    return secondary_stacks[stack_slot[index]];
+}
+
+/* In cpu-id order, so T8152's slots are its cpu-ids, as its cpu_reset assumes (start.S). */
+static void smp_assign_stacks(void)
+{
+    int slot = 0;
+
+    for (int i = 0; i < MAX_CPUS; i++) {
+        if (!cpu_nodes[i])
+            continue;
+        if (slot == SECONDARY_STACKS) {
+            printf("cpu-id %d has no stack: more than %d CPUs\n", i, SECONDARY_STACKS);
+            cpu_nodes[i] = 0;
+            continue;
+        }
+        stack_slot[i] = slot++;
+    }
+}
+
 static u64 secondary_stack_top(int index)
 {
     if (t8142_block)
         return (u64)t8142_block + (u64)(index + 1) * SECONDARY_STACK_SIZE;
-    return (u64)secondary_stacks[index] + SECONDARY_STACK_SIZE;
+    return (u64)cpu_stack(index) + SECONDARY_STACK_SIZE;
 }
 
 u8 *smp_secondary_stack(int index)
@@ -502,6 +535,8 @@ u64 smp_s2r_publish(void)
     s2r_mailbox.resume_pa = 0;
     s2r_mailbox.resumes = 0;
     dc_cvac_range(&s2r_mailbox, sizeof(s2r_mailbox));
+    dc_cvac_range((void *)_base, _rodata_end - (char *)_base);
+    dc_cvac_range((void *)_data_start, _bss_end - _data_start);
     sysop("dsb sy");
     return (u64)&s2r_mailbox;
 }
@@ -510,6 +545,37 @@ u64 smp_s2r_publish(void)
 bool smp_s2r_published(void)
 {
     return s2r_mailbox.magic == AURA_S2R_MAGIC;
+}
+
+/* The bring-up below takes well under a second at boot; Linux's default watchdog period. */
+#define S2R_PCIE_WDT_SECONDS 30
+
+/*
+ * Where the PCIe complex's setup is this image's alone (pcie_needs_sleep_reinit()), the sleep
+ * took it: set it up again before the OS runs. Nobody drains the console now and a full FIFO
+ * holds the core, so the console goes first. The step runs only under a watchdog: the OS's, if
+ * it left one armed (Linux's T8103 sleep does, from its commit to the wake), or one borrowed for
+ * the step and put back after. Without either, or if the complex doesn't come back, the SoC is
+ * in no state the OS knows: reboot rather than resume into it.
+ */
+static void smp_s2r_pcie_reinit(void)
+{
+    struct wdt_guard guard;
+
+    if (!pcie_needs_sleep_reinit())
+        return;
+
+    for (iodev_id_t id = 0; id < IODEV_NUM; id++)
+        iodev_set_usage(id, iodev_get_usage(id) & ~USAGE_CONSOLE);
+
+    if (wdt_s2r_guard_enter(&guard, S2R_PCIE_WDT_SECONDS))
+        reboot();
+    int ret = pmgr_adt_power_enable("/arm-io/ans");
+    if (!ret)
+        ret = pcie_reinit_after_sleep();
+    if (ret)
+        reboot();
+    wdt_s2r_guard_exit(&guard);
 }
 
 /*
@@ -522,7 +588,7 @@ void smp_s2r_return_to_os(void)
 {
     u64 entry = s2r_mailbox.resume_pa;
 
-    /* exception_initialize() unmasked everything. */
+    /* exception_initialize() left everything masked; the OS expects it so. */
     msr(DAIF, 0xf << 6);
 
     /* A reset the OS didn't arm: reboot rather than guess what state it's in. */
@@ -536,6 +602,8 @@ void smp_s2r_return_to_os(void)
                                     : "aura: S2R reset not armed, rebooting");
     if (!armed)
         reboot();
+
+    smp_s2r_pcie_reinit();
 
     s2r_mailbox.resume_pa = 0;
     s2r_mailbox.resumes++;
@@ -576,9 +644,6 @@ void smp_secondary_entry(void)
         msr(TPIDR_EL2, index);
     else
         msr(TPIDR_EL1, index);
-
-    if (chip_id != T8142 && chip_id != T8152 && !smp_s2r_published())
-        printf("  Index: %d (table: %p)\n\n", index, me);
 
     me->mpidr = mpidr;
 
@@ -725,7 +790,8 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
     if (i >= 100) {
         printf("Failed!\n");
     } else {
-        printf("  Started.\n");
+        sysop("dmb ld");
+        printf("  Started, MPIDR 0x%lx.\n", spin_table[index].mpidr);
     }
 
     _reset_stack = dummy_stack + DUMMY_STACK_SIZE;
@@ -853,11 +919,19 @@ static int smp_init_t8152(void)
             return -1;
         present |= BIT(id);
         cpu_nodes[id] = node;
-        cpu_info[id] = (struct cpu_info){true, 0, (reg >> 8) & 0xff, reg & 0xff, impl[0]};
+        cpu_info[id] = (struct cpu_info){
+            .valid = true,
+            .die = 0,
+            .cluster = (reg >> 8) & 0xff,
+            .core = reg & 0xff,
+            .reg = reg,
+            .impl_reg = impl[0],
+        };
     }
     int boot_cpu = t8152_cpu_index(mrs(MPIDR_EL1));
     if (present != 0xfff || boot_cpu < 0)
         return -1;
+    smp_assign_stacks();
 
     boot_cpu_idx = boot_cpu;
     boot_cpu_mpidr = mrs(MPIDR_EL1);
@@ -977,6 +1051,7 @@ int smp_init(void)
 
         cpu_nodes[cpu_id] = node;
     }
+    smp_assign_stacks();
 
     int running_cpu = -1;
     for (int i = 0; i < MAX_CPUS; i++) {
@@ -1047,6 +1122,7 @@ int smp_init(void)
         cpu_info[i].valid = true;
         cpu_info[i].core = FIELD_GET(CPU_REG_CORE, reg);
         cpu_info[i].cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
+        cpu_info[i].reg = reg;
         /* T6050 Ultra's reg puts the die at bit 12 (die 1 = 0x1000); use die-id where given. */
         u32 die_id;
         if (ADT_GETPROP(adt, cpu_node, "die-id", &die_id) == sizeof(die_id))
@@ -1138,8 +1214,14 @@ int smp_start_secondaries(void)
     for (int i = 0; i < MAX_CPUS; i++) {
         struct cpu_info *cpu = &cpu_info[i];
 
+        /*
+         * A CPU is expected when the ADT lists it. iBoot removes the node of a core fused off on
+         * a binned part, so those never reach this loop. A listed core aura cannot describe
+         * (no reg, or no cpu-impl-reg and no /arm-io reg slot for it) cannot be started, and
+         * counts as missing on every chip.
+         */
         if (!cpu->valid) {
-            if (chip_id == T8140 && cpu_nodes[i]) {
+            if (cpu_nodes[i]) {
                 printf("SMP: ADT CPU %d has no valid implementation register\n", i);
                 failed = true;
             }
@@ -1422,7 +1504,8 @@ static u64 smp_guest_mpidr(int i)
         if (type && boot && len && boot_len && type[0] == boot[0])
             aff2 = boot_aff2;
     }
-    return ((u64)cpu->cluster << 8) | cpu->core | (aff2 << 16);
+    /* Preserve Aff0, Aff1, and die bits from ADT reg (bit 11 on M1/M2 Ultra, bit 12 on T6050). */
+    return (u64)(cpu->reg & 0xffff) | (aff2 << 16);
 }
 
 /*
@@ -1452,12 +1535,12 @@ int smp_prepare_guest_resets(void)
                 printf("SMP-guest: boot cpu%d MPIDR 0x%lx, ADT-derived 0x%lx\n", i,
                        smp_reset_stacks[i].mpidr, mpidr);
         } else {
-            if (!secondary_stacks[i]) {
+            if (!cpu_stack(i)) {
                 printf("SMP-guest: cpu%d has no reset stack\n", i);
                 continue;
             }
             smp_reset_stacks[i].mpidr = mpidr;
-            smp_reset_stacks[i].stack = (u64)secondary_stacks[i] + SECONDARY_STACK_SIZE;
+            smp_reset_stacks[i].stack = (u64)cpu_stack(i) + SECONDARY_STACK_SIZE;
             rc = smp_prepare_rvbar(cpu);
         }
         /* A secondary must be powered off here: XNU's CPUSTART only resets a core that is
@@ -1504,7 +1587,7 @@ void smp_reset_stack_range(int cpu, u64 *base, u64 *size)
         *base = (u64)_stack_top;
         *size = (u64)_stack_bot - (u64)_stack_top;
     } else {
-        *base = (u64)secondary_stacks[cpu];
-        *size = secondary_stacks[cpu] ? SECONDARY_STACK_SIZE : 0;
+        *base = (u64)cpu_stack(cpu);
+        *size = cpu_stack(cpu) ? SECONDARY_STACK_SIZE : 0;
     }
 }

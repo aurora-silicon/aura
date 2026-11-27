@@ -229,6 +229,12 @@ AURA_XTEXT static void ctl_catalogue(void)
     ctl_add_adt("/arm-io/nub-spmi0", "spmi0", 0, 0, PG);
     ctl_add_adt("/arm-io/nub-spmi-a0", "spmi-a0", 0, 0, PG);
     ctl_add_adt("/arm-io/dart-dcp", "dart-dcp", 0, 0, 0);
+
+    /* Trace the APR core, wrapper, and DART windows described by this machine. */
+    ctl_add_adt("/arm-io/apr", "apr-core", 0, 0, 0);
+    ctl_add_adt("/arm-io/apr", "apr-wrapper", 1, 0, 0);
+    ctl_add_adt("/arm-io/dart-apr", "dart-apr", 0, 0, 0);
+    ctl_add_adt("/arm-io/dart-apr", "dart-apr-aux", 1, 0, 0);
 }
 
 AURA_XTEXT static void ctl_deny_adt(const char *path)
@@ -721,10 +727,10 @@ int ctl_host_call_unauth(u64 req_va)
  */
 #define CTL_DCC_TAG 0xAC71UL /* top 16 bits of a doorbell write, and of its errno read-back */
 
-static int ctl_dcc_errno[32]; /* per core, indexed by smp_id() */
-static u64 ctl_dcc_cookie;    /* the boot's cookie; 0 (unset) refuses every gated command */
-static u64
-    ctl_dcc_presented[32]; /* per core, the cookie last written to DBGDTRTX before a doorbell */
+static int ctl_dcc_errno[MAX_CPUS]; /* per core, indexed by smp_id() */
+static u64 ctl_dcc_cookie;          /* the boot's cookie; 0 (unset) refuses every gated command */
+/* per core, the cookie last written to DBGDTRTX before a doorbell */
+static u64 ctl_dcc_presented[MAX_CPUS];
 
 /* The per-boot cookie, from the host (run_guest_sptm.py, over the proxy) or extracted from the
  * ESP manifest's boot-args (src/sptm_virt_esp.c). used+retain: a host-called entry, like

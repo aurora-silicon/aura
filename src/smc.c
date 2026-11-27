@@ -20,8 +20,9 @@
 #define SMC_MSG_TYPE GENMASK(7, 0)
 #define SMC_MSG_ID   GENMASK(15, 12)
 
-#define SMC_WRITE_KEY_SIZE GENMASK(23, 16)
-#define SMC_WRITE_KEY_KEY  GENMASK(63, 32)
+#define SMC_WRITE_KEY_WSIZE GENMASK(31, 24)
+#define SMC_WRITE_KEY_SIZE  GENMASK(23, 16)
+#define SMC_WRITE_KEY_KEY   GENMASK(63, 32)
 
 #define SMC_RESULT_RESULT GENMASK(7, 0)
 #define SMC_RESULT_ID     GENMASK(15, 12)
@@ -90,7 +91,7 @@ static void smc_send(smc_dev_t *smc, u64 message)
     rtkit_send(smc->rtkit, &msg);
 }
 
-static int smc_cmd(smc_dev_t *smc, u64 message)
+static int smc_cmd(smc_dev_t *smc, u64 message, u64 *reply)
 {
     u8 id = smc->msgid++ & 0xF;
     assert(!smc->outstanding[id]);
@@ -105,6 +106,8 @@ static int smc_cmd(smc_dev_t *smc, u64 message)
     }
 
     u64 result = smc->ret[id];
+    if (reply)
+        *reply = result;
     u32 ret = FIELD_GET(SMC_RESULT_RESULT, result);
     if (ret) {
         printf("SMC: smc_cmd[0x%x] failed: %u\n", id, ret);
@@ -183,6 +186,30 @@ out_free:
     return NULL;
 }
 
+/*
+ * Write @wvalue to @key and read four bytes back in one exchange. On an SMC GPIO key, a write of
+ * the output command (SMC_GPIO_CMD_OUTPUT) with no level returns the pin's output latch without
+ * changing it.
+ */
+int smc_rw_u32(smc_dev_t *smc, u32 key, u32 wvalue, u32 *value)
+{
+    u64 reply;
+    memcpy(smc->shmem, &wvalue, sizeof(wvalue));
+    u64 msg = FIELD_PREP(SMC_MSG_TYPE, SMC_RW_KEY);
+    msg |= FIELD_PREP(SMC_WRITE_KEY_WSIZE, sizeof(wvalue));
+    msg |= FIELD_PREP(SMC_WRITE_KEY_SIZE, sizeof(*value));
+    msg |= FIELD_PREP(SMC_WRITE_KEY_KEY, key);
+
+    int ret = smc_cmd(smc, msg, &reply);
+    if (ret)
+        return ret;
+    /* A value of up to four bytes comes back in the reply itself */
+    if (FIELD_GET(SMC_RESULT_SIZE, reply) != sizeof(*value))
+        return -1;
+    *value = FIELD_GET(SMC_RESULT_VALUE, reply);
+    return 0;
+}
+
 int smc_write_u32(smc_dev_t *smc, u32 key, u32 value)
 {
     memcpy(smc->shmem, &value, sizeof(value));
@@ -190,7 +217,7 @@ int smc_write_u32(smc_dev_t *smc, u32 key, u32 value)
     msg |= FIELD_PREP(SMC_WRITE_KEY_SIZE, sizeof(value));
     msg |= FIELD_PREP(SMC_WRITE_KEY_KEY, key);
 
-    return smc_cmd(smc, msg);
+    return smc_cmd(smc, msg, NULL);
 }
 
 int smc_write_u64(smc_dev_t *smc, u32 key, u64 value)
@@ -200,11 +227,12 @@ int smc_write_u64(smc_dev_t *smc, u32 key, u64 value)
     msg |= FIELD_PREP(SMC_WRITE_KEY_SIZE, sizeof(value));
     msg |= FIELD_PREP(SMC_WRITE_KEY_KEY, key);
 
-    return smc_cmd(smc, msg);
+    return smc_cmd(smc, msg, NULL);
 }
 
-/* ADT function-reset = pKW4/pKW8: the SMC node's phandle, the function name, then its arguments */
-struct smc_adt_function {
+/* ADT pKW4/pKW8 function: the phandle of the SMC node or one of its children, the function
+ * name, then its arguments */
+struct smc_adt_function_prop {
     u32 phandle;
     char four_cc[4];
     u32 key;
@@ -212,27 +240,70 @@ struct smc_adt_function {
     u32 hi; /* pKW8 only */
 };
 
-int smc_adt_function_reset(const char *path, u32 settle_ms)
+/* Whether phandle names node or any node below it. The functions point at the SMC's PMU (J704:
+ * /arm-io/smc/iop-smc-nub/smc-pmu), not at /arm-io/smc itself; the whole (finite) subtree is
+ * searched, so no particular layout is assumed. */
+static bool smc_adt_node_has_phandle(int node, u32 phandle)
 {
-    struct smc_adt_function fn = {0};
+    u32 own;
+
+    if (ADT_GETPROP(adt, node, "AAPL,phandle", &own) >= 0 && own == phandle)
+        return true;
+
+    int child = node;
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        if (smc_adt_node_has_phandle(child, phandle))
+            return true;
+    }
+    return false;
+}
+
+int smc_adt_function_get(const char *path, const char *prop, struct smc_adt_function *fn)
+{
+    struct smc_adt_function_prop raw = {0};
     u32 len;
     int node = adt_path_offset(adt, path);
-    const void *prop = node < 0 ? NULL : adt_getprop(adt, node, "function-reset", &len);
+    const void *val = node < 0 ? NULL : adt_getprop(adt, node, prop, &len);
 
-    if (!prop || len < 12)
+    if (!val || len < 12)
         return 1;
-    memcpy(&fn, prop, min(len, (u32)sizeof(fn)));
-    bool wide = !memcmp(fn.four_cc, "8WKp", 4);
-    if (!(wide && len == 20) && !(!memcmp(fn.four_cc, "4WKp", 4) && len == 16))
+    memcpy(&raw, val, min(len, (u32)sizeof(raw)));
+    bool wide = !memcmp(raw.four_cc, "8WKp", 4);
+    if (!(wide && len == 20) && !(!memcmp(raw.four_cc, "4WKp", 4) && len == 16))
         return 1; /* a GPIO or other non-SMC function */
+    int smc_node = adt_path_offset(adt, "/arm-io/smc");
+    if (smc_node < 0 || !smc_adt_node_has_phandle(smc_node, raw.phandle)) {
+        /* A pKW4/pKW8 aimed at a controller other than the SMC: present but unusable, so the
+         * caller must not treat it as "no function". */
+        printf("SMC: %s %s names phandle %u, not /arm-io/smc or a node below it: refused\n", path,
+               prop, raw.phandle);
+        return -1;
+    }
+
+    *fn = (struct smc_adt_function){.key = raw.key, .lo = raw.lo, .hi = raw.hi, .wide = wide};
+    return 0;
+}
+
+int smc_adt_function_write(smc_dev_t *smc, const struct smc_adt_function *fn, u32 level)
+{
+    return fn->wide ? smc_write_u64(smc, fn->key, ((u64)fn->hi << 32) | fn->lo | level)
+                    : smc_write_u32(smc, fn->key, fn->lo | level);
+}
+
+int smc_adt_function_reset(const char *path, u32 settle_ms)
+{
+    struct smc_adt_function fn;
+    int ret = smc_adt_function_get(path, "function-reset", &fn);
+
+    if (ret)
+        return ret;
 
     smc_dev_t *smc = smc_init();
     if (!smc)
         return -1;
-    int ret = 0;
     for (u32 level = 0; level < 2 && !ret; level++) {
-        ret = wide ? smc_write_u64(smc, fn.key, ((u64)fn.hi << 32) | fn.lo | level)
-                   : smc_write_u32(smc, fn.key, fn.lo | level);
+        ret = smc_adt_function_write(smc, &fn, level);
         mdelay(settle_ms);
     }
     smc_shutdown(smc);

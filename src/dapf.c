@@ -33,6 +33,22 @@ struct dapf_segment {
 static_assert(sizeof(struct dapf_segment) == 32, "Invalid segment-ranges entry size");
 
 /*
+ * The CPU DART of video encoder N is /arm-io/dart-ave<N>, the encoder /arm-io/ave<N>. Return the
+ * encoder's name ("ave<N>") for such a DART name, or NULL.
+ */
+static const char *dapf_ave_of_dart(const char *name)
+{
+    const char *p;
+
+    if (!name || strncmp(name, "dart-ave", 8) || !name[8])
+        return NULL;
+    for (p = name + 8; *p; p++)
+        if (*p < '0' || *p > '9')
+            return NULL;
+    return name + 5;
+}
+
+/*
  * A coprocessor whose firmware iBoot preloads fetches its __TEXT physically at the
  * address iBoot latched in its reset vector, through its CPU DART's filter. The
  * filter must admit that range. Return the preloaded __TEXT range of the ADT node
@@ -40,12 +56,20 @@ static_assert(sizeof(struct dapf_segment) == 32, "Invalid segment-ranges entry s
  */
 static bool dapf_preload_text(const char *path, u64 *start, u64 *end)
 {
-    if (strcmp(path, "/arm-io/dart-ave0"))
+    char encoder[32];
+    const char *ave =
+        strncmp(path, "/arm-io/", 8) ? NULL : dapf_ave_of_dart(path + strlen("/arm-io/"));
+    if (!ave || snprintf(encoder, sizeof(encoder), "/arm-io/%s", ave) >= (int)sizeof(encoder))
         return false;
 
-    u32 len;
-    int node = adt_path_offset(adt, "/arm-io/ave0");
-    if (node < 0 || !adt_getprop(adt, node, "pre-loaded", &len))
+    u32 len, preloaded;
+    int node = adt_path_offset(adt, encoder);
+    const void *pl = node < 0 ? NULL : adt_getprop(adt, node, "pre-loaded", &len);
+    /* The same test as kboot.c's encoder handoff: pre-loaded is 1, not merely present. */
+    if (!pl || len != sizeof(preloaded))
+        return false;
+    memcpy(&preloaded, pl, sizeof(preloaded));
+    if (preloaded != 1)
         return false;
     const struct dapf_segment *seg = adt_getprop(adt, node, "segment-ranges", &len);
     if (!seg || len < sizeof(*seg) || seg[0].size < 4 || (seg[0].phys & 3))
@@ -67,7 +91,7 @@ static int dapf_init_t8020(const char *path, u64 base, int node)
     }
 
     int count = length / sizeof(*config);
-    u64 text_start, text_end;
+    u64 text_start = 0, text_end = 0;
     bool text = dapf_preload_text(path, &text_start, &text_end);
 
     for (int i = 0; i < count; i++) {
@@ -664,8 +688,57 @@ struct entry dapf_entries[] = {
     {"/arm-io/dart-isp", 5, "isp"},
     {"/arm-io/dart-isp0", 5, "isp"},
     {"/arm-io/dart-ave0", 3, "ave"},
+    {"/arm-io/dart-ave1", 3, "ave1"},
     {NULL, -1, NULL},
 };
+
+/*
+ * The dapf_entries filters dapf_init_fdt() programmed, and those it failed to program, on this
+ * boot. An entry it skipped (its DT alias absent or disabled, its DART not in the ADT) is in
+ * neither.
+ */
+static const char *dapf_programmed_paths[16], *dapf_failed_paths[16];
+static unsigned int dapf_nprogrammed, dapf_nfailed;
+
+static bool dapf_listed(const char *const *paths, unsigned int n, const char *path)
+{
+    for (unsigned int i = 0; i < n; i++)
+        if (!strcmp(paths[i], path))
+            return true;
+    return false;
+}
+
+/* dapf_init_fdt() programmed the filter of the DART at @path on this boot. */
+bool dapf_programmed(const char *path)
+{
+    return dapf_listed(dapf_programmed_paths, dapf_nprogrammed, path);
+}
+
+/* dapf_init_fdt() tried to program the filter of the DART at @path on this boot and failed. */
+bool dapf_failed(const char *path)
+{
+    return dapf_listed(dapf_failed_paths, dapf_nfailed, path);
+}
+
+/*
+ * dart-ave, the CPU DART of the one encoder of the M2 through M5 and T8152 (ADT ave), is in
+ * neither dapf_entries nor programmed by kboot.c: its filter is the one iBoot left, which admits
+ * the encoder's preloaded firmware (rows on M2, M3 and M4).
+ */
+bool dapf_ave_filter_inherited(const char *path)
+{
+    return !strcmp(path, "/arm-io/dart-ave");
+}
+
+/*
+ * T8140 programs only its MTP and PMP DART filters and keeps every other filter as inherited
+ * (programming the rest raised an SError on a J700). dapf_init_fdt() and the encoder filters in
+ * kboot.c both ask this, so the two cannot drift.
+ */
+bool dapf_keeps_inherited(const char *path)
+{
+    return chip_id == T8140 && strcmp(path, "/arm-io/dart-mtp") && strcmp(path, "/arm-io/dart-pmp");
+}
 
 static int dapf_init_j713(void *dt)
 {
@@ -770,16 +843,16 @@ int dapf_init_fdt(const void *fdt)
 {
     j614s_aop_ready = false;
     j614s_isp_ready = false;
+    dapf_nprogrammed = dapf_nfailed = 0;
     if (chip_id == T8132) {
-        /* M4 laptops whose trees state the same DAPF handoff contract as the J713. */
-        static const char *const boards[] = {"apple,j713", "apple,j604", NULL};
-        bool known = false;
-
-        for (const char *const *board = boards; fdt && *board; board++)
-            known |= !fdt_node_check_compatible(fdt, 0, *board);
-        if (!known)
-            return 0; /* No other M4 board's power/DAPF contract is qualified. */
-        return dapf_init_j713((void *)fdt);
+        /*
+         * The tree states the handoff contract itself: /chosen's
+         * linux-enablement-mac,dapf-handoff names the consumers whose filters
+         * are handed off, and dapf_init_j713() preserves the firmware state
+         * of a tree that names none. No board list: a T8132 Mac whose tree
+         * carries the property gets the handoff with no change here.
+         */
+        return fdt ? dapf_init_j713((void *)fdt) : 0;
     }
 
     int ret = 0;
@@ -787,8 +860,7 @@ int dapf_init_fdt(const void *fdt)
     struct entry *entry = dapf_entries;
 
     while (entry->path != NULL) {
-        if (chip_id == T8140 && strcmp(entry->path, "/arm-io/dart-mtp") &&
-            strcmp(entry->path, "/arm-io/dart-pmp")) {
+        if (dapf_keeps_inherited(entry->path)) {
             printf("dapf: preserving inherited %s state on T8140\n", entry->path);
             entry++;
             continue;
@@ -814,11 +886,17 @@ int dapf_init_fdt(const void *fdt)
             continue;
         }
         if (dapf_init(entry->path, entry->index) < 0) {
+            /* dapf_entries has fewer entries than this has slots. */
+            if (dapf_nfailed < sizeof(dapf_failed_paths) / sizeof(dapf_failed_paths[0]))
+                dapf_failed_paths[dapf_nfailed++] = entry->path;
             ret = -1;
-        } else if (dapf_is_j614s() && !strcmp(entry->path, "/arm-io/dart-aop")) {
-            j614s_aop_ready = true;
-        } else if (dapf_is_j614s() && !strcmp(entry->path, "/arm-io/dart-isp0")) {
-            j614s_isp_ready = true;
+        } else {
+            if (dapf_nprogrammed < sizeof(dapf_programmed_paths) / sizeof(dapf_programmed_paths[0]))
+                dapf_programmed_paths[dapf_nprogrammed++] = entry->path;
+            if (dapf_is_j614s() && !strcmp(entry->path, "/arm-io/dart-aop"))
+                j614s_aop_ready = true;
+            else if (dapf_is_j614s() && !strcmp(entry->path, "/arm-io/dart-isp0"))
+                j614s_isp_ready = true;
         }
         entry++;
         count += 1;

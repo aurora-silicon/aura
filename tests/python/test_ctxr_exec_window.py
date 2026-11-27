@@ -31,6 +31,8 @@ enum exc_guard_t { GUARD_OFF = 0, GUARD_MARK = 2, GUARD_SILENT = 0x100 };
 static volatile int exc_guard, exc_count;
 static int register_reads, at_el1, probe_stuck_cpu = -1;
 static bool in_el2(void) { return !at_el1; }
+/* It only logs. */
+static void ctxr_exec_check_expected(bool confined) { (void)confined; }
 /* The register whose read faults, as an undefined one would under the guard. */
 static const u64 *fault_reg;
 static u64 read_register(const u64 *reg)
@@ -626,7 +628,12 @@ def test_nothing_reserves_the_window_from_the_os():
     source = kboot_source()
     # Each range that can span the window goes around it: the heap, the image, CTXR_D
     # and the T8132 high-water interval.
-    assert source.count("dt_reserve_outside_exec_window(") == 5
+    prepare = function(source, "kboot_prepare_dt")
+    retained = function(source, "dt_reserve_retained_span")
+    assert "dt_reserve_retained_span(heap_start, heap_end)" in prepare
+    assert "dt_reserve_retained_span(image_start, image_end)" in prepare
+    assert "dt_reserve_outside_exec_window(start, gap_end - start)" in retained
+    assert "dt_reserve_outside_exec_window(start, end - start)" in prepare
     assert "dt_reserve_outside_exec_window(start, end - start))\n            bail(\"FDT: couldn't reserve the T8132" in source
     # The firmware RO range stays reserved in every mode, before the EL1 guest goes its own way.
     ro = function(source, "dt_reserve_secondary_ro")
