@@ -879,6 +879,22 @@ static void t6030_standin_switch(void)
  * leakage fuse and power model are not known. These also build against an older tree with the
  * T8122 setup (G15_T8122_BASE), and their results must not have changed.
  */
+/*
+ * The only bus access of a default T8122 boot: the guarded leakage fuse read, made on every T8122.
+ * No fuse words are mapped in these fixtures, so it faults, is caught, and nothing is exported.
+ */
+static void expect_only_fuse_read(void)
+{
+    assert(!pmgr_enables && !mmio_reads && !unguarded_faults);
+    assert(strstr(trace_buf, "read32 0x2e42c8128 UNMAPPED\n"));
+    for (const char *l = trace_buf; *l;) {
+        const char *end = strchr(l, '\n');
+        assert(end && memmem(l, end - l, "0x2e42c812", 10));
+        l = end + 1;
+    }
+    assert(log_has("FDT: GPU: T8122 leakage fuse: the read faulted; nothing exported\n"));
+}
+
 static void t8122_default(void)
 {
     struct fixture f = t8122_fx;
@@ -888,7 +904,7 @@ static void t8122_default(void)
     memcpy(before, dtbuf, sizeof(dtbuf));
     run();
     assert(!memcmp(before, dtbuf, sizeof(dtbuf)));
-    assert(!trace_len && !pmgr_enables && !mmio_reads);
+    expect_only_fuse_read();
 }
 
 static void t8122_armed_refuses(void)
@@ -1757,15 +1773,23 @@ static void t8122_j613_fuse_export(void)
     free(after);
 }
 
-static void t8122_fuse_not_j613(void)
+static void t8122_fuse_other_board(void)
 {
-    /* Another T8122 root: the fuse is not read */
-    prepare_fuse(0, 0xa0000000, 0x000aaaaa, 0);
-    static u8 before[sizeof(dtbuf)];
-    memcpy(before, dtbuf, sizeof(dtbuf));
-    run();
-    assert(!memcmp(before, dtbuf, sizeof(dtbuf)));
-    assert(!trace_len && !mmio_reads && !log_has("leakage fuse"));
+    /*
+     * The fuse is the T8122 die's, not a board's: a 14" MacBook Pro (J504) or an iMac (J433)
+     * root reads and exports it exactly as a J613 does.
+     */
+    static const char *const roots[] = {"apple,j504", "apple,j433"};
+    for (size_t i = 0; i < ARRAY_SIZE(roots); i++) {
+        prepare_fuse(0, 0xa0000000, 0x000aaaaa, 0);
+        CHK(fdt_setprop_string(dtbuf, 0, "compatible", roots[i]));
+        run();
+        expect_fuse_prop(10924, 342);
+        assert(log_has("FDT: GPU: T8122 leakage fuse: field A 0x1555, field B 0x155; values 10924 "
+                       "and 342\n"));
+        assert(!strcmp(trace_buf, "read32 0x2e42c8128\nread32 0x2e42c812c\n"));
+        assert(mmio_reads == 2 && !pmgr_enables && !exc_count && !unguarded_faults);
+    }
 }
 
 static void t8122_j613_fuse_fault(void)
@@ -1851,16 +1875,17 @@ static void t8122_j613_standin_fuse_on_fault(void)
     assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1);
 }
 
-static void t8122_j613_standin_fuse_not_j613(void)
+static void t8122_standin_fuse_not_air(void)
 {
-    /* A root without an Air board compatible cannot publish the identity witness. */
+    /* A non-Air T8122 root: the fuse is still read (it is the die's), but the full start
+     * cannot publish the identity witness, so the switch is refused */
     prepare_j613_setup(0x3ff, 1);
     CHK(fdt_setprop_string(dtbuf, 0, "compatible", "apple,t8122"));
     CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-fuse-leakage",
                            "1"));
     run();
     expect_gpu_off(dtbuf);
-    assert(!pmgr_enables && !mmio_reads && !unguarded_faults);
+    assert(!pmgr_enables && mmio_reads == 2 && !unguarded_faults);
     assert(log_has("full-start T8122 identity node unavailable"));
 }
 
@@ -3288,12 +3313,12 @@ static const struct {
     {"t8122-j613-standin-wrong-id", t8122_j613_standin_wrong_id},
     {"t8122-fuse-decode", t8122_fuse_decode},
     {"t8122-j613-fuse-export", t8122_j613_fuse_export},
-    {"t8122-fuse-not-j613", t8122_fuse_not_j613},
+    {"t8122-fuse-other-board", t8122_fuse_other_board},
     {"t8122-j613-fuse-fault", t8122_j613_fuse_fault},
     {"t8122-j613-standin-fuse-off", t8122_j613_standin_fuse_off},
     {"t8122-j613-standin-fuse-on", t8122_j613_standin_fuse_on},
     {"t8122-j613-standin-fuse-on-fault", t8122_j613_standin_fuse_on_fault},
-    {"t8122-j613-standin-fuse-not-j613", t8122_j613_standin_fuse_not_j613},
+    {"t8122-standin-fuse-not-air", t8122_standin_fuse_not_air},
     {"t8122-j615-full14", t8122_j615_full14},
     {"t8122-air-per-mac-power", t8122_air_per_mac_power},
     {"t8122-j615-full14-unknown-image", t8122_j615_full14_unknown_image},
