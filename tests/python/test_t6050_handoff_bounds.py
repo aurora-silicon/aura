@@ -1194,14 +1194,15 @@ def test_prewired_panel_rejects_external_engines_on_unknown_stub_and_packed_dt(h
     assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
     assert r.iommus == [2, 0, 11, 0]
 
-    # Packed DT where ext0's firmware-compat write fails with NOSPACE: rejection is not rolled
-    # back, so stopped ext1 stays disabled and out of display-subsystem iommus.
+    # Packed DT where ext0's firmware-compat write fails with NOSPACE: ext0 is disabled and
+    # stripped from display-subsystem iommus rather than advertising stale/missing compat, and
+    # stopped ext1 stays disabled and out of display-subsystem iommus.
     r = run(host, "prewired", pack=1, nocompat=1, fail=1, meta=META_SIZE, vram=VRAM,
             vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
-    assert r.state["ext0"] == "okay" and r.state["ext0_fw"] == "none"
+    assert r.state["ext0"] == "disabled" and r.state["ext0_fw"] == "none"
     assert r.state["ext1"] == "disabled"
     assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
-    assert r.iommus == [2, 0, 11, 0]
+    assert r.iommus == [2, 0]
 
     # Packed DT where ext1 has no status property so status = "disabled" cannot fit: ext1 is
     # deleted instead and its display DART is removed from display-subsystem iommus.
@@ -1241,18 +1242,21 @@ def test_prewired_panel_rejects_nested_bus_external_engine(host):
 
 
 def test_prewired_panel_rejects_external_engines_across_failure_and_status_edges(host):
-    # Scratch allocation failure during rejection: falls back to in-place edits so stopped ext1
-    # is still disabled and stripped from scanout (and deleted on a packed DT with absent status).
+    # Scratch allocation failure during rejection/version update: falls back to in-place edits so
+    # stopped ext1 is disabled and stripped from scanout, and ext0 (whose compat cannot be updated)
+    # is also disabled and stripped from scanout rather than keeping stale apple,firmware-compat.
     r = run(host, "prewired", fail_scratch=1, fail=1, meta=META_SIZE, vram=VRAM, vsize=VRAM_SIZE,
             **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["ext0"] == "disabled"
     assert r.state["ext1"] == "disabled"
     assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
-    assert r.iommus == [2, 0, 11, 0]
+    assert r.iommus == [2, 0]
 
     r = run(host, "prewired", pack=1, absent_status=1, fail_scratch=1, fail=1, meta=META_SIZE,
             vram=VRAM, vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["ext0"] == "disabled"
     assert r.state["ext1"] == "deleted"
-    assert r.iommus == [2, 0, 11, 0]
+    assert r.iommus == [2, 0]
 
     # Oversized display-subsystem iommus (> 128 bytes): compacts iommus in place without
     # allocating, strips ext1's DART while keeping other phandles intact, disables rejected ext1,
@@ -1281,16 +1285,20 @@ def test_prewired_panel_rejects_external_engines_across_failure_and_status_edges
 def test_prewired_panel_drops_rejected_scanout_from_enabled_oversized_iommus(host, fail_scratch):
     # Display subsystem already enabled ("okay") with >128-byte iommus: rejected ext1 is disabled
     # AND its DART phandle (12) is removed from iommus in place while all other phandles stay
-    # intact, both with scratch allocation and with in-place fallback.
-    expected_iommus = [2, 0, 11, 0] + [x for i in range(3, 18) for x in (100 + i, 0)]
+    # intact. With fail_scratch=0 ext0 is updated to 27.2.0; with fail_scratch=1 ext0 cannot
+    # update compat and is also disabled with its DART phandle (11) stripped in place.
+    tail = [x for i in range(3, 18) for x in (100 + i, 0)]
     r = run(host, "prewired", disp_enabled=1, oversized_iommus=1, fail_scratch=fail_scratch,
             fail=1, meta=META_SIZE, vram=VRAM, vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
     assert r.state["subsystem"] == "okay"
     assert r.state["ext1"] == "disabled"
     assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
-    assert r.iommus == expected_iommus
     if not fail_scratch:
         assert r.state["ext0"] == "okay" and r.state["ext0_fw"] == "27.2.0"
+        assert r.iommus == [2, 0, 11, 0] + tail
+    else:
+        assert r.state["ext0"] == "disabled"
+        assert r.iommus == [2, 0] + tail
 
 
 def test_prewired_panel_rejects_packed_and_no_piodma_duplicate_ext_nodes(host):

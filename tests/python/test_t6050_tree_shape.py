@@ -781,7 +781,9 @@ static void *test_malloc(size_t n)
         definition(source, "static T6050_TEXT bool t6050_dart_at(") + \
         definition(source, "static T6050_TEXT int t6050_drop_ext_scanout(") + \
         definition(source, "static T6050_TEXT int t6050_ext_walk(") + \
+        definition(source, "static T6050_TEXT int t6050_ext_disable(") + \
         definition(source, "static T6050_TEXT void t6050_ext_reject(") + \
+        definition(source, "static T6050_TEXT int t6050_ext_version_one(") + \
         definition(source, "static T6050_TEXT void t6050_ext_version(") + r'''
 static const u32 tree_version[3] = {27, 0, 0};
 enum { PH_DISP0 = 10, PH_DART0 = 11, PH_DART1 = 12, PH_DART2 = 13 };
@@ -907,12 +909,33 @@ int main(void)
     assert(is("/dcpext0", "apple,firmware-version", &v273));
     assert(is("/dcpext1", "apple,firmware-compat", &v273));
     assert(is("/dcpext2", "apple,firmware-version", &old)); cases++;
-    /* No room in the tree for the four cells: nothing changes. */
+    /* Packed DT with no free room for four cells: dcpext1 fails first (disabled, PH_DART1
+     * stripped, +4B net free), leaving too little room for dcpext0's compat+version so dcpext0
+     * fails too and is deleted (absent status) with PH_DART0 stripped. */
     world();
     assert(!fdt_pack(tree));
-    memcpy(before, tree, fdt_totalsize(tree));
     t6050_ext_version(tree);
-    assert(!memcmp(before, tree, fdt_totalsize(tree))); cases++;
+    assert(is_disabled("/dcpext1") && is("/dcpext1", "apple,firmware-compat", &old));
+    assert(fdt_path_offset(tree, "/dcpext0") < 0);
+    assert(has_scanout_dart(PH_DISP0) && !has_scanout_dart(PH_DART0) &&
+           !has_scanout_dart(PH_DART1)); cases++;
+    /* Packed DT where every enabled engine fails the four-cell write and status = "disabled" fits:
+     * both engines are disabled and stripped from scanout rather than keeping stale compat. */
+    world();
+    assert(!fdt_setprop_string(tree, fdt_path_offset(tree, "/dcpext0"), "status", "okay"));
+    {
+        fdt32_t v[3];
+        for (int i = 0; i < 3; i++)
+            v[i] = cpu_to_fdt32(tree_version[i]);
+        assert(!fdt_setprop(tree, fdt_path_offset(tree, "/dcpext1"),
+                            "apple,firmware-version", v, sizeof(v)));
+    }
+    assert(!fdt_pack(tree));
+    t6050_ext_version(tree);
+    assert(is_disabled("/dcpext0") && is("/dcpext0", "apple,firmware-compat", &old));
+    assert(is_disabled("/dcpext1") && is("/dcpext1", "apple,firmware-compat", &old));
+    assert(has_scanout_dart(PH_DISP0) && !has_scanout_dart(PH_DART0) &&
+           !has_scanout_dart(PH_DART1)); cases++;
     /* An unknown firmware: nothing changes. */
     world();
     os_firmware = (struct fw_version_info){V_UNKNOWN, NULL, {0}, 0, NULL};
@@ -1002,14 +1025,17 @@ int main(void)
     assert(is("/dcpext0", "apple,firmware-compat", &old) && !is_disabled("/dcpext0"));
     assert(has_scanout_dart(PH_DISP0) && has_scanout_dart(PH_DART0));
     assert_rejected("/dcpext1", PH_DART1, &old); cases++;
-    /* Packed DT where the four-cell version write fails: rejection is NOT rolled back. */
+    /* Packed DT where the four-cell version write fails: rejection is NOT rolled back, and the
+     * engine whose compatibility could not be updated is deleted (absent status) and stripped from
+     * scanout instead of advertising stale apple,firmware-compat. */
     world();
     os_firmware = v273;
     exts[1].running = 0;
     assert(!fdt_pack(tree));
     t6050_ext_version(tree);
-    assert(is("/dcpext0", "apple,firmware-compat", &old) && !is_disabled("/dcpext0"));
-    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    assert(fdt_path_offset(tree, "/dcpext0") < 0 && !has_scanout_dart(PH_DART0));
+    assert(is_disabled("/dcpext1") && is("/dcpext1", "apple,firmware-compat", &old));
+    assert(has_scanout_dart(PH_DISP0) && !has_scanout_dart(PH_DART1)); cases++;
     /* Packed DT where status = "disabled" cannot fit (absent status on dcpext0): the rejected
      * node is deleted instead and its scanout DART is stripped. */
     world();
@@ -1051,16 +1077,19 @@ int main(void)
     t6050_ext_version(tree);
     assert(is("/dcpext0", "apple,firmware-compat", &v272));
     assert_rejected(nested_ep, PH_DART1, &old); cases++;
-    /* Scratch allocation failure during rejection: falls back to in-place editing so the
-     * unsafe engine is still disabled (or deleted on a packed DT) and stripped from scanout. */
+    /* Scratch allocation failure during rejection/version update: falls back to in-place editing so
+     * both the unsafe engine and any engine whose compatibility could not be updated are disabled
+     * (or deleted on a packed DT) and stripped from scanout. */
     world();
     os_firmware = v272;
     exts[1].running = 0;
     fail_scratch = true;
     t6050_ext_version(tree);
     fail_scratch = false;
-    assert(is("/dcpext0", "apple,firmware-compat", &old));
-    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    assert(is_disabled("/dcpext0") && is("/dcpext0", "apple,firmware-compat", &old));
+    assert(is_disabled("/dcpext1") && is("/dcpext1", "apple,firmware-compat", &old));
+    assert(has_scanout_dart(PH_DISP0) && !has_scanout_dart(PH_DART0) &&
+           !has_scanout_dart(PH_DART1)); cases++;
     world();
     os_firmware = v272;
     exts[0].running = 0;
@@ -1069,10 +1098,12 @@ int main(void)
     t6050_ext_version(tree);
     fail_scratch = false;
     assert(fdt_path_offset(tree, "/dcpext0") < 0 && !has_scanout_dart(PH_DART0));
-    assert(has_scanout_dart(PH_DISP0) && has_scanout_dart(PH_DART1)); cases++;
+    assert(is_disabled("/dcpext1") && is("/dcpext1", "apple,firmware-compat", &old));
+    assert(has_scanout_dart(PH_DISP0) && !has_scanout_dart(PH_DART1)); cases++;
     /* Scanout iommus > 128 bytes on an enabled display-subsystem: compacts iommus in place
      * without allocating, strips PH_DART1 while keeping other phandles intact, disables the
-     * rejected engine, and updates healthy engines. */
+     * rejected engine, and either updates healthy engines (inplace == 0) or deletes dcpext0 and
+     * strips PH_DART0 when scratch allocation fails (inplace == 1). */
     for (int inplace = 0; inplace < 2; inplace++) {
         world();
         os_firmware = v272;
@@ -1095,18 +1126,25 @@ int main(void)
         t6050_ext_version(tree);
         fail_scratch = false;
         assert(is_disabled("/dcpext1") && is("/dcpext1", "apple,firmware-compat", &old));
-        if (!inplace)
-            assert(is("/dcpext0", "apple,firmware-compat", &v272));
-        else
-            assert(is("/dcpext0", "apple,firmware-compat", &old));
         int len = 0;
         const fdt32_t *got = fdt_getprop(tree, fdt_path_offset(tree, "/display"), "iommus", &len);
-        assert(got && len == 34 * (int)sizeof(fdt32_t));
-        assert(fdt32_ld(&got[0]) == PH_DISP0 && !fdt32_ld(&got[1]));
-        assert(fdt32_ld(&got[2]) == PH_DART0 && !fdt32_ld(&got[3]));
-        for (int i = 3; i < 18; i++) {
-            int j = (i - 1) * 2;
-            assert(fdt32_ld(&got[j]) == (u32)(100 + i) && !fdt32_ld(&got[j + 1]));
+        if (!inplace) {
+            assert(is("/dcpext0", "apple,firmware-compat", &v272));
+            assert(got && len == 34 * (int)sizeof(fdt32_t));
+            assert(fdt32_ld(&got[0]) == PH_DISP0 && !fdt32_ld(&got[1]));
+            assert(fdt32_ld(&got[2]) == PH_DART0 && !fdt32_ld(&got[3]));
+            for (int i = 3; i < 18; i++) {
+                int j = (i - 1) * 2;
+                assert(fdt32_ld(&got[j]) == (u32)(100 + i) && !fdt32_ld(&got[j + 1]));
+            }
+        } else {
+            assert(fdt_path_offset(tree, "/dcpext0") < 0 && !has_scanout_dart(PH_DART0));
+            assert(got && len == 32 * (int)sizeof(fdt32_t));
+            assert(fdt32_ld(&got[0]) == PH_DISP0 && !fdt32_ld(&got[1]));
+            for (int i = 3; i < 18; i++) {
+                int j = (i - 2) * 2;
+                assert(fdt32_ld(&got[j]) == (u32)(100 + i) && !fdt32_ld(&got[j + 1]));
+            }
         }
         assert(!has_scanout_dart(PH_DART1));
         cases++;
@@ -1193,4 +1231,4 @@ int main(void)
     return 0;
 }
 '''
-    run(tmp_path, "ext-version", code, "PASS dcpext version 25 cases")
+    run(tmp_path, "ext-version", code, "PASS dcpext version 26 cases")

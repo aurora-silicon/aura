@@ -4604,6 +4604,36 @@ static T6050_TEXT int t6050_ext_walk(void *dt, int target, int *ord, int want_or
 }
 
 /*
+ * Disable (or delete via fdt_del_node() on a packed DT where status = "disabled" cannot fit)
+ * `at` (ADT index `n`, or -1) and drop it from every display-subsystem scanout `iommus`.
+ * Returns -1 on FDT error, 1 if an enclosing display-subsystem node was deleted (caller must
+ * rescan from the top), or 0 otherwise.
+ */
+static T6050_TEXT int t6050_ext_disable(void *dt, int at, int n, bool *changed, const char *why)
+{
+    int ord, total = t6050_ext_walk(dt, at, &ord, -1, NULL);
+    const char *name = fdt_get_name(dt, at, NULL);
+    if (total < 0 || ord < 0)
+        return -1;
+    if (n < 0)
+        dlog("external engine %s %s: disabling\n", name ? name : "(unknown)", why);
+    else
+        dlog("dcpext%d %s: disabling and keeping out of scanout\n", n, why);
+    if (t6050_drop_ext_scanout(dt, at, n, changed))
+        dlog("could not drop %s from display scanout\n", name ? name : "external engine");
+    int after = t6050_ext_walk(dt, -1, NULL, ord, &at);
+    if (after < 0)
+        return -1;
+    if (after != total)
+        /* A deleted display-subsystem node enclosed an engine: re-scan from the top. */
+        return 1;
+    if (at < 0 || (fdt_setprop_string(dt, at, "status", "disabled") && fdt_del_node(dt, at)))
+        return -1;
+    *changed = true;
+    return 0;
+}
+
+/*
  * Disable every available apple,t6050-dcpext node already enabled in the input DT (not one Aura
  * just enabled via t6050_ext_one()) that has no identity-mapped ADT match or fails
  * t6050_check_ext_adt(), and strip it from any display-subsystem scanout iommus. Runs on a
@@ -4656,36 +4686,11 @@ static T6050_TEXT void t6050_ext_reject(void *dt)
             else
                 in_place = true;
         }
-        int ord, total = t6050_ext_walk(cur, at, &ord, -1, NULL);
-        const char *name = fdt_get_name(cur, at, NULL);
-        if (total < 0 || ord < 0) {
+        if (t6050_ext_disable(cur, at, n, &changed,
+                              n < 0 ? "has no matching ADT dcpextN" : "rejected") < 0) {
             err = -1;
             break;
         }
-        if (n < 0)
-            dlog("external engine %s has no matching ADT dcpextN: disabling\n",
-                 name ? name : "(unknown)");
-        else
-            dlog("dcpext%d rejected: disabling and keeping out of scanout\n", n);
-        if (t6050_drop_ext_scanout(cur, at, n, &changed))
-            dlog("could not drop %s from display scanout\n",
-                 name ? name : "rejected external engine");
-        int after = t6050_ext_walk(cur, -1, NULL, ord, &at);
-        if (after < 0) {
-            err = -1;
-            break;
-        }
-        if (after != total) {
-            /* A deleted display-subsystem node enclosed an engine: re-scan from the top. */
-            at = fdt_node_offset_by_compatible(cur, -1, "apple,t6050-dcpext");
-            continue;
-        }
-        if (at < 0 ||
-            (fdt_setprop_string(cur, at, "status", "disabled") && fdt_del_node(cur, at))) {
-            err = -1;
-            break;
-        }
-        changed = true;
         at = fdt_node_offset_by_compatible(cur, -1, "apple,t6050-dcpext");
     }
     if (err || (at < 0 && at != -FDT_ERR_NOTFOUND))
@@ -4698,6 +4703,33 @@ static T6050_TEXT void t6050_ext_reject(void *dt)
 }
 
 /*
+ * Write `os_firmware` to `apple,firmware-compat` and any existing `apple,firmware-version` on
+ * `at` in one scratch transaction. Returns 0 on success, -1 if scratch allocation, any FDT
+ * property write, or commit failed (leaving `dt` untouched and `scratch` freed).
+ */
+static T6050_TEXT int t6050_ext_version_one(void *dt, int at)
+{
+    static const char *const props[] = {"apple,firmware-compat", "apple,firmware-version"};
+    void *scratch = dcp6_scratch(dt);
+    int err = 0;
+
+    if (!scratch)
+        return -1;
+    for (size_t i = 0; !err && i < ARRAY_SIZE(props); i++) {
+        /* apple,firmware-compat (props[0]) always; apple,firmware-version only if present */
+        if (i && !fdt_getprop(scratch, at, props[i], NULL))
+            continue;
+        err = firmware_set_fdt(scratch, at, props[i], &os_firmware);
+    }
+    if (err || dcp6_commit(dt, scratch)) {
+        if (err)
+            free(scratch);
+        return -1;
+    }
+    return 0;
+}
+
+/*
  * External engines the device tree enables itself (the J716c's) run this boot's firmware, but
  * the tree names the build it was written for in their apple,firmware-compat, from which the
  * driver picks their method IDs. Set it to this boot's version on every such engine that passes
@@ -4706,15 +4738,15 @@ static T6050_TEXT void t6050_ext_reject(void *dt)
  * whatever their number of cells, as t6050_publish() does for the internal dcp. An available
  * engine with no valid ADT match or failing the ADT running/uuid or placement checks is disabled
  * and stripped from any display-subsystem scanout iommus first by t6050_ext_reject(), even on an
- * unknown stub or when the version write runs out of space. A node not available (status absent,
- * "okay" or "ok") is t6050_ext_one()'s. The version edit is made on its own scratch copy: a
- * failed write or walk leaves the versions unchanged while keeping any rejections.
+ * unknown stub. A node not available (status absent, "okay" or "ok") is t6050_ext_one()'s.
+ * Each surviving engine's version edit runs in its own scratch transaction; if allocation,
+ * writing, or commit fails, that engine is disabled (or deleted on a packed DT) and stripped
+ * from scanout rather than leaving stale apple,firmware-compat enabled.
  */
 static T6050_TEXT void t6050_ext_version(void *dt)
 {
-    static const char *const props[] = {"apple,firmware-compat", "apple,firmware-version"};
+    u32 done = 0;
     int count = 0, err = 0, at = -1;
-    bool changed = false;
 
     t6050_ext_reject(dt);
 
@@ -4723,37 +4755,31 @@ static T6050_TEXT void t6050_ext_version(void *dt)
              os_firmware.string ? os_firmware.string : "");
         return;
     }
-    void *scratch = dcp6_scratch(dt);
-    if (!scratch)
-        return;
-    while (!err && (at = fdt_node_offset_by_compatible(scratch, at, "apple,t6050-dcpext")) >= 0) {
-        bool set = false, unique;
-        if (!t6050_available(scratch, at))
+    while ((at = fdt_node_offset_by_compatible(dt, at, "apple,t6050-dcpext")) >= 0) {
+        bool unique;
+        if (!t6050_available(dt, at))
             continue;
-        int n = t6050_ext_index(scratch, at, &unique);
-        if (n < 0 || !unique || (t6050.ext_aura & (1u << n)) || t6050_check_ext_adt(n))
+        int n = t6050_ext_index(dt, at, &unique);
+        if (n < 0 || !unique || ((t6050.ext_aura | done) & (1u << n)) || t6050_check_ext_adt(n))
             continue;
-        for (size_t i = 0; !err && i < ARRAY_SIZE(props); i++) {
-            /* apple,firmware-compat (props[0]) always; apple,firmware-version only if present */
-            if (i && !fdt_getprop(scratch, at, props[i], NULL))
-                continue;
-            err = firmware_set_fdt(scratch, at, props[i], &os_firmware);
-            set = set || !err;
+        done |= 1u << n;
+        if (t6050_ext_version_one(dt, at)) {
+            bool dummy = false;
+            if (t6050_ext_disable(dt, at, n, &dummy, "could not take firmware version") < 0) {
+                err = -1;
+                break;
+            }
+        } else {
+            count++;
         }
-        count += set;
-        changed |= set;
+        at = -1;
     }
     /* Only -FDT_ERR_NOTFOUND is a walk's normal end */
-    if (err || at != -FDT_ERR_NOTFOUND) {
-        free(scratch);
-        dlog("could not give the external engines the firmware version: version unchanged\n");
-    } else if (!changed) {
-        free(scratch);
-    } else if (!dcp6_commit(dt, scratch)) {
-        if (count)
-            dlog("firmware %s on %d external engine(s) the device tree enables\n",
-                 os_firmware.string, count);
-    }
+    if (err || at != -FDT_ERR_NOTFOUND)
+        dlog("could not give the external engines the firmware version\n");
+    if (count)
+        dlog("firmware %s on %d external engine(s) the device tree enables\n", os_firmware.string,
+             count);
 }
 
 /* Any failure leaves the display nodes disabled: the boot framebuffer keeps the panel */
