@@ -150,9 +150,21 @@ struct dapf_t8110b_config {
     u32 pad;
 } PACKED;
 
-static int dapf_init_t8110a(u64 base, struct dapf_t8110_config *config, u32 length)
+static int dapf_init_t8110a(u64 base, u64 size, struct dapf_t8110_config *config, u32 length)
 {
     int count = length / sizeof(*config);
+
+    /*
+     * Each entry consumes 0x40 bytes of register space. The ADT property's length and the
+     * register window are independent, and a mis-sized property walks straight off the end of the
+     * window into unmapped MMIO: an external abort, reported as an asynchronous SError at
+     * whatever PC the CPU is at by then.
+     */
+    if (size && (u64)count * 0x40 > size) {
+        printf("dapf: clamping %d entries to %ld (window 0x%lx at 0x%lx)\n", count, size / 0x40,
+               size, base);
+        count = size / 0x40;
+    }
 
     for (int i = 0; i < count; i++) {
         write32(base + 0x04, config[i].r4);
@@ -165,9 +177,21 @@ static int dapf_init_t8110a(u64 base, struct dapf_t8110_config *config, u32 leng
     return 0;
 }
 
-static int dapf_init_t8110b(u64 base, struct dapf_t8110b_config *config, u32 length)
+static int dapf_init_t8110b(u64 base, u64 size, struct dapf_t8110b_config *config, u32 length)
 {
     int count = length / sizeof(*config);
+
+    /*
+     * Each entry consumes 0x40 bytes of register space. The ADT property's length and the
+     * register window are independent, and a mis-sized property walks straight off the end of the
+     * window into unmapped MMIO: an external abort, reported as an asynchronous SError at
+     * whatever PC the CPU is at by then.
+     */
+    if (size && (u64)count * 0x40 > size) {
+        printf("dapf: clamping %d entries to %ld (window 0x%lx at 0x%lx)\n", count, size / 0x40,
+               size, base);
+        count = size / 0x40;
+    }
 
     for (int i = 0; i < count; i++) {
         write32(base + 0x04, config[i].r4);
@@ -180,7 +204,7 @@ static int dapf_init_t8110b(u64 base, struct dapf_t8110b_config *config, u32 len
     return 0;
 }
 
-static int dapf_init_t8110(const char *path, u64 base, int node)
+static int dapf_init_t8110(const char *path, u64 base, u64 size, int node)
 {
     u32 length = 0;
     char prop[32];
@@ -204,9 +228,9 @@ static int dapf_init_t8110(const char *path, u64 base, int node)
     // the observed lengthe for "dapf-instance-0". The 52 byte variant is more
     // common and prefering that works so far.
     if (length % sizeof(struct dapf_t8110_config) == 0) {
-        return dapf_init_t8110a(base, (struct dapf_t8110_config *)config, length);
+        return dapf_init_t8110a(base, size, (struct dapf_t8110_config *)config, length);
     } else if (length % sizeof(struct dapf_t8110b_config) == 0) {
-        return dapf_init_t8110b(base, (struct dapf_t8110b_config *)config, length);
+        return dapf_init_t8110b(base, size, (struct dapf_t8110b_config *)config, length);
     } else {
         printf("dapf: Invalid length for %s property %s\n", path, prop);
         return -1;
@@ -635,8 +659,8 @@ int dapf_init(const char *path, int index)
         index = found;
     }
 
-    u64 base;
-    if (adt_get_reg(adt, dart_path, "reg", index, &base, NULL) < 0) {
+    u64 base, size = 0;
+    if (adt_get_reg(adt, dart_path, "reg", index, &base, &size) < 0) {
         printf("dapf: Error getting DAPF %s base address.\n", path);
         goto out;
     }
@@ -646,7 +670,7 @@ int dapf_init(const char *path, int index)
     } else if (adt_is_compatible(adt, node, "dart,t6000")) {
         ret = dapf_init_t8020(path, base, node);
     } else if (adt_is_compatible(adt, node, "dart,t8110")) {
-        ret = dapf_init_t8110(path, base, node);
+        ret = dapf_init_t8110(path, base, size, node);
     } else {
         printf("dapf: DAPF %s at 0x%lx is of an unknown type\n", path, base);
         goto out;
@@ -738,6 +762,36 @@ bool dapf_ave_filter_inherited(const char *path)
 bool dapf_keeps_inherited(const char *path)
 {
     return chip_id == T8140 && strcmp(path, "/arm-io/dart-mtp") && strcmp(path, "/arm-io/dart-pmp");
+}
+
+/*
+ * A T8110 DART's ADT can carry allow-dram-apf-slices-<n> next to its dapf-instance-<n>. Where it
+ * is 0, leave that DAPF as the firmware programmed it instead of writing the ADT's entries again.
+ * The 27.2 device trees carry it, as 0, on the dart-aop of every M5-family Mac (J700, J704,
+ * J714c/s, J716c/s, J775c/d, J813, J815, J873s) and on no other DART. On the J716s, writing
+ * dart-aop's entries raises an asynchronous SError at its slice 6 (L2C_ERR_ADR = base + 0x180).
+ * Returns the instance, or -1 when the ADT does not ask for this.
+ */
+static int dapf_adt_keeps_firmware_filter(const char *path)
+{
+    int node = adt_path_offset(adt, path);
+    if (node < 0 || !adt_is_compatible(adt, node, "dart,t8110"))
+        return -1;
+    for (int i = 0; i < 8; i++) {
+        char prop[32];
+        u32 len = 0, slices;
+        snprintf(prop, sizeof(prop), "dapf-instance-%d", i);
+        if (!adt_getprop(adt, node, prop, &len) || !len)
+            continue;
+        /* The instance dapf_init_t8110() would write */
+        snprintf(prop, sizeof(prop), "allow-dram-apf-slices-%d", i);
+        const void *val = adt_getprop(adt, node, prop, &len);
+        if (!val || len != sizeof(slices))
+            return -1;
+        memcpy(&slices, val, sizeof(slices));
+        return slices ? -1 : i;
+    }
+    return -1;
 }
 
 static int dapf_init_j713(void *dt)
@@ -882,6 +936,14 @@ int dapf_init_fdt(const void *fdt)
             }
         }
         if (adt_path_offset(adt, entry->path) < 0) {
+            entry++;
+            continue;
+        }
+        int kept = dapf_adt_keeps_firmware_filter(entry->path);
+        if (kept >= 0) {
+            printf("dapf: %s: allow-dram-apf-slices-%d is 0, leaving its DAPF as the firmware "
+                   "set it\n",
+                   entry->path, kept);
             entry++;
             continue;
         }
