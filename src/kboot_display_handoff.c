@@ -3914,15 +3914,65 @@ static T6050_TEXT int t6050_check_placement(const char *nub_path, const char *co
 }
 
 /*
- * External engine `n` in the ADT: its nub must report running == 1 and a valid UUID (matching the
- * pinned image when one has been selected), and its firmware segments and both DART page-table
- * regions (dart-dcpextN SID 23, dart-dispextN SID 16) must lie outside the OS's RAM.
+ * External engine `n` is live in hardware: its power words (and its DARTs' domains) are active,
+ * its ASC CPU is running, and both DART streams (SID 23 on dart-dcpextN, SID 16 on dart-dispextN)
+ * are locked in four-level translate mode on the ADT's l1-tt roots.
+ */
+static T6050_TEXT int t6050_check_ext_live(int n, u64 coproc, const u64 base[2])
+{
+    char a[24];
+    u64 ps[12];
+    u32 pval[12];
+
+    snprintf(a, sizeof(a), "/arm-io/dcpext%d", n);
+    int nps = pmgr_adt_collect_psregs(a, ps, NULL, ARRAY_SIZE(ps));
+    if (nps <= 0)
+        bail("dcpext%d: no power words\n", n);
+    int before = dcp6_guard_begin();
+    for (int i = 0; i < nps; i++)
+        pval[i] = read32(ps[i]);
+    if (dcp6_guard_end(before))
+        bail("dcpext%d: reading power words faulted\n", n);
+    for (int i = 0; i < nps; i++)
+        if (!dcp6_ps_on(pval[i]))
+            bail("dcpext%d: not powered: 0x%lx = 0x%x\n", n, ps[i], pval[i]);
+
+    before = dcp6_guard_begin();
+    u32 bad = read32(coproc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN ? 0 : BIT(2);
+    for (int i = 0; i < 2; i++) {
+        u32 sid = i ? 16 : 23;
+        char d[32], t[16];
+        u64 l1, cnt;
+        snprintf(d, sizeof(d), i ? "/arm-io/dart-dispext%d" : "/arm-io/dart-dcpext%d", n);
+        snprintf(t, sizeof(t), "l1-tt-%u", sid);
+        if (dcp6_adt_u64_pair(adt_path_offset(adt, d), t, &l1, &cnt) || !l1) {
+            bad |= BIT(i);
+            continue;
+        }
+        u32 tcr = read32(base[i] + DART_T8110_TCR(sid)),
+            ttbr = read32(base[i] + DART_T8110_TTBR(sid));
+        if (!(read32(base[i] + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR) ||
+            (tcr & T6050_TCR_MASK) != T6050_TCR_WANT || !(ttbr & DART_T8110_TTBR_VALID) ||
+            ((u64)FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT) != l1)
+            bad |= BIT(i);
+    }
+    if (dcp6_guard_end(before) || bad)
+        bail("dcpext%d: not live (mask 0x%x: bit 2 stopped, 0-1 a stream not locked)\n", n, bad);
+    return 0;
+}
+
+/*
+ * External engine `n` in the ADT and hardware: its nub must report running == 1 and a valid UUID
+ * (matching the pinned image when one has been selected), its firmware segments and both DART
+ * page-table regions (dart-dcpextN SID 23, dart-dispextN SID 16) must lie outside the OS's RAM,
+ * and it must be powered and locked on those ADT roots.
  */
 static T6050_TEXT int t6050_check_ext_adt(int n)
 {
-    char nub_path[64], dd[2][32];
+    char nub_path[64], eng_path[24], dd[2][32];
     const char *darts[2] = {dd[0], dd[1]};
     static const u8 sids[2] = {23, 16};
+    u64 coproc, base[2];
     u32 len = 0, val = 0;
 
     if (n < 0 || n >= T6050_ENGINES)
@@ -3933,9 +3983,15 @@ static T6050_TEXT int t6050_check_ext_adt(int n)
     if (!dcp6_is_uuid(uuid, len) || (t6050.uuid && strcmp(uuid, t6050.uuid)) ||
         dcp6_adt_u32(nub, "running", &val) || val != 1)
         bail("dcpext%d: not running the pinned image\n", n);
+    snprintf(eng_path, sizeof(eng_path), "/arm-io/dcpext%d", n);
     snprintf(dd[0], sizeof(dd[0]), "/arm-io/dart-dcpext%d", n);
     snprintf(dd[1], sizeof(dd[1]), "/arm-io/dart-dispext%d", n);
-    return t6050_check_placement(nub_path, darts, sids, 2);
+    if (t6050_check_placement(nub_path, darts, sids, 2))
+        return -1;
+    if (t6050_adt_reg(eng_path, 0, &coproc, NULL) || t6050_adt_reg(dd[0], 0, &base[0], NULL) ||
+        t6050_adt_reg(dd[1], 0, &base[1], NULL))
+        bail("dcpext%d: no ADT reg\n", n);
+    return t6050_check_ext_live(n, coproc, base);
 }
 
 /*
@@ -4301,7 +4357,7 @@ static T6050_TEXT int t6050_ext_node(void *dt, u64 coproc)
 static T6050_TEXT int t6050_ext_one(void *dt, int n)
 {
     char a[40], b[40];
-    u64 coproc, base[2], l1, cnt, vm_base, vm_size;
+    u64 coproc, base[2], vm_base, vm_size;
     u32 len = 0, val = 0;
     int node = -1, dart[2];
 
@@ -4340,33 +4396,8 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
      * The engine's power words and their parents' (its DARTs' domains). dispextN has no ADT
      * gates, and iBoot leaves the CPU idling under AUTO_ENABLE (DISPEXTn_CPU 0x1404024f).
      */
-    u64 ps[12];
-    int nps = pmgr_adt_collect_psregs(a, ps, NULL, ARRAY_SIZE(ps));
-    if (nps <= 0)
-        bail("dcpext%d: no power words\n", n);
-    for (int i = 0; i < nps; i++)
-        if (!dcp6_ps_on(read32(ps[i])))
-            bail("dcpext%d: not powered: 0x%lx = 0x%x\n", n, ps[i], read32(ps[i]));
-    int before = dcp6_guard_begin();
-    u32 bad = read32(coproc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN ? 0 : BIT(2);
-    for (int i = 0; i < 2; i++) {
-        u32 sid = i ? 16 : 23;
-        char d[32], t[16];
-        snprintf(d, sizeof(d), i ? "/arm-io/dart-dispext%d" : "/arm-io/dart-dcpext%d", n);
-        snprintf(t, sizeof(t), "l1-tt-%u", sid);
-        if (dcp6_adt_u64_pair(adt_path_offset(adt, d), t, &l1, &cnt) || !l1) {
-            bad |= BIT(i);
-            continue;
-        }
-        u32 tcr = read32(base[i] + DART_T8110_TCR(sid)),
-            ttbr = read32(base[i] + DART_T8110_TTBR(sid));
-        if (!(read32(base[i] + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR) ||
-            (tcr & T6050_TCR_MASK) != T6050_TCR_WANT || !(ttbr & DART_T8110_TTBR_VALID) ||
-            ((u64)FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT) != l1)
-            bad |= BIT(i);
-    }
-    if (dcp6_guard_end(before) || bad)
-        bail("dcpext%d: not live (mask 0x%x: bit 2 stopped, 0-1 a stream not locked)\n", n, bad);
+    if (t6050_check_ext_live(n, coproc, base))
+        return -1;
 
     /* Its bandwidth agent: the one dispextN's bw_req interrupt names */
     snprintf(b, sizeof(b), "/arm-io/dispext%d", n);

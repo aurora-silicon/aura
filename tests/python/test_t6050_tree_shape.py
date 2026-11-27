@@ -258,6 +258,33 @@ def test_t6050_external_scanout_darts_resolved(tmp_path):
 #define DART_PAGE 0x4000UL
 #define ALIGN_DOWN(x, a) ((x) & ~((u64)(a) - 1))
 #define ALIGN_UP(x, a) ALIGN_DOWN((x) + (a) - 1, a)
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define BIT(x) (1UL << (x))
+#define GENMASK(msb, lsb) ((~0UL << (lsb)) & (~0UL >> (63 - (msb))))
+#define FIELD_GET(mask, val) (((val) & (mask)) >> __builtin_ctzll(mask))
+#define FIELD_PREP(mask, val) (((u64)(val) << __builtin_ctzll(mask)) & (mask))
+#define sysop(x) do { } while (0)
+enum exc_guard_t { GUARD_OFF = 0, GUARD_MARK = 2, GUARD_SILENT = 0x100 };
+static volatile enum exc_guard_t exc_guard;
+static volatile int exc_count;
+#define ASC_CPU_CONTROL 0x44
+#define ASC_CPU_CONTROL_RUN BIT(4)
+#define PMGR_AUTO_ENABLE BIT(28)
+#define PMGR_PS_ACTUAL GENMASK(7, 4)
+#define PMGR_PS_TARGET GENMASK(3, 0)
+#define PMGR_PS_ACTIVE 0xf
+#define DART_T8110_PROTECT 0x200
+#define DART_T8110_PROTECT_TTBR_TCR BIT(0)
+#define DART_T8110_TCR(sid) (0x1000 + 4 * (sid))
+#define DART_T8110_TCR_TRANSLATE BIT(0)
+#define DART_T8110_TCR_BYPASS_DART BIT(1)
+#define DART_T8110_TCR_FOUR_LEVEL BIT(3)
+#define DART_T8110_TTBR(sid) (0x1400 + 4 * (sid))
+#define DART_T8110_TTBR_VALID BIT(0)
+#define DART_T8110_TTBR_ADDR GENMASK(29, 2)
+#define DART_T8110_TTBR_SHIFT 14
+#define T6050_TCR_WANT (DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_FOUR_LEVEL)
+#define T6050_TCR_MASK (T6050_TCR_WANT | DART_T8110_TCR_BYPASS_DART)
 #define dlog(fmt, ...) printf(fmt, ##__VA_ARGS__)
 ''' + layout + r'''
 static struct { u64 phys_base, mem_size; } cur_boot_args = {0x10000000000UL, 0x200000000UL};
@@ -266,7 +293,9 @@ static void *adt;
 #define DART_DCP 0x48a340000UL
 #define DART_DISP0 0x48a300000UL
 #define EXT0 0x2b2e00000UL
+#define DART_DCPEXT0 0x2b2400000UL
 #define DART_DISPEXT0 0x2b2300000UL
+#define PS_WORD 0x290000100UL
 #define UUID_A "C51FB0C8-C45D-39B0-85BC-520E600FC950"
 #define UUID_B "64863924-B56B-3E32-87FE-038677F52709"
 static struct adt_segment_ranges ext0_segs[2];
@@ -274,6 +303,13 @@ static u32 ext0_nsegs;
 static u32 ext0_running;
 static const char *ext0_uuid;
 static u64 pt23[2], l1_23[2], pt16[2], l1_16[2];
+static u32 ext0_ps, ext0_ctl, ext0_prot[2], ext0_tcr[2], ext0_ttbr[2];
+static bool ext0_fault;
+static u32 make_ttbr(u64 l1, bool valid)
+{
+    return (valid ? DART_T8110_TTBR_VALID : 0) |
+           FIELD_PREP(DART_T8110_TTBR_ADDR, l1 >> DART_T8110_TTBR_SHIFT);
+}
 static void reset_adt(void)
 {
     t6050.uuid = UUID_A;
@@ -286,6 +322,38 @@ static void reset_adt(void)
     l1_23[0] = 0x10201000000UL; l1_23[1] = 1;
     pt16[0] = 0x10201100000UL; pt16[1] = 0x10201140000UL;
     l1_16[0] = 0x10201100000UL; l1_16[1] = 1;
+    ext0_ps = FIELD_PREP(PMGR_PS_ACTUAL, PMGR_PS_ACTIVE) | FIELD_PREP(PMGR_PS_TARGET, PMGR_PS_ACTIVE);
+    ext0_ctl = ASC_CPU_CONTROL_RUN;
+    ext0_prot[0] = ext0_prot[1] = DART_T8110_PROTECT_TTBR_TCR;
+    ext0_tcr[0] = ext0_tcr[1] = T6050_TCR_WANT;
+    ext0_ttbr[0] = make_ttbr(l1_23[0], true);
+    ext0_ttbr[1] = make_ttbr(l1_16[0], true);
+    ext0_fault = false;
+}
+static int pmgr_adt_collect_psregs(const char *path, u64 *out, u8 *flags, int max)
+{
+    (void)flags;
+    if (strcmp(path, "/arm-io/dcpext0") || max < 1)
+        return -1;
+    out[0] = PS_WORD;
+    return 1;
+}
+static u32 read32(u64 addr)
+{
+    if (ext0_fault) {
+        exc_count++;
+        return 0;
+    }
+    if (addr == PS_WORD) return ext0_ps;
+    if (addr == EXT0 + ASC_CPU_CONTROL) return ext0_ctl;
+    if (addr == DART_DCPEXT0 + DART_T8110_PROTECT) return ext0_prot[0];
+    if (addr == DART_DCPEXT0 + DART_T8110_TCR(23)) return ext0_tcr[0];
+    if (addr == DART_DCPEXT0 + DART_T8110_TTBR(23)) return ext0_ttbr[0];
+    if (addr == DART_DISPEXT0 + DART_T8110_PROTECT) return ext0_prot[1];
+    if (addr == DART_DISPEXT0 + DART_T8110_TCR(16)) return ext0_tcr[1];
+    if (addr == DART_DISPEXT0 + DART_T8110_TTBR(16)) return ext0_ttbr[1];
+    assert(0 && "unexpected read32");
+    return 0;
 }
 enum { ADT_NUB = 1, ADT_DDCP, ADT_DDISP };
 static int adt_path_offset(const void *a, const char *path)
@@ -333,18 +401,22 @@ static const void *adt_getprop(const void *a, int node, const char *name, u32 *l
     }
     return NULL;
 }
-/* The ADT: the internal DARTs, dcpext0 and its display DART; nothing else */
+/* The ADT: the internal DARTs, dcpext0 and its DARTs; nothing else */
 static int t6050_adt_reg(const char *path, int idx, u64 *addr, u64 *size)
 {
     (void)idx; (void)size;
     if (!strcmp(path, "/arm-io/dart-dcp")) *addr = DART_DCP;
     else if (!strcmp(path, "/arm-io/dart-disp0")) *addr = DART_DISP0;
     else if (!strcmp(path, "/arm-io/dcpext0")) *addr = EXT0;
+    else if (!strcmp(path, "/arm-io/dart-dcpext0")) *addr = DART_DCPEXT0;
     else if (!strcmp(path, "/arm-io/dart-dispext0")) *addr = DART_DISPEXT0;
     else return -1;
     return 0;
 }
-''' + definition(source, "static bool dcp6_overlaps(") + \
+''' + definition(source, "static int dcp6_guard_begin(") + \
+        definition(source, "static int dcp6_guard_end(") + \
+        definition(source, "static bool dcp6_ps_on(") + \
+        definition(source, "static bool dcp6_overlaps(") + \
         definition(source, "static int dcp6_adt_u32(") + \
         definition(source, "static int dcp6_adt_u64_pair(") + \
         definition(source, "static bool dcp6_is_uuid(") + \
@@ -352,6 +424,7 @@ static int t6050_adt_reg(const char *path, int idx, u64 *addr, u64 *size)
         definition(source, "static T6050_TEXT bool t6050_available(") + \
         definition(source, "static T6050_INIT bool t6050_identity_reg(") + \
         definition(source, "static T6050_TEXT int t6050_check_placement(") + \
+        definition(source, "static T6050_TEXT int t6050_check_ext_live(") + \
         definition(source, "static T6050_TEXT int t6050_check_ext_adt(") + \
         definition(source, "static T6050_TEXT bool t6050_ext_dart_engine(") + \
         definition(source, "static T6050_TEXT bool t6050_ext_display_dart(") + r'''
@@ -436,6 +509,32 @@ int main(void)
     world(PH_EXT, 16, "okay", 1, "okay");
     ext0_uuid = UUID_B;
     assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    /* Stale ADT passes placement checks while live DART root differs (e.g. points into OS RAM). */
+    world(PH_EXT, 16, "okay", 1, "okay");
+    ext0_ttbr[1] = make_ttbr(cur_boot_args.phys_base + 0x300000, true);
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    world(PH_EXT, 16, "okay", 1, "okay");
+    ext0_ttbr[0] = make_ttbr(cur_boot_args.phys_base + 0x200000, true);
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    /* Live DART unlocked, bypass mode, invalid TTBR, CPU stopped, unpowered, or faulted MMIO. */
+    world(PH_EXT, 16, "okay", 1, "okay");
+    ext0_prot[1] = 0;
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    world(PH_EXT, 16, "okay", 1, "okay");
+    ext0_tcr[1] |= DART_T8110_TCR_BYPASS_DART;
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    world(PH_EXT, 16, "okay", 1, "okay");
+    ext0_ttbr[1] = make_ttbr(l1_16[0], false);
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    world(PH_EXT, 16, "okay", 1, "okay");
+    ext0_ctl = 0;
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    world(PH_EXT, 16, "okay", 1, "okay");
+    ext0_ps = 0;
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    world(PH_EXT, 16, "okay", 1, "okay");
+    ext0_fault = true;
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
     /* status as Linux reads it: absent, or first string "okay"/"ok", regardless of trailing bytes */
     fresh();
     int n = node_at("/", "n");
@@ -452,7 +551,7 @@ int main(void)
     return 0;
 }
 '''
-    run(tmp_path, "ext-darts", code, "PASS external scanout darts 25 cases")
+    run(tmp_path, "ext-darts", code, "PASS external scanout darts 33 cases")
 
 
 def test_t6050_rx_clock_groups_pass_whole(tmp_path):
@@ -625,6 +724,33 @@ def test_t6050_external_engines_get_the_stub_version(tmp_path):
 #define ALIGN_DOWN(x, a) ((x) & ~((u64)(a) - 1))
 #define ALIGN_UP(x, a) ALIGN_DOWN((x) + (a) - 1, a)
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define BIT(x) (1UL << (x))
+#define GENMASK(msb, lsb) ((~0UL << (lsb)) & (~0UL >> (63 - (msb))))
+#define FIELD_GET(mask, val) (((val) & (mask)) >> __builtin_ctzll(mask))
+#define FIELD_PREP(mask, val) (((u64)(val) << __builtin_ctzll(mask)) & (mask))
+#define sysop(x) do { } while (0)
+enum exc_guard_t { GUARD_OFF = 0, GUARD_MARK = 2, GUARD_SILENT = 0x100 };
+static volatile enum exc_guard_t exc_guard;
+static volatile int exc_count;
+#define ASC_CPU_CONTROL 0x44
+#define ASC_CPU_CONTROL_RUN BIT(4)
+#define PMGR_AUTO_ENABLE BIT(28)
+#define PMGR_PS_ACTUAL GENMASK(7, 4)
+#define PMGR_PS_TARGET GENMASK(3, 0)
+#define PMGR_PS_ACTIVE 0xf
+#define DART_T8110_PROTECT 0x200
+#define DART_T8110_PROTECT_TTBR_TCR BIT(0)
+#define DART_T8110_TCR(sid) (0x1000 + 4 * (sid))
+#define DART_T8110_TCR_TRANSLATE BIT(0)
+#define DART_T8110_TCR_BYPASS_DART BIT(1)
+#define DART_T8110_TCR_FOUR_LEVEL BIT(3)
+#define DART_T8110_TTBR(sid) (0x1400 + 4 * (sid))
+#define DART_T8110_TTBR_VALID BIT(0)
+#define DART_T8110_TTBR_ADDR GENMASK(29, 2)
+#define DART_T8110_TTBR_SHIFT 14
+#define T6050_TCR_WANT (DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_FOUR_LEVEL)
+#define T6050_TCR_MASK (T6050_TCR_WANT | DART_T8110_TCR_BYPASS_DART)
+#define PS_BASE 0x290000100UL
 #define OS_VER_COMP 4
 enum fw_version { V_UNKNOWN = 0, V27_0, V27_2, V27_3 };
 struct fw_version_info {
@@ -647,20 +773,27 @@ static void *adt;
 #define DART_DISP0 0x48a300000UL
 struct fake_ext {
     u64 coproc;
+    u64 dart_dcp;
     u64 dart_disp;
     u32 running;
     const char *uuid;
     struct adt_segment_ranges seg[2];
     u32 nseg;
     u64 pt23[2], l1_23[2], pt16[2], l1_16[2];
+    u32 ps, ctl, prot[2], tcr[2];
+    u64 ttbr_l1[2];
+    bool ttbr_valid[2], fault;
 };
 static struct fake_ext exts[3];
 static void reset_adt(void)
 {
     t6050.uuid = UUID_A;
     for (int i = 0; i < 3; i++) {
+        u64 l1_dcp = 0x10201000000UL + (u64)i * 0x1000000UL;
+        u64 l1_disp = 0x10201100000UL + (u64)i * 0x1000000UL;
         exts[i] = (struct fake_ext){
             .coproc = 0x2b2e00000UL + (u64)i * 0x1000000UL,
+            .dart_dcp = 0x2b2400000UL + (u64)i * 0x1000000UL,
             .dart_disp = 0x2b2300000UL + (u64)i * 0x1000000UL,
             .running = 1,
             .uuid = UUID_A,
@@ -671,12 +804,57 @@ static void reset_adt(void)
                  0x10004500000UL + (u64)i * 0x4000UL, 0x4000, SEG_FLAGS_OSLOG},
             },
             .nseg = 2,
-            .pt23 = {0x10201000000UL, 0x10201040000UL},
-            .l1_23 = {0x10201000000UL, 1},
-            .pt16 = {0x10201100000UL, 0x10201140000UL},
-            .l1_16 = {0x10201100000UL, 1},
+            .pt23 = {l1_dcp, l1_dcp + 0x40000},
+            .l1_23 = {l1_dcp, 1},
+            .pt16 = {l1_disp, l1_disp + 0x40000},
+            .l1_16 = {l1_disp, 1},
+            .ps = FIELD_PREP(PMGR_PS_ACTUAL, PMGR_PS_ACTIVE) |
+                  FIELD_PREP(PMGR_PS_TARGET, PMGR_PS_ACTIVE),
+            .ctl = ASC_CPU_CONTROL_RUN,
+            .prot = {DART_T8110_PROTECT_TTBR_TCR, DART_T8110_PROTECT_TTBR_TCR},
+            .tcr = {T6050_TCR_WANT, T6050_TCR_WANT},
+            .ttbr_l1 = {l1_dcp, l1_disp},
+            .ttbr_valid = {true, true},
         };
     }
+}
+static int pmgr_adt_collect_psregs(const char *path, u64 *out, u8 *flags, int max)
+{
+    (void)flags;
+    for (int i = 0; i < 3; i++) {
+        char a[32];
+        snprintf(a, sizeof(a), "/arm-io/dcpext%d", i);
+        if (!strcmp(path, a) && max >= 1) {
+            out[0] = PS_BASE + (u64)i * 4;
+            return 1;
+        }
+    }
+    return -1;
+}
+static u32 read32(u64 addr)
+{
+    for (int i = 0; i < 3; i++) {
+        if (addr == PS_BASE + (u64)i * 4) {
+            if (exts[i].fault) { exc_count++; return 0; }
+            return exts[i].ps;
+        }
+        if (addr == exts[i].coproc + ASC_CPU_CONTROL) {
+            if (exts[i].fault) { exc_count++; return 0; }
+            return exts[i].ctl;
+        }
+        for (int d = 0; d < 2; d++) {
+            u64 base = d ? exts[i].dart_disp : exts[i].dart_dcp;
+            u32 sid = d ? 16 : 23;
+            if (addr == base + DART_T8110_PROTECT) return exts[i].prot[d];
+            if (addr == base + DART_T8110_TCR(sid)) return exts[i].tcr[d];
+            if (addr == base + DART_T8110_TTBR(sid))
+                return (exts[i].ttbr_valid[d] ? DART_T8110_TTBR_VALID : 0) |
+                       FIELD_PREP(DART_T8110_TTBR_ADDR,
+                                  exts[i].ttbr_l1[d] >> DART_T8110_TTBR_SHIFT);
+        }
+    }
+    assert(0 && "unexpected read32");
+    return 0;
 }
 static int kboot_fdt_path_exact(void *t, const char *path)
 {
@@ -694,6 +872,11 @@ static int t6050_adt_reg(const char *path, int idx, u64 *addr, u64 *size)
         snprintf(a, sizeof(a), "/arm-io/dcpext%d", i);
         if (!strcmp(path, a)) {
             *addr = exts[i].coproc;
+            return 0;
+        }
+        snprintf(a, sizeof(a), "/arm-io/dart-dcpext%d", i);
+        if (!strcmp(path, a)) {
+            *addr = exts[i].dart_dcp;
             return 0;
         }
         snprintf(a, sizeof(a), "/arm-io/dart-dispext%d", i);
@@ -759,6 +942,9 @@ static const void *adt_getprop(const void *a, int node, const char *name, u32 *l
     return NULL;
 }
 ''' + definition(firmware, "int firmware_set_fdt(") + \
+        definition(source, "static int dcp6_guard_begin(") + \
+        definition(source, "static int dcp6_guard_end(") + \
+        definition(source, "static bool dcp6_ps_on(") + \
         definition(source, "static bool dcp6_overlaps(") + \
         definition(source, "static int dcp6_adt_u32(") + \
         definition(source, "static int dcp6_adt_u64_pair(") + \
@@ -775,6 +961,7 @@ static void *test_malloc(size_t n)
         definition(source, "static T6050_TEXT bool t6050_available(") + \
         definition(source, "static T6050_INIT bool t6050_identity_reg(") + \
         definition(source, "static T6050_TEXT int t6050_check_placement(") + \
+        definition(source, "static T6050_TEXT int t6050_check_ext_live(") + \
         definition(source, "static T6050_TEXT int t6050_check_ext_adt(") + \
         definition(source, "static T6050_TEXT int t6050_node_at(") + \
         definition(source, "static T6050_TEXT int t6050_ext_index(") + \
@@ -1227,8 +1414,42 @@ int main(void)
     assert_rejected("/dcpext1", PH_DART1, &old);
     assert(is_disabled("/dcpext1-dup") && is("/dcpext1-dup", "apple,firmware-compat", &old));
     cases++;
+    /* Stale ADT passes placement checks while live DART root differs (points into OS RAM):
+     * disabled and dropped from scanout without version-stamping. */
+    world();
+    os_firmware = v272;
+    exts[1].ttbr_l1[1] = cur_boot_args.phys_base + 0x300000;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    world();
+    exts[1].ttbr_l1[0] = cur_boot_args.phys_base + 0x200000;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    /* Live DART unlocked, CPU stopped, unpowered, or faulted MMIO: disabled and dropped. */
+    world();
+    exts[1].prot[1] = 0;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    world();
+    exts[1].ctl = 0;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    world();
+    exts[1].ps = 0;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    world();
+    exts[1].fault = true;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
     printf("PASS dcpext version %d cases\n", cases);
     return 0;
 }
 '''
-    run(tmp_path, "ext-version", code, "PASS dcpext version 26 cases")
+    run(tmp_path, "ext-version", code, "PASS dcpext version 32 cases")

@@ -236,11 +236,18 @@ const struct adt_property *host_adt_prop(int n, int i)
 static struct {
     u64 addr;
     u32 val;
-} words[32];
+} words[64];
 static int nwords;
 
 static void word(u64 addr, u32 val)
 {
+    for (int i = 0; i < nwords; i++)
+        if (words[i].addr == addr) {
+            words[i].val = val;
+            return;
+        }
+    if (nwords == (int)ARRAY_SIZE(words))
+        DIE("too many MMIO words\n");
     words[nwords].addr = addr;
     words[nwords++].val = val;
 }
@@ -282,9 +289,10 @@ int firmware_set_fdt(void *fdt, int n, const char *name, const struct fw_version
 int pmgr_adt_collect_psregs(const char *path, u64 *out, u8 *flags, int max)
 {
     UNUSED(flags);
-    if (strcmp(path, "/arm-io/dcpext0") || max < 1)
+    if (strncmp(path, "/arm-io/dcpext", 14) || path[14] < '0' || path[14] > '7' || path[15] ||
+        max < 1)
         return -1;
-    out[0] = PS_WORD;
+    out[0] = PS_WORD + 4 * (u64)(path[14] - '0');
     return 1;
 }
 
@@ -700,6 +708,24 @@ static int prewired(int argc, char **argv)
         u64 pt16_lo = (e == 1 && fail == 4) ? ram + 0x200000 : l1 + 0x100000;
         prop_u64s(ddispp, "l1-tt-16", pt16_lo, 1, 2);
         prop_u64s(ddispp, "pt-region-16", pt16_lo, pt16_lo + 0x40000, 2);
+        u64 live_23 = (e == 1 && fail == 6) ? ram + 0x300000 : l1;
+        u64 live_16 = (e == 1 && fail == 5) ? ram + 0x200000 : pt16_lo;
+        word(PS_WORD + 4 * (u64)e,
+             (e == 1 && fail == 7)
+                 ? 0
+                 : (FIELD_PREP(PMGR_PS_ACTUAL, PMGR_PS_ACTIVE) |
+                    FIELD_PREP(PMGR_PS_TARGET, PMGR_PS_ACTIVE)));
+        word(ext_coproc[e] + ASC_CPU_CONTROL, (e == 1 && fail == 8) ? 0 : ASC_CPU_CONTROL_RUN);
+        word(ext_ddcp[e] + DART_T8110_PROTECT, DART_T8110_PROTECT_TTBR_TCR);
+        word(ext_ddcp[e] + DART_T8110_TCR(23), T6050_TCR_WANT);
+        word(ext_ddcp[e] + DART_T8110_TTBR(23),
+             DART_T8110_TTBR_VALID |
+                 FIELD_PREP(DART_T8110_TTBR_ADDR, live_23 >> DART_T8110_TTBR_SHIFT));
+        word(ext_ddisp[e] + DART_T8110_PROTECT, DART_T8110_PROTECT_TTBR_TCR);
+        word(ext_ddisp[e] + DART_T8110_TCR(16), T6050_TCR_WANT);
+        word(ext_ddisp[e] + DART_T8110_TTBR(16),
+             DART_T8110_TTBR_VALID |
+                 FIELD_PREP(DART_T8110_TTBR_ADDR, live_16 >> DART_T8110_TTBR_SHIFT));
     }
 
     enum { PH_CLK = 10, PH_EXT0_DISP, PH_EXT1_DISP };
@@ -1165,7 +1191,7 @@ def test_headless_duplicate_ext_node_refused(host, no_pt_region):
     assert not r.said("handed off")
 
 
-@pytest.mark.parametrize("fail", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("fail", [0, 1, 2, 3, 4, 5, 6, 7, 8])
 def test_prewired_panel_keeps_rejected_external_engines_out_of_handoff(host, fail):
     r = run(host, "prewired", fail=fail, meta=META_SIZE, vram=VRAM, vsize=VRAM_SIZE,
             **framebuffer(VRAM, VRAM_SIZE))
@@ -1184,7 +1210,17 @@ def test_prewired_panel_keeps_rejected_external_engines_out_of_handoff(host, fai
 
 def test_prewired_panel_rejects_external_engines_on_unknown_stub_and_packed_dt(host):
     # Unknown stub: dt_set_display_handoff() refuses the internal panel, keeps healthy ext0 at
-    # the tree's version, and still disables stopped ext1 and removes its display DART.
+    # the tree's version, and still disables ext1 whose live DART root differs from the ADT (and
+    # removes its display DART).
+    r = run(host, "prewired", unknown=1, fail=5, meta=META_SIZE, vram=VRAM, vsize=VRAM_SIZE,
+            **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["chosen"] == "refused", r.log
+    assert r.state["dcp"] == "disabled" and r.state["subsystem"] == "disabled"
+    assert r.state["ext0"] == "okay" and r.state["ext0_fw"] == "27.0.0"
+    assert r.state["ext1"] == "disabled"
+    assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
+    assert r.iommus == [2, 0, 11, 0]
+
     r = run(host, "prewired", unknown=1, fail=1, meta=META_SIZE, vram=VRAM, vsize=VRAM_SIZE,
             **framebuffer(VRAM, VRAM_SIZE))
     assert r.state["chosen"] == "refused", r.log
