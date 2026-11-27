@@ -5,7 +5,7 @@
  *
  *   kboot-audio-host <in.adt> <in.dtb>
  *
- * Runs kboot_audio_amp_config() and prints, for every ti,sn012776 node of the result in tree
+ * Runs kboot_audio_amp_config() and prints, for every supported amp node of the result in tree
  * order, its I2C address and its apple,bop-config, apple,amp-dcblocker-config,
  * apple,speaker-config and apple,amp-tx-zd-config ("-" when absent), one line each ("amp ..."),
  * after aura's own log lines.
@@ -137,6 +137,21 @@ static void print_prop(const void *dt, int node, const char *name)
         printf("%02x", v[i]);
 }
 
+static void print_amps(const void *dt, const char *compat)
+{
+    for (int node = fdt_node_offset_by_compatible(dt, -1, compat); node >= 0;
+         node = fdt_node_offset_by_compatible(dt, node, compat)) {
+        const fdt32_t *reg = fdt_getprop(dt, node, "reg", NULL);
+
+        printf("amp 0x%x", reg ? fdt32_to_cpu(reg[0]) : 0);
+        print_prop(dt, node, "apple,bop-config");
+        print_prop(dt, node, "apple,amp-dcblocker-config");
+        print_prop(dt, node, "apple,speaker-config");
+        print_prop(dt, node, "apple,amp-tx-zd-config");
+        printf("\n");
+    }
+}
+
 int main(int argc, char **argv)
 {
     size_t asz, dsz;
@@ -164,17 +179,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    for (int node = fdt_node_offset_by_compatible(dt, -1, "ti,sn012776"); node >= 0;
-         node = fdt_node_offset_by_compatible(dt, node, "ti,sn012776")) {
-        const fdt32_t *reg = fdt_getprop(dt, node, "reg", NULL);
-
-        printf("amp 0x%x", reg ? fdt32_to_cpu(reg[0]) : 0);
-        print_prop(dt, node, "apple,bop-config");
-        print_prop(dt, node, "apple,amp-dcblocker-config");
-        print_prop(dt, node, "apple,speaker-config");
-        print_prop(dt, node, "apple,amp-tx-zd-config");
-        printf("\n");
-    }
+    print_amps(dt, "ti,sn012776");
+    print_amps(dt, "ti,tas5770l");
 
     if (kboot_audio_speaker_id(dt, adt)) {
         printf("kboot_audio_speaker_id failed\n");
