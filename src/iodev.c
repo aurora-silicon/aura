@@ -10,6 +10,7 @@
 #include "smp.h"
 #endif
 #include "string.h"
+#include "utils.h"
 
 #ifdef DEBUG_IODEV
 #define dprintf printf
@@ -40,6 +41,7 @@ struct iodev *iodevs[IODEV_NUM] = {
 char con_buf[CONSOLE_BUFFER_SIZE];
 size_t con_wp;
 size_t con_rp[IODEV_NUM];
+static size_t con_dropped[IODEV_NUM];
 
 void iodev_register_device(iodev_id_t id, struct iodev *dev)
 {
@@ -267,8 +269,26 @@ void iodev_console_write(const void *buf, size_t length)
         if (!iodev_can_write(id))
             continue;
 
-        if (con_wp > CONSOLE_BUFFER_SIZE)
-            con_rp[id] = max(con_wp - CONSOLE_BUFFER_SIZE, con_rp[id]);
+        if (con_wp > CONSOLE_BUFFER_SIZE) {
+            size_t min_rp = con_wp - CONSOLE_BUFFER_SIZE;
+            if (min_rp > con_rp[id]) {
+                con_dropped[id] += min_rp - con_rp[id];
+                con_rp[id] = min_rp;
+            }
+        }
+
+        if (con_dropped[id]) {
+            char note[64];
+            int n =
+                snprintf(note, sizeof(note), "\n[console: dropped %zu bytes]\n", con_dropped[id]);
+            if (n > 0) {
+                if ((size_t)n >= sizeof(note))
+                    n = sizeof(note) - 1;
+                if (iodev_write_nonblocking(id, note, n) < n)
+                    goto next_dev;
+            }
+            con_dropped[id] = 0;
+        }
 
         dprintf("  rp=%d\n", con_rp[id]);
         // Flush existing buffer to device if possible
