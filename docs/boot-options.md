@@ -54,16 +54,16 @@ and the display. The mailbox sits in aura's image, which kboot reserves anyway, 
 takes no memory of its own. On A7 to M3 RVBAR isn't locked, so nothing is published,
 and a guest at EL1 gets nothing.
 
-## Hibernation layout (`hib=1`, T6040)
+## Hibernation layout (`hib=1`, T6040 and T6041)
 
 A hibernation image restores every page the OS saved to the frame it came from, so the
 boot that resumes it must give the OS the same RAM and keep the same ranges from it.
 The payload line `hib=1`, in Stage 2's own lines (Stage 1 does not hand it on), asks
-kboot for a fixed layout on T6040:
+kboot for a fixed layout on T6040 and T6041:
 
 - the CTXR exec window is the part of CTXR_D that every placement of the boot object
-  arms above aura's slot, at the same address on every boot (on the J616s with the
-  installer's padding: 96 MiB at 0x10008200000);
+  arms above aura's slot, at the same address on every boot (on the J616s and J616c
+  with the installer's padding: 96 MiB at 0x10008200000);
 - everything from the start of RAM up to a fixed end is kept from the OS, except that
   window;
 - the device tree the OS is started with is copied, last, into a 2 MiB slot 320 MiB
@@ -80,6 +80,14 @@ slot and kboot gives no layout. aura's own image, with its spin tables and its S
 mailbox, still moves with the object, inside the kept range: Linux uses the release
 addresses only when it starts, and a restored kernel reads this boot's mailbox from the
 tree in the slot.
+
+The fixed layout targets the standard Stage 2 to U-Boot chain, where Stage 2's heap
+before `kboot_prepare_dt()` is only a few MiB and stays well below the +320 MiB slot
+across all KASLR placements (iBoot's `region-id-46` ceiling sits at +496 MiB, 48 MiB
+above the +448 MiB end of the fixed 128 MiB slot-and-heap range). Direct `boot=` loads
+the compressed kernel, inflated kernel image, and initramfs into `heapblock` before
+`kboot_prepare_dt()`, so a large kernel/initrd pair can push the heap past the fixed
+slot and cause kboot to refuse the layout (`the heap reaches the fixed slot`).
 
 kboot refuses the layout, says why, and boots without it when the window is not the
 fixed one or is not below the slot, or when aura, the boot arguments, what iBoot and

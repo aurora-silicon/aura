@@ -1165,7 +1165,7 @@ static int dt_check_trial_esp(void)
 }
 
 /*
- * Hibernation layout (T6040, config line hib=1).
+ * Hibernation layout (T6040 and T6041, config line hib=1).
  *
  * A hibernation image restores every page Linux saved to the frame it came from, so the boot that
  * resumes it must give Linux the same RAM and keep the same ranges from it. Without hib=1 they
@@ -1215,11 +1215,18 @@ static u64 hib_dt_base, hib_heap_base, hib_heap_end;
 /* The CTXR exec window inside the kept range, which the OS owns; empty without one */
 static u64 hib_window_base, hib_window_end;
 
+static bool hib_chip_supported(void)
+{
+    return chip_id == T6040 || chip_id == T6041;
+}
+
 void kboot_request_hibernate_layout(bool on)
 {
     hib_requested = on;
-    /* The layout is only known for T6040; another chip keeps the window it always had. */
-    ctxr_exec_request_fixed_window(on && chip_id == T6040);
+    /*
+     * The layout is only known for T6040 and T6041; another chip keeps the window it always had.
+     */
+    ctxr_exec_request_fixed_window(on && hib_chip_supported());
 }
 
 /* Whether [start, end) meets a range iBoot or the firmware owns, saying which. */
@@ -1283,8 +1290,8 @@ static const char *hib_layout_refused(u64 *slot, u64 *end, u64 *window, u64 *win
     u64 ram = cur_boot_args.phys_base, size = cur_boot_args.mem_size;
     u64 lo, base, top, win = 0, win_size = 0;
 
-    if (chip_id != T6040)
-        return "the fixed layout is only known for T6040";
+    if (!hib_chip_supported())
+        return "the fixed layout is only known for T6040 and T6041";
     if (!size || ram > UINT64_MAX - size)
         return "invalid RAM extent";
     lo = ALIGN_UP(ram, HIB_RAM_ALIGN);

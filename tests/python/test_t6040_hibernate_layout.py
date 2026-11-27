@@ -47,6 +47,8 @@ typedef uint8_t u8;
 _Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define T6040 0x6040
 #define T6041 0x6041
+#define T6050 0x6050
+#define T8132 0x8132
 #define SZ_16K 0x4000UL
 #define SZ_1M  0x100000UL
 #define SZ_32M 0x2000000UL
@@ -167,6 +169,12 @@ static void *dt = blob;
 #define TOP_OFF   0x98c0000UL
 #define HEAP_OFF  0xf064000UL
 
+/* J616c (T6041, Mac16,5): exact low-RAM and carveout geometry from a live 36 GiB j616c.adt */
+#define J616C_RAM     0x10003538000UL
+#define J616C_BELOW   0xfc000UL
+#define J616C_TOP_OFF 0xc8d8000UL
+#define J616C_LOAD    0x10006b30000UL
+
 static unsigned char input[1 << 16];
 
 static void reset(void)
@@ -240,6 +248,30 @@ static void boot(u64 load, u64 unused)
     boot_at(load, TOP_OFF, HEAP_OFF);
 }
 
+/* J616c (T6041) boot: reuse J616s setup and override only J616c RAM, carveout, and iBoot deltas. */
+static void boot_j616c(u64 load, u64 ram_size, u64 heap_off)
+{
+    u64 top_ram = J616C_RAM + ram_size;
+    boot_at(load, TOP_OFF, heap_off);
+    chip_id = T6041;
+    cur_boot_args.phys_base = J616C_RAM;
+    cur_boot_args.mem_size = ram_size;
+    map_move(2, "region-id-25", 0x10001d64000UL, 0x17d4000);
+    map_move(2, "region-id-24", J616C_RAM, ram_size);
+    map_entry(2, "region-id-4", top_ram, 0x1fd0000);
+    map_move(2, "region-id-14", top_ram + 0x6e40000UL, 0x72c4000);
+    map_move(1, "BootKC-entry", 0x34b40800, 0);
+    mcc_carveouts[0] = (struct mcc_carveout){top_ram + 0xf6ac000UL, 0x25800000};
+    armed[CTXR_RANGE_D][0] = load - J616C_BELOW;
+    map_move(1, "DeviceTree", load - J616C_BELOW, 0x9c000);
+    map_move(1, "TrustCache", load - J616C_BELOW + 0x9c000, 0x60000);
+    map_move(1, "SEPFW", load + 0xc2e8000UL, 0x5ac000);
+    map_move(1, "preoslog", load + 0xc894000UL, 0x40000);
+    boot_args_addr = load + 0xc8d4000UL;
+    map_move(1, "BootArgs", boot_args_addr, SZ_16K);
+    cur_boot_args.top_of_kernel_data = load + J616C_TOP_OFF;
+}
+
 static bool meets(u64 a, u64 b, u64 c, u64 d) { return a < d && c < b; }
 
 /* What the kernel's aura-hibernate accepts as the tree in the slot (aura_slot_tree_valid()) */
@@ -299,9 +331,8 @@ static void *run(bool hib)
 /* The same steps with no hibernation code at all: the boot j616s/el2-full gives */
 static unsigned char reference[sizeof(blob)];
 static u64 reference_heap;
-static void run_reference(u64 load, u64 after)
+static void capture_reference(void)
 {
-    boot(load, after);
     assert(!fdt_open_into(input, dt, sizeof(blob)));
     heap_base = (u8 *)heap_base + 0x60000;
     assert(!fdt_add_mem_rsv(dt, (u64)heap_base - 0x60000, 0x60000));
@@ -311,6 +342,11 @@ static void run_reference(u64 load, u64 after)
     heap_base = (u8 *)heap_base + 0x200000;
     memcpy(reference, dt, fdt_totalsize(dt));
     reference_heap = (u64)heap_base;
+}
+static void run_reference(u64 load, u64 after)
+{
+    boot(load, after);
+    capture_reference();
 }
 static bool unchanged(void *handoff)
 {
@@ -356,6 +392,27 @@ static void refused(const char *why)
         assert(0);
     }
     assert(!hib_dt_base && !hib_heap_base && !hib_heap_end && (u64)heap_base == heap);
+}
+
+/* Verify hib=1 acceptance for the current T6041 setup and optionally return /chosen bytes. */
+static void check_t6041_accept(u64 exp_ram, u64 exp_slot, u64 exp_end, unsigned char prop_out[24])
+{
+    u64 w0 = window_base, w1 = window_base + window_size;
+    kboot_request_hibernate_layout(true);
+    kboot_decide_hibernate_layout();
+    assert(fixed_asked && hib_dt_base == exp_slot && hib_heap_base == exp_slot + 2 * SZ_1M &&
+           hib_heap_end == exp_end && heapblock_high_water() == exp_slot + 2 * SZ_1M &&
+           hib_window_base == w0 && hib_window_end == w1 && !prepare_dt());
+    assert(rsv_covers(exp_ram, w0) && rsv_covers(w1, exp_end) && !rsv_meets(w0, w1));
+    int chosen = fdt_path_offset(dt, "/chosen"), plen;
+    const fdt64_t *hl = fdt_getprop(dt, chosen, "aura,hibernate-layout", &plen);
+    assert(plen == 16 && fdt64_ld(&hl[0]) == exp_ram && fdt64_ld(&hl[1]) == exp_end);
+    const fdt64_t *hd = fdt_getprop(dt, chosen, "aura,hibernate-dt", &plen);
+    assert(plen == 8 && fdt64_ld(hd) == exp_slot && kernel_accepts(dt, exp_slot));
+    if (prop_out) {
+        memcpy(prop_out, hl, 16);
+        memcpy(prop_out + 16, hd, 8);
+    }
 }
 
 int main(int argc, char **argv)
@@ -416,10 +473,64 @@ int main(int argc, char **argv)
     assert(!memcmp(props[0], props[1], 24) && !memcmp(props[0], props[2], 24) &&
            !memcmp(props[0], props[3], 24));
     /* Another chip doesn't ask ctxr_exec.c for the fixed window. */
-    boot(loads[0], afters[0]);
-    chip_id = T6041;
-    kboot_request_hibernate_layout(true);
-    assert(!fixed_asked);
+    static const int unsupported_chips[] = {T8132, T6050};
+    for (size_t i = 0; i < ARRAY_SIZE(unsupported_chips); i++) {
+        boot(loads[0], afters[0]);
+        chip_id = unsupported_chips[i];
+        kboot_request_hibernate_layout(true);
+        assert(!fixed_asked);
+    }
+
+    /*
+     * T6041 (J616c): identical LO/SLOT/END and 96 MiB fixed window across 36/48/64/128 GiB RAM
+     * configurations and observed/min/max iBoot placements.
+     */
+    static const u64 j616c_ram_sizes[] = {
+        0x8c70fc000UL,  /* 36 GiB (j616c.adt) */
+        0xbc70fc000UL,  /* 48 GiB */
+        0xfc70fc000UL,  /* 64 GiB */
+        0x1fc70fc000UL, /* 128 GiB */
+    };
+    static const u64 j616c_loads[] = {
+        J616C_LOAD,
+        LO + 0x1004000UL + J616C_BELOW,
+        LO + 0x3000000UL,
+    };
+    for (size_t r = 0; r < ARRAY_SIZE(j616c_ram_sizes); r++) {
+        unsigned char t6041_props[3][24];
+        for (size_t i = 0; i < ARRAY_SIZE(j616c_loads); i++) {
+            boot_j616c(j616c_loads[i], j616c_ram_sizes[r], HEAP_OFF);
+            check_t6041_accept(J616C_RAM, SLOT, END, t6041_props[i]);
+        }
+        assert(!memcmp(t6041_props[0], t6041_props[1], 24) &&
+               !memcmp(t6041_props[0], t6041_props[2], 24));
+    }
+    /* T6041 without hib=1: unchanged, no hib log. */
+    boot_j616c(J616C_LOAD, j616c_ram_sizes[0], HEAP_OFF);
+    capture_reference();
+    boot_j616c(J616C_LOAD, j616c_ram_sizes[0], HEAP_OFF);
+    assert(unchanged(run(false)) && !strstr(log_text, "hib:"));
+    /* T6041 with direct boot= pushing heap past SLOT: cleanly refused. */
+    boot_j616c(LO + 0x3000000UL, j616c_ram_sizes[0], 0x11800000UL);
+    refused("the heap reaches the fixed slot");
+
+    /*
+     * 128 GiB low-carveout growth: if iBoot pushes phys_base past 0x10004000000 so LO aligns to
+     * 0x10006000000, END = 0x10022000000 still clears region-id-46 (0x10023000000) by 16 MiB and
+     * is accepted; pushing phys_base past 0x10006000000 (LO = 0x10008000000, END = 0x10024000000)
+     * collides with region-id-46 and is cleanly refused.
+     */
+    boot_j616c(0x10006000000UL + 0x2b30000UL, j616c_ram_sizes[3], HEAP_OFF);
+    cur_boot_args.phys_base = 0x10004100000UL;
+    map_move(2, "region-id-24", cur_boot_args.phys_base, j616c_ram_sizes[3]);
+    window_base = 0x10006000000UL + 0x4200000UL;
+    check_t6041_accept(cur_boot_args.phys_base, 0x1001a000000UL, 0x10022000000UL, NULL);
+
+    boot_j616c(0x10008000000UL + 0x2b30000UL, j616c_ram_sizes[3], HEAP_OFF);
+    cur_boot_args.phys_base = 0x10006100000UL;
+    map_move(2, "region-id-24", cur_boot_args.phys_base, j616c_ram_sizes[3]);
+    window_base = 0x10008000000UL + 0x4200000UL;
+    refused("meets ADT /chosen/carveout-memory-map/region-id-46");
 
     /* Without a window (a raw Stage 1, or no secondary to probe): one range, RAM to the end. */
     boot(loads[0], afters[0]);
@@ -441,7 +552,8 @@ int main(int argc, char **argv)
 
     /* Refused: nothing changes, and the tree is the one without hib=1. */
     struct { const char *why; int what; } cases[] = {
-        {"only known for T6040", 0},
+        {"only known for T6040 and T6041", 0},
+        {"only known for T6040 and T6041", 18},
         {"invalid RAM extent", 1},
         {"invalid RAM extent", 2},
         {"too little RAM", 3},
@@ -465,7 +577,8 @@ int main(int argc, char **argv)
         run_reference(load, after);
         boot(load, after);
         switch (cases[i].what) {
-        case 0: chip_id = T6041; break;
+        case 0: chip_id = T8132; break;
+        case 18: chip_id = T6050; break;
         case 1: cur_boot_args.mem_size = 0; break;
         case 2: cur_boot_args.phys_base = ~0UL - SZ_16K; break;
         case 3: cur_boot_args.mem_size = 300 * SZ_1M; break;
@@ -491,7 +604,8 @@ int main(int argc, char **argv)
             continue; /* the model's later steps need valid RAM */
         boot(load, after);
         switch (cases[i].what) { /* again, through the whole flow */
-        case 0: chip_id = T6041; break;
+        case 0: chip_id = T8132; break;
+        case 18: chip_id = T6050; break;
         case 4: window_base = SLOT - 64 * SZ_1M; break;
         case 5: window_base = RAM; break;
         case 6: confined = false; aura_end = SLOT + SZ_1M; break;
@@ -561,6 +675,10 @@ int main(int argc, char **argv)
     }
     boot(loads[1], afters[1]);
     void *handoff = run(true);
+    assert(handoff == slot && !memcmp(slot, dt, fdt_totalsize(dt)));
+    assert(kernel_accepts(slot, SLOT) && strstr(log_text, "device tree copied to its slot"));
+    boot_j616c(J616C_LOAD, j616c_ram_sizes[0], HEAP_OFF);
+    handoff = run(true);
     assert(handoff == slot && !memcmp(slot, dt, fdt_totalsize(dt)));
     assert(kernel_accepts(slot, SLOT) && strstr(log_text, "device tree copied to its slot"));
     puts("T6040 hibernation slot copy PASS");
