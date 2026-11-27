@@ -61,11 +61,29 @@ def test_fill_keys(tmp_path):
     assert struct.unpack_from("<I", d, 4 + 160)[0] == zlib.crc32(body)
     assert run("fill-keys", "--pub", PUB, out, tmp_path / "x").returncode == 0  # refill is fine
     enf = tmp_path / "s1-enforce.bin"
-    assert run("fill-keys", "--pub", PUB, "--enforce", src, enf).returncode == 0
+    # Anyone can sign with the published test key: enforce with it only when asked for a test.
+    r = run("fill-keys", "--pub", PUB, "--enforce", src, enf)
+    assert r.returncode != 0 and "test key" in r.stderr and not enf.exists()
+    assert run("fill-keys", "--pub", PUB, "--enforce", "--test-key", src, enf).returncode == 0
     body = enf.read_bytes()[4 + 16:4 + 16 + 144]
     assert struct.unpack_from("<IIII", body) == (1, 1, 0, 1)
+    own = tmp_path / "own.pub"
+    own.write_bytes(bytes(range(32)))
+    assert run("fill-keys", "--pub", own, "--enforce", src, tmp_path / "own.bin").returncode == 0
+    r = run("fill-keys", "--pub", own, "--pub", PUB, "--enforce", src, tmp_path / "mixed.bin")
+    assert r.returncode != 0 and "test key" in r.stderr
     src.write_bytes(b"no block here")
     assert run("fill-keys", "--pub", PUB, src, tmp_path / "y").returncode != 0
+
+
+def test_the_tool_knows_the_published_test_key():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("secboot_sign", ROOT / "tools/secboot_sign.py")
+    secboot_sign = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(secboot_sign)
+    assert secboot_sign.TEST_KEY_ID == secboot_sign.key_id(PUB.read_bytes())
+    assert secboot_sign.pubkey(KEY.read_bytes()) == PUB.read_bytes()
 
 
 def aura_stage2(footprint=0x20000):
@@ -117,3 +135,84 @@ def test_a_built_stage2_signs(tmp_path):
     src = tmp_path / "boot.bin"
     src.write_bytes(composed(built.read_bytes()))
     assert run("sign-image", "--key", KEY, src, tmp_path / "out.bin").returncode == 0
+
+
+def test_a_record_verifies_only_as_the_form_it_was_signed_for(tmp_path):
+    import struct
+    head, covered = b"\0" * 0x4000, b"dtbs, u-boot and config lines" * 100
+    src = tmp_path / "stage2.bin"
+    src.write_bytes(head + covered)
+    signed = tmp_path / "p.bin"
+    assert run("sign-payloads", "--key", KEY, "--head-len", "0x4000", src, signed).returncode == 0
+    rec = signed.read_bytes()[0x4000:0x5000]
+    # The payload record and its covered bytes, laid out as a signed image.
+    image = tmp_path / "image.bin"
+    image.write_bytes(covered + rec + struct.pack("<Q", len(covered)) + b"AURSIGT1")
+    r = run("verify", "--pub", PUB, image)
+    assert r.returncode != 0 and "bad-format" in r.stdout, r.stdout
+    # And the other way: an image trailer's record in front of the image as payloads.
+    trailer = tmp_path / "t.bin"
+    assert run("sign-image", "--key", KEY, src, trailer).returncode == 0
+    t = trailer.read_bytes()
+    payloads = tmp_path / "payloads.bin"
+    payloads.write_bytes(head + t[len(head + covered):-16] + head + covered)
+    r = run("verify", "--pub", PUB, "--head-len", "0x4000", payloads)
+    assert r.returncode != 0 and "bad-format" in r.stdout, r.stdout
+
+
+def test_a_record_without_a_form_is_refused(tmp_path):
+    import importlib.util
+    import struct
+    spec = importlib.util.spec_from_file_location("secboot_sign", ROOT / "tools/secboot_sign.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    seed = KEY.read_bytes()
+    covered = b"an image" * 64
+    # What older signers wrote: flags 0.
+    header = tool.BODY_MAGIC + struct.pack("<IIIIQ", 1, 1, 0, 0, len(covered)) + tool.key_id(tool.pubkey(seed))
+    sig = tool.sign(seed, tool.DOMAIN + header + tool.hashlib.sha256(covered).digest())
+    rec = (tool.TAG + struct.pack("<I", tool.RECORD_SIZE) + header + sig).ljust(tool.RECORD_SIZE, b"\0")
+    image = tmp_path / "old.bin"
+    image.write_bytes(covered + rec + struct.pack("<Q", len(covered)) + b"AURSIGT1")
+    r = run("verify", "--pub", PUB, image)
+    assert r.returncode != 0 and "bad-format" in r.stdout, r.stdout
+
+
+def test_a_caller_from_before_the_form_still_signs_an_image(tmp_path):
+    """aurora-secboot stage2 sign calls make_record(seed, data, secver) and appends the footer."""
+    import importlib.util
+    import struct
+    spec = importlib.util.spec_from_file_location("secboot_sign", ROOT / "tools/secboot_sign.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    data = b"a stage 2" * 100
+    rec, _ = tool.make_record(KEY.read_bytes(), data, 2)
+    out = tmp_path / "s2.bin"
+    out.write_bytes(data + rec + struct.pack("<Q", len(data)) + tool.FOOTER)
+    r = run("verify", "--pub", PUB, out)
+    assert r.returncode == 0 and "image trailer: verified" in r.stdout, r.stdout
+
+
+def test_make_record_writes_no_record_without_a_form(tmp_path):
+    """The fourth argument was the flags word, 0 by default, before it named the form."""
+    import importlib.util
+    import struct
+    import pytest
+    spec = importlib.util.spec_from_file_location("secboot_sign", ROOT / "tools/secboot_sign.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    seed, data = KEY.read_bytes(), b"a stage 2" * 100
+    # No form, or one no stage checks for: refused instead of signing a record nothing verifies.
+    for args, kwargs in (((0,), {}), ((), {"form": 0}), ((), {"flags": 0}), ((3,), {}),
+                         ((tool.FORM_IMAGE | 0x10,), {})):
+        with pytest.raises(ValueError, match="form"):
+            tool.make_record(seed, data, 2, *args, **kwargs)
+    # The old keyword still names the same argument.
+    for kwargs, form in (({"flags": tool.FORM_IMAGE}, "image trailer"), ({"form": tool.FORM_IMAGE}, "image trailer")):
+        rec, _ = tool.make_record(seed, data, 2, **kwargs)
+        out = tmp_path / "s2.bin"
+        out.write_bytes(data + rec + struct.pack("<Q", len(data)) + tool.FOOTER)
+        r = run("verify", "--pub", PUB, out)
+        assert r.returncode == 0 and f"{form}: verified" in r.stdout, r.stdout
+    with pytest.raises(TypeError):
+        tool.make_record(seed, data, 2, form=tool.FORM_IMAGE, flags=tool.FORM_IMAGE)

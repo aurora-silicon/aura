@@ -129,9 +129,27 @@ endif
 ifneq ($(filter audit enforce,$(SECBOOT)),)
 CFG += SECBOOT_$(shell echo $(SECBOOT) | tr a-z A-Z)
 endif
-SECBOOT_PUBKEY ?= data/secboot/test-ed25519.pub
-# SECBOOT_FLAVOUR=dev (default) keeps the USB host windows a lab needs (recovery window, aura-proxy,
-# DebugUSB) unless the stage enforces; SECBOOT_FLAVOUR=secure never opens one and needs SECBOOT.
+SECBOOT_TEST_PUBKEY := data/secboot/test-ed25519.pub
+SECBOOT_PUBKEY ?= $(SECBOOT_TEST_PUBKEY)
+# Anyone can sign with the test key (its private half is in data/secboot), so a build that
+# enforces or is the secure flavour refuses it unless SECBOOT_TEST_KEY=1 says this is a test build.
+# A stage that enforces (by its build, or by its key block at run time) runs what the test key
+# signed only in such a test build.
+ifeq ($(SECBOOT_TEST_KEY),1)
+ifneq ($(filter audit enforce,$(SECBOOT)),)
+CFG += SECBOOT_ALLOW_TEST_KEY
+endif
+endif
+ifneq ($(filter enforce,$(SECBOOT))$(filter secure,$(SECBOOT_FLAVOUR)),)
+ifneq ($(SECBOOT_TEST_KEY),1)
+ifeq ($(shell cmp -s $(SECBOOT_PUBKEY) $(SECBOOT_TEST_PUBKEY) && echo same),same)
+$(error SECBOOT=enforce or SECBOOT_FLAVOUR=secure needs SECBOOT_PUBKEY=<your key>: $(SECBOOT_PUBKEY) is the published test key (SECBOOT_TEST_KEY=1 builds with it anyway, for tests))
+endif
+endif
+endif
+# SECBOOT_FLAVOUR=dev (default) keeps the USB host windows someone asks for (aura-proxy, the
+# configured window, DebugUSB) unless the stage enforces; SECBOOT_FLAVOUR=secure never opens one and
+# needs SECBOOT.
 SECBOOT_FLAVOUR ?= dev
 ifeq ($(SECBOOT_FLAVOUR),secure)
 ifeq ($(filter audit enforce,$(SECBOOT)),)
@@ -143,6 +161,16 @@ endif
 CFG += SECBOOT_SECURE_FLAVOUR
 else ifneq ($(SECBOOT_FLAVOUR),dev)
 $(error SECBOOT_FLAVOUR must be dev or secure)
+endif
+
+# Lab Stage 1 builds only: also give the proxy to a USB host nobody asked for, in the recovery
+# window after a failed boot and when no payload starts or a hand-off fails (docs/secure-boot.md).
+# Without it a Stage 1 reboots instead.
+ifeq ($(LAB_PROXY),1)
+ifeq ($(SECBOOT_FLAVOUR),secure)
+$(error SECBOOT_FLAVOUR=secure cannot have LAB_PROXY=1)
+endif
+CFG += LAB_PROXY
 endif
 
 # Development builds only: a boot started by a VDM `reboot debugusb` with a host reading the
@@ -428,7 +456,7 @@ build-tag src/../build/build_tag.h &:
 
 build-cfg src/../build/build_cfg.h &:
 	$(QUIET)mkdir -p build
-	$(QUIET)python3 tools/secboot_sign.py c-header $(SECBOOT_PUBKEY) > build/secboot_key.tmp
+	$(QUIET)python3 tools/secboot_sign.py c-header $(SECBOOT_PUBKEY) --test-pub $(SECBOOT_TEST_PUBKEY) > build/secboot_key.tmp
 	$(QUIET)cmp -s build/secboot_key.h build/secboot_key.tmp 2>/dev/null || \
 	( mv -f build/secboot_key.tmp build/secboot_key.h && echo "  KEY   build/secboot_key.h" )
 	$(QUIET)python3 tools/execute_window.py c-header > build/execute_window.tmp

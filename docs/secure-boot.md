@@ -12,12 +12,17 @@ Both are build options; a default build only writes the record.
 - `SECBOOT_PUBKEY=<file>`: the raw 32-byte Ed25519 public key built into the
   stage. The default, `data/secboot/test-ed25519.pub`, is a published test
   key (its private half is in the same directory), so a build with it proves
-  nothing about who signed an image.
+  nothing about who signed an image. A `SECBOOT=enforce` or `secure` build
+  refuses to build with it unless `SECBOOT_TEST_KEY=1` is given (test builds).
+  Whatever key a stage trusts, a good signature by the test key is recorded as
+  `test-key`, not `verified`, and the chain is not called verified. A stage
+  that does not enforce runs it. A stage that enforces, by its build or by its
+  key block, refuses it unless it is a `SECBOOT_TEST_KEY=1` test build.
 - `SECBOOT_MIN_SECURITY_VERSION` (a `-D` define): the lowest security version
   a signature may carry. Signatures below it are refused as rollbacks.
 - `SECBOOT_FLAVOUR=dev|secure` (default `dev`): `dev` keeps the USB host
-  windows a lab needs (the recovery window after a failed boot, `aura-proxy`,
-  DebugUSB) while the stage does not enforce. `secure` never gives a USB host
+  windows someone asks for (the configured window, `aura-proxy`, DebugUSB)
+  while the stage does not enforce. `secure` never gives a USB host
   the proxy, whatever the policy: no window, and a failed hand-off or a boot
   with no payload reboots instead of falling back to the proxy. `secure` needs
   `SECBOOT=audit` or `enforce` and refuses `DEBUGUSB_PROXY=1`. Its image
@@ -25,6 +30,12 @@ Both are build options; a default build only writes the record.
   keeps a `secure` Stage 1 well below the DCP log buffer (`aura-raw.ld`) on
   every distribution's toolchain. `tools/stage1_room.py` reports how much room
   a Stage 1 build has left; CI checks it for each flavour (`stage1-size.yml`).
+- `LAB_PROXY=1` (a `dev` Stage 1 for lab Macs): also give a USB host that
+  nobody asked for the proxy, in the recovery window after a boot that stopped
+  before an OS, and when no payload starts or a hand-off fails. Anyone with a
+  cable could take those, so a Stage 1 built without it leaves a message on
+  the panel and reboots instead. Later stages keep these fallbacks while they
+  do not enforce.
 
 The usual pair is a `secure` Stage 1 built with `SECBOOT=audit` for users and a
 `dev` one for development Macs. Both report and boot by default; enforcing is
@@ -37,6 +48,8 @@ A Stage 1 built with `SECBOOT=audit` or `enforce` also carries an
 security version, filled before `kmutil` enrols the image, so the
 LocalPolicy's `coih` covers them like the rest of Stage 1:
 `secboot_sign.py fill-keys --pub aurora.pub [--pub owner.pub] --min-secver N [--enforce] in out`.
+`fill-keys --enforce` refuses the published test key unless `--test-key` is
+given; that is for a Stage 1 built with `SECBOOT_TEST_KEY=1`.
 A record is checked with the key whose id it names. An unfilled block leaves
 the built-in key in charge; a damaged one (bad CRC, unknown flags) is reported
 and ignored.
@@ -59,6 +72,23 @@ window after a failed boot, not the DebugUSB window, and not the fallbacks when
 no payload starts or a hand-off fails (it leaves a message on the panel and
 reboots).
 
+A stage started by one that enforced does the same, whatever it was built with:
+the earlier stage's `chosen.aurora,measure-N` line names its policy, and a
+stage that reads `enforce` there runs no ESP `boot=` files, gives no USB
+host the proxy and chainloads only a next stage it has verified. A stage built
+without `SECBOOT` verifies nothing, so under an enforcing stage it refuses
+every `chainload=` target; an audit build goes on with what its key signed. It
+does not check its own payloads under that policy (the earlier stage's image
+trailer covered them) and records its own policy as built. A forged line can
+only make a stage stricter.
+
+The line shares a fixed list with the owner's `chosen.*` lines and the
+loader's own (`nvme.sart`, the trial, the Stage 1 log). A stage that enforces
+and finds no room for the line refuses the next stage, since handing over
+without it would drop the policy: keep the configuration a few `chosen.*`
+lines under the limit of 16 on an enforcing chain. A stage that does not
+enforce goes on without the line, as before.
+
 ## Signature forms
 
 Both are made and checked with `tools/secboot_sign.py`.
@@ -79,11 +109,39 @@ Both are made and checked with `tools/secboot_sign.py`.
 The record body is `AURSIG01`, version, algorithm (1 = Ed25519), security
 version, flags, covered length and an 8-byte key id (SHA-256 of the public
 key), then an Ed25519 signature over `AURA-SIG-V1` (padded to 16 bytes), the
-header, and SHA-256 of the covered bytes. The tool refuses to sign an image
+header, and SHA-256 of the covered bytes. The low four bits of the signed
+flags name the form (1 = payload record, 2 = image trailer), and each check
+asks for its own: a record of one form never verifies as the other. A record
+without a form (flags 0, from a signer older than this rule) is `bad-format`
+for both, since its covered bytes could be taken for either: re-sign such
+images before a stage with this rule checks them. Stages older than the rule
+ignore the flags, so a newly signed Stage 2 still verifies under them. The
+other flag bits are signed and reserved. The tool refuses to sign an image
 that carries `chosen.aurora,measure-` lines, which only a loading stage may
 add. In an aura image it searches only what follows the image (from the load
 header's footprint, where `_payload_start` is), since aura's own code holds
 the line's format string.
+
+## Updating a Stage 1 that checks signatures
+
+Sign Stage 2 again with the `secboot_sign.py` that ships with the new Stage 1
+before, or together with, enrolling that Stage 1:
+
+1. Update aura and its tools, and sign the installed Stage 2 with them
+   (`secboot_sign.py sign-image`, or `aurora-secboot stage2 sign`).
+   `secboot_sign.py verify --pub K` from the new tools must say `verified`.
+2. Boot once. The Stage 1 still enrolled, whatever its age, verifies the
+   newly signed Stage 2: it ignores the form.
+3. Only then build, fill and enrol the new Stage 1.
+
+The other order does not boot under enforce. A new Stage 1 reports a Stage 2
+that an older signer wrote as `bad-format`; an enforcing one refuses it,
+leaves the message on the panel and reboots every 10 s until the owner holds
+the power button and starts another system or recoveryOS, where the earlier
+Stage 1 can be enrolled again or Stage 2 signed. An audit Stage 1 boots it and
+records `bad-format`, so check the record after the update and before turning
+enforce on. Tools that enrol a Stage 1 (the installer, `aurora-secboot stage1
+build`) have to keep this order.
 
 ## The record
 
@@ -101,10 +159,21 @@ that builds the OS device tree writes `/chosen/aurora,boot-security`:
   and `apple,secure-boot`, `apple,effective-security-mode-ap` and related
   `/chosen` properties, copied as they are;
 - `measurement@N`: `stage`, `policy`, `component`, `verdict` (`verified`,
-  `unsigned`, `measured`, `bad-signature`, `unknown-key`, `rollback`,
-  `bad-format`), `sha256`, and for signed items `key-id` and
+  `test-key`, `unsigned`, `measured`, `bad-signature`, `unknown-key`,
+  `rollback`, `bad-format`), `sha256`, and for signed items `key-id` and
   `security-version`.
 
 U-Boot (`EFI_AURORA_MEASURE`) adds an entry for every EFI image it loads.
 The record is only as good as the first stage that enforces: a stage nobody
 verified can write anything here.
+
+## What a stage that does not enforce trusts
+
+- The ESP. A Stage 1 that does not enforce starts whatever Stage 2 the ESP
+  holds, so anyone who can write the ESP already chooses the code that runs.
+- The `aura-proxy` request for the same reason. It is an unauthenticated file
+  at the ESP root or a boot argument, and it gives a USB host the proxy for 15
+  seconds. That is no more than an ESP or NVRAM writer has anyway under such a
+  Stage 1, and it is why the request counts as asked for by the owner. A stage
+  that enforces, one started by an enforcing stage, and the `secure` flavour
+  ignore it.

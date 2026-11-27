@@ -16,6 +16,7 @@ enum secboot_verdict {
     SECBOOT_ROLLBACK = 4,
     SECBOOT_UNSIGNED = 5,
     SECBOOT_MEASURED = 6, /* hashed only: covered by a signature checked elsewhere, or none */
+    SECBOOT_TEST_KEY = 7, /* a good signature, but by the published test key: proves nothing */
 };
 
 /* Record a measurement (SHA-256 of data) for the hand-off record this stage builds. */
@@ -39,8 +40,18 @@ u8 *secboot_payload_next(u8 *p);
 bool secboot_allow_unverified(const char *what);
 
 /*
+ * A chosen. line from the payloads. An earlier stage that enforced passes that on in its
+ * chosen.aurora,measure-N line; this stage then runs no ESP boot= files, chainloads nothing it
+ * has not verified and gives no USB host the proxy, whatever it was built with. A forged line
+ * can only make a stage stricter.
+ */
+void secboot_note_chosen(const char *line);
+
+/*
  * Check the trailer signature of an image this stage chainloads. Returns 0 to go on, with *size
- * cut to the covered bytes when a trailer is present. Adds the measurement var for the next stage.
+ * cut to the covered bytes when a trailer is present. Adds the measurement var for the next stage;
+ * a stage that enforces refuses the image when the var list has no room for it, because the next
+ * stage takes the policy from that var.
  */
 int secboot_check_chainload(void *image, size_t *size, char **vars, size_t *var_cnt,
                             size_t var_capacity);
@@ -64,6 +75,21 @@ static inline bool secboot_host_proxy_allowed(void)
 }
 #else
 bool secboot_host_proxy_allowed(void);
+#endif
+
+/*
+ * Whether a USB host nobody asked for may get the proxy: the Stage 1 recovery window after a
+ * failed boot, and the fallbacks when no payload starts or a hand-off fails. Nobody asked for
+ * those, so a Stage 1 offers them only when built for a lab (LAB_PROXY=1). Windows the
+ * owner asks for (the configured window, aura-proxy) go by secboot_host_proxy_allowed() alone.
+ */
+#ifdef SECBOOT_SECURE_FLAVOUR
+static inline bool secboot_unrequested_proxy_allowed(void)
+{
+    return false;
+}
+#else
+bool secboot_unrequested_proxy_allowed(void);
 #endif
 
 /* "dev" or "secure" (SECBOOT_FLAVOUR). */
