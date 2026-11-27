@@ -291,6 +291,22 @@ int smc_adt_function_write(smc_dev_t *smc, const struct smc_adt_function *fn, u3
                     : smc_write_u32(smc, fn->key, fn->lo | level);
 }
 
+int smc_adt_function_set(const char *path, const char *prop, u32 level)
+{
+    struct smc_adt_function fn;
+    int ret = smc_adt_function_get(path, prop, &fn);
+
+    if (ret)
+        return ret;
+
+    smc_dev_t *smc = smc_init();
+    if (!smc)
+        return -1;
+    ret = smc_adt_function_write(smc, &fn, level);
+    smc_shutdown(smc);
+    return ret ? -1 : 0;
+}
+
 int smc_adt_function_reset(const char *path, u32 settle_ms)
 {
     struct smc_adt_function fn;

@@ -45,6 +45,8 @@ static const struct t6050_port {
     {3, {0x21421b21}, "ASM3142 xHCI", false},
     /* The N1's control function: 1900 in its ROM personality, 1901 once its firmware runs */
     {0, {0x1900106b, 0x1901106b}, "N1 Wi-Fi/Bluetooth", false},
+    /* Existing links must reserve their buses before this newly trained port. */
+    {1, {0x975517a0}, "GL9755 SD reader", false},
 };
 
 /* apcie0 "reg": shared windows, then six per port */
@@ -681,11 +683,41 @@ static int stage_g(const struct port_regs *pp)
     return 0;
 }
 
+/* Leave the optional reader powered through the Linux handoff. */
+static int sdreader_power(const struct port_regs *pp)
+{
+    const char *property = "function-sd_pwr_en";
+    int node = adt_path_offset(adt, pp->bridge);
+    if (node < 0)
+        return 1;
+
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        if (!adt_getprop(adt, node, property, NULL))
+            continue;
+
+        char path[64];
+        const char *name = adt_get_name(adt, node);
+        if (!name || snprintf(path, sizeof(path), "%s/%s", pp->bridge, name) >= (int)sizeof(path))
+            FAIL("%s: cannot resolve SD reader path\n", pp->bridge);
+
+        int ret = smc_adt_function_set(path, property, 1);
+        if (ret)
+            FAIL("%s: SD reader power enable failed: %d\n", path, ret);
+        /* Wait 100 ms (PCIe CEM T_PVPERL) plus 50 ms rail-ramp margin before PERST# release. */
+        const u32 power_to_perst_ms = 150;
+        mdelay(power_to_perst_ms);
+        return 0;
+    }
+    return 1;
+}
+
 /* B-G for one port, after the shared A and S */
 static int port_up(struct port_regs *pp)
 {
     u64 p2 = pp->ctl;
 
+    TRY(sdreader_power(pp));
     if (read32(p2 + PORT_LINKSTS) & BIT(0)) {
         printf("pcie-t6050: port %d already has a link: adopting it\n", pp->p->port);
     } else {

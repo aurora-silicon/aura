@@ -32,6 +32,8 @@ struct smc_adt_function {
  * is a pKW4/pKW8 whose phandle is not that of /arm-io/smc or a node below it. */
 int smc_adt_function_get(const char *path, const char *prop, struct smc_adt_function *fn);
 int smc_adt_function_write(smc_dev_t *smc, const struct smc_adt_function *fn, u32 level);
+/* Set the level of a pKW4/pKW8 function under /arm-io/smc. 1 if absent/non-SMC, negative on error. */
+int smc_adt_function_set(const char *path, const char *prop, u32 level);
 
 /*
  * Release the reset an ADT node's "function-reset" names through the SMC: pKW4(key, lo) is a
