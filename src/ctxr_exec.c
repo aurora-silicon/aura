@@ -280,7 +280,7 @@ static bool ranges_overlap(u64 start_a, u64 end_a, u64 start_b, u64 end_b)
 
 /*
  * Whether [start, end) holds something kboot keeps from the OS: the firmware RO range
- * where aura knows one (T8140), the windows A to C, or what the secondaries can't write.
+ * where the chip sets one, the windows A to C, or what the secondaries can't write.
  */
 static bool ctxr_exec_holds_ro_range(u64 start, u64 end)
 {
