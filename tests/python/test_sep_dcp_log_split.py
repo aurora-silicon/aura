@@ -151,8 +151,12 @@ static void expect_unchanged(void)
     assert(!memcmp(blob, before, sizeof(blob)));
 }
 
-#define REFUSED(setup) do { setup; memcpy(before, blob, sizeof(blob)); \
+/* Nothing to do: the handoff goes on with the tree as it was. */
+#define KEPT(setup) do { setup; memcpy(before, blob, sizeof(blob)); \
     assert(!prepare()); expect_unchanged(); } while (0)
+/* Refused before any change: the handoff fails, and the tree is as it was. */
+#define REFUSED(setup) do { setup; memcpy(before, blob, sizeof(blob)); \
+    assert(prepare() == -1); expect_unchanged(); } while (0)
 
 int main(void)
 {
@@ -192,11 +196,11 @@ int main(void)
     assert(reserved("dcp-oslog@10005f3c000") >= 0 && reserved("asc-firmware@10005fa8000") >= 0);
 
     /* A Mac whose SEP range overlaps nothing keeps its tree as it is. */
-    REFUSED(tree("/arm-io/sep"); oslog("dcp-oslog@20000000", 0x20000000, 0x100000));
+    KEPT(tree("/arm-io/sep"); oslog("dcp-oslog@20000000", 0x20000000, 0x100000));
 
     /* Another coprocessor's no-map firmware inside the range, with no DCP OS log there: nothing
      * shows the warm SEP range is shared, so it stays whole. */
-    REFUSED(tree("/arm-io/sep");
+    KEPT(tree("/arm-io/sep");
             reserve("asc-firmware@10100000", SEP_BASE + 0x100000, 0x100000, true, "apple,asc-mem"));
     /* The same firmware beside a DCP OS log is split out with it. */
     tree("/arm-io/sep");
@@ -206,7 +210,7 @@ int main(void)
     expect_sep_unlinked("/arm-io/sep");
     assert(count_retained() == 3);
     assert(retained(SEP_BASE + 0x200000) == 0x100000);
-    /* Anything else inside the range is refused, and the boot goes on: a mapped asc-mem region, */
+    /* Anything else inside the range is refused, and the handoff fails: a mapped asc-mem region, */
     REFUSED(tree("/arm-io/sep"); oslog("dcp-oslog@10100000", SEP_BASE + 0x100000, 0x100000);
             reserve("asc-firmware@10300000", SEP_BASE + 0x300000, 0x40000, false, "apple,asc-mem"));
     /* a no-map region of another kind, */
@@ -221,7 +225,8 @@ int main(void)
             oslog("dcp-oslog@10180000", SEP_BASE + 0x180000, 0x100000));
 
     /* A SEP node that does not take sep-firmware as sepfw, or one that is not apple,sep, or a
-     * sep-firmware the SEP cannot read (no-map): refused before any change. */
+     * sep-firmware the SEP cannot read (no-map): refused before any change, and the handoff
+     * fails. */
     REFUSED(tree("/arm-io/sep"); oslog("dcp-oslog@10100000", SEP_BASE + 0x100000, 0x100000);
             assert(!fdt_setprop(dt, fdt_path_offset(dt, "/arm-io/sep"), "memory-region-names",
                                 "other", 6)));
@@ -230,6 +235,23 @@ int main(void)
                                        "apple,other")));
     REFUSED(tree("/arm-io/sep"); oslog("dcp-oslog@10100000", SEP_BASE + 0x100000, 0x100000);
             assert(!fdt_setprop_empty(dt, reserved("sep-firmware"), "no-map")));
+
+    /* A sep-firmware reservation of an unexpected shape (not 16 KiB aligned), or a reservation
+     * with an unexpected reg beside a DCP OS log inside the range: refused, and the handoff
+     * fails. */
+    REFUSED(tree_at("/arm-io/sep", SEP_BASE + 0x1000, SEP_SIZE);
+            oslog("dcp-oslog@10100000", SEP_BASE + 0x100000, 0x100000));
+    REFUSED(tree("/arm-io/sep"); oslog("dcp-oslog@10100000", SEP_BASE + 0x100000, 0x100000);
+            assert(!fdt_setprop_u64(dt, reserve("other@20000000", 0x20000000, 0x100000, true, NULL),
+                                    "reg", 0x20000000)));
+    /* An unaligned sep-firmware with no DCP OS log inside it: nothing to split, and the
+     * handoff goes on. */
+    KEPT(tree_at("/arm-io/sep", SEP_BASE + 0x1000, SEP_SIZE));
+    /* The same reservation with no DCP OS log inside the range: nothing to split, and the
+     * handoff goes on. */
+    KEPT(tree("/arm-io/sep");
+         assert(!fdt_setprop_u64(dt, reserve("other@20000000", 0x20000000, 0x100000, true, NULL),
+                                 "reg", 0x20000000)));
 
     /* No SEP reservation at all. */
     dt = blob;

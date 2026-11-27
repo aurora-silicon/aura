@@ -10765,16 +10765,18 @@ static int dt_split_sep_reservations(void)
         return 0;
     why = "unexpected sep-firmware reservation";
     if (fdt_address_cells(dt, parent) != 2 || fdt_size_cells(dt, parent) != 2)
-        goto keep;
+        goto refuse;
     reg = fdt_getprop(dt, fw, "reg", &len);
     if (!reg || len != 16)
-        goto keep;
+        goto refuse;
     start = fdt64_ld(reg);
     end = start + fdt64_ld(reg + 1);
-    if (!start || end <= start || (start & 0x3fff) || (end & 0x3fff))
-        goto keep;
+    if (!start || end <= start)
+        goto refuse;
 
-    why = "a reservation inside the SEP range is not a no-map coprocessor reservation";
+    /* A reservation this code cannot place, or one inside the SEP range that is not a no-map
+     * coprocessor region, refuses the split; it only matters when there is a split to do. */
+    why = NULL;
     fdt_for_each_subnode(node, dt, parent)
     {
         u64 a, b;
@@ -10783,31 +10785,43 @@ static int dt_split_sep_reservations(void)
         reg = fdt_getprop(dt, node, "reg", &len);
         if (!reg)
             continue;
-        if (len != 16)
-            goto keep;
+        if (len != 16) {
+            why = "a reservation has an unexpected reg";
+            continue;
+        }
         a = fdt64_ld(reg);
         b = a + fdt64_ld(reg + 1);
-        if (b < a)
-            goto keep;
+        if (b < a) {
+            why = "a reservation has an unexpected reg";
+            continue;
+        }
         /* Empty placeholders reserve no physical memory. */
         if (a == b)
             continue;
         if (a >= end || b <= start)
             continue;
         bool log = fdt_getprop(dt, node, "apple,dcp-os-log", NULL);
-        if (!fdt_getprop(dt, node, "no-map", NULL) ||
-            (!log && fdt_node_check_compatible(dt, node, "apple,asc-mem")) || count == 64)
-            goto keep;
         logs += log;
+        if (!fdt_getprop(dt, node, "no-map", NULL) ||
+            (!log && fdt_node_check_compatible(dt, node, "apple,asc-mem")) || count == 64) {
+            why = "a reservation inside the SEP range is not a no-map coprocessor reservation";
+            continue;
+        }
         spans[count++] = (struct sep_interval){a < start ? start : a, b > end ? end : b};
     }
-    /* Nothing inside the SEP range: the reservation stands as dt_set_sep() made it. */
-    if (!count)
+    /* Only the DCP OS logs show the warm SEP range is shared. With none inside it there is
+     * nothing to split: the reservation stands as dt_set_sep() made it. */
+    if (!logs) {
+        if (count || why)
+            printf("FDT: SEP reservation left whole (no DCP OS log inside the SEP range)\n");
         return 0;
-    /* Only the DCP OS logs show the warm SEP range is shared; without one it stays whole. */
-    why = "no DCP OS log inside the SEP range";
-    if (!logs)
-        goto keep;
+    }
+    if (why)
+        goto refuse;
+    /* The retained ranges must stay page-aligned. */
+    why = "unexpected sep-firmware reservation";
+    if ((start & 0x3fff) || (end & 0x3fff))
+        goto refuse;
 
     /* The SEP node is the one the sep alias names, as in dt_set_sep(). */
     why = "the SEP node does not reference sep-firmware as sepfw";
@@ -10815,19 +10829,19 @@ static int dt_split_sep_reservations(void)
     alias = node < 0 ? NULL : fdt_getprop(dt, node, "sep", &len);
     if (!alias || len < 2 || len > (int)sizeof(sep_path) || alias[0] != '/' ||
         memchr(alias, '\0', len) != alias + len - 1)
-        goto keep;
+        goto refuse;
     memcpy(sep_path, alias, len);
     sep = fdt_path_offset(dt, sep_path);
     if (sep < 0 || fdt_node_check_compatible(dt, sep, "apple,sep") ||
         fdt_node_check_compatible(dt, fw, "apple,asc-mem") || fdt_getprop(dt, fw, "no-map", NULL))
-        goto keep;
+        goto refuse;
     phandle = fdt_get_phandle(dt, fw);
     ref = fdt_getprop(dt, sep, "memory-region", &len);
     if (!phandle || !ref || len != 4 || fdt32_ld(ref) != phandle)
-        goto keep;
+        goto refuse;
     name = fdt_getprop(dt, sep, "memory-region-names", &len);
     if (!name || len != 6 || memcmp(name, "sepfw", 6))
-        goto keep;
+        goto refuse;
 
     for (i = 1; i < count; i++)
         for (j = i; j > 0 && spans[j].start < spans[j - 1].start; j--) {
@@ -10839,7 +10853,7 @@ static int dt_split_sep_reservations(void)
     why = "the reservations inside the SEP range overlap each other";
     for (i = 1; i < count; i++)
         if (spans[i].start < spans[i - 1].end)
-            goto keep;
+            goto refuse;
     /* From here on the tree is being changed: a failure fails the handoff. */
     if (fdt_delprop(dt, sep, "memory-region"))
         return -1;
@@ -10870,10 +10884,10 @@ static int dt_split_sep_reservations(void)
            count, logs);
     return 0;
 
-keep:
-    /* Refused before any change: the tree keeps the SEP reservation as it was. */
-    printf("FDT: SEP reservation left whole (%s)\n", why);
-    return 0;
+refuse:
+    /* Refused before any change, and the handoff fails: a tree this code does not expect is not
+     * booted with its SEP reservation either split or whole. */
+    bail("FDT: SEP reservation not split (%s)\n", why);
 }
 
 static int dt_set_sep(void)
