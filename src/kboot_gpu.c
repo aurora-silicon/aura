@@ -4492,7 +4492,7 @@ static T6050_GPU_INIT int dt_set_gpu_t6050(void *dt)
 #define T6050_G17C_DEPS         8
 
 /* Every OPP of an OPP table: opp-hz and an opp-microvolt of `cells` cells, `count` of them. */
-static int t6050_g17c_opp_shape(void *dt, int table, u32 count, u32 cells, bool sram)
+static AURA_XTEXT int t6050_g17c_opp_shape(void *dt, int table, u32 count, u32 cells, bool sram)
 {
     int opp, opps = 0, len;
     if (table < 0)
@@ -4519,7 +4519,7 @@ static const struct {
     {"gpu-region", "/reserved-memory/uat-ttbs"},
 };
 
-static int t6050_g17c_sgx_range(int sgx, const char *name, u64 *base, u64 *size)
+static AURA_XTEXT int t6050_g17c_sgx_range(int sgx, const char *name, u64 *base, u64 *size)
 {
     char prop[64];
     snprintf(prop, sizeof(prop), "%s-base", name);
@@ -4536,8 +4536,8 @@ static int t6050_g17c_sgx_range(int sgx, const char *name, u64 *base, u64 *size)
 
 /* A role's three segments (__TEXT, __DATA, __DATA_SHARED_RO), which must match its sgx data
  * properties. */
-static const struct adt_segment_ranges *t6050_g17c_segments(const char *asc_path, int sgx,
-                                                            const char *role)
+static AURA_XTEXT const struct adt_segment_ranges *t6050_g17c_segments(const char *asc_path,
+                                                                       int sgx, const char *role)
 {
     u32 len;
     int asc = adt_path_offset(adt, asc_path);
@@ -4567,7 +4567,7 @@ static const struct adt_segment_ranges *t6050_g17c_segments(const char *asc_path
  * up in /arm-io/aon-ptd's ptd_data_table: 12-byte records, a FourCC stored little-endian then two
  * words. out[] gets FourCC, word 1, word 2 for each, in this order.
  */
-static int t6050_g17c_aon(u32 out[T6050_G17C_AON * 3])
+static AURA_XTEXT int t6050_g17c_aon(u32 out[T6050_G17C_AON * 3])
 {
     static const char names[T6050_G17C_AON][5] = {"g0TR", "g1TR", "r0TR"};
     u32 len;
@@ -4600,8 +4600,8 @@ static int t6050_g17c_aon(u32 out[T6050_G17C_AON * 3])
  * many argument cells as the provider's `cells` property says), each after the power domains it
  * names itself.
  */
-static int t6050_g17c_deps(void *dt, int node, const char *prop, const char *cells,
-                           u32 ph[T6050_G17C_DEPS], u32 *n, int depth)
+static AURA_XTEXT int t6050_g17c_deps(void *dt, int node, const char *prop, const char *cells,
+                                      u32 ph[T6050_G17C_DEPS], u32 *n, int depth)
 {
     int len, clen;
     const fdt32_t *list = fdt_getprop(dt, node, prop, &len);
@@ -4638,7 +4638,7 @@ static int t6050_g17c_deps(void *dt, int node, const char *prop, const char *cel
  * gpu,t6050, which the binding does not allow (apple,agx-g17c comes only with apple,agx-g17s) and
  * no aliased G17C node carries.
  */
-static int t6050_g17c_node(void *dt)
+static AURA_XTEXT int t6050_g17c_node(void *dt)
 {
     int gpu;
     if (fdt_get_alias(dt, "gpu")) {
@@ -4655,7 +4655,7 @@ static int t6050_g17c_node(void *dt)
  * a tree without room even for that, the node is removed: the OS must not take a G17C node with
  * the tree's placeholder operating points. Returns 1 when the node is gone.
  */
-static int t6050_g17c_hold(void *dt, int gpu)
+static AURA_XTEXT int t6050_g17c_hold(void *dt, int gpu)
 {
     int len;
     const char *status = fdt_getprop(dt, gpu, "status", &len);
@@ -4667,7 +4667,7 @@ static int t6050_g17c_hold(void *dt, int gpu)
     return fdt_del_node(dt, gpu) ? -1 : 1;
 }
 
-static T6050_GPU_INIT int dt_set_gpu_g17c(void *dt)
+static AURA_XTEXT int dt_set_gpu_g17c(void *dt)
 {
     int gpu = t6050_g17c_node(dt);
     int held = gpu < 0 ? 1 : t6050_g17c_hold(dt, gpu);

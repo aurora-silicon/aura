@@ -44,6 +44,7 @@ _Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define T6050_GPU_INIT
 #define T6050_GPU_TEXT_FN
+#define AURA_XTEXT
 #define G15_PS_MIN_MV 400
 #define G15_PS_MAX_MV 1500
 #define G15_PS_MIN_HZ 100000000u
