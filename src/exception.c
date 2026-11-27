@@ -9,6 +9,7 @@
 #include "gxf.h"
 #include "iodev.h"
 #include "memory.h"
+#include "smp.h"
 #include "sptm_virt.h"
 #include "sptm_virt_priv.h"
 #include "uart.h"
@@ -138,8 +139,14 @@ static const char *get_exception_level(void)
 
 void exception_initialize(void)
 {
+    /*
+     * At EL2, name VBAR_EL2 itself: VBAR_EL1 reaches it only through the E2H alias, which a core
+     * reset (a wake from a system sleep) need not have set up by this point.
+     */
     if (in_el3())
         msr(VBAR_EL3, _vectors_start);
+    else if (in_el2())
+        msr(VBAR_EL2, _vectors_start);
     else
         msr(VBAR_EL1, _vectors_start);
 
@@ -168,9 +175,14 @@ void exception_initialize(void)
     }
 
     /* Initial T8152 bring-up polls KIS without configuring the AIC. A core reset while the
-     * virtualized SPTM's guest is live must not take the guest's interrupts at EL2. */
-    if (is_boot_cpu() && chip_id != T8152 && !sptm_virt_guest_live)
+     * virtualized SPTM's guest is live must not take the guest's interrupts at EL2. A core back
+     * from a system sleep returns to the OS that slept, which owns every interrupt source by
+     * then: nothing may be taken here on the way back. */
+    bool s2r = smp_s2r_published();
+    if (is_boot_cpu() && chip_id != T8152 && !sptm_virt_guest_live && !s2r)
         msr(DAIF, 0 << 6); // Enable SError, IRQ and FIQ
+    else if (s2r)
+        msr(DAIF, 0xf << 6); // Mask debug, SError, IRQ and FIQ
     else
         msr(DAIF, 3 << 6); // Disable IRQ and FIQ
 
@@ -404,6 +416,12 @@ void exc_sync(u64 *regs)
     exc_last_esr = esr;
     exc_last_afsr1 = (in_gl || el3) ? 0 : mrs(SYS_AFSR1_EL1);
 
+    /*
+     * GUARD_RETURN clears exc_guard below. Latch GUARD_SILENT first, or a silent probe that
+     * returns still prints "Recovering from exception".
+     */
+    bool silent = exc_guard & GUARD_SILENT;
+
     switch (exc_guard & GUARD_TYPE_MASK) {
         case GUARD_SKIP:
             elr += 4;
@@ -427,7 +445,7 @@ void exc_sync(u64 *regs)
 
     exc_count++;
 
-    if (!(exc_guard & GUARD_SILENT))
+    if (!silent)
         printf("Recovering from exception (ELR=0x%lx)\n", elr);
     if (in_gl)
         msr(SYS_IMP_APL_ELR_GL1, elr);

@@ -238,7 +238,7 @@ def test_j713_aop_dapf(tmp_path):
         ("end mask", "(read64(slice + 0x10) & ~3UL) != (want[i].end & ~3UL)",
          "read64(slice + 0x10) != want[i].end"),
         ("slice limit", "length / sizeof(*config) > T8132_DAPF_SLICES", "false"),
-        ("slice order", "config[i].end < config[i].start", "false"),
+        ("slice order", "entry.end < entry.start", "false"),
         ("merge", "if (pos > 0 && window.start <= out[pos - 1].end) {", "if (false) {"),
         ("grown merge", "while (pos + 1 < used && out[pos + 1].start <= out[pos].end) {",
          "while (false) {"),

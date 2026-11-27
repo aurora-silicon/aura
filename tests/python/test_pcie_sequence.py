@@ -61,12 +61,26 @@ static int reset_delay, pll, auspma, port_run, fail_tunable;
 static int common_mode, rc_ready, port_tunables;
 static int bad_common;
 static u32 reg_len_override;
+/* pci-bridge0's apcie-port and reg (phys.hi first), each with its length; 0 is absent. */
+static u32 bridge_port, bridge_port_len, bridge_reg[5], bridge_reg_len;
 static u32 phy_ctrl, port_ctrl, appclk;
+/* /arm-io/ans, and whether it has nvme-secure-bar (an ANS on the APCIe block) */
+static int ans_present, ans_secure_bar;
+/* The RC window's word at +4, and how often it was read and written */
+#define RC_MISC 0x394000004ULL
+static u32 rc_misc;
+static int rc_misc_reads, rc_misc_writes;
 static int adt_path_offset(const void *a, const char *path)
 {
     if (!strcmp(path, "/arm-io/apcie")) return 1;
     if (!strcmp(path, "/arm-io/apcie/pci-bridge0")) return 2;
+    if (!strcmp(path, "/arm-io/ans") && ans_present) return 3;
     return -1;
+}
+static const void *adt_get_property(const void *a, int node, const char *prop)
+{
+    return node == 3 && !strcmp(prop, "nvme-secure-bar") && ans_secure_bar ? &ans_secure_bar
+                                                                           : NULL;
 }
 static int adt_path_offset_trace(const void *a, const char *path, int *trace)
 {
@@ -79,6 +93,10 @@ static bool adt_is_compatible(const void *a, int node, const char *compat)
 }
 static const void *adt_getprop(const void *a, int node, const char *prop, u32 *len)
 {
+    if (node == 2 && !strcmp(prop, "reg")) {
+        if (len) *len = bridge_reg_len;
+        return bridge_reg_len ? bridge_reg : NULL;
+    }
     if (!strcmp(prop, "apcie-common-tunables")) return bad_common ? regs : NULL;
     if (len) *len = reg_len_override ? reg_len_override : sizeof(regs);
     return regs;
@@ -88,6 +106,9 @@ static int adt_getprop_copy(const void *a, int node, const char *prop, void *out
     assert(len == 4);
     if (!strcmp(prop, "#ports")) *(u32 *)out = 3;
     else if (!strcmp(prop, "maximum-link-speed")) *(u32 *)out = 2;
+    /* Absent, or not the size asked for, is a miss, as in adt_getprop_copy. */
+    else if (!strcmp(prop, "apcie-port") && node == 2 && bridge_port_len == len)
+        *(u32 *)out = bridge_port;
     else return -1;
     return 4;
 }
@@ -137,11 +158,19 @@ static u32 read32(u64 addr)
     if (addr == PHY + 4) return 0x11;
     if (addr == PORT_PHY) return port_ctrl;
     if (addr == PORT + 0x800) return appclk;
+    if (addr == RC_MISC) {
+        rc_misc_reads++;
+        return rc_misc;
+    }
     return 0;
 }
 static void write32(u64 addr, u32 val)
 {
     access_mmio(addr);
+    if (addr == RC_MISC) {
+        rc_misc_writes++;
+        rc_misc = val;
+    }
     if (addr == PHY || addr == PORT_PHY) {
         u32 *ctrl = addr == PHY ? &phy_ctrl : &port_ctrl;
         if ((*ctrl & 0x10) && !(val & 0x10)) assert((*ctrl & 0xf) == 0xf);
@@ -211,8 +240,26 @@ static void reset_model(void)
     common_mode = rc_ready = port_tunables = 0;
     bad_common = 0;
     reg_len_override = 0;
+    /* As on T8132 (J604): pci-bridge0 has apcie-port 0 and no reg. */
+    bridge_port = 0;
+    bridge_port_len = 4;
+    memset(bridge_reg, 0, sizeof(bridge_reg));
+    bridge_reg_len = 0;
     regs[1][1] = 0x4000;
     regs[7][1] = 0x8000;
+    phy_ctrl = port_ctrl = 0x10;
+    appclk = 0;
+    ans_present = 1;
+    ans_secure_bar = 0;
+    rc_misc = 0;
+    rc_misc_reads = rc_misc_writes = 0;
+    pcie_set_os_restores_apcie(false);
+}
+/* A system sleep: the hardware loses its state, aura's memory keeps controllers[]. */
+static void power_cycle(void)
+{
+    powered = common_mode = rc_ready = port_tunables = 0;
+    reset_delay = pll = auspma = port_run = 0;
     phy_ctrl = port_ctrl = 0x10;
     appclk = 0;
 }
@@ -270,6 +317,56 @@ int main(void)
     assert(pcie_init() == -1 && pll == 1 && auspma == 0 && !port_run);
 
     /*
+     * After a system sleep: the controller that came up at boot comes up again from the node it
+     * came up from, with the same MMIO accesses and polls, and nothing else is tried. A step that
+     * fails fails the whole bring-up; with nothing up at boot there is nothing to bring back.
+     */
+    reset_model();
+    chip_id = 0x8132;
+    controller_compat = "apcie,t8132";
+    rc_misc = 0x5;
+    assert(pcie_init() == 0 && !strcmp(controllers[APCIE].up_path, "/arm-io/apcie"));
+    assert(!controllers[APCIE_GE0].up_path && !controllers[APCIE_GE1].up_path);
+    /* Boot writes the RC word without reading it, as it always has. */
+    assert(rc_misc == 0 && rc_misc_reads == 0 && rc_misc_writes == 1);
+    /* Replayed: no tables for the OS and an ANS off the APCIe block (T8103). */
+    assert(pcie_needs_sleep_reinit());
+    int boot_accesses = accesses, boot_polls = polls;
+    power_cycle();
+    /* Left clear by the sleep: read, not written. */
+    assert(pcie_reinit_after_sleep() == 0 && pcie_initialized && port_run);
+    assert(controllers[APCIE].initialized && controllers[APCIE].active_ports == 1);
+    assert(rc_misc_reads == 1 && rc_misc_writes == 1);
+    assert(accesses == 2 * boot_accesses && polls == 2 * boot_polls);
+    /* Left set: read, then cleared. */
+    power_cycle();
+    rc_misc = 0x5;
+    assert(pcie_reinit_after_sleep() == 0 && rc_misc == 0);
+    assert(rc_misc_reads == 2 && rc_misc_writes == 2);
+    /* Not replayed: an OS that got the tables, an ANS on the APCIe block, or no ANS. */
+    pcie_set_os_restores_apcie(true);
+    assert(!pcie_needs_sleep_reinit());
+    pcie_set_os_restores_apcie(false);
+    ans_secure_bar = 1;
+    assert(!pcie_needs_sleep_reinit() && !pcie_sleep_reinit_possible());
+    ans_secure_bar = 0;
+    ans_present = 0;
+    assert(!pcie_needs_sleep_reinit() && !pcie_sleep_reinit_possible());
+    ans_present = 1;
+    assert(pcie_needs_sleep_reinit());
+    power_cycle();
+    fail_poll = polls + 1;
+    assert(pcie_reinit_after_sleep() == -1 && !pcie_initialized);
+    reset_model();
+    assert(pcie_reinit_after_sleep() == -1 && accesses == 0);
+    /*
+     * PCIe up without a controller set up here (T6050's own bring-up): nothing to replay, even
+     * with no tables handed over and an ANS off the APCIe block.
+     */
+    pcie_initialized = true;
+    assert(pcie_sleep_reinit_possible() && !pcie_needs_sleep_reinit());
+
+    /*
      * ANS through its storage gates alone: no APCIe block power or MMIO, so the GP ports (N1 on
      * T8142) stay as they are. T8142: AppleT8142PCIe's storage half, on in ADT order.
      */
@@ -298,6 +395,41 @@ int main(void)
     assert(!strcmp(steps, "ANS+ APCIE_SYS_ST0+ APCIE_SYS_ST1+ APHY_ST0_AUS5_A+ APHY_ST1_AUS5_A+ "
                           "APHY_ST0_AUS5+ APHY_ST1_AUS5+ "));
     assert(powered == 0 && accesses == 0);
+
+    /*
+     * The bridge check: apcie-port first, else reg's device number, else one "has neither"
+     * line. Port 0 is set up the same way in each case; the lines are checked below.
+     */
+    static const struct {
+        u32 port, port_len, phys_hi, reg_len;
+    } bridges[] = {
+        {0, 4, 0, 0},       /* apcie-port 0, no reg (T8132): silent */
+        {1, 4, 0, 0},       /* apcie-port 1 */
+        {0, 4, 0x1000, 20}, /* apcie-port 0 is read before reg's device 2: silent */
+        {0, 0, 0, 20},      /* no apcie-port, reg device 0: silent */
+        {0, 0, 0x1000, 20}, /* no apcie-port, reg device 2 */
+        {0, 2, 0, 0},       /* a 2-byte apcie-port is a miss, and no reg */
+        {0, 0, 0, 2},       /* no apcie-port, a 2-byte reg */
+        {0, 0, 0, 0},       /* neither */
+    };
+    int first_accesses = 0, first_polls = 0;
+    for (unsigned i = 0; i < ARRAY_SIZE(bridges); i++) {
+        reset_model();
+        chip_id = 0x8132;
+        controller_compat = "apcie,t8132";
+        bridge_port = bridges[i].port;
+        bridge_port_len = bridges[i].port_len;
+        bridge_reg[0] = bridges[i].phys_hi;
+        bridge_reg_len = bridges[i].reg_len;
+        printf("bridge case %u\n", i);
+        assert(pcie_init() == 0 && pll == 1 && auspma == 1 && port_run);
+        /* The same MMIO accesses and polls whatever the bridge carries. */
+        if (!i) {
+            first_accesses = accesses;
+            first_polls = polls;
+        }
+        assert(accesses == first_accesses && polls == first_polls);
+    }
     return 0;
 }
 '''
@@ -307,4 +439,19 @@ int main(void)
          "-x", "c", "-", "-o", str(binary)],
         input=harness, text=True, check=True,
     )
-    subprocess.run([str(binary)], check=True)
+    out = subprocess.run([str(binary)], check=True, capture_output=True,
+                         text=True).stdout
+    bridge = "pcie: /arm-io/apcie/pci-bridge0 has "
+    lines = [line for line in out.splitlines()
+             if line.startswith(("bridge case ", bridge))]
+    neither = bridge + "neither apcie-port nor reg"
+    assert lines == [
+        "bridge case 0",
+        "bridge case 1", bridge + "apcie-port 1",
+        "bridge case 2",
+        "bridge case 3",
+        "bridge case 4", bridge + "reg device 2",
+        "bridge case 5", neither,
+        "bridge case 6", neither,
+        "bridge case 7", neither,
+    ]

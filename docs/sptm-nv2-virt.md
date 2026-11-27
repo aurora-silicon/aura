@@ -1,13 +1,14 @@
-# Virtualized SPTM under aura (M4 and later)
+# Virtualized SPTM under aura (M2 and later)
 
 aura can run macOS's own stock SPTM, TXM, the cL4 secure kernel with its exclaves, and XNU as a
 FEAT_NV2 guest at virtual EL2, with their guarded world (GXF and SPRR) running natively one
-level below aura's own GL2. macOS boots to the desktop this way on all six cores of a J700, and
-it suspends to RAM and wakes as it does natively. It is a development tool: aura sees every
-power-management access macOS makes, which is how the sleep sequence for Linux was recorded.
+level below aura's own GL2. macOS boots to the desktop this way on all cores (proven on J473 M2,
+J700, J713, J616c, and J815), and on supported SoCs it suspends to RAM and wakes as it does
+natively. For a step-by-step replication guide and host tether helper scripts, see
+[sptm-virt-macos-guest.md](sptm-virt-macos-guest.md).
 
 It is built only with `SPTM_VIRT=1` (which needs `CHAINLOADING=1`) and only does anything on a CPU
-with FEAT_NV2 and GXF (M4 and later), booted as a kcbz=0 Mach-O boot object
+with FEAT_NV2 and GXF (M2 and later), booted as a kcbz=0 Mach-O boot object
 (`docs/macho-boot-object.md`): iBoot then skips its
 own SPTM loader, leaves GXF and SPRR writable, and jumps to aura at EL2. aura's NV2 support is
 built only with `SPTM_VIRT=1` as well: other images, the Linux boot included, carry none of it.

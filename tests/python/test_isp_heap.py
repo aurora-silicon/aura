@@ -47,8 +47,10 @@ typedef uint64_t u64;
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define GENMASK(h, l) (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
-/* Stub: the T6041 ISP handoff isn't exercised here. */
-__attribute__((unused)) static int dt_set_isp_t6041(int node) { (void)node; return 0; }
+/* Stub: placeholder-based ISP handoff isn't exercised here. */
+__attribute__((unused)) static bool dt_isp_has_placeholders(void) { return false; }
+__attribute__((unused)) static int dt_fill_isp_placeholders(int node, bool req)
+{ (void)node; (void)req; return 0; }
 
 struct adt_segment_ranges {
     u64 phys, iova, remap;
@@ -79,6 +81,17 @@ int adt_path_offset_trace(const void *tree, const char *path, int *trace)
     (void)tree;
     trace[0] = 1;
     return strstr(path, "dart-") ? 2 : 1;
+}
+int adt_path_offset(const void *tree, const char *path)
+{
+    (void)tree;
+    return strstr(path, "dart-") ? 2 : 1;
+}
+/* The ADT names the ISP17a (T8140, T8142) "isp,isp-generic-ex". */
+bool adt_is_compatible(const void *tree, int node, const char *compat)
+{
+    (void)tree; (void)node;
+    return !strcmp(compat, "isp,isp-generic-ex") && (chip_id == T8140 || chip_id == T8142);
 }
 int pmgr_adt_power_enable(const char *path)
 {
@@ -344,9 +357,8 @@ def test_isp_fdt_fails_closed_and_exports_heap(tmp_path):
 #include <string.h>
 typedef uint64_t u64;
 typedef uint32_t u32;
-#define T6041 0x6041
-static u32 chip_id;
-static int dt_set_isp_t6041(int node) { (void)node; return 0; }
+static bool dt_isp_has_placeholders(void) { return false; }
+static int dt_fill_isp_placeholders(int node, bool req) { (void)node; (void)req; return 0; }
 #define V13_6_1 1
 #define V13_5 2
 #define bail(...) do { fprintf(stderr, __VA_ARGS__); return -1; } while (0)

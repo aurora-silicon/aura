@@ -54,11 +54,12 @@ Upload and read back every byte, comparing SHA-256 hashes before handoff.
 Set `/chosen/bootargs` to:
 
 ```
-earlycon=dockchannel,0x38812c000 console=tty0 console=ttyDC0 keep_bootcon maxcpus=1 nokaslr rdinit=/init panic=0 arm64.nomte
+earlycon=dockchannel,0x38812c000 console=tty0 console=ttyDC0 keep_bootcon maxcpus=1 nokaslr rdinit=/init panic=0
 ```
 
-`arm64.nomte` keeps MTE off: the tag store at the top of RAM is not yet reserved
-from Linux.
+`kboot_prepare_dt` reserves the MTE tag store at the top of RAM from Linux
+(`/reserved-memory/mte-tag-storage@...`, no-map). If it can't confirm where the
+store is, it appends `arm64.nomte` and sets `/chosen/aurora,mte` to the reason.
 
 Set the initrd range, `/chosen/stdout-path=serial0:1500000n8`, and the U-Boot
 configuration `bootcmd=booti <Image-address> <initrd-address>:<size> $fdtcontroladdr`,

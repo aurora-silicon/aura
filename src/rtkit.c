@@ -121,6 +121,11 @@ struct rtkit_dev {
     bool no_hello;
     /* Started warm: the firmware keeps the buffers an earlier owner gave it. */
     bool inherited;
+
+    /* The negotiated session, for a later owner (rtkit_get_live_state()). */
+    u32 version;
+    u32 epmap[8];
+    bool have_epmap;
 };
 
 struct syslog_log {
@@ -371,14 +376,16 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
     } else if (addr) {
         if (!rtk->dart)
             return false;
-        bfr->dva = addr & ~rtk->dva_base;
-        bfr->sz = sz;
-        bfr->owned = false;
-        bfr->bfr = dart_translate(rtk->dart, bfr->dva & IOVA_MASK);
-        if (!bfr->bfr) {
-            rtkit_printf("failed to translate pre-allocated buffer (ep 0x%x)\n", msg->ep);
+        u64 dva = addr & ~rtk->dva_base;
+        void *phys = dart_translate_range(rtk->dart, dva & IOVA_MASK, sz);
+        if (!phys) {
+            rtkit_printf("pre-allocated buffer (ep 0x%x) isn't mapped contiguously\n", msg->ep);
             return false;
         }
+        bfr->dva = dva;
+        bfr->bfr = phys;
+        bfr->sz = sz;
+        bfr->owned = false;
         return true;
 
     } else {
@@ -427,22 +434,16 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
             rtkit_printf("pre-allocated oslog buffer (phys %#lx, size %#zx)\n", addr, sz);
             return true;
         }
-        if (rtk->dart && sz && addr <= UINT64_MAX - sz) {
+        if (rtk->dart && sz) {
             u64 dva = addr & ~rtk->dva_base;
-            u64 page = ALIGN_DOWN(dva, SZ_16K);
-            u64 end = ALIGN_UP(dva + sz, SZ_16K);
-            void *phys = dart_translate(rtk->dart, page & IOVA_MASK);
-            if (!phys)
-                return false;
             /* The RTKit buffer API requires one contiguous host mapping. */
-            for (u64 next = page + SZ_16K; next < end; next += SZ_16K) {
-                if (dart_translate(rtk->dart, next & IOVA_MASK) != phys + (next - page)) {
-                    rtkit_printf("oslog DART buffer is not contiguous\n");
-                    return false;
-                }
+            void *phys = dart_translate_range(rtk->dart, dva & IOVA_MASK, sz);
+            if (!phys) {
+                rtkit_printf("oslog DART buffer is not mapped contiguously\n");
+                return false;
             }
             bfr->dva = dva;
-            bfr->bfr = phys + (dva - page);
+            bfr->bfr = phys;
             bfr->sz = sz;
             rtkit_printf("pre-allocated oslog buffer (dva %#lx, phys %p, size %#zx)\n", dva,
                          bfr->bfr, sz);
@@ -479,33 +480,61 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
 
 static void rtkit_crashed(rtkit_dev_t *rtk)
 {
-    struct crashlog_hdr *hdr = rtk->crashlog_bfr.bfr;
+    const u8 *base = rtk->crashlog_bfr.bfr;
     rtk->crashed = true;
 
     rtkit_printf("IOP crashed!\n");
 
     /* A warm-started session's crash log is in a buffer an earlier owner gave. */
-    if (!hdr)
+    if (!base)
         return;
 
-    if (hdr->type != 'CLHE') {
-        rtkit_printf("bad crashlog header 0x%x @ %p\n", hdr->type, hdr);
+    /* The firmware writes the log; every read stays inside the buffer it was given. */
+    struct crashlog_hdr hdr;
+    if (rtk->crashlog_bfr.sz < sizeof(hdr)) {
+        rtkit_printf("crashlog buffer too small (%#zx)\n", rtk->crashlog_bfr.sz);
+        return;
+    }
+    memcpy(&hdr, base, sizeof(hdr));
+    if (hdr.type != 'CLHE') {
+        rtkit_printf("bad crashlog header 0x%x @ %p\n", hdr.type, base);
         return;
     }
 
-    struct crashlog_entry *p = (void *)(hdr + 1);
+    const u8 *end = base + rtk->crashlog_bfr.sz;
+    const u8 *cur = base + sizeof(hdr);
 
     rtkit_printf("== CRASH INFO ==\n");
-    while (p->type != 'CLHE') {
-        switch (p->type) {
-            case 'Cstr':
-                rtkit_printf("  Message %d: %s\n", p->payload[0], &p->payload[4]);
+    while ((size_t)(end - cur) >= sizeof(struct crashlog_entry)) {
+        struct crashlog_entry e;
+        memcpy(&e, cur, sizeof(e));
+        if (e.type == 'CLHE')
+            break;
+
+        size_t room = (size_t)(end - cur);
+        if (e.len < sizeof(e) || e.len > room) {
+            rtkit_printf("  bad crashlog entry length %#x @ %p\n", e.len, cur);
+            break;
+        }
+        switch (e.type) {
+            case 'Cstr': {
+                size_t n = e.len - sizeof(e);
+
+                if (n > 4) {
+                    size_t max_len = n - 4;
+                    if (max_len > INT_MAX)
+                        max_len = INT_MAX;
+                    rtkit_printf("  Message %d: %.*s\n", cur[sizeof(e)],
+                                 (int)strnlen((const char *)(cur + sizeof(e) + 4), max_len),
+                                 cur + sizeof(e) + 4);
+                }
                 break;
+            }
             default:
-                rtkit_printf("  0x%x\n", p->type);
+                rtkit_printf("  0x%x\n", e.type);
                 break;
         }
-        p = ((void *)p) + p->len;
+        cur += e.len;
     }
 }
 
@@ -545,6 +574,9 @@ int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg)
                 switch (msgtype) {
                     case MGMT_MSG_IOP_PWR_STATE_ACK:
                         rtk->iop_power = FIELD_GET(MGMT_PWR_STATE, msg->msg);
+                        /* A warm start's only progress report: say what came and when. */
+                        if (rtk->inherited)
+                            rtkit_printf("IOP power state %#x\n", rtk->iop_power);
                         break;
                     case MGMT_MSG_AP_PWR_STATE_ACK:
                         rtk->ap_power = FIELD_GET(MGMT_PWR_STATE, msg->msg);
@@ -663,7 +695,8 @@ static bool rtkit_wait_for_power(rtkit_dev_t *rtk, enum rtkit_power_state *state
             return false;
 
         if (timeout && timeout_expired(timeout)) {
-            rtkit_printf("timed out waiting for %s power state %#x\n", name, target);
+            rtkit_printf("timed out waiting for %s power state %#x (last %#x)\n", name, target,
+                         *state);
             return false;
         }
     }
@@ -727,6 +760,9 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
     }
 
     rtkit_printf("booting with version %d\n", want_ver);
+    rtk->version = want_ver;
+    memset(rtk->epmap, 0, sizeof(rtk->epmap));
+    rtk->have_epmap = false;
 
     msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_HELLO_ACK);
     msg.msg0 |= FIELD_PREP(MGMT_MSG_HELLO_MINVER, want_ver);
@@ -764,6 +800,7 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
 
         u32 bitmap = FIELD_GET(MGMT_MSG_EPMAP_BITMAP, msg.msg0);
         u32 base = FIELD_GET(MGMT_MSG_EPMAP_BASE, msg.msg0);
+        rtk->epmap[base] |= bitmap;
         for (unsigned int i = 0; i < 32; i++) {
             if (bitmap & (1U << i)) {
                 u8 ep_idx = 32 * base + i;
@@ -793,8 +830,10 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
             }
         }
 
-        if (msg.msg0 & MGMT_MSG_EPMAP_DONE)
+        if (msg.msg0 & MGMT_MSG_EPMAP_DONE) {
             got_epmap = true;
+            rtk->have_epmap = true;
+        }
 
         msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_EPMAP_REPLY);
         msg.msg0 |= FIELD_PREP(MGMT_MSG_EPMAP_BASE, base);
@@ -840,15 +879,51 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
     return true;
 }
 
+/* The IOVA is the DART input address: asc-dram-mask is only part of what the IOP is told. */
+static void rtkit_live_add(struct rtkit_live_state *st, u32 ep, const struct rtkit_buffer *bfr)
+{
+    if (!bfr->bfr || !bfr->sz || st->n_buffers >= RTKIT_LIVE_MAX_BUFFERS)
+        return;
+    struct rtkit_live_buffer *b = &st->buffers[st->n_buffers++];
+    b->ep = ep;
+    b->flags = bfr->owned ? RTKIT_LIVE_BUFFER_OWNED : 0;
+    b->iova = bfr->dva;
+    b->phys = (u64)bfr->bfr;
+    b->size = bfr->sz;
+}
+
+/* Only a session whose endpoint map this owner received completely can be described. */
+bool rtkit_get_live_state(rtkit_dev_t *rtk, struct rtkit_live_state *st)
+{
+    memset(st, 0, sizeof(*st));
+    if (!rtk || !rtk->have_epmap || rtk->crashed)
+        return false;
+
+    st->version = rtk->version;
+    memcpy(st->epmap, rtk->epmap, sizeof(st->epmap));
+    rtkit_live_add(st, RTKIT_EP_CRASHLOG, &rtk->crashlog_bfr);
+    rtkit_live_add(st, RTKIT_EP_SYSLOG, &rtk->syslog_bfr);
+    rtkit_live_add(st, RTKIT_EP_IOREPORT, &rtk->ioreport_bfr);
+    rtkit_live_add(st, RTKIT_EP_OSLOG, &rtk->oslog_bfr);
+    return true;
+}
+
 bool rtkit_boot(rtkit_dev_t *rtk)
 {
     return rtkit_boot_internal(rtk, 0, false, 0);
 }
 
+/*
+ * The J713's ANS (M4, macOS 27.2 firmware) answered HELLO and the endpoint map, then reported its
+ * IOP power state only just after a 2 s wait gave up. Give the report 6 s: it costs nothing when
+ * the firmware is quick, and a start that gives up early can't be retried cleanly.
+ */
+#define RTKIT_WARM_TIMEOUT_US (6 * USEC_PER_SEC)
+
 bool rtkit_boot_warm(rtkit_dev_t *rtk, u32 last_mask)
 {
     rtk->inherited = true;
-    return rtkit_boot_internal(rtk, 2 * USEC_PER_SEC, true, last_mask);
+    return rtkit_boot_internal(rtk, RTKIT_WARM_TIMEOUT_US, true, last_mask);
 }
 
 /* Boot the IOP, or adopt the session of one a previous stage left running. Such
@@ -963,39 +1038,6 @@ static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ap
             rtkit_printf("IOP died during shutdown\n");
             return false;
         }
-    }
-
-    return true;
-}
-
-/*
- * Stop the IOP sending syslog, ioreport and oslog traffic to the AP while the
- * IOP itself keeps running, for a next stage that uses the coprocessor without
- * servicing its mailbox.
- */
-bool rtkit_quiesce_ap(rtkit_dev_t *rtk)
-{
-    struct rtkit_message msg;
-    int ret;
-
-    if (rtk->crashed)
-        return false;
-
-    while ((ret = rtkit_recv(rtk, &msg)) > 0)
-        rtkit_printf("dropping message to non-system endpoint 0x%02x before AP quiesce: %lx\n",
-                     msg.ep, msg.msg);
-    if (ret < 0 || !rtkit_quiesce_ap_power(rtk, RTKIT_POWER_QUIESCED))
-        return false;
-
-    /* Acknowledge anything the IOP sent along with the transition. */
-    u64 timeout = timeout_calculate(50000);
-    while (!timeout_expired(timeout)) {
-        ret = rtkit_recv(rtk, &msg);
-        if (ret < 0)
-            return false;
-        if (ret > 0)
-            rtkit_printf("dropping message to non-system endpoint 0x%02x after AP quiesce: %lx\n",
-                         msg.ep, msg.msg);
     }
 
     return true;

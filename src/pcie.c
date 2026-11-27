@@ -270,6 +270,8 @@ struct state {
     bool initialized;
     bool dirty;
     u32 active_ports;
+    /* The ADT node this controller last came up from, for pcie_reinit_after_sleep() */
+    const char *up_path;
 };
 
 static struct state controllers[NUM_CONTROLLERS];
@@ -361,6 +363,36 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
     return 0;
 }
 
+/*
+ * The link speed the ADT sets for the port behind bridge node `bridge`, as a Target Link Speed
+ * value (1: 2.5 GT/s, 2: 5 GT/s, 3: 8 GT/s, ...), in *speed. -1 when the bridge has no
+ * "maximum-link-speed": the ADT sets no limit.
+ *
+ * Some devices override "maximum-link-speed" in the device child nodes.
+ * The property used for the link speed seems to be ad-hoc made up.
+ * The 10 GB ethernet adapter uses "target-link-speed" and the SD card
+ * reader uses "expected-link-speed". Assume that PCIe link speed override
+ * resides in the first (only?) child node.
+ */
+int pcie_adt_link_speed(int bridge, u32 *speed)
+{
+    if (ADT_GETPROP(adt, bridge, "maximum-link-speed", speed) < 0)
+        return -1;
+    if (*speed == 1) {
+        int np = adt_first_child_offset(adt, bridge);
+        if (np >= 0) {
+            int target_speed;
+            if (ADT_GETPROP(adt, np, "target-link-speed", &target_speed) >= 0 && target_speed > 0) {
+                *speed = target_speed;
+            } else if (ADT_GETPROP(adt, np, "expected-link-speed", &target_speed) >= 0 &&
+                       target_speed > 0) {
+                *speed = target_speed;
+            }
+        }
+    }
+    return 0;
+}
+
 /* What PHY control gets once the PHY is ready. */
 static u32 pcie_phy_up(const struct state *state)
 {
@@ -371,8 +403,11 @@ static u32 pcie_phy_up(const struct state *state)
     return BIT(27);
 }
 
-/* With ans_off, only read the windows, stop the shared PHY and power ANS's gates off. */
-static int pcie_init_controller(int controller, const char *path, bool ans_off)
+/*
+ * With ans_off, only read the windows, stop the shared PHY and power ANS's gates off. With wake,
+ * the controller comes up again after a system sleep (pcie_reinit_after_sleep()).
+ */
+static int pcie_init_controller(int controller, const char *path, bool ans_off, bool wake)
 {
     struct state *state = &controllers[controller];
     int adt_path[8];
@@ -627,7 +662,8 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
     /* ??? */
     if (state->pcie_regs->type == APCIE_T8140)
         printf("pcie: T8140 RC reg[1] setup\n");
-    if (controller == APCIE)
+    /* On the way back from a sleep, read first: written only if the sleep left it set. */
+    if (controller == APCIE && (!wake || read32(state->rc_base + 0x4)))
         write32(state->rc_base + 0x4, 0);
 
     if (!adt_getprop(adt, adt_offset, "apcie-common-tunables", NULL)) {
@@ -805,6 +841,30 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
             continue;
 
         printf("pcie: Initializing port %d\n", port);
+
+        /*
+         * The port's registers are found by its index, which assumes the bridge is that port.
+         * Check it against the bridge's apcie-port (read as pcie_t6050.c reads it) or, when it
+         * has none, its reg's device number (phys.hi bits 15:11, as in the PCI bus binding), and
+         * log a bridge that names another port or carries neither. This only logs; the port is
+         * still set up by its index.
+         */
+        if (controller == APCIE) {
+            u32 apcie_port, reg_len = 0, phys_hi;
+            const void *bridge_reg;
+
+            if (ADT_GETPROP(adt, bridge_offset, "apcie-port", &apcie_port) >= 0) {
+                if (apcie_port != port)
+                    printf("pcie: %s has apcie-port %u\n", bridge, apcie_port);
+            } else if ((bridge_reg = adt_getprop(adt, bridge_offset, "reg", &reg_len)) &&
+                       reg_len >= sizeof(phys_hi)) {
+                memcpy(&phys_hi, bridge_reg, sizeof(phys_hi));
+                if (((phys_hi >> 11) & 0x1f) != port)
+                    printf("pcie: %s has reg device %u\n", bridge, (phys_hi >> 11) & 0x1f);
+            } else {
+                printf("pcie: %s has neither apcie-port nor reg\n", bridge);
+            }
+        }
 
         if (adt_get_reg(adt, adt_path, "reg",
                         port * port_reg_cnt + state->pcie_regs->shared_reg_count,
@@ -992,46 +1052,29 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
             write32(state->port_ltssm_base[port] + 0x14, 0x1);
         }
 
+        /* Each root port is its own device on bus 0, whether or not the ports before it exist. */
+        u64 port_cfg = config_base + ((u64)port << 15);
+
         /* Make Designware PCIe Core registers writable. */
         if (state->pcie_regs->type == APCIE_T8140)
             printf("pcie: T8140 port %d ECAM reg[0] DBI and tunables\n", port);
-        set32(config_base + DWC_DBI_RO_WR, DWC_DBI_RO_WR_EN);
+        set32(port_cfg + DWC_DBI_RO_WR, DWC_DBI_RO_WR_EN);
 
-        if (tunables_apply_local_addr(bridge, "pcie-rc-tunables", config_base)) {
+        if (tunables_apply_local_addr(bridge, "pcie-rc-tunables", port_cfg)) {
             printf("pcie: Error applying %s for %s\n", "pcie-rc-tunables", bridge);
             return -1;
         }
-        if (tunables_apply_local_addr(bridge, "pcie-rc-gen3-shadow-tunables", config_base)) {
+        if (tunables_apply_local_addr(bridge, "pcie-rc-gen3-shadow-tunables", port_cfg)) {
             printf("pcie: Error applying %s for %s\n", "pcie-rc-gen3-shadow-tunables", bridge);
             return -1;
         }
-        if (tunables_apply_local_addr(bridge, "pcie-rc-gen4-shadow-tunables", config_base)) {
+        if (tunables_apply_local_addr(bridge, "pcie-rc-gen4-shadow-tunables", port_cfg)) {
             printf("pcie: Error applying %s for %s\n", "pcie-rc-gen4-shadow-tunables", bridge);
             return -1;
         }
 
         u32 max_speed;
-        if (ADT_GETPROP(adt, bridge_offset, "maximum-link-speed", &max_speed) >= 0) {
-            /* Some devices override "maximum-link-speed" in the device child nodes.
-             * The property used for the link speed seems to be ad-hoc made up.
-             * The 10 GB ethernet adapter uses "target-link-speed" and the SD card
-             * reader uses "expected-link-speed". Assume that PCIe link speed override
-             * resides in the first (only?) child node.
-             */
-            if (max_speed == 1) {
-                int np = adt_first_child_offset(adt, bridge_offset);
-                if (np >= 0) {
-                    int target_speed;
-                    if (ADT_GETPROP(adt, np, "target-link-speed", &target_speed) >= 0 &&
-                        target_speed > 0) {
-                        max_speed = target_speed;
-                    } else if (ADT_GETPROP(adt, np, "expected-link-speed", &target_speed) >= 0 &&
-                               target_speed > 0) {
-                        max_speed = target_speed;
-                    }
-                }
-            }
-
+        if (pcie_adt_link_speed(bridge_offset, &max_speed) >= 0) {
             printf("pcie: Port %d max speed = %d\n", port, max_speed);
 
             if (max_speed == 0) {
@@ -1041,28 +1084,28 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
             if (max_speed > 4)
                 max_speed = 4;
 
-            mask32(config_base + PCIE_CAP_BASE + PCIE_LNKCAP, PCIE_LNKCAP_SLS,
+            mask32(port_cfg + PCIE_CAP_BASE + PCIE_LNKCAP, PCIE_LNKCAP_SLS,
                    FIELD_PREP(PCIE_LNKCAP_SLS, max_speed));
 
-            mask32(config_base + PCIE_CAP_BASE + PCIE_LNKCAP2, PCIE_LNKCAP2_SLS,
+            mask32(port_cfg + PCIE_CAP_BASE + PCIE_LNKCAP2, PCIE_LNKCAP2_SLS,
                    FIELD_PREP(PCIE_LNKCAP2_SLS, (1 << max_speed) - 1));
 
-            mask16(config_base + PCIE_CAP_BASE + PCIE_LNKCTL2, PCIE_LNKCTL2_TLS,
+            mask16(port_cfg + PCIE_CAP_BASE + PCIE_LNKCTL2, PCIE_LNKCTL2_TLS,
                    FIELD_PREP(PCIE_LNKCTL2_TLS, max_speed));
 
-            set32(config_base + DWC_DBI_LINK_WIDTH_SPEED_CONTROL, DWC_DBI_SPEED_CHANGE);
+            set32(port_cfg + DWC_DBI_LINK_WIDTH_SPEED_CONTROL, DWC_DBI_SPEED_CHANGE);
         }
 
         /* Max link width */
-        mask32(config_base + DWC_DBI_PORT_LINK_CONTROL, DWC_DBI_PORT_LINK_MODE,
+        mask32(port_cfg + DWC_DBI_PORT_LINK_CONTROL, DWC_DBI_PORT_LINK_MODE,
                FIELD_PREP(DWC_DBI_PORT_LINK_MODE, lane_mode));
-        mask32(config_base + DWC_DBI_LINK_WIDTH_SPEED_CONTROL, DWC_DBI_LINK_WIDTH,
+        mask32(port_cfg + DWC_DBI_LINK_WIDTH_SPEED_CONTROL, DWC_DBI_LINK_WIDTH,
                FIELD_PREP(DWC_DBI_LINK_WIDTH, link_width));
-        mask32(config_base + PCIE_CAP_BASE + PCIE_LNKCAP, PCIE_LNKCAP_MLW,
+        mask32(port_cfg + PCIE_CAP_BASE + PCIE_LNKCAP, PCIE_LNKCAP_MLW,
                FIELD_PREP(PCIE_LNKCAP_MLW, link_width));
 
         /* Make Designware PCIe Core registers readonly. */
-        clear32(config_base + DWC_DBI_RO_WR, DWC_DBI_RO_WR_EN);
+        clear32(port_cfg + DWC_DBI_RO_WR, DWC_DBI_RO_WR_EN);
 
         if (state->pcie_regs->type == APCIE_T602X || state->pcie_regs->type == APCIE_T6031) {
             write32(state->port_base[port] + 0x4020, 0x3);
@@ -1078,14 +1121,12 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
         if (state->pcie_regs->type == APCIE_T8140)
             printf("pcie: T8140 port %d ready, link status 0x%x\n", port, link_status);
         state->active_ports |= BIT(port);
-
-        /* Move to the next PCIe device on this bus. */
-        config_base += (1 << 15);
     }
 
     printf("pcie: Initialized controller %d\n", controller);
     state->initialized = true;
     state->dirty = false;
+    state->up_path = path;
 
     return 0;
 }
@@ -1110,7 +1151,7 @@ int pcie_init(void)
             printf("pcie: T8140 controller absent\n");
             return 1;
         }
-        int ret = pcie_init_controller(APCIE, path, false);
+        int ret = pcie_init_controller(APCIE, path, false, false);
         if (!ret) {
             pcie_initialized = true;
             return 0;
@@ -1129,15 +1170,77 @@ int pcie_init(void)
         return ret;
     }
 
-    success |= pcie_init_controller(APCIE, "/arm-io/apcie", false) == 0;
-    success |= pcie_init_controller(APCIE, "/arm-io/apcie0", false) == 0;
-    success |= pcie_init_controller(APCIE_GE0, "/arm-io/apcie-ge0", false) == 0;
-    success |= pcie_init_controller(APCIE_GE1, "/arm-io/apcie-ge1", false) == 0;
+    success |= pcie_init_controller(APCIE, "/arm-io/apcie", false, false) == 0;
+    success |= pcie_init_controller(APCIE, "/arm-io/apcie0", false, false) == 0;
+    success |= pcie_init_controller(APCIE_GE0, "/arm-io/apcie-ge0", false, false) == 0;
+    success |= pcie_init_controller(APCIE_GE1, "/arm-io/apcie-ge1", false, false) == 0;
 
     if (success)
         pcie_initialized = true;
 
     return success ? 0 : -1;
+}
+
+/* Set by kboot once it has handed the OS the APCIe tables (pcie_apcie_tables_fdt()). */
+static bool pcie_os_restores_apcie;
+
+void pcie_set_os_restores_apcie(bool restores)
+{
+    pcie_os_restores_apcie = restores;
+}
+
+/*
+ * Whether the ADT leaves a system sleep's PCIe bring-up to aura at all: an ANS without
+ * nvme-secure-bar does not run on the APCIe block (before M4), so the OS is never handed the
+ * APCIe tables for it. Known before kboot sets PCIe up, for the S2R mailbox's own check.
+ */
+bool pcie_sleep_reinit_possible(void)
+{
+    int ans = adt_path_offset(adt, "/arm-io/ans");
+
+    return ans >= 0 && !adt_get_property(adt, ans, "nvme-secure-bar");
+}
+
+/*
+ * A system sleep takes the PCIe complex's power with the rest of the SoC. An OS that was handed
+ * the APCIe tables brings the block back itself. Without them, only this image's boot setup
+ * describes the complex, so if that setup brought a controller up, it has to run again before
+ * the OS does: ANS's power domains first (pcie_init() runs at boot with them already on), then
+ * the complex. Only controllers set up by pcie_init_controller() can be replayed; a SoC whose
+ * PCIe came up another way (T6050) or whose ANS runs on the APCIe block never is.
+ */
+bool pcie_needs_sleep_reinit(void)
+{
+    bool up = false;
+
+    for (int i = 0; i < NUM_CONTROLLERS; i++)
+        up |= controllers[i].up_path != NULL;
+    return up && pcie_initialized && !pcie_os_restores_apcie && pcie_sleep_reinit_possible();
+}
+
+/*
+ * pcie_needs_sleep_reinit()'s step: each controller that came up at boot, from the ADT node it
+ * came up from, and nothing else. Every one of them must come up again.
+ */
+int pcie_reinit_after_sleep(void)
+{
+    int count = 0;
+
+    for (int i = 0; i < NUM_CONTROLLERS; i++) {
+        struct state *state = &controllers[i];
+
+        if (!state->up_path)
+            continue;
+        count++;
+        if (pcie_init_controller(i, state->up_path, false, true)) {
+            pcie_initialized = false;
+            return -1;
+        }
+    }
+    if (!count)
+        return -1;
+    pcie_initialized = true;
+    return 0;
 }
 
 /* For a stage done with a post-M4 ANS, which runs on the APCIe PHY: the PHY and ANS powered off. */
@@ -1222,7 +1325,7 @@ int pcie_ans_power_off(void)
         return 0;
     }
     pcie_initialized = false;
-    return pcie_init_controller(APCIE, pcie_ans_path(), true);
+    return pcie_init_controller(APCIE, pcie_ans_path(), true, false);
 }
 
 int pcie_ans_power_on(void)

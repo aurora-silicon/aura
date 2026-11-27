@@ -23,10 +23,35 @@ struct rtkit_buffer {
     bool owned;
 };
 
+/*
+ * What a later owner needs to adopt an RTKit session left running: the protocol version the
+ * session runs, the whole endpoint map the IOP announced (word i covers endpoints 32 * i to
+ * 32 * i + 31) and the system buffers given to it, each as the IOP addresses it and where it is.
+ */
+#define RTKIT_LIVE_MAX_BUFFERS 4
+
+#define RTKIT_LIVE_BUFFER_OWNED BIT(0) /* the loader allocated it (in its retained heap) */
+
+struct rtkit_live_buffer {
+    u32 ep;
+    u32 flags;
+    u64 iova;
+    u64 phys;
+    u64 size;
+};
+
+struct rtkit_live_state {
+    u32 version;
+    u32 epmap[8];
+    u32 n_buffers;
+    struct rtkit_live_buffer buffers[RTKIT_LIVE_MAX_BUFFERS];
+};
+
+bool rtkit_get_live_state(rtkit_dev_t *rtk, struct rtkit_live_state *st);
+
 rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
                         iova_domain_t *dart_iovad, sart_dev_t *sart, bool sram);
 bool rtkit_quiesce(rtkit_dev_t *rtk);
-bool rtkit_quiesce_ap(rtkit_dev_t *rtk);
 bool rtkit_sleep(rtkit_dev_t *rtk);
 bool rtkit_idle(rtkit_dev_t *rtk);
 int rtkit_probe_hello(asc_dev_t *asc);

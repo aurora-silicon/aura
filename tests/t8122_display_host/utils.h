@@ -10,6 +10,7 @@
 #define dprintf(...) printf(__VA_ARGS__)
 #define ARRAY_SIZE(s)        (sizeof(s) / sizeof((s)[0]))
 #define ALIGN_UP(x, a)       (((x) + ((a)-1)) & ~((a)-1))
+#define max(a, b)            (((a) > (b)) ? (a) : (b))
 #define BIT(x)               (1UL << (x))
 #define GENMASK(msb, lsb)    ((~0UL << (lsb)) & (~0UL >> (63 - (msb))))
 #define FIELD_GET(mask, val) (((val) & (mask)) >> __builtin_ctzll(mask))

@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+# A newer push to main supersedes the run for the older main head. PR heads, tags and manual
+# runs get a group of their own and are never cancelled: the merge train needs CI on the exact
+# PR head.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main-push' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
 jobs:
   test:
     name: Pytest (${{ matrix.os }} + ${{ matrix.compiler }})
@@ -61,6 +68,15 @@ jobs:
 
       - name: Test PMP boot data fixups
         run: sh tests/run-pmp-boot-data.sh
+
+      - name: Test keeping an FDT node off with no free space
+        run: sh tests/run-fdt-disable.sh
+
+      - name: Test locked-DART AOP OS-RAM reservation and failure handling
+        run: sh tests/run-aop-os-ram.sh
+
+      - name: Test RTKit placed-buffer DART range check and bounded crash log parse
+        run: sh tests/run-rtkit-placed-buffer.sh
 
       - name: Run pytest with clang
         if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'llvm'

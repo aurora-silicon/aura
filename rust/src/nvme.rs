@@ -314,7 +314,7 @@ impl fatfs::Seek for NVMEStorage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use fatfs::{Read, Seek};
     use std::sync::Mutex;
@@ -326,6 +326,8 @@ mod tests {
         fail: bool,
         uncertain: bool,
         destination: usize,
+        /// the blocks from `offset` on, if set; otherwise block n holds the byte n
+        image: Vec<u8>,
     }
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -354,6 +356,7 @@ mod tests {
         fail: false,
         uncertain: false,
         destination: 0,
+        image: Vec::new(),
     });
 
     fn reset(offset: u64, sectors: u64) {
@@ -364,7 +367,16 @@ mod tests {
             fail: false,
             uncertain: false,
             destination: 0,
+            image: Vec::new(),
         };
+    }
+
+    /// Run `f` with the namespace holding `image` at block `offset` (and nothing after it).
+    pub(crate) fn with_image<R>(offset: u64, image: &[u8], f: impl FnOnce() -> R) -> R {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset(offset, image.len().div_ceil(SECTOR_SIZE) as u64);
+        MOCK.lock().unwrap().image = image.to_vec();
+        f()
     }
 
     #[no_mangle]
@@ -383,12 +395,17 @@ mod tests {
             return false;
         }
         for i in 0..count as usize {
-            unsafe {
-                core::ptr::write_bytes(
+            let block = unsafe {
+                core::slice::from_raw_parts_mut(
                     buffer.cast::<u8>().add(i * SECTOR_SIZE),
-                    (relative + i as u64) as u8,
                     SECTOR_SIZE,
-                );
+                )
+            };
+            if mock.image.is_empty() {
+                block.fill((relative + i as u64) as u8);
+            } else {
+                let at = (relative as usize + i) * SECTOR_SIZE;
+                block.copy_from_slice(&mock.image[at..at + SECTOR_SIZE]);
             }
         }
         true
@@ -533,7 +550,7 @@ mod tests {
             }
             // Run the actual APFS scanner and unwind its owned partition on failure.
             // A successful mock read contains zeroes, so its invalid superblock also errors.
-            assert!(crate::apfs::test_scan_volume(100).is_err());
+            assert!(crate::apfs::test_scan_volume(100, 1).is_err());
             let mock = MOCK.lock().unwrap();
             assert_eq!(mock.reads, [(100, 1)]);
             let destination = mock.destination;
