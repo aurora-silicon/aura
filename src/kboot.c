@@ -4849,6 +4849,22 @@ static int dt_set_mtp_dma_window(void)
 }
 
 /*
+ * The RAM of one ASC firmware segment: reserved no-map as asc-firmware@<phys>, its size rounded
+ * up to whole 16K pages (returned in *rounded). Returns the reserved-memory node.
+ */
+static int dt_reserve_asc_segment_ram(u64 phys, size_t size, size_t *rounded, char *name,
+                                      size_t name_len)
+{
+    snprintf(name, name_len, "asc-firmware@%lx", phys);
+    if (size & (SZ_16K - 1)) {
+        printf("ADT: segment %s uses non 16k aligned size: 0x%06zx\n", name, size);
+        size = ALIGN_UP(size, SZ_16K);
+    }
+    *rounded = size;
+    return dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, phys, size);
+}
+
+/*
  * Reserve the firmware segments of an ASC coprocessor from its ADT
  * segment-ranges and attach them to its FDT node. With dram_only, segments
  * outside DRAM (such as the coprocessor's own SRAM, which the OS maps as MMIO)
@@ -4915,16 +4931,9 @@ static int dt_reserve_asc_segments_at(int fdt_node, const char *adt_path, const 
         u64 iova = (remap ? seg->remap : seg->iova) | base;
 
         char node_name[64];
-        snprintf(node_name, sizeof(node_name), "asc-firmware@%lx", seg->phys);
-
-        size_t seg_size = seg->size;
-        if (seg->size & (SZ_16K - 1)) {
-            printf("ADT: segment %s uses non 16k aligned size: 0x%06zx\n", node_name, seg_size);
-            seg_size = ALIGN_UP(seg_size, SZ_16K);
-        }
-
-        int mem_node =
-            dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, seg->phys, seg_size);
+        size_t seg_size;
+        int mem_node = dt_reserve_asc_segment_ram(seg->phys, seg->size, &seg_size, node_name,
+                                                  sizeof(node_name));
         if (mem_node < 0)
             return mem_node;
         /*
@@ -4978,6 +4987,118 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
 {
     return dt_reserve_asc_segments(adt_path, adt_path_alt, fdt_path, remap, base, false);
 }
+
+/* Stage 2 only: the OS is booted from Stage 2, and Stage 1 must stay below the DCP log buffer */
+#if !defined(CHAINLOADING) || defined(ESP_STAGE2)
+/*
+ * iBoot puts the __OS_LOG segment (segment-ranges flags 0xa) of a coprocessor it loads in DRAM it
+ * then gives the OS, and a coprocessor it leaves running keeps writing it. A driver that takes its
+ * coprocessor over reserves its segments (dt_reserve_asc_segments_at()); nothing reserves the log
+ * of one the device tree does not hand over, so the OS can give those pages to anything while the
+ * coprocessor writes them. On a J716s that is aop, mtp and auss-cpu0, next to the display's.
+ *
+ * Last, once every hand-off has reserved what it takes: walk every /arm-io node and its nubs, and
+ * reserve each __OS_LOG segment that lies in the OS's RAM and that no reservation covers yet, as
+ * dt_reserve_asc_segments_at() reserves a segment's RAM (dt_reserve_asc_segment_ram()). Unlike a
+ * hand-off, it attaches no memory-region: the device tree has no node for such a coprocessor. The
+ * ADT marks only some of these coprocessors running (the J716s' aop and auss-cpu0 have no running
+ * property), so the segment itself is the evidence: iBoot places it only for a coprocessor it
+ * loaded. A segment that overlaps a /memreserve/ entry or a reservation is left alone and logged.
+ * Fail-soft: a reservation that cannot be added stops the pass, and the ones already added stay.
+ * Nothing is written to the hardware.
+ */
+static const char *dt_resv_overlap(u64 base, u64 size)
+{
+    u64 a, s;
+    for (int i = 0; i < fdt_num_mem_rsv(dt); i++)
+        if (!fdt_get_mem_rsv(dt, i, &a, &s) && base < a + s && a < base + size)
+            return "/memreserve/";
+
+    int resv = fdt_path_offset(dt, "/reserved-memory"), node;
+    if (resv < 0)
+        return NULL;
+    fdt_for_each_subnode(node, dt, resv)
+    {
+        const char *status = fdt_getprop(dt, node, "status", NULL);
+        int len = 0;
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+            continue;
+        for (int k = 0; reg && (k + 2) * (int)sizeof(*reg) <= len; k += 2) {
+            a = fdt64_ld(&reg[k]);
+            s = fdt64_ld(&reg[k + 1]);
+            if (base < a + s && a < base + size)
+                return fdt_get_name(dt, node, NULL) ?: "?";
+        }
+    }
+    return NULL;
+}
+
+/* Returns the number of segments reserved, or -1 if one could not be */
+static int dt_reserve_oslogs_of(int at, u64 ram_lo, u64 ram_hi)
+{
+    u32 len = 0;
+    int n = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, at, "segment-ranges", &len);
+
+    if (!seg || !len || len % sizeof(*seg))
+        return 0;
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        struct adt_segment_ranges r;
+        memcpy(&r, &seg[i], sizeof(r));
+        u64 span = ALIGN_UP((u64)r.size, SZ_16K);
+        if (r.unk != 0xa || !r.size || r.phys < ram_lo || r.phys >= ram_hi ||
+            span > ram_hi - r.phys)
+            continue;
+        char name[64];
+        snprintf(name, sizeof(name), "asc-firmware@%lx", r.phys);
+        const char *other = dt_resv_overlap(r.phys, span);
+        if (other) {
+            /* A hand-off's reservation of this segment, or the node's when this is its nub */
+            if (strcmp(other, name))
+                printf("FDT: %s __OS_LOG 0x%lx+0x%lx is in %s already\n", adt_get_name(adt, at),
+                       r.phys, span, other);
+            continue;
+        }
+        size_t size;
+        if (dt_reserve_asc_segment_ram(r.phys, r.size, &size, name, sizeof(name)) < 0)
+            return -1;
+        printf("FDT: %s __OS_LOG 0x%lx+0x%zx reserved\n", adt_get_name(adt, at), r.phys, size);
+        n++;
+    }
+    return n;
+}
+
+static void dt_reserve_coprocessor_oslogs(void)
+{
+    u64 ram_lo = cur_boot_args.phys_base, ram_hi = ram_lo + cur_boot_args.mem_size;
+    int total = 0, n = 0, dev = adt_path_offset(adt, "/arm-io");
+
+    if (dev < 0)
+        return;
+    ADT_FOREACH_CHILD(adt, dev)
+    {
+        n = dt_reserve_oslogs_of(dev, ram_lo, ram_hi);
+        if (n < 0)
+            break;
+        total += n;
+        int nub = dev;
+        ADT_FOREACH_CHILD(adt, nub)
+        {
+            n = dt_reserve_oslogs_of(nub, ram_lo, ram_hi);
+            if (n < 0)
+                break;
+            total += n;
+        }
+        if (n < 0)
+            break;
+    }
+    if (n < 0)
+        printf("FDT: coprocessor __OS_LOG reservation stopped after %d\n", total);
+    else if (total)
+        printf("FDT: reserved %d coprocessor __OS_LOG segment(s) no hand-off had\n", total);
+}
+#endif
 
 /*
  * The AVE video encoders run firmware that iBoot preloads, each its own copy. The ADT calls an
@@ -14334,6 +14455,10 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_t6040_sleep_dcpext())
         return -1;
     dt_set_t6050_sleep();
+#if !defined(CHAINLOADING) || defined(ESP_STAGE2)
+    /* After every hand-off has reserved its coprocessor's segments */
+    dt_reserve_coprocessor_oslogs();
+#endif
 #ifndef RELEASE
     if (dt_transfer_virtios())
         return 1;

@@ -15,7 +15,8 @@ def test_isp_reservation_no_space(tmp_path):
         start = source.index(signature)
         return source[start:source.index("\n}", start) + 2]
 
-    firmware = definition("static int dt_reserve_asc_segments_at(") + "\n" + \
+    firmware = definition("static int dt_reserve_asc_segment_ram(") + "\n" + \
+        definition("static int dt_reserve_asc_segments_at(") + "\n" + \
         definition("static int dt_reserve_asc_segments(") + "\n" + \
         definition("static int dt_reserve_asc_firmware(")
     heap = definition("static int dt_set_isp_fwdata(void)")

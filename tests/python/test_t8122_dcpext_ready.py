@@ -126,7 +126,7 @@ static int set_u32(void *tree, int node, const char *name, uint32_t value)
 #define fdt_setprop_u32 set_u32
 ''' + function("dt_enable_dcp_with_typec_routes") +
         function("dt_device_set_reserved_mem") +
-        function("dt_reserve_asc_segments_at") + function("dt_reserve_asc_segments") + function("dt_reserve_asc_firmware") + aliases + "\n" +
+        function("dt_reserve_asc_segment_ram") + function("dt_reserve_asc_segments_at") + function("dt_reserve_asc_segments") + function("dt_reserve_asc_firmware") + aliases + "\n" +
         function("dt_ext26_existing_reservation") + function("dt_t8122_dcpext_reserve") +
         function("dt_display_transaction") +
         "static int dt_ext26_reserve(const char *alias) { return -1; }\n"
