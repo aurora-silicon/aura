@@ -1260,7 +1260,8 @@ struct g15_aux {
     u64 sram_uv; /* the trailing value, 0 if the ADT has none */
 };
 
-static int g15_get_aux(void *dt, int gpu, int sgx, u32 dies, bool off_state, struct g15_aux *a)
+static AURA_XTEXT int g15_get_aux(void *dt, int gpu, int sgx, u32 dies, bool off_state,
+                                  struct g15_aux *a)
 {
     u64 hdr[2];
     u32 len = 0;
@@ -1306,7 +1307,8 @@ static int g15_get_aux(void *dt, int gpu, int sgx, u32 dies, bool off_state, str
  * The CS and AFR SRAM floor: the one both ADT tables end with, else, where @gpu_floor says the
  * part's layout allows it (G15C: the tables' floor equals the GPU's), the GPU's SRAM floor
  */
-static int g15_csafr_sram(const struct g15_aux aux[2], bool gpu_floor, u32 gpu_floor_uv, u32 *out)
+static AURA_XTEXT int g15_csafr_sram(const struct g15_aux aux[2], bool gpu_floor, u32 gpu_floor_uv,
+                                     u32 *out)
 {
     if (aux[0].sram_uv && aux[1].sram_uv) {
         if (aux[0].sram_uv != aux[1].sram_uv)
@@ -4234,11 +4236,9 @@ disable:
  * builds are tried as before. The G17D build is tried only when the ADT puts GFX1's __TEXT right
  * after GFX's and the two reach 0xa8000, so its check reads no further than the loaded TEXT.
  */
-#define T6050_GPU_INIT    __attribute__((minsize, noinline, section(".init.t6050gpu")))
-#define T6050_GPU_TEXT_FN __attribute__((minsize, noinline))
-#define T6050_GPU_TEXT    0xa4000 /* G17S */
-#define T6050_GPU_TEXT_D  0xa8000 /* G17D, the largest */
-#define T6050_GPU_DATA    0x184000
+#define T6050_GPU_TEXT   0xa4000 /* G17S */
+#define T6050_GPU_TEXT_D 0xa8000 /* G17D, the largest */
+#define T6050_GPU_DATA   0x184000
 
 static const struct {
     const char *props[11], *resv[6], *on[7];
@@ -4336,7 +4336,7 @@ extern void aura_sha256(const void *data, size_t size, u8 digest[32]);
  * this GPU, 0 if the ADT does not have the ranges, 1 if fw-text is none of the builds (normalized
  * as Linux's fwid does), and 2 plus the build's index if it is one of them.
  */
-static T6050_GPU_TEXT_FN int t6050_gpu_check(void *dt, u64 r[12])
+static AURA_XTEXT int t6050_gpu_check(void *dt, u64 r[12])
 {
     int gpu = kboot_fdt_path_exact(dt, "gpu");
     if (gpu < 0 || fdt_node_check_compatible(dt, gpu, "apple,agx-g17s"))
@@ -4386,7 +4386,7 @@ static T6050_GPU_TEXT_FN int t6050_gpu_check(void *dt, u64 r[12])
 }
 
 /* Enables every node of t6050_gpu.on, in order, if they all exist */
-static T6050_GPU_INIT bool t6050_gpu_enable(void *dt)
+static AURA_XTEXT bool t6050_gpu_enable(void *dt)
 {
     for (int pass = 0; pass < 2; pass++)
         for (size_t i = 0; i < ARRAY_SIZE(t6050_gpu.on); i++) {
@@ -4435,7 +4435,7 @@ static AURA_XTEXT int t6050_gpu_leakage(void *dt, int gpu)
     return 1;
 }
 
-static T6050_GPU_INIT int dt_set_gpu_t6050(void *dt)
+static AURA_XTEXT int dt_set_gpu_t6050(void *dt)
 {
     if (chip_id != T6050) {
         printf("ADT: GPU: unsupported chip!\n");
