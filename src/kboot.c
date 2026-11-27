@@ -12491,6 +12491,37 @@ static int dt_set_clpc_low_power(void)
  * memory channels depends on the storage configuration of the host Mac
  * and can only be determined at runtime.
  */
+/*
+ * The PMGR's AP wake mask and the wake sources the Mac's firmware keeps enabled in a sleep, for the
+ * macsmc driver. /chosen "aurora,ap-wake-mask-reg" = the 64-bit address of the mask's first word
+ * (PMGR register block 7, mask at +0xc), "aurora,ap-wake-sources" = the source numbers listed in
+ * the ADT pmgr "ap-wake-sources" property (entries of a u32 number and a 32-byte name).
+ */
+static int dt_set_ap_wake_sources(void)
+{
+    int path[8];
+    int pnode = adt_path_offset_trace(adt, "/arm-io/pmgr", path);
+    int node = fdt_path_offset(dt, "/chosen");
+    const struct adt_property *prop;
+    u32 out[64];
+    u64 base;
+    int n = 0;
+
+    if (pnode < 0 || node < 0)
+        return 0;
+    prop = adt_get_property(adt, pnode, "ap-wake-sources");
+    if (!prop || adt_get_reg(adt, path, "reg", 7, &base, NULL) < 0)
+        return 0;
+    for (u32 off = 0; off + 36 <= prop->size && n < 64; off += 36)
+        out[n++] = cpu_to_fdt32(*(const u32 *)((const u8 *)prop->value + off));
+    if (!n)
+        return 0;
+    fdt_setprop_u64(dt, node, "aurora,ap-wake-mask-reg", base + 0xc);
+    fdt_setprop(dt, node, "aurora,ap-wake-sources", out, n * 4);
+    printf("FDT: %d AP wake sources published\n", n);
+    return 0;
+}
+
 static int dt_set_pmgr(void)
 {
     if (chip_id != T8012)
@@ -14320,6 +14351,8 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     dt_set_j713_isp();
     if (dt_set_pmgr())
+        return -1;
+    if (dt_set_ap_wake_sources())
         return -1;
     if (dt_set_clpc_low_power())
         return -1;
