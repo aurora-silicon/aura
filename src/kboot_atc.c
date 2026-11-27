@@ -1423,8 +1423,13 @@ struct t6050_atc_tunable {
     u32 offset;
 };
 
-#define T6050_ATC      __attribute__((minsize, noinline))
-#define T6050_ATC_INIT __attribute__((minsize, noinline, section(".init.t6050")))
+#ifdef __clang__
+#define T6050_ATC_MINSIZE __attribute__((minsize))
+#else
+#define T6050_ATC_MINSIZE
+#endif
+#define T6050_ATC      T6050_ATC_MINSIZE AURA_XTEXT
+#define T6050_ATC_INIT T6050_ATC_MINSIZE AURA_XTEXT
 
 static const struct t6050_atc_tunable t6050_atc_tunables[] = {
     {"tunable_ATC0AXI2AF", "apple,tunable-axi2af", "axi2af", 41, 0},
@@ -1502,8 +1507,12 @@ static T6050_ATC_INIT void t6050_setup_atc(void *dt)
         const fdt32_t *index = fdt_getprop(dt, node, "apple,port-index", &len);
         u32 port = index && len == 4 ? fdt32_ld(index) : 0;
 
-        /* Port 0 carries aura's debug link: never describe it */
-        if (!port || port > 5)
+        /*
+         * Only a port the tree hands to the OS (apple,guest-port-reserved): port 0 carries aura's
+         * debug link unless the tree takes it.
+         */
+        if (!index || len != 4 || port > 5 ||
+            !fdt_getprop(dt, node, "apple,guest-port-reserved", NULL))
             continue;
         t6050_clear_atc(dt, node);
         bool ok = !t6050_export_atc(dt, node, port);
@@ -1579,7 +1588,7 @@ int kboot_setup_atc(void *dt)
     char fdt_alias[32];
     bool t6041_max = t6041_max_atc(dt);
 
-    if (chip_id == T6050) {
+    if (fdt_node_offset_by_compatible(dt, -1, "apple,t6050-combo-phy") >= 0) {
         t6050_setup_atc(dt);
         return 0;
     }

@@ -38,9 +38,16 @@ VRAM_END = VRAM + VRAM_SIZE
 META_SIZE, BW = 0x40000, 0x20000
 
 HOST = r'''
-#include "kboot_display_handoff.c"
-
 #include <stdlib.h>
+
+static int fail_malloc;
+static void *test_malloc(size_t size)
+{
+    return fail_malloc ? NULL : malloc(size);
+}
+#define malloc test_malloc
+#include "kboot_display_handoff.c"
+#undef malloc
 
 void *adt = (void *)1;
 u32 chip_id = T6050;
@@ -71,10 +78,10 @@ static struct node {
         char name[32];
         u8 data[96];
         u32 len;
-    } props[8];
+    } props[10];
     int nprops, nreg;
     u64 reg[5][2];
-} nodes[16];
+} nodes[32];
 static int nnodes;
 
 static struct node *node(const char *path)
@@ -229,7 +236,7 @@ const struct adt_property *host_adt_prop(int n, int i)
 static struct {
     u64 addr;
     u32 val;
-} words[16];
+} words[32];
 static int nwords;
 
 static void word(u64 addr, u32 val)
@@ -293,6 +300,8 @@ int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *gate)
 
 int pmgr_adt_is_powered(const char *path)
 {
+    if (!strcmp(path, "/arm-io/dcp") || !strcmp(path, "/arm-io/disp0"))
+        return 1;
     DIE("pmgr_adt_is_powered(%s)\n", path);
 }
 
@@ -421,9 +430,11 @@ enum { PH_DART_DCP = 1, PH_DART_DISP, PH_MBOX, PH_PMC };
  */
 static int headless(int argc, char **argv)
 {
-    static char dt[0x10000];
+    static _Alignas(8) char dt[0x10000];
     u64 vram = arg(argc, argv, "vram", 0), vram_size = arg(argc, argv, "vsize", 0);
     u64 meta_size = arg(argc, argv, "meta", 0), bw = arg(argc, argv, "bw", 0);
+    u64 no_pt_region = arg(argc, argv, "no_pt_region", 0);
+    u64 dup_ext = arg(argc, argv, "dup_ext", 0);
     const char *nub = "/arm-io/dcpext0/iop-dcpext0-nub";
 
     prop(nub, "uuid", image(true), 37);
@@ -438,7 +449,8 @@ static int headless(int argc, char **argv)
         prop_u64s(d, "vm-base", VM_BASE, 0, 1);
         prop_u64s(d, "vm-size", VM_SIZE, 0, 1);
         prop_u64s(d, i ? "l1-tt-16" : "l1-tt-23", l1, 1, 2);
-        prop_u64s(d, i ? "pt-region-16" : "pt-region-23", l1 - 0x4000, l1 + 0x40000, 2);
+        if (!no_pt_region)
+            prop_u64s(d, i ? "pt-region-16" : "pt-region-23", l1 - 0x4000, l1 + 0x40000, 2);
         word(base + DART_T8110_PROTECT, DART_T8110_PROTECT_TTBR_TCR);
         word(base + DART_T8110_TCR(sid), T6050_TCR_WANT);
         word(base + DART_T8110_TTBR(sid),
@@ -463,6 +475,7 @@ static int headless(int argc, char **argv)
     OK(soc);
     OK(fdt_setprop_u32(dt, soc, "#address-cells", 2));
     OK(fdt_setprop_u32(dt, soc, "#size-cells", 2));
+    OK(fdt_setprop_empty(dt, soc, "ranges"));
     for (int i = 0; i < 2; i++) {
         int d = fdt_dev(dt, soc, i ? "iommu@389308000" : "iommu@389304000",
                         i ? DART_DISP : DART_DCP, i ? PH_DART_DISP : PH_DART_DCP);
@@ -482,6 +495,15 @@ static int headless(int argc, char **argv)
     int piodma = fdt_add_subnode(dt, ext, "piodma");
     OK(piodma);
     fdt_u32s(dt, piodma, "iommus", 2, PH_DART_DISP, 16, 0, 0);
+    if (dup_ext) {
+        int dup = fdt_dev(dt, soc, "dcpext-dup@389c00000", COPROC, 0);
+        OK(fdt_setprop_string(dt, dup, "compatible", "apple,t6050-dcpext"));
+        OK(fdt_setprop_string(dt, dup, "status", "okay"));
+        fdt_u32s(dt, dup, "mboxes", 1, PH_MBOX, 0, 0, 0);
+        int dpio = fdt_add_subnode(dt, dup, "piodma");
+        OK(dpio);
+        fdt_u32s(dt, dpio, "iommus", 2, PH_DART_DISP, 16, 0, 0);
+    }
     int disp = fdt_add_subnode(dt, soc, "display-subsystem");
     OK(disp);
     OK(fdt_setprop_string(dt, disp, "compatible", "apple,display-subsystem"));
@@ -495,11 +517,14 @@ static int headless(int argc, char **argv)
 
     int chosen = fdt_path_offset(dt, "/chosen");
     const char *said = fdt_getprop(dt, chosen, T6050_STATUS, NULL);
-    printf("result chosen=%s engine=%s subsystem=%s dart-dcp=%s dart-disp=%s mbox=%s pmc=%s\n",
+    printf("result chosen=%s engine=%s subsystem=%s dart-dcp=%s dart-disp=%s mbox=%s pmc=%s",
            said ? said : "none", status(dt, "/soc/dcpext@389c00000"),
            status(dt, "/soc/display-subsystem"), status(dt, "/soc/iommu@389304000"),
            status(dt, "/soc/iommu@389308000"), status(dt, "/soc/mbox@389c08000"),
            status(dt, "/soc/pmc-metadata@510f00000"));
+    if (dup_ext)
+        printf(" dup=%s", status(dt, "/soc/dcpext-dup@389c00000"));
+    printf("\n");
     int len = 0, n, count = 0;
     const fdt32_t *s = fdt_getprop(dt, fdt_path_offset(dt, "/soc/dcpext@389c00000"),
                                    "apple,bw-scratch", &len);
@@ -553,6 +578,329 @@ static int panel(int argc, char **argv)
     printf("result rc=%d vram=0x%llx size=0x%llx scratch=0x%x nits=%u\n", rc,
            (unsigned long long)t6050.vram, (unsigned long long)t6050.vram_size, t6050.bw_offset,
            t6050.nits);
+    return 0;
+}
+
+/*
+ * A prewired panel tree with two enabled external engines (dcpext0 healthy, dcpext1 optionally
+ * failing running/uuid/segment/pt-region checks via fail=0..4). Runs the full
+ * dt_set_display_handoff() and reports the published DT state.
+ */
+static int prewired(int argc, char **argv)
+{
+    static _Alignas(8) char dt[0x10000];
+    u64 fail = arg(argc, argv, "fail", 0);
+    u64 unknown = arg(argc, argv, "unknown", 0);
+    u64 nocompat = arg(argc, argv, "nocompat", 0);
+    u64 absent_status = arg(argc, argv, "absent_status", 0);
+    u64 extra_status = arg(argc, argv, "extra_status", 0);
+    u64 disp_enabled = arg(argc, argv, "disp_enabled", 0);
+    u64 oversized_iommus = arg(argc, argv, "oversized_iommus", 0);
+    u64 fail_scratch = arg(argc, argv, "fail_scratch", 0);
+    u64 pack = arg(argc, argv, "pack", 0);
+    u64 nested = arg(argc, argv, "nested", 0);
+    u64 dup_ext = arg(argc, argv, "dup_ext", 0);
+    u64 no_piodma = arg(argc, argv, "no_piodma", 0);
+    u64 vram = arg(argc, argv, "vram", 0), vram_size = arg(argc, argv, "vsize", 0);
+    u64 meta_size = arg(argc, argv, "meta", 0), ram = cur_boot_args.phys_base;
+    const char *uuid = image(true);
+    if (unknown) {
+        os_firmware = (struct fw_version_info){V_UNKNOWN, "unknown", {0}, 0, NULL};
+    } else {
+        os_firmware.version = V27_2;
+        os_firmware.string = "27.2";
+        os_firmware.num[0] = 27;
+        os_firmware.num[1] = 2;
+        os_firmware.num[2] = 0;
+        os_firmware.num_length = 3;
+    }
+    /* Use the 27.2 ext=true UUID row */
+    uuid = NULL;
+    for (size_t i = 0; i < ARRAY_SIZE(t6050_images); i++)
+        if (t6050_images[i].os_fw == V27_2 && t6050_images[i].ext)
+            uuid = t6050_images[i].uuid;
+    if (!uuid)
+        DIE("no 27.2 ext row\n");
+
+    u64 dcp_coproc = 0x48ae00000UL, dart_dcp = 0x48a340000UL, dart_disp = 0x48a300000UL;
+    u64 ext_coproc[2] = {0x2b2e00000UL, 0x2b3e00000UL};
+    u64 ext_ddcp[2] = {0x2b2400000UL, 0x2b3400000UL};
+    u64 ext_ddisp[2] = {0x2b2300000UL, 0x2b3300000UL};
+    u64 l1_dcp = 0x20100004000UL, l1_disp = 0x20100104000UL;
+    u8 agent[24] = {1, 0, 3};
+    u32 fn[3] = {0x77, 0, 0x2a5}, clock_id = 256 + 7, freq[8] = {0};
+
+    prop(DCP6_NUB, "uuid", uuid, 37);
+    prop_u32(DCP6_NUB, "running", 1);
+    segments(DCP6_NUB, vram, vram_size);
+    reg("/arm-io/dcp", 0, dcp_coproc, 0x4000);
+    reg("/arm-io/dcp", 1, 0x48a000000UL, 0x4000);
+    for (int i = 0; i < 4; i++)
+        reg("/arm-io/disp0", i, 0x489200000UL + i * 0x10000UL, 0x4000);
+    reg("/arm-io/disp0", 4, PMC, meta_size);
+    prop("/arm-io/disp0", "function-bw_req_interrupt0", fn, sizeof(fn));
+    prop_u32("/arm-io/disp0", "clock-ids", clock_id);
+    memcpy(agent + 4, &fn[2], 4);
+    prop("/arm-io/pmgr", "bwr-agent", agent, sizeof(agent));
+    prop_u32("/arm-io/pmgr", "AAPL,phandle", fn[0]);
+    freq[7] = 594000000;
+    prop("/arm-io", "clock-frequencies", freq, sizeof(freq));
+    prop_u32("/backlight", "user-accessible-max-nits", 600 << 16);
+    reg("/vram", 0, vram, vram_size);
+    word(dcp_coproc + ASC_CPU_CONTROL, ASC_CPU_CONTROL_RUN);
+
+    const char *idarts[2] = {"/arm-io/dart-dcp", "/arm-io/dart-disp0"};
+    for (int i = 0; i < 2; i++) {
+        u64 base = i ? dart_disp : dart_dcp, l1 = i ? l1_disp : l1_dcp;
+        reg(idarts[i], 0, base, 0x4000);
+        prop_u64s(idarts[i], "vm-base", VM_BASE, 0, 1);
+        prop_u64s(idarts[i], "vm-size", VM_SIZE, 0, 1);
+        u32 sid = i ? 0 : 23;
+        prop_u64s(idarts[i], i ? "l1-tt-0" : "l1-tt-23", l1, 1, 2);
+        prop_u64s(idarts[i], i ? "pt-region-0" : "pt-region-23", l1 - 0x4000, l1 + 0x40000, 2);
+        word(base + DART_T8110_PROTECT, DART_T8110_PROTECT_TTBR_TCR);
+        word(base + DART_T8110_TCR(sid), T6050_TCR_WANT);
+        word(base + DART_T8110_TTBR(sid),
+             DART_T8110_TTBR_VALID |
+                 FIELD_PREP(DART_T8110_TTBR_ADDR, l1 >> DART_T8110_TTBR_SHIFT));
+        if (i) {
+            prop_u64s(idarts[i], "l1-tt-16", l1 + 0x4000, 1, 2);
+            prop_u64s(idarts[i], "pt-region-16", l1 - 0x4000, l1 + 0x40000, 2);
+            word(base + DART_T8110_TCR(16), T6050_TCR_WANT);
+            word(base + DART_T8110_TTBR(16),
+                 DART_T8110_TTBR_VALID |
+                     FIELD_PREP(DART_T8110_TTBR_ADDR, (l1 + 0x4000) >> DART_T8110_TTBR_SHIFT));
+        }
+    }
+
+    for (int e = 0; e < 2; e++) {
+        char nubp[48], dcpp[32], ddcpp[32], ddispp[32];
+        snprintf(nubp, sizeof(nubp), "/arm-io/dcpext%d/iop-dcpext%d-nub", e, e);
+        snprintf(dcpp, sizeof(dcpp), "/arm-io/dcpext%d", e);
+        snprintf(ddcpp, sizeof(ddcpp), "/arm-io/dart-dcpext%d", e);
+        snprintf(ddispp, sizeof(ddispp), "/arm-io/dart-dispext%d", e);
+        const char *euuid = (e == 1 && fail == 2) ? "64863924-B56B-3E32-87FE-038677F52709" : uuid;
+        prop(nubp, "uuid", euuid, 37);
+        prop_u32(nubp, "running", (e == 1 && fail == 1) ? 0 : 1);
+        struct adt_segment_ranges eseg = {
+            .phys = (e == 1 && fail == 3) ? ram + 0x100000 : 0x20000000000UL + (u64)e * 0x1000000UL,
+            .iova = 0x10000000,
+            .remap = 0x10000000,
+            .size = 0x4000,
+        };
+        static const char enames[] = "__TEXT";
+        prop(nubp, "segment-ranges", &eseg, sizeof(eseg));
+        prop(nubp, "segment-names", enames, sizeof(enames));
+        reg(dcpp, 0, ext_coproc[e], 0x4000);
+        reg(ddcpp, 0, ext_ddcp[e], 0x4000);
+        reg(ddispp, 0, ext_ddisp[e], 0x4000);
+        u64 l1 = 0x20200000000UL + (u64)e * 0x1000000UL;
+        prop_u64s(ddcpp, "l1-tt-23", l1, 1, 2);
+        prop_u64s(ddcpp, "pt-region-23", l1 - 0x4000, l1 + 0x40000, 2);
+        u64 pt16_lo = (e == 1 && fail == 4) ? ram + 0x200000 : l1 + 0x100000;
+        prop_u64s(ddispp, "l1-tt-16", pt16_lo, 1, 2);
+        prop_u64s(ddispp, "pt-region-16", pt16_lo, pt16_lo + 0x40000, 2);
+    }
+
+    enum { PH_CLK = 10, PH_EXT0_DISP, PH_EXT1_DISP };
+    OK(fdt_create_empty_tree(dt, sizeof(dt)));
+    OK(fdt_setprop_string(dt, 0, "compatible", "apple,t6050"));
+    OK(fdt_setprop_u32(dt, 0, "#address-cells", 2));
+    OK(fdt_setprop_u32(dt, 0, "#size-cells", 2));
+    OK(fdt_add_subnode(dt, 0, "chosen"));
+    OK(fdt_add_subnode(dt, 0, "reserved-memory"));
+    int clk = fdt_add_subnode(dt, 0, "clock-dcp-fw");
+    OK(clk);
+    OK(fdt_setprop_string(dt, clk, "compatible", "fixed-clock"));
+    OK(fdt_setprop_u32(dt, clk, "#clock-cells", 0));
+    OK(fdt_setprop_u32(dt, clk, "phandle", PH_CLK));
+
+    int soc = fdt_add_subnode(dt, 0, "soc");
+    OK(soc);
+    OK(fdt_setprop_u32(dt, soc, "#address-cells", 2));
+    OK(fdt_setprop_u32(dt, soc, "#size-cells", 2));
+    OK(fdt_setprop_empty(dt, soc, "ranges"));
+
+    int ddcp = fdt_dev(dt, soc, "iommu@48a340000", dart_dcp, PH_DART_DCP);
+    OK(fdt_setprop_string(dt, ddcp, "compatible", "apple,t8110-dart"));
+    OK(fdt_setprop_u32(dt, ddcp, "#iommu-cells", 1));
+    fdt_u32s(dt, ddcp, "apple,dma-range", 4, VM_BASE >> 32, (u32)VM_BASE, VM_SIZE >> 32,
+             (u32)VM_SIZE);
+    int ddisp = fdt_dev(dt, soc, "iommu@48a300000", dart_disp, PH_DART_DISP);
+    OK(fdt_setprop_string(dt, ddisp, "compatible", "apple,t8110-dart"));
+    OK(fdt_setprop_u32(dt, ddisp, "#iommu-cells", 1));
+    fdt_u32s(dt, ddisp, "apple,dma-range", 4, VM_BASE >> 32, (u32)VM_BASE, VM_SIZE >> 32,
+             (u32)VM_SIZE);
+
+    int mbox = fdt_dev(dt, soc, "mbox@48ae08000", dcp_coproc + T6050_MBOX, PH_MBOX);
+    OK(fdt_setprop_string(dt, mbox, "compatible", "apple,asc-mailbox-v4"));
+    int pmc = fdt_dev(dt, soc, "pmc-metadata@510f00000", PMC, PH_PMC);
+    fdt_reg(dt, pmc, PMC, meta_size);
+    OK(fdt_setprop_u32(dt, pmc, "#apple,bw-scratch-cells", 3));
+
+    int dcp = fdt_dev(dt, soc, "dcp@48ae00000", dcp_coproc, 0);
+    OK(fdt_setprop_string(dt, dcp, "compatible", "apple,t6050-dcp"));
+    {
+        fdt64_t r[14] = {
+            cpu_to_fdt64(dcp_coproc),     cpu_to_fdt64(0x4000),
+            cpu_to_fdt64(0x48a000000UL),  cpu_to_fdt64(0x4000),
+            cpu_to_fdt64(0x489200000UL),  cpu_to_fdt64(0x4000),
+            cpu_to_fdt64(0x489210000UL),  cpu_to_fdt64(0x4000),
+            cpu_to_fdt64(0x489220000UL),  cpu_to_fdt64(0x4000),
+            cpu_to_fdt64(0x489230000UL),  cpu_to_fdt64(0x4000),
+            cpu_to_fdt64(PMC),            cpu_to_fdt64(meta_size),
+        };
+        OK(fdt_setprop(dt, dcp, "reg", r, sizeof(r)));
+        static const char rnames[] = "coproc\0iop-vbar\0disp-0\0disp-1\0disp-2\0disp-3\0disp-4";
+        OK(fdt_setprop(dt, dcp, "reg-names", rnames, sizeof(rnames)));
+    }
+    fdt_u32s(dt, dcp, "clocks", 1, PH_CLK, 0, 0, 0);
+    fdt_u32s(dt, dcp, "apple,clock-ids", 1, clock_id, 0, 0, 0);
+    fdt_u32s(dt, dcp, "apple,bw-scratch", 4, PH_PMC, 0, T6050_NDISP, 0x20000 + 3 * 0x4000);
+    fdt_u32s(dt, dcp, "mboxes", 1, PH_MBOX, 0, 0, 0);
+    fdt_u32s(dt, dcp, "iommus", 2, PH_DART_DCP, 23, 0, 0);
+    OK(fdt_add_subnode(dt, dcp, "panel"));
+    int piodma = fdt_add_subnode(dt, dcp, "piodma");
+    OK(piodma);
+    fdt_u32s(dt, piodma, "iommus", 2, PH_DART_DISP, 16, 0, 0);
+
+    const char *ext1_path = "/soc/dcpext1";
+    for (int e = 0; e < 2; e++) {
+        char dn[32], en[32];
+        u32 dph = e ? PH_EXT1_DISP : PH_EXT0_DISP;
+        snprintf(dn, sizeof(dn), "iommu@%lx", (unsigned long)ext_ddisp[e]);
+        int ed = fdt_add_subnode(dt, soc, dn);
+        OK(ed);
+        fdt_reg(dt, ed, ext_ddisp[e], 0x4000);
+        OK(fdt_setprop_string(dt, ed, "compatible", "apple,t8110-dart"));
+        OK(fdt_setprop_u32(dt, ed, "#iommu-cells", 1));
+        OK(fdt_setprop_u32(dt, ed, "phandle", dph));
+
+        int parent = soc;
+        if (e == 1 && nested) {
+            int b1 = fdt_add_subnode(dt, soc, "bus-level-one-display-fabric");
+            OK(b1);
+            OK(fdt_setprop_u32(dt, b1, "#address-cells", 2));
+            OK(fdt_setprop_u32(dt, b1, "#size-cells", 2));
+            fdt32_t idr[6] = {cpu_to_fdt32(2), 0, cpu_to_fdt32(2), 0, cpu_to_fdt32(4), 0};
+            OK(fdt_setprop(dt, b1, "ranges", idr, sizeof(idr)));
+            int b2 = fdt_add_subnode(dt, b1, "bus-level-two-external-engines");
+            OK(b2);
+            OK(fdt_setprop_u32(dt, b2, "#address-cells", 2));
+            OK(fdt_setprop_u32(dt, b2, "#size-cells", 2));
+            OK(fdt_setprop_empty(dt, b2, "ranges"));
+            parent = b2;
+            snprintf(en, sizeof(en), "dcpext@%lx", (unsigned long)ext_coproc[e]);
+            ext1_path = "/soc/bus-level-one-display-fabric/bus-level-two-external-engines/"
+                        "dcpext@2b3e00000";
+        } else {
+            snprintf(en, sizeof(en), "dcpext%d", e);
+        }
+        int ext = fdt_add_subnode(dt, parent, en);
+        OK(ext);
+        fdt_reg(dt, ext, ext_coproc[e], 0x4000);
+        OK(fdt_setprop_string(dt, ext, "compatible", "apple,t6050-dcpext"));
+        if (e == 1 && extra_status) {
+            static const char extra[] = "okay\0disabled";
+            OK(fdt_setprop(dt, ext, "status", extra, sizeof(extra)));
+        } else if (!(e == 1 && absent_status)) {
+            OK(fdt_setprop_string(dt, ext, "status", "okay"));
+        }
+        if (!(e == 0 && nocompat)) {
+            fdt_u32s(dt, ext, "apple,firmware-compat", 3, 27, 0, 0, 0);
+            fdt_u32s(dt, ext, "apple,firmware-version", 3, 27, 0, 0, 0);
+        }
+        if (!(e == 1 && no_piodma)) {
+            int epio = fdt_add_subnode(dt, ext, "piodma");
+            OK(epio);
+            fdt_u32s(dt, epio, "iommus", 2, dph, 16, 0, 0);
+        }
+        if (e == 1 && dup_ext) {
+            int dup = fdt_dev(dt, soc, "dcpext1-dup", ext_coproc[e], 0);
+            OK(fdt_setprop_string(dt, dup, "compatible", "apple,t6050-dcpext"));
+            OK(fdt_setprop_string(dt, dup, "status", "okay"));
+            fdt_u32s(dt, dup, "apple,firmware-compat", 3, 27, 0, 0, 0);
+            fdt_u32s(dt, dup, "apple,firmware-version", 3, 27, 0, 0, 0);
+            if (!no_piodma) {
+                int dpio = fdt_add_subnode(dt, dup, "piodma");
+                OK(dpio);
+                fdt_u32s(dt, dpio, "iommus", 2, dph, 16, 0, 0);
+            }
+        }
+    }
+
+    int disp = fdt_add_subnode(dt, soc, "display-subsystem");
+    OK(disp);
+    OK(fdt_setprop_string(dt, disp, "compatible", "apple,display-subsystem"));
+    OK(fdt_setprop_string(dt, disp, "status", disp_enabled ? "okay" : "disabled"));
+    if (oversized_iommus) {
+        fdt32_t io[36];
+        io[0] = cpu_to_fdt32(PH_DART_DISP);
+        io[1] = 0;
+        io[2] = cpu_to_fdt32(PH_EXT0_DISP);
+        io[3] = 0;
+        io[4] = cpu_to_fdt32(PH_EXT1_DISP);
+        io[5] = 0;
+        for (int i = 3; i < 18; i++) {
+            io[2 * i] = cpu_to_fdt32(100 + i);
+            io[2 * i + 1] = 0;
+        }
+        OK(fdt_setprop(dt, disp, "iommus", io, sizeof(io)));
+    } else {
+        fdt32_t io[6] = {
+            cpu_to_fdt32(PH_DART_DISP), 0,
+            cpu_to_fdt32(PH_EXT0_DISP), 0,
+            cpu_to_fdt32(PH_EXT1_DISP), 0,
+        };
+        OK(fdt_setprop(dt, disp, "iommus", io, sizeof(io)));
+    }
+
+    if (pack)
+        OK(fdt_pack(dt));
+
+    fail_malloc = fail_scratch ? 1 : 0;
+    int rc = dt_set_display_handoff(dt);
+    fail_malloc = 0;
+    if (rc)
+        DIE("dt_set_display_handoff() failed\n");
+    if (fdt_check_header(dt))
+        DIE("the device tree is not valid\n");
+
+    int chosen = fdt_path_offset(dt, "/chosen");
+    const char *said = fdt_getprop(dt, chosen, T6050_STATUS, NULL);
+    int e0 = fdt_path_offset(dt, "/soc/dcpext0"), e1 = fdt_path_offset(dt, ext1_path);
+    int len = 0;
+    const fdt32_t *c0 = e0 < 0 ? NULL : fdt_getprop(dt, e0, "apple,firmware-compat", &len);
+    const fdt32_t *c1 = e1 < 0 ? NULL : fdt_getprop(dt, e1, "apple,firmware-compat", &len);
+    const fdt32_t *v1 = e1 < 0 ? NULL : fdt_getprop(dt, e1, "apple,firmware-version", &len);
+    char c0s[32] = "none", c1s[32] = "none", v1s[32] = "none";
+    if (c0)
+        snprintf(c0s, sizeof(c0s), "%u.%u.%u", fdt32_ld(&c0[0]), fdt32_ld(&c0[1]), fdt32_ld(&c0[2]));
+    if (c1)
+        snprintf(c1s, sizeof(c1s), "%u.%u.%u", fdt32_ld(&c1[0]), fdt32_ld(&c1[1]), fdt32_ld(&c1[2]));
+    if (v1)
+        snprintf(v1s, sizeof(v1s), "%u.%u.%u", fdt32_ld(&v1[0]), fdt32_ld(&v1[1]), fdt32_ld(&v1[2]));
+    printf("result chosen=%s dcp=%s subsystem=%s ext0=%s ext1=%s ext0_fw=%s ext1_fw=%s "
+           "ext1_ver=%s",
+           said ? said : "none", status(dt, "/soc/dcp@48ae00000"),
+           status(dt, "/soc/display-subsystem"), status(dt, "/soc/dcpext0"),
+           e1 < 0 ? "deleted" : status(dt, ext1_path), c0s, c1s, v1s);
+    if (dup_ext) {
+        int dup = fdt_path_offset(dt, "/soc/dcpext1-dup");
+        const fdt32_t *dc = dup < 0 ? NULL : fdt_getprop(dt, dup, "apple,firmware-compat", &len);
+        char dcs[32] = "none";
+        if (dc)
+            snprintf(dcs, sizeof(dcs), "%u.%u.%u", fdt32_ld(&dc[0]), fdt32_ld(&dc[1]),
+                     fdt32_ld(&dc[2]));
+        printf(" dup=%s dup_fw=%s", dup < 0 ? "deleted" : status(dt, "/soc/dcpext1-dup"), dcs);
+    }
+    printf("\n");
+    disp = fdt_path_offset(dt, "/soc/display-subsystem");
+    const fdt32_t *io = fdt_getprop(dt, disp, "iommus", &len);
+    printf("iommus");
+    for (int i = 0; io && i < len / 4; i++)
+        printf(" %u", fdt32_ld(&io[i]));
+    printf("\n");
     return 0;
 }
 
@@ -610,6 +958,8 @@ int main(int argc, char **argv)
         return headless(argc, argv);
     if (!strcmp(argv[1], "panel"))
         return panel(argc, argv);
+    if (!strcmp(argv[1], "prewired"))
+        return prewired(argc, argv);
     if (!strcmp(argv[1], "t6041-headless"))
         return t6041_headless_fb();
     return 2;
@@ -672,6 +1022,8 @@ class Result:
                 self.reserved.append((name, int(base, 16), int(size, 16)))
             elif kind == "reservations":
                 assert int(rest) == len(self.reserved)
+            elif kind == "iommus":
+                self.iommus = [int(x) for x in rest.split()]
             else:
                 raise AssertionError(line)
 
@@ -789,6 +1141,185 @@ def test_panel_framebuffer_must_lie_in_vram(host, fb, size, taken):
         assert r.log == []
     else:
         assert r.state["rc"] == "-1" and len(r.log) == 1
+
+
+def test_headless_without_pt_region_stays_handed_off(host):
+    # t6050_ext_version() / t6050_ext_reject() apply only to engines already enabled in the input
+    # DT, not engines Aura just enabled via t6050_ext_one(): omitting pt-region-* from the
+    # headless ADT still leaves dcpext0, display-subsystem, and their providers enabled.
+    r = headless(host, no_pt_region=1)
+    assert handed_off(r)
+    assert not r.said("rejected")
+    assert not r.said("the device tree enables")
+
+
+@pytest.mark.parametrize("no_pt_region", [1, 0])
+def test_headless_duplicate_ext_node_refused(host, no_pt_region):
+    # A second, input-enabled apple,t6050-dcpext node at the same coprocessor address makes the
+    # mapping ambiguous: the headless handoff refuses before committing and t6050_ext_reject()
+    # disables the duplicate node too, even when pt-region-* is absent.
+    r = headless(host, no_pt_region=no_pt_region, dup_ext=1)
+    assert r.state == {"chosen": "refused", **DISABLED, "dup": "disabled"}, r.log
+    assert r.reserved == [OSLOG]
+    assert r.said(REFUSED)
+    assert not r.said("handed off")
+
+
+@pytest.mark.parametrize("fail", [0, 1, 2, 3, 4])
+def test_prewired_panel_keeps_rejected_external_engines_out_of_handoff(host, fail):
+    r = run(host, "prewired", fail=fail, meta=META_SIZE, vram=VRAM, vsize=VRAM_SIZE,
+            **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["chosen"] == "published", r.log
+    assert r.state["dcp"] == "okay" and r.state["subsystem"] == "okay"
+    assert r.state["ext0"] == "okay" and r.state["ext0_fw"] == "27.2.0"
+    if fail == 0:
+        assert r.state["ext1"] == "okay" and r.state["ext1_fw"] == "27.2.0"
+        assert r.state["ext1_ver"] == "27.2.0"
+        assert r.iommus == [2, 0, 11, 0, 12, 0]
+    else:
+        assert r.state["ext1"] == "disabled"
+        assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
+        assert r.iommus == [2, 0, 11, 0]
+
+
+def test_prewired_panel_rejects_external_engines_on_unknown_stub_and_packed_dt(host):
+    # Unknown stub: dt_set_display_handoff() refuses the internal panel, keeps healthy ext0 at
+    # the tree's version, and still disables stopped ext1 and removes its display DART.
+    r = run(host, "prewired", unknown=1, fail=1, meta=META_SIZE, vram=VRAM, vsize=VRAM_SIZE,
+            **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["chosen"] == "refused", r.log
+    assert r.state["dcp"] == "disabled" and r.state["subsystem"] == "disabled"
+    assert r.state["ext0"] == "okay" and r.state["ext0_fw"] == "27.0.0"
+    assert r.state["ext1"] == "disabled"
+    assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
+    assert r.iommus == [2, 0, 11, 0]
+
+    # Packed DT where ext0's firmware-compat write fails with NOSPACE: ext0 is disabled and
+    # stripped from display-subsystem iommus rather than advertising stale/missing compat, and
+    # stopped ext1 stays disabled and out of display-subsystem iommus.
+    r = run(host, "prewired", pack=1, nocompat=1, fail=1, meta=META_SIZE, vram=VRAM,
+            vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["ext0"] == "disabled" and r.state["ext0_fw"] == "none"
+    assert r.state["ext1"] == "disabled"
+    assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
+    assert r.iommus == [2, 0]
+
+    # Packed DT where ext1 has no status property so status = "disabled" cannot fit: ext1 is
+    # deleted instead and its display DART is removed from display-subsystem iommus.
+    r = run(host, "prewired", pack=1, nocompat=1, absent_status=1, fail=1, meta=META_SIZE,
+            vram=VRAM, vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["ext0"] == "okay"
+    assert r.state["ext1"] == "deleted"
+    assert r.iommus == [2, 0, 11, 0]
+
+
+def test_prewired_panel_rejects_nested_bus_external_engine(host):
+    # Stopped ext1 behind two identity-mapped buses with path > 64 bytes: still disabled and
+    # stripped from display-subsystem iommus while healthy ext0 and the panel stay up.
+    r = run(host, "prewired", nested=1, fail=1, meta=META_SIZE, vram=VRAM, vsize=VRAM_SIZE,
+            **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["chosen"] == "published", r.log
+    assert r.state["dcp"] == "okay" and r.state["subsystem"] == "okay"
+    assert r.state["ext0"] == "okay" and r.state["ext0_fw"] == "27.2.0"
+    assert r.state["ext1"] == "disabled"
+    assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
+    assert r.iommus == [2, 0, 11, 0]
+
+    # Healthy ext1 behind the same two identity-mapped buses stays okay and gets 27.2.0.
+    r = run(host, "prewired", nested=1, fail=0, meta=META_SIZE, vram=VRAM, vsize=VRAM_SIZE,
+            **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["chosen"] == "published", r.log
+    assert r.state["ext1"] == "okay" and r.state["ext1_fw"] == "27.2.0"
+    assert r.state["ext1_ver"] == "27.2.0"
+    assert r.iommus == [2, 0, 11, 0, 12, 0]
+
+    # Packed DT with absent status on the nested-bus stopped engine deletes it and strips scanout.
+    r = run(host, "prewired", pack=1, nocompat=1, absent_status=1, nested=1, fail=1, meta=META_SIZE,
+            vram=VRAM, vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["ext0"] == "okay"
+    assert r.state["ext1"] == "deleted"
+    assert r.iommus == [2, 0, 11, 0]
+
+
+def test_prewired_panel_rejects_external_engines_across_failure_and_status_edges(host):
+    # Scratch allocation failure during rejection/version update: falls back to in-place edits so
+    # stopped ext1 is disabled and stripped from scanout, and ext0 (whose compat cannot be updated)
+    # is also disabled and stripped from scanout rather than keeping stale apple,firmware-compat.
+    r = run(host, "prewired", fail_scratch=1, fail=1, meta=META_SIZE, vram=VRAM, vsize=VRAM_SIZE,
+            **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["ext0"] == "disabled"
+    assert r.state["ext1"] == "disabled"
+    assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
+    assert r.iommus == [2, 0]
+
+    r = run(host, "prewired", pack=1, absent_status=1, fail_scratch=1, fail=1, meta=META_SIZE,
+            vram=VRAM, vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["ext0"] == "disabled"
+    assert r.state["ext1"] == "deleted"
+    assert r.iommus == [2, 0]
+
+    # Oversized display-subsystem iommus (> 128 bytes): compacts iommus in place without
+    # allocating, strips ext1's DART while keeping other phandles intact, disables rejected ext1,
+    # and updates healthy ext0 to 27.2.0.
+    expected_oversized = [2, 0, 11, 0] + [x for i in range(3, 18) for x in (100 + i, 0)]
+    r = run(host, "prewired", oversized_iommus=1, fail=1, meta=META_SIZE, vram=VRAM,
+            vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["ext0"] == "okay" and r.state["ext0_fw"] == "27.2.0"
+    assert r.state["ext1"] == "disabled"
+    assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
+    assert r.iommus == expected_oversized
+
+    # Extra-bytes status string ("okay\0disabled"): Linux probes the first string, so rejection
+    # still disables ext1 and strips its display DART while keeping the panel and ext0 active.
+    r = run(host, "prewired", extra_status=1, fail=1, meta=META_SIZE, vram=VRAM, vsize=VRAM_SIZE,
+            **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["chosen"] == "published", r.log
+    assert r.state["dcp"] == "okay" and r.state["subsystem"] == "okay"
+    assert r.state["ext0"] == "okay" and r.state["ext0_fw"] == "27.2.0"
+    assert r.state["ext1"] == "disabled"
+    assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
+    assert r.iommus == [2, 0, 11, 0]
+
+
+@pytest.mark.parametrize("fail_scratch", [0, 1])
+def test_prewired_panel_drops_rejected_scanout_from_enabled_oversized_iommus(host, fail_scratch):
+    # Display subsystem already enabled ("okay") with >128-byte iommus: rejected ext1 is disabled
+    # AND its DART phandle (12) is removed from iommus in place while all other phandles stay
+    # intact. With fail_scratch=0 ext0 is updated to 27.2.0; with fail_scratch=1 ext0 cannot
+    # update compat and is also disabled with its DART phandle (11) stripped in place.
+    tail = [x for i in range(3, 18) for x in (100 + i, 0)]
+    r = run(host, "prewired", disp_enabled=1, oversized_iommus=1, fail_scratch=fail_scratch,
+            fail=1, meta=META_SIZE, vram=VRAM, vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["subsystem"] == "okay"
+    assert r.state["ext1"] == "disabled"
+    assert r.state["ext1_fw"] == "27.0.0" and r.state["ext1_ver"] == "27.0.0"
+    if not fail_scratch:
+        assert r.state["ext0"] == "okay" and r.state["ext0_fw"] == "27.2.0"
+        assert r.iommus == [2, 0, 11, 0] + tail
+    else:
+        assert r.state["ext0"] == "disabled"
+        assert r.iommus == [2, 0] + tail
+
+
+def test_prewired_panel_rejects_packed_and_no_piodma_duplicate_ext_nodes(host):
+    # Packed DT with two healthy duplicate ext1 nodes (both having piodma): deleting the first
+    # duplicate must not let the second survive as unique, stay okay, or get version-stamped.
+    r = run(host, "prewired", pack=1, absent_status=1, dup_ext=1, fail=0, meta=META_SIZE,
+            vram=VRAM, vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["ext0"] == "okay"
+    assert r.state["ext1"] == "deleted"
+    assert r.state["dup"] == "disabled" and r.state["dup_fw"] == "27.0.0"
+    assert r.iommus == [2, 0, 11, 0]
+
+    # Duplicate healthy ext1 nodes that both lack piodma: both are disabled and PH_EXT1_DISP (12)
+    # is still removed from display-subsystem iommus via the preserved ADT index.
+    r = run(host, "prewired", dup_ext=1, no_piodma=1, fail=0, meta=META_SIZE, vram=VRAM,
+            vsize=VRAM_SIZE, **framebuffer(VRAM, VRAM_SIZE))
+    assert r.state["chosen"] == "refused", r.log
+    assert r.state["ext0"] == "okay" and r.state["ext0_fw"] == "27.2.0"
+    assert r.state["ext1"] == "disabled" and r.state["ext1_fw"] == "27.0.0"
+    assert r.state["dup"] == "disabled" and r.state["dup_fw"] == "27.0.0"
+    assert r.iommus == [2, 0, 11, 0]
 
 
 @pytest.mark.parametrize("mode", ["headless", "panel"])
