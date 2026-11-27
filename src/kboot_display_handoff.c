@@ -3457,8 +3457,8 @@ static const struct {
 #else
 #define T6050_MINSIZE
 #endif
-#define T6050_INIT T6050_MINSIZE AURA_XTEXT
-#define T6050_TEXT T6050_MINSIZE AURA_XTEXT
+#define T6050_INIT T6050_MINSIZE
+#define T6050_TEXT T6050_MINSIZE
 
 /*
  * Nodes, by device tree path; the first five are enabled by the handoff. T6050_PMC: the PMC
