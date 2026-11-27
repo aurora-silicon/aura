@@ -41,7 +41,7 @@ LIBFDT = [
 def test_t6050_mcc_handoff(tmp_path):
     source = (ROOT / "src/kboot.c").read_text()
     start = source.index("#define T6050_MCC_PLANE_SIZE")
-    end = source.index("\nvoid kboot_set_initrd(", start)
+    end = source.index("\n#endif /* ESP_STAGE2 */", start)
     prod = source[start:end]
 
     # Verify kboot_prepare_dt() invokes dt_set_t6050_mcc().
