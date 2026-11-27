@@ -16,5 +16,6 @@ int wdt_arm_trial(void);
 int wdt_arm_boot(void);
 void wdt_host_attached(void);
 bool wdt_boot_watchdog_armed(void);
+bool wdt_host_was_attached(void);
 
 #endif

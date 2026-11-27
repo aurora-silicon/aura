@@ -10,12 +10,31 @@
  * Nobody may be at the Mac when an aura-try trial would stop in the proxy, and only a host can
  * drive it or reboot it there; the trial watchdog is the only other way out. The trial spent its
  * marker on the ESP before its image was read, so a reboot lands on the configured image. This
- * needs nothing from Stage 1 beyond the trial itself. Any other stage stops in the proxy as before.
+ * needs nothing from Stage 1 beyond the trial itself.
+ *
+ * A plain boot that stops in the proxy is in the same place. Stage 1 runs its boot watchdog for
+ * that (wdt_arm_boot()), but a Stage 2 disarms it at its start, so a Stage 2 that could not start
+ * its payload stayed in the proxy until someone held the power button or reset it over USB-C (on
+ * the M4 MacBook Air: an ANS that a warm boot's start from off could not bring up, about one
+ * warm boot in eight; a later boot brings it up). Such a stop arms the boot watchdog again, unless
+ * a host has attached already or this is a debug boot, and then stops in the proxy as before.
+ * The first host request turns it off (wdt_host_attached()), so a debugging session is never
+ * reset under it; without a host the Mac restarts and the next boot tries again.
  */
 bool proxy_fallback(const char *why)
 {
-    if (!aura_trial_enabled())
+    if (!aura_trial_enabled()) {
+        if (wdt_boot_watchdog_armed() || wdt_host_was_attached() || aura_debug_enabled())
+            return false;
+        if (wdt_arm_boot()) {
+            printf("%s; no boot watchdog, staying in the proxy\n", why);
+            return false;
+        }
+        /* Shown on the panel */
+        printf("\n%s. Without a host, this Mac restarts by itself within %u s to try again.\n", why,
+               WDT_BOOT_SECONDS);
         return false;
+    }
 
     /*
      * A Stage 1 that took the trial marker still runs its boot watchdog, and the first host turns
