@@ -166,8 +166,11 @@ class UartInterface(Reloadable):
         # KIS bridges DockChannel through bounded USB receive windows. Split
         # memory transactions, including their replies, instead of just the
         # host write calls within one unbounded proxy request.
+        # macOS kisd names its pty cu.kis-*/tty.kis-*; on Linux the bridge links its pty as
+        # /run/kis-<name> (kis-bridge) and kisd itself as /dev/m1n1. Go by the path given, not
+        # the pty it resolves to.
         port = self.devpath or getattr(device, "port", "") or ""
-        self.is_kis = os.path.basename(port).startswith(("cu.kis-", "tty.kis-"))
+        self.is_kis = os.path.basename(port).startswith(("cu.kis-", "tty.kis-", "kis-"))
         self.dev.timeout = 0
         self.dev.flushOutput()
         self.dev.flushInput()

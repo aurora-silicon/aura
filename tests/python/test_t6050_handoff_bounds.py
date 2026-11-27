@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 """The T6050 display handoff refuses an empty, overflowing or out-of-/vram boot framebuffer and a
 zero, unaligned or out-of-range bandwidth scratch, and the T6041 headless handoff refuses an empty
 or overflowing boot framebuffer.
@@ -22,7 +22,7 @@ import sys
 
 import pytest
 
-from host_compiler import host_cc
+from host_compiler import display_handoff_sources, host_cc
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = Path(os.environ.get("AURA_T6050_SOURCE", ROOT / "src/kboot_display_handoff.c"))
@@ -186,59 +186,32 @@ int adt_get_property_count(const void *a, int n)
     return n < 1 || n > nnodes ? -1 : nodes[n - 1].nprops;
 }
 
-/* The tree walk: a node's children are the nodes whose path is its path plus one component. */
-static bool child_of(int parent, int n)
-{
-    const char *p = parent ? nodes[parent - 1].path : "";
-    size_t len = strlen(p);
-    const char *c = nodes[n - 1].path;
-    return !strncmp(c, p, len) && c[len] == '/' && c[len + 1] && !strchr(c + len + 1, '/');
-}
-
-static int parent_of(int n)
-{
-    const char *c = nodes[n - 1].path;
-    const char *slash = strrchr(c, '/');
-    for (int i = 1; i <= nnodes; i++)
-        if (strlen(nodes[i - 1].path) == (size_t)(slash - c) &&
-            !strncmp(nodes[i - 1].path, c, slash - c))
-            return i;
-    return 0;
-}
-
-static int child_after(int parent, int after)
-{
-    for (int i = after + 1; i <= nnodes; i++)
-        if (child_of(parent, i))
-            return i;
-    return -1;
-}
-
 int adt_get_child_count(const void *a, int n)
 {
     UNUSED(a);
-    int count = 0;
-    for (int i = 1; i <= nnodes; i++)
-        count += child_of(n, i);
-    return count;
+    UNUSED(n);
+    return 0;
 }
 
 int adt_first_child_offset(const void *a, int n)
 {
     UNUSED(a);
-    return child_after(n, 0);
+    UNUSED(n);
+    return -1;
 }
 
 int adt_next_sibling_offset(const void *a, int n)
 {
     UNUSED(a);
-    return n < 1 || n > nnodes ? -1 : child_after(parent_of(n), n);
+    UNUSED(n);
+    return -1;
 }
 
 const char *adt_get_name(const void *a, int n)
 {
     UNUSED(a);
-    return n < 1 || n > nnodes ? NULL : strrchr(nodes[n - 1].path, '/') + 1;
+    UNUSED(n);
+    return "";
 }
 
 int host_adt_nprops(int n)
@@ -321,6 +294,11 @@ int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *gate)
 int pmgr_adt_is_powered(const char *path)
 {
     DIE("pmgr_adt_is_powered(%s)\n", path);
+}
+
+bool kboot_config_lost(void)
+{
+    return false;
 }
 
 u64 kboot_ram_base(void)
@@ -653,6 +631,13 @@ def host(tmp_path_factory):
         # The host fixture has no aura ELF linker script; retain a dedicated Mach-O section.
         code = code.replace('section(".init.t6050")', 'section("__TEXT,__t6050_init")')
     (src / "kboot_display_handoff.c").write_text(code)
+    extra_srcs = [name for name in display_handoff_sources(ROOT)
+                  if name != "kboot_display_handoff.c"]
+    for name in extra_srcs:
+        shutil.copy(ROOT / "src" / name, src)
+        hdr = ROOT / "src" / name.replace(".c", ".h")
+        if hdr.exists():
+            shutil.copy(hdr, src)
     (src / "t6050_bounds_host.c").write_text(HOST)
     for header in (ROOT / "tests/t8122_display_host").glob("*.h"):
         shutil.copy(header, src)
@@ -662,7 +647,7 @@ def host(tmp_path_factory):
          "-Wno-unused-parameter", "-Wno-format", "-Wno-format-truncation",
          "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
          "-fno-sanitize-recover=undefined", "-I", str(src), "-I", str(ROOT / "src"),
-         str(src / "t6050_bounds_host.c"),
+         str(src / "t6050_bounds_host.c"), *(str(src / name) for name in extra_srcs),
          *(str(ROOT / "src/libfdt" / f) for f in LIBFDT), "-o", str(binary)],
         check=True,
     )

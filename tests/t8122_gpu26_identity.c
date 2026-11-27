@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,18 +9,36 @@
 
 #define MAX_PSTATES        16
 #define G15_MAX_CLUSTERS   2
+#define G15_PS_MAX_MV      1500
 #define G15_SGX_ID_VERSION 0xd04000
 #define G15_SGX_CORE_MASK  0xe01500
 #define G15_SGX_ID_COUNTS_1 0xd04010
 #define G15_SGX_ID_COUNTS_2 0xd04014
 #define T8122              0x8122
+#define GPU26_ERR_FATAL    (-2)
 #define bail(...)                                                                                  \
     do {                                                                                           \
         printf(__VA_ARGS__);                                                                       \
         return -1;                                                                                 \
     } while (0)
 
+struct fw_version_info;
+
 /* SOURCE STRUCTS */
+
+struct t6031_closure {
+    int unused;
+};
+static int t6031_closure_get(const char *path, struct t6031_closure *closure)
+{
+    assert(0);
+    return -1;
+}
+static int t6031_closure_restore(const struct t6031_closure *closure)
+{
+    assert(0);
+    return -1;
+}
 
 struct g15_power_values {
     u32 unused;
@@ -153,7 +171,7 @@ static int stub_read_leak(const struct g15_soc *soc, float *leak)
     return 0;
 }
 static const struct g15_soc g15_soc_t8122_standin = {
-    .chip = T8122,
+    /* Calibration must work from the descriptor without a firmware lookup chip ID. */
     .name = "T8122",
     .gpu_name = "G15G",
     .compatible = "apple,agx-t8122",
@@ -163,7 +181,10 @@ static const struct g15_soc g15_soc_t8122_standin = {
     .dies = 1,
     .mask2_bits = 32,
     .power_closure = true,
+    .publish_powered_identity = true,
+    .power_props = true,
     .read_leak = stub_read_leak,
+    .calc_power = calc_power_t8122_standin,
 };
 
 /* SOURCE FUNCTIONS */

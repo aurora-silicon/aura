@@ -688,6 +688,7 @@ struct entry dapf_entries[] = {
     {"/arm-io/dart-isp", 5, "isp"},
     {"/arm-io/dart-isp0", 5, "isp"},
     {"/arm-io/dart-ave0", 3, "ave"},
+    {"/arm-io/dart-ave1", 3, "ave1"},
     {NULL, -1, NULL},
 };
 
@@ -696,7 +697,7 @@ struct entry dapf_entries[] = {
  * boot. An entry it skipped (its DT alias absent or disabled, its DART not in the ADT) is in
  * neither.
  */
-static const char *dapf_programmed_paths[8], *dapf_failed_paths[8];
+static const char *dapf_programmed_paths[16], *dapf_failed_paths[16];
 static unsigned int dapf_nprogrammed, dapf_nfailed;
 
 static bool dapf_listed(const char *const *paths, unsigned int n, const char *path)
@@ -844,15 +845,14 @@ int dapf_init_fdt(const void *fdt)
     j614s_isp_ready = false;
     dapf_nprogrammed = dapf_nfailed = 0;
     if (chip_id == T8132) {
-        /* M4 laptops whose trees state the same DAPF handoff contract as the J713. */
-        static const char *const boards[] = {"apple,j713", "apple,j604", NULL};
-        bool known = false;
-
-        for (const char *const *board = boards; fdt && *board; board++)
-            known |= !fdt_node_check_compatible(fdt, 0, *board);
-        if (!known)
-            return 0; /* No other M4 board's power/DAPF contract is qualified. */
-        return dapf_init_j713((void *)fdt);
+        /*
+         * The tree states the handoff contract itself: /chosen's
+         * linux-enablement-mac,dapf-handoff names the consumers whose filters
+         * are handed off, and dapf_init_j713() preserves the firmware state
+         * of a tree that names none. No board list: a T8132 Mac whose tree
+         * carries the property gets the handoff with no change here.
+         */
+        return fdt ? dapf_init_j713((void *)fdt) : 0;
     }
 
     int ret = 0;

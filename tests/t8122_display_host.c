@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 /*
  * Host test of the T8122 (J613) internal display handoff in src/kboot_display_handoff.c, checked
  * against what the kernel reads from the device tree it hands over.
@@ -78,6 +78,12 @@ enum fw_version firmware_os_components(void)
 size_t mcc_carveout_count;
 struct mcc_carveout mcc_carveouts[8];
 static u64 ram_base, ram_size, fb_base;
+static bool config_lost;
+
+bool kboot_config_lost(void)
+{
+    return config_lost;
+}
 
 u64 kboot_ram_base(void)
 {
@@ -251,8 +257,6 @@ int adt_get_property_count(const void *a, int node)
     return host_adt_nprops(node);
 }
 
-#include "adt_tree.h"
-
 /* ---- fake PMGR table: device id -> name, virtual or power state register, parents ---- */
 
 static struct fdev {
@@ -420,7 +424,7 @@ static u32 ttbr_of(u64 l1)
 
 #define TB         0x10000000000ULL
 static bool fw25;
-static bool fw27; /* the generalised T8122 profile admitting the 27.2 image */
+static bool fw27;
 #define J613_UUID                                                                                  \
     (fw25   ? "C042E95C-B9D8-3F0E-94B3-582A08AA6FDD"                                                \
      : fw27 ? "93FA4B31-BB97-3B2A-8673-49EA489EE9C1"                                                \
@@ -455,6 +459,7 @@ static const int region_ids[NSEGS] = {49, 50, -1, 57, 94, 95, 14};
 
 struct opts {
     bool armed, twice, wrong_uuid, not_running, stray_map, power_off;
+    bool reordered_text, dcpext;
 };
 
 static void world_j613(const struct opts *o)
@@ -570,6 +575,7 @@ static const struct seg segs6[8] = {
     {TB + 0x280200000ULL, ~0ULL, TB + 0x1b60000, 0x4000, 2},
 };
 static const int region_ids6[8] = {49, 50, -1, 57, 94, 95, 14, 157};
+#define T6030_UUID_27_2 "94D7C96F-63F6-3D8A-B208-B3D8E2D3621E"
 
 static void world_t6030(const struct opts *o)
 {
@@ -580,11 +586,19 @@ static void world_t6030(const struct opts *o)
     prop_u64("/chosen", "dram-size", 0x300000000ULL);
     mcc_carveout_count = 0;
 
-    prop_set("/arm-io/dcp/iop-dcp-nub", "segment-ranges", segs6, sizeof(segs6));
+    struct seg panel_segs[8];
+    memcpy(panel_segs, segs6, sizeof(panel_segs));
+    if (o->reordered_text) {
+        panel_segs[0] = segs6[1];
+        panel_segs[1] = segs6[0];
+    }
+    prop_set("/arm-io/dcp/iop-dcp-nub", "segment-ranges", panel_segs, sizeof(panel_segs));
     prop_str("/arm-io/dcp/iop-dcp-nub", "segment-names",
-             "__TEXT;__DATA;__OS_LOG;unknown;unknown;unknown;unknown;unknown");
+             o->reordered_text ? "__DATA;__TEXT;__OS_LOG;unknown;unknown;unknown;unknown;unknown"
+                               : "__TEXT;__DATA;__OS_LOG;unknown;unknown;unknown;unknown;unknown");
     prop_str("/arm-io/dcp/iop-dcp-nub", "uuid",
              o->wrong_uuid ? "11111111-2222-3333-4444-555555555555"
+             : fw27        ? T6030_UUID_27_2
                            : "DDF38191-93B3-324A-BC8F-643006F5AC82");
     prop_u32("/arm-io/dcp/iop-dcp-nub", "pre-loaded", 1);
     prop_u32("/arm-io/dcp/iop-dcp-nub", "running", 1);
@@ -601,12 +615,19 @@ static void world_t6030(const struct opts *o)
         snprintf(path, sizeof(path), "/arm-io/dcpext%d/iop-dcpext%d-nub", i, i);
         prop_set(path, "segment-ranges", ext, sizeof(ext));
         prop_str(path, "segment-names", "__TEXT;__DATA;__OS_LOG;unknown");
+        if (o->dcpext && i == 0) {
+            prop_str(path, "uuid", "DDF38191-93B3-324A-BC8F-643006F5AC82");
+            prop_u32(path, "pre-loaded", 1);
+            reg_add("/arm-io/dcpext0", 0x2d2c00000ULL, 0x4000);
+            reg_add("/arm-io/dart-dcpext0", 0x2d130c000ULL, 0x4000);
+        }
     }
     for (int i = 0; i < 8; i++) {
         if (region_ids6[i] < 0)
             continue;
         char p[32];
-        snprintf(p, sizeof(p), "region-id-%d", region_ids6[i]);
+        /* A different carveout ID for a heap segment, with the same valid DART mappings. */
+        snprintf(p, sizeof(p), "region-id-%d", fw27 && i == SEG_HEAP3 ? 123 : region_ids6[i]);
         prop_pair("/chosen/carveout-memory-map", p, segs6[i].phys,
                   ALIGN_UP((u64)segs6[i].size, SZ_16K));
     }
@@ -1004,19 +1025,37 @@ int main(int argc, char **argv)
         return 2;
     }
     const char *sc = argv[2];
-    /* t6030-<scenario>: the same scenario in the T6030 world, run and kept, not checked */
+    /* t6030-<scenario>: run the same scenario in the T6030 world. */
     bool t6030 = !strncmp(sc, "t6030-", 6);
     if (t6030)
         sc += 6;
-    fw27 = !t6030 && !strcmp(sc, "publish-27_2");
+    fw27 = !strcmp(sc, "publish-27_2") || !strcmp(sc, "publish-27_2-unlisted-board") ||
+           !strcmp(sc, "27_2-owner-disabled") || !strcmp(sc, "27_2-m3-defaults-off") ||
+           !strcmp(sc, "27_2-config-lost");
+    bool unlisted_board = !strcmp(sc, "publish-27_2-unlisted-board");
+    bool owner_disabled = !strcmp(sc, "27_2-owner-disabled");
+    bool m3_defaults_off = !strcmp(sc, "27_2-m3-defaults-off");
+    bool lost_cfg = !strcmp(sc, "27_2-config-lost");
     fw25 = !t6030 && !fw27 && getenv("J613_25G83") != NULL;
     struct opts o = {0};
     bool publish = true;
+    config_lost = lost_cfg;
     if (!strcmp(sc, "unarmed")) {
         publish = false;
     } else if (!strcmp(sc, "publish") || !strcmp(sc, "contract-selftest") ||
                !strcmp(sc, "publish-27_2")) {
         o.armed = true;
+    } else if (!strcmp(sc, "publish-27_2-unlisted-board")) {
+        /* No opt-in injected: proves unlisted-board 27.2 default boot by capability. */
+        o.armed = false;
+    } else if (owner_disabled || m3_defaults_off) {
+        publish = false;
+    } else if (lost_cfg) {
+        o.armed = true;
+        publish = false;
+    } else if (!strcmp(sc, "14_7-panel-dcpext") || !strcmp(sc, "reordered-text-dcpext")) {
+        o.armed = o.dcpext = true;
+        o.reordered_text = !strcmp(sc, "reordered-text-dcpext");
     } else if (!strcmp(sc, "repeat")) {
         o.armed = o.twice = true;
     } else if (!strcmp(sc, "wrong-image")) {
@@ -1078,9 +1117,44 @@ int main(int argc, char **argv)
         fdt_setprop(dt, fdt_path_offset(dt, "dcp"), "apple,firmware-compat", compat,
                     sizeof(compat));
     }
+    if (unlisted_board) {
+        const char compat[] = "apple,j999s\0apple,t6030";
+        const char compat_air[] = "apple,j999\0apple,t8122";
+        if (t6030)
+            fdt_setprop(dt, 0, "compatible", compat, sizeof(compat));
+        else
+            fdt_setprop(dt, 0, "compatible", compat_air, sizeof(compat_air));
+    }
+    if (o.dcpext) {
+        int soc = fdt_path_offset(dt, "/soc");
+        int dart = fdt_add_subnode(dt, soc, "iommu@2d130c000");
+        fdt64_t dreg[2] = {cpu_to_fdt64(0x2d130c000ULL), cpu_to_fdt64(0x4000)};
+        fdt32_t range[4] = {cpu_to_fdt32(0x100), cpu_to_fdt32(0), cpu_to_fdt32(0x10),
+                            cpu_to_fdt32(0)};
+        fdt_setprop_string(dt, dart, "compatible", "apple,t8110-dart");
+        fdt_setprop_u32(dt, dart, "#iommu-cells", 1);
+        fdt_setprop(dt, dart, "reg", dreg, sizeof(dreg));
+        fdt_setprop(dt, dart, "apple,dma-range", range, sizeof(range));
+        fdt_setprop_string(dt, dart, "status", "disabled");
+        fdt_setprop_u32(dt, dart, "phandle", 77);
+
+        int ext = fdt_add_subnode(dt, fdt_path_offset(dt, "/soc"), "dcp@2d2c00000");
+        fdt64_t ereg[2] = {cpu_to_fdt64(0x2d2c00000ULL), cpu_to_fdt64(0x4000)};
+        fdt32_t iommu[2] = {cpu_to_fdt32(77), cpu_to_fdt32(5)};
+        fdt_setprop(dt, ext, "reg", ereg, sizeof(ereg));
+        fdt_setprop(dt, ext, "iommus", iommu, sizeof(iommu));
+        fdt_setprop_string(dt, ext, "status", "disabled");
+        fdt_setprop_string(dt, fdt_path_offset(dt, "/aliases"), "dcpext0", "/soc/dcp@2d2c00000");
+        fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "asahi,t6030-dcpext", "1");
+    }
     if (o.armed)
         fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"),
                            t6030 ? "asahi,t6030-dcp" : "asahi,t8122-dcp", "1");
+    if (owner_disabled)
+        fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"),
+                           t6030 ? "asahi,t6030-dcp" : "asahi,t8122-dcp", "0");
+    if (m3_defaults_off)
+        fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "asahi,m3-defaults", "0");
 
     printf("== %s\n", sc);
     fflush(stdout);
@@ -1102,7 +1176,38 @@ int main(int argc, char **argv)
         check(mmio_writes == 0, "unarmed: no MMIO write");
 
     if (t6030) {
-        /* Compared with another tree's output by tests/run-t6031-unchanged.sh */
+        /* The 14.7 output is compared separately by tests/run-t6031-unchanged.sh. */
+        if (fw27 && publish) {
+            int dcp = fdt_path_offset(dt, "dcp"), len;
+            const fdt32_t *marker = fdt_getprop(dt, dcp, "apple,t6030-handoff", &len);
+            check(marker && len == 4 && fdt32_ld(marker) == 1, "T6030 27.2 handoff published");
+            int i = fdt_stringlist_search(dt, dcp, "memory-region-names", "region123");
+            u64 base, size;
+            check(i >= 0 && reg_of(dt, region_at(dt, dcp, i), &base, &size) &&
+                      base == segs6[SEG_HEAP3].phys && size == segs6[SEG_HEAP3].size,
+                  "T6030 heap uses the live carveout ID and range");
+        } else if (fw27 && !publish) {
+            int dcp = fdt_path_offset(dt, "dcp");
+            check(dcp >= 0 && !fdt_getprop(dt, dcp, "apple,t6030-handoff", NULL),
+                  "T6030 27.2 handoff suppressed when opted out or config lost");
+            check(dcp >= 0 && status_is(dt, dcp, "disabled"), "T6030 27.2 dcp stays disabled");
+        } else if (o.dcpext) {
+            int dcp = fdt_path_offset(dt, "dcp"), ext = fdt_path_offset(dt, "dcpext0"), len;
+            const fdt32_t *pm = fdt_getprop(dt, dcp, "apple,t6030-handoff", &len);
+            check(pm && len == 4 && fdt32_ld(pm) == 1, "T6030 14.7 panel handoff published");
+            const fdt32_t *em =
+                ext < 0 ? NULL : fdt_getprop(dt, ext, "apple,t6030-dcpext-memory-ready", &len);
+            check(em && len == 4 && fdt32_ld(em) == 1,
+                  "T6030 14.7 dcpext0 memory ready");
+            int panel_ti = fdt_stringlist_search(dt, dcp, "memory-region-names", "asc-firmware");
+            int ext_ti = fdt_stringlist_search(dt, ext, "memory-region-names", "asc-firmware");
+            u64 base = 0, size = 0;
+            int panel_tr = panel_ti >= 0 ? region_at(dt, dcp, panel_ti) : -1;
+            int ext_tr = ext_ti >= 0 ? region_at(dt, ext, ext_ti) : -1;
+            check(panel_tr >= 0 && panel_tr == ext_tr && reg_of(dt, ext_tr, &base, &size) &&
+                      base == segs6[0].phys && size == segs6[0].size,
+                  "T6030 dcpext0 shares the derived panel dcp-text reservation");
+        }
     } else if (publish) {
         contract_check(dt);
         if (fw25) {

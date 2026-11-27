@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 /*
  * Host test of the T6041 (M4 Pro J616s) internal display handoff in src/kboot_display_handoff.c.
  *
@@ -69,6 +69,11 @@ enum fw_version firmware_os_components(void)
 size_t mcc_carveout_count;
 struct mcc_carveout mcc_carveouts[8];
 static u64 ram_base, ram_size, fb_base;
+
+bool kboot_config_lost(void)
+{
+    return false;
+}
 
 u64 kboot_ram_base(void)
 {
@@ -267,8 +272,6 @@ int adt_get_property_count(const void *a, int node)
     UNUSED(a);
     return host_adt_nprops(node);
 }
-
-#include "adt_tree.h"
 
 /* ---- fake PMGR table: device id -> name, virtual or power state register, parent ---- */
 

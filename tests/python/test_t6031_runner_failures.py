@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 """Black-box runner control-flow checks with synthetic compiler/host outputs.
 
 These checks establish execution and comparison behavior, not hardware behavior
@@ -12,6 +12,8 @@ import subprocess
 import sys
 
 import pytest
+
+from host_compiler import display_handoff_sources
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -65,8 +67,14 @@ def runner(tmp_path):
         (tree / directory).mkdir(parents=True, exist_ok=True)
     for name, source in (("handoff", HANDOFF), ("unchanged", UNCHANGED)):
         (tree / f"tests/run-t6031-{name}.sh").write_bytes(source.read_bytes())
+    (tree / "tests/display-handoff-sources.txt").write_bytes(
+        (REPO / "tests/display-handoff-sources.txt").read_bytes())
     (tree / "rust/src/adt.rs").write_text("// from_raw_parts(self.name.as_ptr() as *const u8, 32)\n")
     (tree / "src/kboot.c").write_text("""
+static int dt_fill_pmp_from_node(void) { return 0;
+}
+static int dt_fill_pmp_from(void) { return 0;
+}
 static int dt_fill_pmp(void) { return 0;
 }
 static void dt_pass_pmp(void) {
@@ -76,9 +84,9 @@ static int dt_set_pmp_t6031(void) { return 0;
 static const struct pmp_values_soc pmp_values_t6031 = {
 };
 """)
-    for name in ("kboot_display_handoff.c", "kboot_gpu.c", "kboot_gpu26.c",
-                 "kboot_gpu_t6031.c", "kboot_gpu_t8122_power.c", "kboot_t6031.c",
-                 "firmware.c", "pmgr.c"):
+    for name in (*display_handoff_sources(REPO), "kboot_gpu.c",
+                 "kboot_gpu26.c", "kboot_gpu_t6031.c", "kboot_gpu_t8122_power.c",
+                 "kboot_t6031.c", "firmware.c", "pmgr.c"):
         (tree / "src" / name).write_text("/* synthetic input */\n")
     for name in ("t6031_host", "g15_host", "t8122_display_host"):
         (tree / "tests" / name / "stub.h").write_text("/* synthetic header */\n")
@@ -180,9 +188,11 @@ def test_unchanged_positive_control_executes_actual_comparisons(runner):
     assert scenario_calls(calls, "g15-base") == ["one", "two"]
     assert scenario_calls(calls, "g15-new") == ["one", "two"]
     for role in ("disp-base", "disp-new"):
-        assert len(scenario_calls(calls, role)) == 25
+        scenarios = scenario_calls(calls, role)
+        assert len(scenarios) == 26
+        assert "t6030-14_7-panel-dcpext" in scenarios
     assert "G15 GPU setup: 2 scenarios identical" in result.stdout
-    assert "Display handoff: 25 J613" in result.stdout
+    assert "Display handoff: 26 J613" in result.stdout
     assert "PASS: every other SoC's handoff results" in result.stdout
 
 
