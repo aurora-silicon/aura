@@ -205,6 +205,26 @@ int tps6598x_cold_reset(tps6598x_dev_t *dev)
     return 0;
 }
 
+/* After tps6598x_cold_reset(): wait until the controller runs its application firmware again. */
+int tps6598x_wait_app(tps6598x_dev_t *dev, unsigned timeout_ms)
+{
+    u64 start = get_ticks();
+
+    do {
+        u8 mode[4];
+        if (dev->spmi)
+            spmi_send_wakeup(dev->spmi, dev->addr);
+        if (tps6598x_read_reg(dev, TPS_REG_MODE, mode, sizeof(mode)) == sizeof(mode) &&
+            !memcmp(mode, "APP ", sizeof(mode))) {
+            dev->resetting = false;
+            return 0;
+        }
+        mdelay(10);
+    } while (ticks_to_msecs(get_ticks() - start) < timeout_ms);
+
+    return -1;
+}
+
 int tps6598x_cmd_status(tps6598x_dev_t *dev, const char *cmd)
 {
     u32 cmd_status;

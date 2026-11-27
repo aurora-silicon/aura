@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 /*
  * Internal display handoff, for SoCs whose internal DCP iBoot leaves running.
  *
@@ -104,6 +104,7 @@
 #include "adt.h"
 #include "exception.h"
 #include "firmware.h"
+#include "kboot_display_routes.h"
 #include "malloc.h"
 #include "mcc.h"
 #include "pmgr.h"
@@ -175,7 +176,6 @@
 #define DART_DVA_MASK    ((1UL << 36) - 1)
 #define DART_PT_MAX_SIZE SZ_1M
 
-#define DCP6_SEGS         8 /* T6030 */
 #define DCP6_SEGS_MAX     12
 #define DCP6_SEG_MAX_SIZE (256 * SZ_1M)
 #define DCP6_OSLOG_MAX    SZ_1M
@@ -197,30 +197,14 @@
 #define SEG_FLAGS_HEAP  2
 #define SEG_FLAGS_OSLOG 0xa
 
-/* Segment indices of the T6030 dcp layout, and of the T6030 dcpext0 layout (its first four) */
-enum { SEG_TEXT, SEG_DATA, SEG_OSLOG, SEG_3, SEG_4, SEG_5, SEG_VRAM, SEG_7 };
+/* Segment indices used by the external display handoffs. */
+enum { SEG_TEXT, SEG_DATA, SEG_OSLOG, SEG_3 };
 
 struct dcp6_seg_def {
-    u32 flags;
     int region_id;
     const char *node;   /* /reserved-memory node name, before the unit address */
     const char *name;   /* memory-region-names entry */
     const char *compat; /* compatible of the reserved-memory node, or NULL */
-};
-
-/*
- * T6030 iop-dcp-nub segment-ranges, in ADT order. Every segment except __OS_LOG is also a carveout
- * from /chosen/carveout-memory-map (region-id-14 is /vram, the boot framebuffer).
- */
-static const struct dcp6_seg_def dcp6_seg_defs_t6030[DCP6_SEGS] = {
-    {SEG_FLAGS_TEXT, 49, "dcp-text", "asc-firmware", "apple,asc-mem"},
-    {SEG_FLAGS_DATA, 50, "dcp-data", "dcp_data", "apple,asc-mem"},
-    {SEG_FLAGS_OSLOG, -1, "dcp-oslog", "os_log", NULL},
-    {SEG_FLAGS_HEAP, 57, "dcp-seg3", "region57", "apple,asc-mem"},
-    {SEG_FLAGS_HEAP, 94, "dcp-seg4", "region94", "apple,asc-mem"},
-    {SEG_FLAGS_HEAP, 95, "dcp-seg5", "region95", "apple,asc-mem"},
-    {SEG_FLAGS_HEAP, 14, "framebuffer", "framebuffer", "framebuffer"},
-    {SEG_FLAGS_HEAP, 157, "dcp-seg7", "region157", "apple,asc-mem"},
 };
 
 #define DCP6_OSLOG_NODE "dcp-oslog"
@@ -272,15 +256,19 @@ struct dcp_soc {
     int nfws;
     /* Nonzero: the ADT must say the same. Zero: taken from the ADT. */
     u64 coproc, dart_dcp, dart_disp;
-    u64 vm_base, vm_size; /* both DARTs' DVA window (vm-base, vm-size, apple,dma-range) */
-    u64 pmgr_disp_cpu;    /* display CPU power state register (with adt_psreg: compared only) */
-    const struct dcp6_seg_def *segs; /* fixed iop-dcp-nub layout, or NULL: derived from the ADT */
-    int nsegs;
+    u64 vm_base, vm_size;    /* both DARTs' DVA window (vm-base, vm-size, apple,dma-range) */
+    u64 pmgr_disp_cpu;       /* display CPU power state register (with adt_psreg: compared only) */
     const char *const *nubs; /* owners whose __OS_LOG is reserved, or NULL: every dcp/dcpextN */
     int nnubs;
 };
 
 static const char *const dcp_boards_t6030[] = {"apple,j516s", "apple,j514s", NULL};
+
+/* T6030 (M3 Pro J514s/J516s) DCP images by OS: the 14.7 native image and the 27.2 image. */
+static const struct dcp_fw dcp_fws_t6030[] = {
+    {.os_fw = V14_7, .os_fw_name = "14.7", .uuid = DCP6_UUID},
+    {.os_fw = V27_2, .os_fw_name = "27.2", .uuid = "94D7C96F-63F6-3D8A-B208-B3D8E2D3621E"},
+};
 
 static const struct dcp_soc dcp_soc_t6030 = {
     .name = "T6030",
@@ -294,17 +282,16 @@ static const struct dcp_soc dcp_soc_t6030 = {
     .optin = "asahi,t6030-dcp",
     .always = true,
     .ext = true,
+    /* Only read when no build matches: dart-dcp is still locked on every boot, as before. */
     .uuid = DCP6_UUID,
-    .os_fw = V14_7,
-    .os_fw_name = "14.7",
+    .fws = dcp_fws_t6030,
+    .nfws = ARRAY_SIZE(dcp_fws_t6030),
     .coproc = 0x28ec00000UL,
     .dart_dcp = 0x28d30c000UL,
     .dart_disp = 0x28d304000UL,
     .vm_base = DCP6_DART_VM_BASE,
     .vm_size = DCP6_DART_VM_SIZE,
     .pmgr_disp_cpu = 0x350710000UL,
-    .segs = dcp6_seg_defs_t6030,
-    .nsegs = DCP6_SEGS,
     .nubs = dcp6_nubs_t6030,
     .nnubs = ARRAY_SIZE(dcp6_nubs_t6030),
 };
@@ -393,6 +380,16 @@ static bool dcp25_selected(void *dt)
  */
 static const char *const dcp_boards_t6031[] = {"apple,j514c", "apple,j516c", NULL};
 
+/*
+ * T6031 (M3 Max J514C/J516C) DCP images by OS. The 14.7 arm keeps the long-standing unpinned
+ * behaviour (any_uuid: the running ADT image is published); 27.2 (T603x high-core) pins the
+ * exact 27.2 image UUID, the same exact-UUID whitelist the other refmac SoCs use.
+ */
+static const struct dcp_fw dcp_fws_t6031[] = {
+    {.os_fw = V14_7, .os_fw_name = "14.7", .any_uuid = true},
+    {.os_fw = V27_2, .os_fw_name = "27.2", .uuid = "0C885956-0484-36CA-97D6-0255FA2D4F9E"},
+};
+
 static const struct dcp_soc dcp_soc_t6031 = {
     .name = "T6031",
     .chip = T6031,
@@ -408,8 +405,8 @@ static const struct dcp_soc dcp_soc_t6031 = {
     .board_gate = true,
     .any_uuid = true,
     .log_streams = true,
-    .os_fw = V14_7,
-    .os_fw_name = "14.7",
+    .fws = dcp_fws_t6031,
+    .nfws = ARRAY_SIZE(dcp_fws_t6031),
     .coproc = 0x386c00000UL,
     .dart_dcp = 0x38530c000UL,
     .dart_disp = 0x385304000UL,
@@ -555,8 +552,7 @@ static struct {
     bool vm_ok;
     int nnubs;
     const char *nubs[DCP6_NUBS_MAX];
-    int nsegs, seg_oslog, seg_vram;
-    const struct dcp6_seg_def *defs; /* the SoC's layout, or derived[] */
+    int nsegs, seg_text, seg_oslog, seg_vram;
     struct dcp6_seg_def derived[DCP6_SEGS_MAX];
     char derived_names[DCP6_SEGS_MAX][2][DCP6_DEF_LEN]; /* heap segments' names */
     bool mmio_ok;     /* display domain on and the register reads below did not fault */
@@ -1748,9 +1744,9 @@ static int dcp6_find_carveout(int cmap, u64 base, u64 size)
 }
 
 /*
- * A layout for an SoC without a fixed one: exactly one text, one __DATA and one __OS_LOG segment,
- * every other one a heap segment, the one at /vram the framebuffer. Each segment except __OS_LOG
- * must be exactly one carveout, whose region id names it as on T6030.
+ * The panel layout has exactly one text, one __DATA and one __OS_LOG segment and uses heap
+ * segments for everything else, including the framebuffer at /vram. Every segment except
+ * __OS_LOG must match exactly one carveout. The carveout ID names each ordinary heap.
  */
 static int dcp6_derive_segs(const struct adt_segment_ranges *seg, int n, const char *names,
                             u32 names_len, int cmap)
@@ -1766,7 +1762,6 @@ static int dcp6_derive_segs(const struct adt_segment_ranges *seg, int n, const c
         struct dcp6_seg_def *d = &dcp6.derived[i];
 
         memcpy(&r, &seg[i], sizeof(r));
-        d->flags = r.unk;
         d->region_id = -1;
         d->compat = "apple,asc-mem";
         switch (r.unk) {
@@ -1822,9 +1817,9 @@ static int dcp6_derive_segs(const struct adt_segment_ranges *seg, int n, const c
         bail("dcp segments lack text, __DATA, __OS_LOG or /vram\n");
 
     dcp6.nsegs = n;
+    dcp6.seg_text = text;
     dcp6.seg_oslog = oslog;
     dcp6.seg_vram = vram_seg;
-    dcp6.defs = dcp6.derived;
     for (int i = 0; i < n; i++) {
         if (i == oslog)
             dlog_debug("dcp segment %d: %s, physical buffer\n", i, dcp6.derived[i].name);
@@ -1869,7 +1864,6 @@ static int dcp6_get_vm(void)
 
 static int dcp6_get_segs(void)
 {
-    const struct dcp_soc *soc = dcp6.soc;
     int nub = adt_path_offset(adt, DCP6_NUB);
     if (nub < 0)
         bail("no %s\n", DCP6_NUB);
@@ -1877,16 +1871,8 @@ static int dcp6_get_segs(void)
     u32 len = 0, names_len = 0;
     const struct adt_segment_ranges *seg = adt_getprop(adt, nub, "segment-ranges", &len);
     const char *names = adt_getprop(adt, nub, "segment-names", &names_len);
-    if (soc->segs) {
-        if (!seg || len != soc->nsegs * sizeof(*seg) || !names)
-            bail("dcp segment-ranges missing or not %d entries (len %u)\n", soc->nsegs, len);
-        /* Segment 0 (text) is checked by its flags below */
-        if (!dcp6_seg_name_is(names, names_len, SEG_DATA, "__DATA") ||
-            !dcp6_seg_name_is(names, names_len, SEG_OSLOG, "__OS_LOG"))
-            bail("dcp segments 1 and 2 are not named __DATA and __OS_LOG\n");
-    } else if (!seg || !len || len % sizeof(*seg) || len > DCP6_SEGS_MAX * sizeof(*seg) || !names) {
+    if (!seg || !len || len % sizeof(*seg) || len > DCP6_SEGS_MAX * sizeof(*seg) || !names)
         bail("dcp segment-ranges missing or not 1 to %d entries (len %u)\n", DCP6_SEGS_MAX, len);
-    }
 
     u64 dram_base, dram_size;
     if (dcp6_dram(&dram_base, &dram_size))
@@ -1898,21 +1884,14 @@ static int dcp6_get_segs(void)
     if (cmap < 0)
         bail("no /chosen/carveout-memory-map\n");
 
-    if (soc->segs) {
-        dcp6.nsegs = soc->nsegs;
-        dcp6.seg_oslog = SEG_OSLOG;
-        dcp6.seg_vram = SEG_VRAM;
-        dcp6.defs = soc->segs;
-    } else if (dcp6_derive_segs(seg, len / sizeof(*seg), names, names_len, cmap)) {
+    if (dcp6_derive_segs(seg, len / sizeof(*seg), names, names_len, cmap))
         return -1;
-    }
     if (!dcp6.vm_ok && dcp6_get_vm())
         return -1;
 
     for (int i = 0; i < dcp6.nsegs; i++) {
         struct adt_segment_ranges r;
         struct dcp6_seg *s = &dcp6.segs[i];
-        const struct dcp6_seg_def *d = &dcp6.defs[i];
 
         memcpy(&r, &seg[i], sizeof(r));
         s->phys = r.phys;
@@ -1920,8 +1899,6 @@ static int dcp6_get_segs(void)
         s->remap = r.remap;
         s->flags = r.unk;
 
-        if (s->flags != d->flags)
-            bail("dcp segment %d flags 0x%x, expected 0x%x\n", i, s->flags, d->flags);
         if (!r.size || s->size > DCP6_SEG_MAX_SIZE || (s->phys & (SZ_16K - 1)) ||
             s->phys < dram_base || s->phys + s->size < s->phys ||
             s->phys + s->size > dram_base + dram_size)
@@ -1942,14 +1919,6 @@ static int dcp6_get_segs(void)
                 bail("dcp segment %d 0x%lx+0x%lx is in usable RAM\n", i, s->phys, s->size);
             if (dcp6_carveout_conflict(s->phys, s->size, "dcp segment"))
                 return -1;
-
-            /* The matching carveout: same base, same (16K rounded) size */
-            char prop[32];
-            u64 cbase, csize;
-            snprintf(prop, sizeof(prop), "region-id-%d", d->region_id);
-            if (dcp6_adt_u64_pair(cmap, prop, &cbase, &csize) || cbase != s->phys ||
-                csize != s->size)
-                bail("dcp segment %d does not match carveout %s\n", i, prop);
         }
 
         for (int j = 0; j < i; j++) {
@@ -2240,7 +2209,7 @@ static int dcp6_check_dt(void *dt, struct dcp6_dt *n)
 {
     const struct dcp_soc *soc = dcp6.soc;
 
-    if (!dcp6_board_ok(dt))
+    if ((!dcp6.fw || dcp6.fw->os_fw != V27_2) && !dcp6_board_ok(dt))
         bail("not a %s device tree\n", soc->boards_desc);
     if (soc->fw25 && !t8122_25g83_board(dt))
         bail(
@@ -2536,7 +2505,7 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
                                dcp6_alias(VM_DISP, 0)};
 
     for (int i = 0; i < dcp6.nsegs; i++) {
-        const struct dcp6_seg_def *d = &dcp6.defs[i];
+        const struct dcp6_seg_def *d = &dcp6.derived[i];
         const struct dcp6_seg *s = &dcp6.segs[i];
         char name[DCP6_NAME_LEN];
         u32 ph;
@@ -2607,6 +2576,14 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
     return 0;
 }
 
+static bool dcp6_optout(void *dt, const char *name)
+{
+    int chosen = fdt_path_offset(dt, "/chosen");
+    int len = 0;
+    const char *val = chosen >= 0 ? fdt_getprop(dt, chosen, name, &len) : NULL;
+    return val && (len != 2 || strcmp(val, "1"));
+}
+
 static bool dcp6_armed(void *dt)
 {
     if (!dcp6.soc->optin)
@@ -2614,7 +2591,11 @@ static bool dcp6_armed(void *dt)
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
     const char *optin = chosen >= 0 ? fdt_getprop(dt, chosen, dcp6.soc->optin, &len) : NULL;
-    return optin && len == 2 && !strcmp(optin, "1");
+    if (optin)
+        return !kboot_config_lost() && len == 2 && !strcmp(optin, "1");
+    if (dcp6.fw && dcp6.fw->os_fw == V27_2)
+        return !kboot_config_lost() && !dcp6_optout(dt, "asahi,m3-defaults");
+    return false;
 }
 
 /* The segments' reservations: __OS_LOG's is in place, the others do not collide with anything */
@@ -2624,7 +2605,7 @@ static int dcp6_check_resv(void *dt)
         const struct dcp6_seg *s = &dcp6.segs[i];
         char name[DCP6_NAME_LEN];
 
-        snprintf(name, sizeof(name), "%s@%lx", dcp6.defs[i].node, s->phys);
+        snprintf(name, sizeof(name), "%s@%lx", dcp6.derived[i].node, s->phys);
         int node = dcp6_find_resv(dt, name, s->phys, s->size);
         if (i == dcp6.seg_oslog) {
             if (node < 0 || !fdt_get_phandle(dt, node) ||
@@ -2844,8 +2825,10 @@ static int dcpext6_publish(void *dt, const struct dcpext6_inst *inst)
         }
     }
     /* Only the immutable text may alias the panel's firmware allocation. */
-    if (segs[0].phys != dcp6.segs[0].phys || segs[0].size != dcp6.segs[0].size ||
-        segs[0].remap != dcp6.segs[0].remap)
+    if (dcp6.seg_text < 0 || dcp6.seg_text >= dcp6.nsegs ||
+        segs[0].phys != dcp6.segs[dcp6.seg_text].phys ||
+        segs[0].size != dcp6.segs[dcp6.seg_text].size ||
+        segs[0].remap != dcp6.segs[dcp6.seg_text].remap)
         return -1;
 
     u32 owner = dcp6_phandle(dt, path);
@@ -3257,13 +3240,16 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
                 return -1;
     }
     /* The two external processors and the panel share immutable TEXT. */
-    const struct dcp6_seg *shared_text = &dcp6.segs[SEG_TEXT];
+    const struct dcp6_seg *shared_text = NULL;
     if (t6041_headless(dt)) {
         if (!t6041_headless_text.phys)
             t6041_headless_text = segs[SEG_TEXT];
         shared_text = &t6041_headless_text;
+    } else if (dcp6.seg_text >= 0 && dcp6.seg_text < dcp6.nsegs) {
+        shared_text = &dcp6.segs[dcp6.seg_text];
     }
-    if (segs[SEG_TEXT].phys != shared_text->phys || segs[SEG_TEXT].size != shared_text->size)
+    if (!shared_text || segs[SEG_TEXT].phys != shared_text->phys ||
+        segs[SEG_TEXT].size != shared_text->size)
         return -1;
 
     u32 owner = dcp6_phandle(dt, ext->dt_path);
@@ -3549,7 +3535,32 @@ static T6050_TEXT bool t6050_pick_image(const char *uuid, u32 len)
     return false;
 }
 
-/* The ADT side: firmware, VRAM and segments, bandwidth agent, clocks, panel */
+/*
+ * The scratch offset of the PMGR bandwidth requester that `disp`'s bw_req interrupt names (ADT
+ * /arm-io/pmgr bwr-agent), or 0; if `die` is non-NULL, *die is that interrupt's die.
+ */
+static T6050_TEXT u32 t6050_bw_agent(const char *disp, u32 *die)
+{
+    u32 len = 0, val = 0, fn[3];
+    int node = adt_path_offset(adt, disp), pmgr = adt_path_offset(adt, "/arm-io/pmgr");
+    const u8 *agents = pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "bwr-agent", &len);
+    if (!agents || node < 0 || dcp6_adt_u32(pmgr, "AAPL,phandle", &val) ||
+        adt_getprop_copy(adt, node, "function-bw_req_interrupt0", fn, sizeof(fn)) != sizeof(fn) ||
+        fn[0] != val)
+        return 0;
+    for (u32 off = 0; off + 24 <= len; off += 24) {
+        u32 birq;
+        memcpy(&birq, agents + off + 4, sizeof(birq));
+        if (agents[off] == 1 && birq == fn[2]) {
+            if (die)
+                *die = birq >> 28;
+            return T6050_BW_BASE + agents[off + 2] * T6050_BW_STRIDE;
+        }
+    }
+    return 0;
+}
+
+/* The ADT side: firmware, VRAM and segments, bandwidth scratch, clocks, panel */
 static T6050_INIT int t6050_check_adt(void)
 {
     u32 len = 0, val = 0;
@@ -3583,24 +3594,13 @@ static T6050_INIT int t6050_check_adt(void)
     if (!vram_seg)
         bail("/vram is not a DCP segment\n");
 
-    /* The scratch of the PMGR bandwidth agent disp0's bw_req interrupt names */
-    u32 fn[3];
-    int pmgr = adt_path_offset(adt, "/arm-io/pmgr");
-    const u8 *agents = pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "bwr-agent", &len);
+    /* The scratch of the PMGR bandwidth requester disp0's bw_req interrupt names */
     if (t6050_adt_reg("/arm-io/dcp", 0, &t6050.coproc, NULL) ||
-        t6050_adt_reg("/arm-io/disp0", 4, &t6050.pmc, &t6050.pmc_size) || t6050.pmc_size < 4 ||
-        !agents || dcp6_adt_u32(pmgr, "AAPL,phandle", &val) ||
-        adt_getprop_copy(adt, disp0, "function-bw_req_interrupt0", fn, sizeof(fn)) != sizeof(fn) ||
-        fn[0] != val)
-        bail("no dcp registers, PMC metadata or PMGR bandwidth interrupt\n");
-    for (u32 off = 0; off + 24 <= len && !t6050.bw_offset; off += 24) {
-        u32 birq;
-        memcpy(&birq, agents + off + 4, sizeof(birq));
-        if (agents[off] == 1 && birq == fn[2])
-            t6050.bw_offset = T6050_BW_BASE + agents[off + 2] * T6050_BW_STRIDE;
-    }
+        t6050_adt_reg("/arm-io/disp0", 4, &t6050.pmc, &t6050.pmc_size) || t6050.pmc_size < 4)
+        bail("no dcp registers or PMC metadata\n");
+    t6050.bw_offset = t6050_bw_agent("/arm-io/disp0", NULL);
     if (!t6050_bw_valid(t6050.bw_offset, t6050.pmc_size))
-        bail("no bandwidth agent scratch for BIRQ 0x%x\n", fn[2]);
+        bail("no bandwidth scratch for disp0\n");
 
     /* The firmware's clocks: clock-ids index /arm-io clock-frequencies from 256 */
     int arm = adt_path_offset(adt, "/arm-io");
@@ -3795,46 +3795,13 @@ static T6050_TEXT int t6050_publish(void *dt)
 
 /*
  * Headless, the device tree keeps what an engine's output needs disabled until that engine is
- * handed off. A Type-C route (typec-routes: dcpext0's on J775D): the PHYs (phys) with their
- * mailboxes and the crossbar (mux-controls), each with its power domains, and the HPM its route@0
- * endpoint leads to, with the bus it sits on. A fixed route (die 1's dcpext4, the HDMI port): the
- * PHY with its power domains, and the GPIO controllers of the converter's hotplug input and power
- * enables. The walk finds the first of them still disabled, or with `all` checks the whole route.
+ * handed off. A Type-C route (typec-routes): the PHYs (phys) with their mailboxes and the
+ * crossbars (mux-controls), each with its power domains, and the HPM each route's endpoint leads
+ * to, with the bus it sits on. A fixed route (die 1's dcpext4, the HDMI port): the PHY with its
+ * power domains, and the GPIO controllers of the converter's hotplug input and power enables.
+ * The walk finds the first of them still disabled, or with `all` checks the whole route.
  */
-enum { T6050_ROUTE_DONE = -1, T6050_ROUTE_BAD = -2 };
-
-static T6050_TEXT int t6050_route_refs(void *dt, int node, const char *prop, const char *cells,
-                                       int depth, bool all);
-
-/* `target`, then its power domains */
-static T6050_TEXT int t6050_route_node(void *dt, int target, int depth, bool all)
-{
-    const char *status = target < 0 ? NULL : fdt_getprop(dt, target, "status", NULL);
-    if (target < 0 || depth > 4)
-        return T6050_ROUTE_BAD;
-    if (!all && status && !strcmp(status, "disabled"))
-        return target;
-    return t6050_route_refs(dt, target, "power-domains", "#power-domain-cells", depth + 1, all);
-}
-
-/* Each target of a phandle list, its arguments counted by the target's `cells` property */
-static T6050_TEXT int t6050_route_refs(void *dt, int node, const char *prop, const char *cells,
-                                       int depth, bool all)
-{
-    int len;
-    const fdt32_t *v = fdt_getprop(dt, node, prop, &len);
-    for (int i = 0; v && i < len / 4;) {
-        int target = fdt_node_offset_by_phandle(dt, fdt32_ld(&v[i]));
-        const fdt32_t *n = target < 0 ? NULL : fdt_getprop(dt, target, cells, NULL);
-        int r = t6050_route_node(dt, target, depth, all);
-        if (r != T6050_ROUTE_DONE)
-            return r;
-        i += 1 + (n ? fdt32_ld(n) : 0);
-        if (i > len / 4)
-            return T6050_ROUTE_BAD;
-    }
-    return T6050_ROUTE_DONE;
-}
+enum { T6050_ROUTE_DONE = DCP_TYPEC_ROUTE_DONE, T6050_ROUTE_BAD = DCP_TYPEC_ROUTE_BAD };
 
 static T6050_TEXT int t6050_route_next(void *dt, int node, bool all)
 {
@@ -3845,45 +3812,62 @@ static T6050_TEXT int t6050_route_next(void *dt, int node, bool all)
 
     if (!phys)
         return T6050_ROUTE_DONE;
-    r = t6050_route_refs(dt, node, "phys", "#phy-cells", 0, all);
+    r = dcp_typec_route_refs(dt, node, "phys", "#phy-cells", 0, all);
     for (size_t i = 0; ep < 0 && r == T6050_ROUTE_DONE && i < ARRAY_SIZE(gpios); i++)
-        r = t6050_route_refs(dt, node, gpios[i], "#gpio-cells", 0, all);
+        r = dcp_typec_route_refs(dt, node, gpios[i], "#gpio-cells", 0, all);
     if (ep < 0 || r != T6050_ROUTE_DONE)
         return r;
-    r = t6050_route_refs(dt, node, "mux-controls", "#mux-control-cells", 0, all);
+    r = dcp_typec_route_refs(dt, node, "mux-controls", "#mux-control-cells", 0, all);
     for (int i = 0; r == T6050_ROUTE_DONE && i < len / 4; i++) {
         int phy = fdt_node_offset_by_phandle(dt, fdt32_ld(&phys[i]));
         const fdt32_t *n = phy < 0 ? NULL : fdt_getprop(dt, phy, "#phy-cells", NULL);
-        r = phy < 0 ? T6050_ROUTE_BAD : t6050_route_refs(dt, phy, "mboxes", "#mbox-cells", 0, all);
+        r = phy < 0 ? T6050_ROUTE_BAD
+                    : dcp_typec_route_refs(dt, phy, "mboxes", "#mbox-cells", 0, all);
         i += n ? fdt32_ld(n) : 0;
     }
     if (r != T6050_ROUTE_DONE)
         return r;
 
-    static const char *const hops[] = {"route@0", "port", "endpoint"};
-    for (size_t i = 0; ep >= 0 && i < ARRAY_SIZE(hops); i++)
-        ep = fdt_subnode_offset(dt, ep, hops[i]);
-    const fdt32_t *remote = ep < 0 ? NULL : fdt_getprop(dt, ep, "remote-endpoint", NULL);
-    int hpm = remote ? fdt_node_offset_by_phandle(dt, fdt32_ld(remote)) : -1;
-    for (int up = 0; hpm >= 0 && up < 5 && fdt_node_check_compatible(dt, hpm, "apple,sn201202x");
-         up++)
-        hpm = fdt_parent_offset(dt, hpm);
-    if (hpm < 0 || fdt_node_check_compatible(dt, hpm, "apple,sn201202x"))
-        return T6050_ROUTE_BAD;
-    r = t6050_route_node(dt, hpm, 0, all);
-    return r == T6050_ROUTE_DONE ? t6050_route_node(dt, fdt_parent_offset(dt, hpm), 0, all) : r;
+    /* Every route's PD controller, and the bus it sits on */
+    int rt, routes = 0;
+    fdt_for_each_subnode(rt, dt, ep)
+    {
+        const char *status = fdt_getprop(dt, rt, "status", NULL);
+        if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+            continue;
+        int e = fdt_subnode_offset(dt, rt, "port");
+        e = e < 0 ? e : fdt_subnode_offset(dt, e, "endpoint");
+        const fdt32_t *remote = e < 0 ? NULL : fdt_getprop(dt, e, "remote-endpoint", NULL);
+        int rnode = remote ? fdt_node_offset_by_phandle(dt, fdt32_ld(remote)) : -1;
+        int hpm = dcp_typec_route_controller(dt, rnode);
+        if (hpm < 0)
+            return T6050_ROUTE_BAD;
+        r = dcp_typec_route_node(dt, hpm, 0, all);
+        if (r == T6050_ROUTE_DONE)
+            r = dcp_typec_route_node(dt, fdt_parent_offset(dt, hpm), 0, all);
+        if (r != T6050_ROUTE_DONE)
+            return r;
+        routes++;
+    }
+    return routes ? T6050_ROUTE_DONE : T6050_ROUTE_BAD;
 }
 
-/* Enable an engine's route, node by node (each write moves the offsets); one not fully described
- * is left disabled */
+/*
+ * Enable an engine's routes, node by node (each write moves the offsets); routes not fully
+ * described are left disabled. Each step enables one disabled node, so the tree's node count
+ * bounds the walk.
+ */
 static T6050_TEXT int t6050_route(void *dt, const char *path, int n)
 {
-    int count = 0, r = t6050_route_next(dt, kboot_fdt_path_exact(dt, path), true);
+    int count = 0, nodes = 0, r = t6050_route_next(dt, kboot_fdt_path_exact(dt, path), true);
     if (r == T6050_ROUTE_BAD) {
         dlog("dcpext%d: its route is not fully described: handed off without it\n", n);
         return 0;
     }
-    while ((r = t6050_route_next(dt, kboot_fdt_path_exact(dt, path), false)) >= 0 && count < 16) {
+    for (int o = fdt_next_node(dt, -1, NULL); o >= 0; o = fdt_next_node(dt, o, NULL))
+        nodes++;
+    while ((r = t6050_route_next(dt, kboot_fdt_path_exact(dt, path), false)) >= 0 &&
+           count < nodes) {
         if (fdt_setprop_string(dt, r, "status", "okay"))
             return -1;
         count++;
@@ -3920,7 +3904,7 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
 {
     char a[40], b[40];
     u64 coproc, base[2], l1, cnt, vm_base, vm_size;
-    u32 len = 0, val = 0, fn[3];
+    u32 len = 0, val = 0;
     int node = -1, dart[2];
 
     snprintf(a, sizeof(a), "/arm-io/dcpext%d/iop-dcpext%d-nub", n, n);
@@ -3984,11 +3968,16 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
 
     /* Its bandwidth agent: the one dispextN's bw_req interrupt names */
     snprintf(b, sizeof(b), "/arm-io/dispext%d", n);
-    u32 bw = 0;
+    u32 die = 0, bw = 0, agent = t6050_bw_agent(b, &die);
     int pmc = -1;
     fdt32_t v[4] = {0};
     if (t6050.headless) {
-        /* No panel's PMC node: the scratch the node names, in the PMC metadata of dispextN */
+        /*
+         * No panel's PMC node: the scratch the node names, in the PMC metadata of dispextN, at
+         * the ADT's bandwidth agent. Agents are numbered across both dies; how a die-1 agent's
+         * number maps into its die's PMC metadata is not known yet, so a die-1 engine keeps
+         * the offset its node names.
+         */
         u64 meta, meta_size;
         const fdt32_t *s = fdt_getprop(dt, node, "apple,bw-scratch", (int *)&len);
         if (s && len == sizeof(v)) {
@@ -3997,22 +3986,20 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
         }
         const fdt64_t *r = pmc < 0 ? NULL : fdt_getprop(dt, pmc, "reg", (int *)&len);
         bw = fdt32_ld(&v[3]);
+        if (agent && !die) {
+            if (bw && bw != agent)
+                dlog("dcpext%d: apple,bw-scratch names 0x%x, the ADT's agent is at 0x%x: the "
+                     "ADT's is used\n",
+                     n, bw, agent);
+            bw = agent;
+            v[3] = cpu_to_fdt32(bw);
+        }
         if (!r || len != 16 || t6050_adt_reg(b, 4, &meta, &meta_size) || fdt64_ld(&r[0]) != meta ||
             fdt64_ld(&r[1]) != meta_size || fdt32_ld(&v[1]) || fdt32_ld(&v[2]) != T6050_NDISP ||
             !t6050_bw_valid(bw, meta_size))
             bail("dcpext%d: apple,bw-scratch is not in %s's PMC metadata\n", n, b);
     } else {
-        int disp = adt_path_offset(adt, b), pmgr = adt_path_offset(adt, "/arm-io/pmgr");
-        const u8 *agents = pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "bwr-agent", &len);
-        if (!agents || disp < 0 ||
-            adt_getprop_copy(adt, disp, "function-bw_req_interrupt0", fn, sizeof(fn)) != sizeof(fn))
-            bail("dcpext%d: no bandwidth interrupt\n", n);
-        for (u32 off = 0; off + 24 <= len && !bw; off += 24) {
-            u32 birq;
-            memcpy(&birq, agents + off + 4, sizeof(birq));
-            if (agents[off] == 1 && birq == fn[2])
-                bw = T6050_BW_BASE + agents[off + 2] * T6050_BW_STRIDE;
-        }
+        bw = agent;
         v[0] = cpu_to_fdt32(t6050.pmc_ph);
         v[1] = 0;
         v[2] = cpu_to_fdt32(T6050_NDISP);
@@ -4058,7 +4045,11 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
     for (int i = 0; i < ntargets; i++)
         if (fdt_setprop_string(dt, kboot_fdt_path_exact(dt, path[i]), "status", "okay"))
             return -1;
-    if (t6050.headless && t6050_route(dt, path[0], n))
+    /* The Type-C display routes the tree asks for (an empty typec-routes), from the ADT */
+    int routes = kboot_dcp_typec_routes(dt, path[0], a);
+    if (routes < 0)
+        return -1;
+    if ((t6050.headless || routes) && t6050_route(dt, path[0], n))
         return -1;
     dlog("dcpext%d handed off: bw-scratch 0x%x\n", n, bw);
     return 0;
@@ -4246,12 +4237,13 @@ int dt_set_display_handoff(void *dt)
         return 0;
     }
 
-    if (dcp6.soc->board_gate && (chip_id != dcp6.soc->chip || !dcp6_board_ok(dt))) {
+    dcp6.fw = dcp6_select_fw(dcp6.soc);
+
+    if (dcp6.soc->board_gate && (chip_id != dcp6.soc->chip ||
+                                 ((!dcp6.fw || dcp6.fw->os_fw != V27_2) && !dcp6_board_ok(dt)))) {
         dlog("not a %s (chip 0x%x): nothing done\n", dcp6.soc->boards_desc, chip_id);
         return 0;
     }
-
-    dcp6.fw = dcp6_select_fw(dcp6.soc);
 
     /* Reject unsupported firmware before reserving __OS_LOG or touching registers. */
     if (!dcp6.soc->optin && !dcp6.fw) {

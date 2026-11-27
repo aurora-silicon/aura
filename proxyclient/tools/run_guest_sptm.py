@@ -20,7 +20,7 @@ Environment (all optional; 1 enables a switch):
   AURA_HIDE_DOCKCHANNEL    hide the DockChannel that carries aura's console and proxy
   AURA_KEEP_ERRH           keep the platform error handler visible to XNU
   AURA_AMCC_CLEAR          clear the AMCC error latches stage 1 left, before entry
-  AURA_S2R_TRACE           sleep path: hooks on the power blocks and the trace ring
+  AURA_S2R_TRACE           sleep path: hooks on the power blocks and the trace ring (debug only)
   AURA_S2R_GO              let the sleep proceed (otherwise stop in the proxy before it)
   AURA_S2R_FULLTRACE       also hook the high-volume blocks
   AURA_S2R_COPROC          also hook the coprocessor and exclave mailboxes
@@ -51,6 +51,9 @@ Environment (all optional; 1 enables a switch):
   AURA_GPU_STOP_REBOOT     reboot via watchdog on a stop park instead of entering the proxy
   AURA_GPU_STOP_MSG=<v>    park right after the guest writes v to the GPU (a mailbox message)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
+  AURA_SEP_TRACE           record the SEP mailbox and each endpoint's OOL buffers into the ring
+                           (AURACTL=1 builds; read with auractl; debug only)
+  AURA_SEP_MAXB=<n>        bytes copied per OOL buffer at most (default 128 KiB)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
@@ -116,11 +119,12 @@ CONFIG_FLAGS = {
     "AURA_S2R_DROP_USB": 1 << 4,
     "AURA_XNU_BT": 1 << 5,
     "AURA_GPU_TRACE": 1 << 6,
-    "AURA_ANE_TRACE": 1 << 11,
+    "AURA_ANE_TRACE": 1 << 12,
     "AURA_SAMPLE": 1 << 7,
     "AURA_S2R_MEM": 1 << 8,
     # bit 9 is reserved for AURA_AURACTL in the feat/auractl runner
     "AURA_AURACTL_DCC": 1 << 10,  # arm auractl's kext-free DCC transport (off by default)
+    "AURA_SEP_TRACE": 1 << 11,  # SEP mailbox + OOL buffers into the ring (AURACTL=1, debug only)
 }
 KNOWN_ENV = {
     "AURA_S2R_ARM_S",
@@ -157,6 +161,7 @@ KNOWN_ENV = {
     "AURA_GPU_STOP_REBOOT",
     "AURA_GPU_STOP_MSG",
     "AURA_GPU_PRINT_MAX",
+    "AURA_SEP_MAXB",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
     "AURA_XNU_ENTRY",
@@ -779,6 +784,8 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
         p.write64(sym["sptm_virt_gpu_stop_msg"], env_int("AURA_GPU_STOP_MSG"))
     if os.environ.get("AURA_GPU_PRINT_MAX"):
         p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
+    if os.environ.get("AURA_SEP_MAXB"):
+        p.write32(sym["sptm_virt_sep_maxb"], env_int("AURA_SEP_MAXB"))
     if env_on("AURA_S2R_DCP_PKT"):
         p.write32(sym["sptm_virt_s2r_dcp_pkt"], 1)
         print("coprocessor trace: DCP IOMFB packets copied into the ring")

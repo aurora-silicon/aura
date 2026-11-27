@@ -831,6 +831,48 @@ static bool dart_table_in_dram(u64 page, u64 base, u64 size)
            page >= base && page - base <= size - SZ_16K;
 }
 
+/*
+ * The register window of a T8110 DART node: its translated base and the size of
+ * its first reg entry. The parent must use two address and two size cells.
+ */
+int dart_fdt_t8110_window(void *dt, u32 phandle, u64 *base, u64 *size)
+{
+    int node = fdt_node_offset_by_phandle(dt, phandle), len;
+    if (node < 0 || fdt_node_check_compatible(dt, node, "apple,t8110-dart"))
+        return -1;
+    int parent = fdt_parent_offset(dt, node);
+    const fdt32_t *reg = fdt_getprop(dt, node, "reg", &len);
+    if (parent < 0 || fdt_address_cells(dt, parent) != 2 || fdt_size_cells(dt, parent) != 2 ||
+        !reg || len < 16)
+        return -1;
+    *base = dt_get_address(dt, node);
+    *size = ((u64)fdt32_ld(&reg[2]) << 32) | fdt32_ld(&reg[3]);
+    return *base ? 0 : -1;
+}
+
+/*
+ * A T8110 stream's state, read from its registers before any DART view is made:
+ * 1 if the DART is locked and the stream translates through a valid root, 0 if
+ * it is not locked or the stream has no root, -1 if the node cannot be read.
+ */
+int dart_fdt_t8110_translating(void *dt, u32 phandle, u32 sid)
+{
+    u64 base, size;
+    /* The stream's TTBR is the highest register read; the window must cover it. */
+    if (sid >= (u32)dart_t8110.sid_count || dart_fdt_t8110_window(dt, phandle, &base, &size) ||
+        size < DART_T8110_TTBR_OFF + 4 * ((u64)sid + 1))
+        return -1;
+    int node = fdt_node_offset_by_phandle(dt, phandle);
+    u32 protect = read32(base + DART_T8110_PROTECT);
+    u32 tcr = read32(base + DART_T8110_TCR_OFF + 4 * sid);
+    u32 ttbr = read32(base + DART_T8110_TTBR_OFF + 4 * sid);
+    printf("dart: %s at 0x%lx sid %u: protect %x tcr %x ttbr %x\n", fdt_get_name(dt, node, NULL),
+           base, sid, protect, tcr, ttbr);
+    if (!(protect & DART_T8110_PROTECT_TTBR_TCR))
+        return 0;
+    return (tcr & DART_T8110_TCR_TRANSLATE_ENABLE) && (ttbr & DART_T8110_TTBR_VALID);
+}
+
 int dart_collect_locked_tables(dart_dev_t *dart, u64 dram_base, u64 dram_size, u64 *pages,
                                size_t capacity, size_t *count)
 {
@@ -1310,13 +1352,15 @@ static void *dart_translate_internal(dart_dev_t *dart, uintptr_t iova, int silen
     u32 ttbr = (iova >> 36) & 0x3;
     u32 l1_index = (iova >> 25) & 0x7ff;
 
-    if ((int)ttbr >= dart->params->ttbr_count) {
-        printf("dart[%lx %u]: ttbr out of range: %d\n", dart->regs, dart->device, ttbr);
+    if (!dart->params || (int)ttbr >= dart->params->ttbr_count) {
+        if (!silent)
+            printf("dart[%lx %u]: ttbr out of range: %d\n", dart->regs, dart->device, ttbr);
         return NULL;
     }
 
     if (!dart->l1[ttbr]) {
-        printf("dart[%lx %u]: l1[%u] is not set\n", dart->regs, dart->device, ttbr);
+        if (!silent)
+            printf("dart[%lx %u]: l1[%u] is not set\n", dart->regs, dart->device, ttbr);
         return NULL;
     }
 
@@ -1359,6 +1403,35 @@ bool dart_is_locked(dart_dev_t *dart)
 void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova)
 {
     return dart_translate_internal(dart, iova, 1);
+}
+
+/*
+ * The host address of a buffer a device names by its DVA, when every DART page it
+ * touches (the tables' 16 KiB pages) translates to one contiguous range, else NULL.
+ * The buffer need not start on a page boundary, so every page from the one holding
+ * its first byte to the one holding its last is checked.
+ */
+void *dart_translate_range(dart_dev_t *dart, uintptr_t iova, size_t size)
+{
+    if (!dart || !size || iova > UINTPTR_MAX - (size - 1))
+        return NULL;
+
+    uintptr_t last = iova + (size - 1);
+    /* High bits (>= 38) carry a window tag on some callers (e.g. Gen3 vm_base); a contiguous
+     * range cannot cross a 256 GiB window boundary and alias into TTBR 0. */
+    if ((iova >> 38) != (last >> 38))
+        return NULL;
+
+    void *start = dart_translate_silent(dart, iova);
+
+    if (!start || (uintptr_t)start > UINTPTR_MAX - size)
+        return NULL;
+    uintptr_t next = (iova & ~(uintptr_t)(SZ_16K - 1)) + SZ_16K;
+    for (uintptr_t page = next; page && page <= last; page += SZ_16K) {
+        if (dart_translate_silent(dart, page) != (u8 *)start + (page - iova))
+            return NULL;
+    }
+    return start;
 }
 
 /*
@@ -1447,10 +1520,9 @@ u64 dart_search(dart_dev_t *dart, void *paddr)
 
 u64 dart_search_range(dart_dev_t *dart, u64 paddr, size_t len)
 {
-    if (!len || (paddr & (SZ_16K - 1)) || paddr > UINT64_MAX - len || len > SIZE_MAX - (SZ_16K - 1))
+    if (!len || (paddr & (SZ_16K - 1)) || paddr > UINT64_MAX - len)
         return DART_PTR_ERR;
 
-    size_t pages = ALIGN_UP(len, SZ_16K) / SZ_16K;
     for (int ttbr = 0; ttbr < dart->params->ttbr_count; ttbr++) {
         if (!dart->l1[ttbr])
             continue;
@@ -1466,15 +1538,7 @@ u64 dart_search_range(dart_dev_t *dart, u64 paddr, size_t len)
                 if (first != paddr)
                     continue;
                 u64 iova = ((u64)ttbr << 36) | ((u64)l1 << 25) | ((u64)page << 14);
-                bool contiguous = true;
-                for (size_t n = 1; n < pages; n++) {
-                    if (n > (UINT64_MAX - iova) / SZ_16K ||
-                        (u64)dart_translate_silent(dart, iova + n * SZ_16K) != paddr + n * SZ_16K) {
-                        contiguous = false;
-                        break;
-                    }
-                }
-                if (contiguous) {
+                if (dart_translate_range(dart, iova, len) == (void *)paddr) {
                     if (dart->type == DART_GEN3)
                         iova |= dart->vm_base & ~GENMASK(35, 0);
                     return iova;
