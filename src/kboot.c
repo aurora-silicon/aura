@@ -5315,24 +5315,6 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
         crcs[i] = tinf_crc32((void *)seg[i].phys, seg[i].size);
 
     /*
-     * The driver checks every encoder's firmware against the one set of CRCs in /chosen. An
-     * encoder whose preloaded copy differs from that of an encoder already handed over is left
-     * off rather than overwrite them.
-     */
-    int crc_node = fdt_path_offset(dt, "/chosen");
-    for (size_t i = 0; crc_node >= 0 && i < count; i++) {
-        char prop[48], value[9];
-        int len;
-        snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
-        snprintf(value, sizeof(value), "%08x", crcs[i]);
-        const char *have = fdt_getprop(dt, crc_node, prop, &len);
-        if (have && (len != sizeof(value) || memcmp(have, value, sizeof(value)))) {
-            reason = "firmware differs from the encoder already handed over";
-            goto disable;
-        }
-    }
-
-    /*
      * The firmware runs where iBoot left it: TEXT at the start of the encoder's DART window,
      * the DART's ADT vm-base, and each segment at vm-base plus its offset (the ADT iova-offset).
      * That is 0 on the M1 family (vm-base 0), 0x800000000 on the M2, and 0x10000000000 on the M2
@@ -5405,14 +5387,42 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
         reason = "firmware reservation failed";
         goto disable;
     }
+    /*
+     * Export each encoder's preloaded segment CRCs on its own DT node: multi-encoder SoCs
+     * (e.g. M4 Max / T6041) preload independent copies whose DATA (or per-load TEXT) differs
+     * between instances. Mirror the first handed-over encoder's CRCs into /chosen for SMBIOS
+     * firmware inventory and kernels that only read /chosen, without overwriting them when a
+     * later encoder differs.
+     */
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0) {
+        reason = "CRC export failed";
+        goto disable;
+    }
+    bool export_chosen = true;
+    for (size_t i = 0; i < count; i++) {
+        char prop[48];
+        snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
+        if (fdt_getprop(dt, chosen, prop, NULL)) {
+            export_chosen = false;
+            break;
+        }
+    }
     for (size_t i = 0; i < count; i++) {
         char prop[48], value[9];
         snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
         snprintf(value, sizeof(value), "%08x", crcs[i]);
-        int chosen = fdt_path_offset(dt, "/chosen");
-        if (chosen < 0 || fdt_setprop_string(dt, chosen, prop, value)) {
+        node = phandle ? fdt_node_offset_by_phandle(dt, phandle) : dt_ave_next(-1, compat);
+        if (node < 0 || fdt_setprop_string(dt, node, prop, value)) {
             reason = "CRC export failed";
             goto disable;
+        }
+        if (export_chosen) {
+            chosen = fdt_path_offset(dt, "/chosen");
+            if (chosen < 0 || fdt_setprop_string(dt, chosen, prop, value)) {
+                reason = "CRC export failed";
+                goto disable;
+            }
         }
     }
     /* The qualified T8112 AVE AXI2AF list is explicitly empty. */
