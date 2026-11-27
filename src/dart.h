@@ -39,6 +39,7 @@ bool dart_unmap_checked(dart_dev_t *dart, uintptr_t iova, size_t len);
 void dart_free_l2(dart_dev_t *dart, uintptr_t iova);
 void *dart_translate(dart_dev_t *dart, uintptr_t iova);
 void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova);
+void *dart_translate_range(dart_dev_t *dart, uintptr_t iova, size_t size);
 int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram_base, u64 dram_size,
                            int (*visit)(u64 iova, u64 paddr, void *opaque), void *opaque);
 bool dart_is_locked(dart_dev_t *dart);
