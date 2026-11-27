@@ -23,7 +23,7 @@ def run(tmp_path, name, code, expect):
     command = host_cc() + ["-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                            "-Wno-unused-function", "-fsanitize=undefined",
                            "-fno-sanitize-recover=all", "-I", str(LIBFDT), str(path)]
-    command += [str(LIBFDT / f) for f in LIBFDT_SOURCES] + ["-o", str(binary)]
+    command += [str(LIBFDT / f) for f in (*LIBFDT_SOURCES, "fdt_addresses.c")] + ["-o", str(binary)]
     built = subprocess.run(command, capture_output=True, text=True)
     assert built.returncode == 0, built.stdout + built.stderr
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30)
