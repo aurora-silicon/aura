@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 /*
  * Host test of the G15 GPU setup in kboot_gpu.c (T6030 and T8122), with a synthetic ADT, a
  * simulated bus and real libfdt. run-kboot-gpu-g15.sh copies kboot_gpu.c next to this file and
@@ -104,12 +104,29 @@ int32_t rust_fill_gpu_initdata(struct initdata_inputs *a, void *b, void *c, void
 
 /* PMGR: the GPU power closure. pmgr_off is the state seen by pmgr_adt_power_is_off(). */
 static int pmgr_enable_ret, pmgr_off = 1, pmgr_off_after_release = 1;
+enum { GFX_GATE = 1, AFR_GATE };
+static const u64 gfx_psreg = 0x350000008, afr_psreg = 0x350000010;
+static const u32 ps_active = (PMGR_PS_ACTIVE << 4) | PMGR_PS_ACTIVE;
+static const u32 ps_auto = BIT(28);
+static bool mock_pmgr_gates;
+static bool mock_config_lost;
+static int mock_pmgr_set_mode_fail;
+static u32 gfx_ps, afr_ps;
+
+bool kboot_config_lost(void)
+{
+    return mock_config_lost;
+}
+
 int pmgr_adt_power_enable(const char *path)
 {
     trace("pmgr enable %s\n", path);
     pmgr_enables++;
-    if (!pmgr_enable_ret)
+    if (!pmgr_enable_ret) {
         pmgr_off = 0;
+        if (mock_pmgr_gates)
+            gfx_ps = afr_ps = ps_active;
+    }
     return pmgr_enable_ret;
 }
 int pmgr_adt_power_enable_traced_saved(const char *path, struct pmgr_saved_modes *saved)
@@ -132,39 +149,70 @@ int pmgr_adt_power_disable_recursive(const char *path)
     trace("pmgr disable-recursive %s\n", path);
     pmgr_disables++;
     pmgr_off = pmgr_off_after_release;
+    if (mock_pmgr_gates)
+        gfx_ps = afr_ps = 0;
     return 0;
 }
 int pmgr_adt_power_is_off(const char *path)
 {
-    trace("pmgr is-off %s = %d\n", path, pmgr_off);
-    return pmgr_off;
+    int off = mock_pmgr_gates ? !(gfx_ps || afr_ps) : pmgr_off;
+    trace("pmgr is-off %s = %d\n", path, off);
+    return off;
 }
 
-/*
- * The T6031 code (kboot_gpu_t6031.c, kboot_t6031.c) links in with kboot_gpu.c from trees that have
- * it. No T6030 or T8122 scenario reaches it: a register write or PMGR lookup here fails the run.
- */
 void host_write32(u64 addr, u32 val)
 {
+    if (mock_pmgr_gates && addr == afr_psreg) {
+        afr_ps = val;
+        return;
+    }
     trace("write32 0x%lx = 0x%x UNEXPECTED\n", addr, val);
     unguarded_faults++;
 }
 int pmgr_adt_gate(const char *path, const char *prop, u32 index, struct pmgr_gate *gate)
 {
-    (void)prop, (void)index, (void)gate;
+    if (mock_pmgr_gates && !strcmp(path, "/arm-io/sgx") && !strcmp(prop, "clock-gates")) {
+        if (index)
+            return -1;
+        return pmgr_device_gate(0, GFX_GATE, gate);
+    }
     trace("pmgr gate %s UNEXPECTED\n", path);
     unguarded_faults++;
     return -1;
 }
 int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *gate)
 {
-    (void)die, (void)id, (void)gate;
+    if (mock_pmgr_gates && die == 0) {
+        if (id == GFX_GATE) {
+            *gate = (struct pmgr_gate){
+                .id = id,
+                .found = true,
+                .name = "GFX",
+                .psreg = gfx_psreg,
+                .parent = {AFR_GATE},
+            };
+            return 0;
+        }
+        if (id == AFR_GATE) {
+            *gate = (struct pmgr_gate){.id = id, .found = true, .name = "AFR", .psreg = afr_psreg};
+            return 0;
+        }
+    }
     unguarded_faults++;
     return -1;
 }
 int pmgr_set_mode(uintptr_t addr, u8 target_mode)
 {
-    (void)addr, (void)target_mode;
+    if (mock_pmgr_gates && target_mode == 0 && (addr == gfx_psreg || addr == afr_psreg)) {
+        trace("pmgr set-mode 0x%lx = %u\n", addr, target_mode);
+        if (mock_pmgr_set_mode_fail)
+            return -1;
+        if (addr == gfx_psreg)
+            gfx_ps = 0;
+        else
+            afr_ps = 0;
+        return 0;
+    }
     unguarded_faults++;
     return -1;
 }
@@ -338,6 +386,10 @@ static u32 bus_fault(u64 addr)
 
 u32 host_read32(u64 addr)
 {
+    if (mock_pmgr_gates && addr == gfx_psreg)
+        return gfx_ps;
+    if (mock_pmgr_gates && addr == afr_psreg)
+        return afr_ps;
     if (addr >= fw_text + 0x4200 && addr < fw_text + 0x4200 + sizeof(fw_hdr)) {
         trace("read32 fw+0x%lx\n", addr - fw_text);
         return fw_hdr[(addr - fw_text - 0x4200) / 4];
@@ -656,6 +708,9 @@ static void prepare(const struct fixture *f)
     pmgr_enables = pmgr_disables = mmio_reads = unguarded_faults = 0;
     pmgr_enable_ret = 0;
     pmgr_off = pmgr_off_after_release = 1;
+    mock_pmgr_gates = false;
+    mock_config_lost = false;
+    gfx_ps = afr_ps = 0;
     exc_guard = GUARD_OFF;
     exc_count = 0;
     os_firmware = fw_versions[V14_7];
@@ -690,6 +745,12 @@ static void t6030_unknown_fw(void)
     prepare(&t6030_fx);
     fw_hdr[5] ^= 1;
     run();
+#ifdef G15_NEW
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(prop_len(dtbuf, "/reserved-memory/uat-ttbs", "no-map") == 0);
+    assert(prop_len(dtbuf, "/reserved-memory/asc-firmware@101f8000000", "no-map") == 0);
+    assert(!pmgr_enables && !pmgr_disables);
+#endif
 }
 static void t6030_wrong_id(void)
 {
@@ -917,6 +978,10 @@ static const struct {
 static void prepare_j613_setup(u32 core_mask, int standin)
 {
     prepare(&t8122_fx);
+    static const char compat[] = "apple,j613\0apple,t8122";
+    CHK(fdt_setprop(dtbuf, 0, "compatible", compat, sizeof(compat)));
+    mmio_set(T8122_LEAK_FUSE_WORD0, 0xa0000000, 0);
+    mmio_set(T8122_LEAK_FUSE_WORD1, 0x000aaaaa, 0);
 
     hset_u32("/arm-io", "chip-revision", 0x20);
     static const struct perf_state ps[14] = {
@@ -989,7 +1054,7 @@ static void t8122_j613_switch_off(void)
     run();
     expect_gpu_off(dtbuf);
     assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "disabled"));
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("the G15G leakage fuse and power model are not known yet"));
     assert(log_has("FW: GFX: image uuid df697f05-f6b5-33ef-a137-61c4a73d666a"));
     assert(log_has("FW: GFX: unknown GPU firmware image, not identified"));
@@ -1028,6 +1093,8 @@ static int run_t8122_test_soc(void)
 {
     test_soc = g15_soc_t8122;
     test_soc.chip = T6030; /* the G15S images stand in for the G15G ones */
+    /* The stand-in firmware exercises the pipeline without the G15G identity witness. */
+    test_soc.publish_powered_identity = false;
     test_soc.read_leak = test_read_leak;
     test_soc.calc_power = test_calc_power;
     return dt_set_gpu_g15(dtbuf, &test_soc);
@@ -1173,6 +1240,15 @@ static void t8122_powered_identity(void)
     assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
     assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "disabled"));
     assert(unguarded_faults == 0);
+}
+
+static void t8122_diag_release_failure(void)
+{
+    prepare_powered_identity();
+    pmgr_off_after_release = 0;
+    assert(run() == GPU26_ERR_FATAL);
+    assert(pmgr_enables == 1 && pmgr_disables == 1 && !pmgr_off);
+    assert(identity_u32("probe-result") == T8122_ID_POWER_OFF_FAILED);
 }
 
 static void t8122_powered_identity_counts(void)
@@ -1339,14 +1415,9 @@ static void expect_standin_handoff(const u32 *max_pwr)
     assert(log_has("FW: GFX: identified image g15g build c0, firmware 14.8.3"));
     assert(log_has("FDT: GPU: T8122 power model: stand-in (not measured; does not limit clocks)"));
     assert(!log_has("perf-states-sram present but unused"));
-    /*
-     * No fuse words are mapped here: the read (made on every T8122) faults under the guard,
-     * nothing is exported, and the setup keeps the stand-in leakage
-     */
-    assert(log_has("FDT: GPU: T8122 leakage: the stand-in\n"));
-    assert(strstr(trace_buf, "read32 0x2e42c8128 UNMAPPED\n"));
-    assert(log_has("FDT: GPU: T8122 leakage fuse: the read faulted; nothing exported\n"));
-    assert(prop_len(dtbuf, "/chosen", "asahi,t8122-gpu-leak-fuse") < 0);
+    /* The J613 exports its fuse, but the stand-in uses the default leakage. */
+    assert(log_has("FDT: GPU: T8122 leakage: the stand-in (the fuse values are exported only)\n"));
+    assert(prop_len(dtbuf, "/chosen", "asahi,t8122-gpu-leak-fuse") == 8);
     assert(log_has("FDT: GPU: Leakage: 6412.000"));
     assert(log_has("FDT: GPU: T8122 GPU enabled (firmware 14.8.3)"));
     assert(log_has("ADT: GPU: 39 power-management values, fast-die sensor mask 0x2, SRAM floor "
@@ -1451,11 +1522,14 @@ static void t8122_j613_standin_only(void)
     /* The stand-in switch alone arms nothing: logged, and the boot is the default one */
     prepare_j613_setup(0x3ff, 1);
     fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu");
-    static u8 before[sizeof(dtbuf)];
-    memcpy(before, dtbuf, sizeof(dtbuf));
+    char *before = dump_path(dtbuf, "/");
     run();
-    assert(!memcmp(before, dtbuf, sizeof(dtbuf)));
-    expect_only_fuse_read();
+    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), T8122_LEAK_FUSE_PROP));
+    char *after = dump_path(dtbuf, "/");
+    assert(!strcmp(before, after));
+    free(before);
+    free(after);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("asahi,t8122-gpu-power-standin ignored: it needs chosen.asahi,t8122-gpu=1"));
 }
 
@@ -1467,7 +1541,7 @@ static void t8122_j613_standin_missing_value(void)
     run();
     expect_gpu_off(dtbuf);
     assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "disabled"));
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("ADT: GPU: missing or invalid gpu-se-tgt"));
     assert(log_has("T8122 GPU setup failed"));
     assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,se-ki") < 0);
@@ -1481,7 +1555,7 @@ static void t8122_j613_standin_bad_mask_size(void)
     hset("/arm-io/sgx", "gpu-fast-die0-sensor-mask", &mask, sizeof(mask));
     run();
     expect_gpu_off(dtbuf);
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("missing or invalid gpu-fast-die0-sensor-mask"));
 }
 
@@ -1493,7 +1567,7 @@ static void t8122_j613_standin_bad_sram(void)
     hset("/arm-io/sgx", "perf-states-sram", sram, sizeof(sram));
     run();
     expect_gpu_off(dtbuf);
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("invalid or missing perf-states-sram"));
 }
 
@@ -1505,7 +1579,7 @@ static void t8122_j613_standin_idleoff_malformed(void)
     hset("/arm-io/sgx", "gpu-idleoff-standby-timer", &timer, sizeof(timer));
     run();
     expect_gpu_off(dtbuf);
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("ADT: GPU: malformed gpu-idleoff-standby-timer (len 8)"));
     assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,idleoff-standby-timer") < 0);
 }
@@ -1530,7 +1604,7 @@ static void t8122_j613_standin_sram_above(void)
     run();
     expect_gpu_off(dtbuf);
     assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "disabled"));
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("ADT: GPU: perf state 0/13 SRAM 960 mV is above max(core 935 mV, floor 790 mV); "
                    "not supported"));
     assert(log_has("T8122 GPU setup failed"));
@@ -1544,7 +1618,7 @@ static void t8122_j613_standin_sram_above_floor(void)
     set_j613_sram(1, 800);
     run();
     expect_gpu_off(dtbuf);
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("ADT: GPU: perf state 0/1 SRAM 800 mV is above max(core 630 mV, floor 790 mV); "
                    "not supported"));
 }
@@ -1580,7 +1654,7 @@ static void t8122_j613_standin_g15s_image(void)
     fw_hdr[13] = 0x5c000;
     run();
     expect_gpu_off(dtbuf);
-    assert(!pmgr_enables && !mmio_reads);
+    assert(!pmgr_enables && mmio_reads == 2 && !exc_count && !unguarded_faults);
     assert(log_has("FW: GFX: unknown GPU firmware image, not identified"));
     assert(log_has("loaded GPU firmware is not a known ABI"));
 }
@@ -1610,7 +1684,7 @@ static void t8122_j613_standin_wrong_id(void)
     run();
     expect_gpu_off(dtbuf);
     assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1);
-    assert(log_has("not a G15G"));
+    assert(log_has("full-start T8122 powered identity rejected"));
 }
 
 /*
@@ -1732,9 +1806,7 @@ static void t8122_j613_fuse_fault(void)
 static void prepare_j613_standin_fuse(int use, int fault)
 {
     prepare_j613_setup(0x3ff, 1);
-    CHK(fdt_setprop_string(dtbuf, 0, "compatible", "apple,j613"));
     mmio_set(T8122_LEAK_FUSE_WORD0, 0xa0000000, fault);
-    mmio_set(T8122_LEAK_FUSE_WORD1, 0x000aaaaa, 0);
     if (use)
         CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"),
                                "asahi,t8122-gpu-fuse-leakage", "1"));
@@ -1803,16 +1875,18 @@ static void t8122_j613_standin_fuse_on_fault(void)
     assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1);
 }
 
-static void t8122_standin_fuse_unreadable(void)
+static void t8122_standin_fuse_not_air(void)
 {
-    /* The switch on a T8122 whose fuse read faults (none mapped): no values; the setup refuses */
+    /* A non-Air T8122 root: the fuse is still read (it is the die's), but the full start
+     * cannot publish the identity witness, so the switch is refused */
     prepare_j613_setup(0x3ff, 1);
+    CHK(fdt_setprop_string(dtbuf, 0, "compatible", "apple,t8122"));
     CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-fuse-leakage",
                            "1"));
     run();
     expect_gpu_off(dtbuf);
-    assert(strstr(trace_buf, "read32 0x2e42c8128 UNMAPPED\n"));
-    assert(log_has("but this boot has no T8122 leakage fuse values"));
+    assert(!pmgr_enables && mmio_reads == 2 && !unguarded_faults);
+    assert(log_has("full-start T8122 identity node unavailable"));
 }
 
 /* Each Air hands over its own fuse, clock and power values. */
@@ -2064,6 +2138,306 @@ static void t27_refused(void)
     assert(log_has("handoff not published; reserving the GPU firmware memory only"));
     assert(!pmgr_enables);
 }
+/* J516s on 26B123. The ADT has one voltage table for both clusters and no
+ * FastDie target. Model the 14.x header location as empty for the 27.2 image.
+ */
+static const char t6030_27_b000[] = "A0EA5119-604D-3372-B38F-528F9E967970";
+static const char t6030_27_a000[] = "3FC79C19-5D8B-3EE9-80FF-0F49FC416C00";
+static const char t6030_27_unknown[] = "00000000-0000-0000-0000-000000000000";
+static const struct {
+    const char *name, *node, *adt_prefix;
+    u64 base, size;
+} t6030_27_ranges[] = {
+    {"ttbs", "uat-ttbs@10", "gpu-region", 0x1047ffb8000, 0x4000},
+    {"pagetables", "uat-pagetables@20", "gfx-shared-region", 0x1047ff78000, 0x40000},
+    {"handoff", "uat-handoff@30", "gfx-handoff", 0x1047ff70000, 0x4000},
+    {"shared-l2", "uat-pagetables-l2@40", "gfx-shared-l2-region", 0x1047ff74000, 0x4000},
+    {"fw-text", "asc-firmware@100009f0000", NULL, 0x100009f0000, 0x60000},
+    {"fw-data", "asc-firmware@10001918000", NULL, 0x10001918000, 0x134000},
+};
+
+static void prepare_t6030_27(const char *uuid)
+{
+    struct fixture f = t6030_fx;
+    f.mbox_disabled = 1;
+    prepare(&f);
+    mock_pmgr_gates = true;
+    mock_pmgr_set_mode_fail = 0;
+    /* Route by the loaded image even if the OS version differs. */
+    os_firmware = fw_versions[V14_8_3];
+    fw_text = t6030_27_ranges[4].base;
+    memset(fw_hdr, 0, sizeof(fw_hdr));
+    mem_size_actual = 0x480000000;
+    hset_u64("/chosen", "dram-size", mem_size_actual);
+    hset("/arm-io/sgx", "compatible", "gpu,t6030", sizeof("gpu,t6030"));
+    const u64 sgx_reg[] = {SGX_BASE, 0x32a4000, 0x290d00000, 0x16c000};
+    const u64 asc_reg[] = {ASC_BASE, 0x6c000, 0x292050000, 0x6c000};
+    hset("/arm-io/sgx", "reg", sgx_reg, sizeof(sgx_reg));
+    hset("/arm-io/gfx-asc", "reg", asc_reg, sizeof(asc_reg));
+    const struct perf_state core[] = {
+        {0, 125}, {338000000, 650}, {618000000, 690}, {796000000, 710}, {832000000, 750},
+        {924000000, 750}, {952000000, 825}, {1056000000, 825}, {1064000000, 875},
+        {1182000000, 875}, {1182000000, 940}, {1312000000, 940}, {1242000000, 975},
+        {1380000000, 975},
+    };
+    struct perf_state sram[ARRAY_SIZE(core)];
+    for (size_t i = 0; i < ARRAY_SIZE(core); i++)
+        sram[i] = (struct perf_state){core[i].freq, max(core[i].volt, 810)};
+    hset_u32("/arm-io/sgx", "perf-state-count", ARRAY_SIZE(core));
+    hset_u32("/arm-io/sgx", "gpu-num-perf-states", ARRAY_SIZE(core) - 1);
+    hset_u32("/arm-io/sgx", "perf-state-table-count", 1);
+    hset("/arm-io/sgx", "perf-states", core, sizeof(core));
+    hset("/arm-io/sgx", "perf-states-sram", sram, sizeof(sram));
+
+    /* hset keeps the property names by reference. */
+    static char props[4][2][40];
+    for (size_t i = 0; i < ARRAY_SIZE(props); i++) {
+        snprintf(props[i][0], sizeof(props[i][0]), "%s-base", t6030_27_ranges[i].adt_prefix);
+        snprintf(props[i][1], sizeof(props[i][1]), "%s-size", t6030_27_ranges[i].adt_prefix);
+        hset_u64("/arm-io/sgx", props[i][0], t6030_27_ranges[i].base);
+        hset_u64("/arm-io/sgx", props[i][1], t6030_27_ranges[i].size);
+        int resv = fdt_path_offset(dtbuf, "/reserved-memory");
+        char node[40];
+        snprintf(node, sizeof(node), "%s", t6030_27_ranges[i].node);
+        *strchr(node, '@') = 0;
+        CHK(fdt_set_name(dtbuf, fdt_subnode_offset(dtbuf, resv, node), t6030_27_ranges[i].node));
+    }
+
+    const struct adt_segment_ranges seg[] = {
+        {0x100009f0000, FW_VA, 0x100009f0000, 0x60000, 1},
+        {0x10001918000, FW_VA + 0x60000, 0x10001918000, 0x12c000, 0x10},
+        {0x10001a44000, FW_VA + 0x18c000, 0x10001a44000, 0x8000, 0},
+    };
+    static const char names[] = "__TEXT;__DATA;__DATA_SHARED_RO";
+    const char *nub = "/arm-io/gfx-asc/iop-gfx-nub";
+    hset("/arm-io/gfx-asc", "segment-names", names, sizeof(names));
+    hset("/arm-io/gfx-asc", "segment-ranges", seg, sizeof(seg));
+    hset(nub, "segment-ranges", seg, sizeof(seg));
+    hset(nub, "uuid", uuid, strlen(uuid) + 1);
+    hset_u32(nub, "coredump-copy-buffer", 0x8000);
+    hset_u64("/arm-io/sgx", "gfx-data-shared-ro-base", seg[2].phys);
+    hset_u64("/arm-io/sgx", "gfx-data-shared-ro-size", seg[2].size);
+    hset_u64("/arm-io/sgx", "gfx-data-shared-rw-size", 0);
+
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/soc/mbox@292408000"), "compatible",
+                           "apple,t6030-agx-asc-mailbox"));
+    int ps = fdt_add_subnode(dtbuf, fdt_path_offset(dtbuf, "/soc"), "power-controller@gfx");
+    CHK(ps);
+    CHK(fdt_setprop_u32(dtbuf, ps, "phandle", 41));
+    CHK(fdt_setprop_u32(dtbuf, fdt_path_offset(dtbuf, "gpu"), "power-domains", 41));
+}
+
+static void check_t6030_27_handoff(void)
+{
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "okay"));
+    assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "okay"));
+    assert(prop_len(dtbuf, "/soc/power-controller@gfx", "apple,no-auto-pm") == 0);
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,pmp") < 0);
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,fast-die0-target") < 0);
+    assert(gpu_u32("apple,g16-handoff-version") == 2);
+    assert(gpu_u32("apple,coredump-copy-buffer") == 0x8000);
+
+    int gpu = fdt_path_offset(dtbuf, "gpu"), len;
+    static const char names[] = "ttbs\0pagetables\0handoff\0shared-l2\0fw-text\0fw-data";
+    const char *actual = fdt_getprop(dtbuf, gpu, "memory-region-names", &len);
+    assert(actual && len == sizeof(names) && !memcmp(actual, names, sizeof(names)));
+    const fdt32_t *regions = gpu_prop("memory-region", &len);
+    assert(regions && len == sizeof(*regions) * ARRAY_SIZE(t6030_27_ranges));
+    for (size_t i = 0; i < ARRAY_SIZE(t6030_27_ranges); i++) {
+        int node = fdt_node_offset_by_phandle(dtbuf, fdt32_ld(regions + i));
+        CHK(node);
+        assert(fdt_getprop(dtbuf, node, "no-map", &len) && len == 0);
+        const fdt64_t *reg = fdt_getprop(dtbuf, node, "reg", &len);
+        assert(reg && len == 16 && fdt64_ld(reg) == t6030_27_ranges[i].base &&
+               fdt64_ld(reg + 1) == t6030_27_ranges[i].size);
+    }
+    const fdt64_t *vas = fdt_getprop(dtbuf, gpu, "apple,firmware-segment-vas", &len);
+    assert(vas && len == 24 && fdt64_ld(vas) == FW_VA && fdt64_ld(vas + 1) == FW_VA + 0x60000 &&
+           fdt64_ld(vas + 2) == FW_VA + 0x18c000);
+    const fdt32_t *flags = gpu_prop("apple,firmware-segment-flags", &len);
+    assert(flags && len == 12 && fdt32_ld(flags) == 1 && fdt32_ld(flags + 1) == 0x10 &&
+           fdt32_ld(flags + 2) == 0);
+    const char *const versions[] = {"apple,firmware-compat", "apple,firmware-version"};
+    for (size_t i = 0; i < ARRAY_SIZE(versions); i++) {
+        const fdt32_t *v = fdt_getprop(dtbuf, gpu, versions[i], &len);
+        assert(v && len == 12 && fdt32_ld(v) == 27 && fdt32_ld(v + 1) == 2 && !fdt32_ld(v + 2));
+    }
+    CHK(fdt_path_offset(dtbuf, "/opp-table-gpu/opp13"));
+    int opp = fdt_path_offset(dtbuf, "/opp-table-gpu/opp01");
+    const fdt32_t *sram = fdt_getprop(dtbuf, opp, "opp-microvolt-sram", &len);
+    assert(sram && len == 8 && fdt32_ld(sram) == 810000 && fdt32_ld(sram + 1) == 810000);
+    assert(pmgr_enables == 1 && pmgr_disables == 0 && gfx_ps == 0 && !unguarded_faults);
+}
+
+static void t6030_27_handoff(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    run();
+    check_t6030_27_handoff();
+    assert(afr_ps == 0);
+    assert(log_has("identified image g15s 27.2 b000"));
+}
+
+static void t6030_27_handoff_a000(void)
+{
+    prepare_t6030_27(t6030_27_a000);
+    run();
+    check_t6030_27_handoff();
+    assert(log_has("identified image g15s 27.2 a000"));
+}
+
+static void t6030_27_afr_already_on(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    /* The parent is active with automatic power management before the probe. */
+    afr_ps = ps_active | ps_auto;
+    run();
+    check_t6030_27_handoff();
+    assert(afr_ps == (ps_active | ps_auto));
+}
+
+static void check_t6030_27_reserve_only(void)
+{
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "disabled"));
+    assert(prop_len(dtbuf, "/soc/power-controller@gfx", "apple,no-auto-pm") < 0);
+    assert(!gpu_prop("apple,g16-handoff-version", NULL));
+    for (size_t i = 0; i < ARRAY_SIZE(t6030_27_ranges); i++) {
+        char path[80];
+        snprintf(path, sizeof(path), "/reserved-memory/%s", t6030_27_ranges[i].node);
+        assert(prop_len(dtbuf, path, "no-map") == 0);
+    }
+    assert(prop_len(dtbuf, "/reserved-memory/asc-firmware@10001a44000", "no-map") == 0);
+    assert(!unguarded_faults);
+}
+
+static void t6030_27_missing_alias(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "gpu"), "status", "okay"));
+    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/aliases"), "gpu"));
+    assert(run() == 0);
+    check_t6030_27_reserve_only();
+    assert(!pmgr_enables && !pmgr_disables);
+}
+
+static void t6030_27_incompatible_alias(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/aliases"), "gpu", "/chosen"));
+    assert(run() == 0);
+    assert(prop_len(dtbuf, "/chosen", "status") < 0);
+    check_t6030_27_reserve_only();
+    assert(!pmgr_enables && !pmgr_disables);
+}
+
+static void t6030_27_unknown_image(void)
+{
+    prepare_t6030_27(t6030_27_unknown);
+    os_firmware = fw_versions[V27_2];
+    assert(run() == 0);
+    check_t6030_27_reserve_only();
+    assert(!pmgr_enables && !pmgr_disables);
+}
+
+static void t6030_27_identity_failure(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    mmio_set(LEAK_FUSE, 0, 1);
+    assert(run() == 0);
+    check_t6030_27_reserve_only();
+    assert(pmgr_enables == 1 && pmgr_disables == 0 && gfx_ps == 0 && afr_ps == 0);
+}
+
+static void t6030_27_unlisted_board_default(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    static const char compat[] = "apple,j999s\0apple,t6030";
+    CHK(fdt_setprop(dtbuf, 0, "compatible", compat, sizeof(compat)));
+    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t6030-gpu"));
+    assert(run() == 0);
+    check_t6030_27_handoff();
+}
+
+static void t6030_27_owner_disabled(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t6030-gpu", "0"));
+    assert(run() == 0);
+    check_t6030_27_reserve_only();
+    assert(!pmgr_enables && !pmgr_disables);
+}
+
+static void t6030_27_config_lost(void)
+{
+    /* Listed board after dt_drop_m3_graphics(): switch absent and config lost keeps GPU off. */
+    prepare_t6030_27(t6030_27_b000);
+    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t6030-gpu"));
+    mock_config_lost = true;
+    assert(run() == 0);
+    check_t6030_27_reserve_only();
+    assert(!pmgr_enables && !pmgr_disables);
+    assert(log_has("config line lost; GPU stays disabled"));
+
+    /* Unlisted board with an earlier =1 still present: config lost still keeps GPU off. */
+    prepare_t6030_27(t6030_27_b000);
+    static const char compat[] = "apple,j999s\0apple,t6030";
+    CHK(fdt_setprop(dtbuf, 0, "compatible", compat, sizeof(compat)));
+    mock_config_lost = true;
+    assert(run() == 0);
+    check_t6030_27_reserve_only();
+    assert(!pmgr_enables && !pmgr_disables);
+    assert(log_has("config line lost; GPU stays disabled"));
+}
+
+static void t6030_27_full_fdt(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "gpu"), "status", "okay"));
+    CHK(fdt_pack(dtbuf));
+    assert(run() < 0);
+    assert(log_has("cannot mark the gpu node disabled"));
+    assert(log_has("T6030 handoff fallback failed"));
+    assert(!pmgr_enables && !pmgr_disables);
+}
+
+static void t6030_27_closure_restore_fail(void)
+{
+    prepare_t6030_27(t6030_27_b000);
+    mock_pmgr_set_mode_fail = 1;
+    assert(run() < 0);
+    check_t6030_27_reserve_only();
+    assert(log_has("failed to release SGX power vote"));
+    assert(log_has("T6030 handoff fallback failed"));
+}
+
+static void t6030_27_reserve_partial_overlap(void)
+{
+    prepare_t6030_27(t6030_27_unknown);
+    os_firmware = fw_versions[V27_2];
+    int resv = fdt_path_offset(dtbuf, "/reserved-memory");
+    int blocker = fdt_add_subnode(dtbuf, resv, "other-carveout@100009e8000");
+    CHK(blocker);
+    fdt64_t reg[2] = {cpu_to_fdt64(0x100009e8000), cpu_to_fdt64(0x10000)};
+    CHK(fdt_setprop(dtbuf, blocker, "reg", reg, sizeof(reg)));
+    CHK(fdt_setprop_empty(dtbuf, blocker, "no-map"));
+    assert(run() < 0);
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(log_has("partially overlaps another reservation; not reserved"));
+    assert(log_has("T6030 handoff fallback failed"));
+}
+
+static void t6030_27_reserve_failure(void)
+{
+    prepare_t6030_27(t6030_27_unknown);
+    os_firmware = fw_versions[V27_2];
+    CHK(fdt_del_node(dtbuf, fdt_path_offset(dtbuf, "/reserved-memory")));
+    assert(run() < 0);
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(log_has("not reserved (no /reserved-memory)"));
+    assert(log_has("T6030 handoff fallback failed"));
+}
+
 static void t8122_27_handoff(void)
 {
     prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
@@ -2151,6 +2525,28 @@ static void t8122_27_identity(void)
     assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1 && unguarded_faults == 0);
     assert(log_has("GPU and ASC remain disabled"));
 }
+static void t8122_27_diag_release_failure(void)
+{
+    prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-power-diag",
+                           "1"));
+    pmgr_off_after_release = 0;
+    assert(run() == GPU26_ERR_FATAL);
+    assert(pmgr_enables == 1 && pmgr_disables == 1 && !pmgr_off);
+    assert(log_has("failed to release SGX power vote"));
+    assert(!gpu_prop("apple,m3-handoff-version", NULL));
+}
+
+static void t8122_27_reserve_failure(void)
+{
+    prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
+    CHK(fdt_del_node(dtbuf, fdt_path_offset(dtbuf, "/reserved-memory")));
+    assert(run() < 0);
+    assert(log_has("not reserved (no /reserved-memory)"));
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(!pmgr_enables && !pmgr_disables);
+}
+
 static void t8122_27_no_identity(void)
 {
     /* Without the switch: no identity node and the GPU is never powered. */
@@ -2239,15 +2635,29 @@ static void t8122_27_start_t8122_mailbox(void)
 }
 static void t8122_27_start_values_absent(void)
 {
-    /* Both machine values are optional: absent in the ADT, absent on the GPU node. */
+    /* Both machine values are required: without them the GPU stays off and is never powered. */
     prepare_27_start();
     hdel("/arm-io/sgx", "gpu-fast-die0-target");
     hdel("/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer");
-    run();
-    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "okay"));
-    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,fast-die0-target") < 0);
-    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,coredump-copy-buffer") < 0);
-    assert(log_has("27.2 machine values: fast-die0 target absent, coredump copy buffer absent"));
+    t27_start_refused();
+    assert(log_has("gpu-fast-die0-target absent, GPU left disabled"));
+    assert(!pmgr_enables && !pmgr_disables);
+}
+static void t8122_27_start_fast_die_absent(void)
+{
+    prepare_27_start();
+    hdel("/arm-io/sgx", "gpu-fast-die0-target");
+    t27_start_refused();
+    assert(log_has("gpu-fast-die0-target absent, GPU left disabled"));
+    assert(!pmgr_enables && !pmgr_disables);
+}
+static void t8122_27_start_coredump_absent(void)
+{
+    prepare_27_start();
+    hdel("/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer");
+    t27_start_refused();
+    assert(log_has("coredump-copy-buffer absent, GPU left disabled"));
+    assert(!pmgr_enables && !pmgr_disables);
 }
 static void t8122_27_start_value_malformed(void)
 {
@@ -2256,8 +2666,16 @@ static void t8122_27_start_value_malformed(void)
     hset("/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer", &wide, sizeof(wide));
     t27_start_refused();
     assert(log_has("malformed coredump-copy-buffer"));
-    /* Refused after the calibration: its power vote was still released. */
-    assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1);
+    /* Refused from the ADT alone: nothing was powered. */
+    assert(!pmgr_enables && !pmgr_disables);
+}
+static void t8122_27_start_value_zero(void)
+{
+    prepare_27_start();
+    hset_u32("/arm-io/sgx", "gpu-fast-die0-target", 0);
+    t27_start_refused();
+    assert(log_has("malformed gpu-fast-die0-target"));
+    assert(!pmgr_enables && !pmgr_disables);
 }
 static void t8122_27_start_no_pmp(void)
 {
@@ -2301,6 +2719,19 @@ static void t8122_27_start_identity_mismatch(void)
     t27_start_refused();
     assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1);
 }
+static void t8122_27_restore_failure(void)
+{
+    prepare_27_start();
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-power-diag",
+                           "1"));
+    pmgr_off_after_release = 0;
+    assert(run() == GPU26_ERR_FATAL);
+    assert(pmgr_enables == 1 && pmgr_disables == 1);
+    assert(!log_has("skipping probe"));
+    assert(fdt_path_offset(dtbuf, "/chosen/asahi,t8122-gpu-powered-identity") < 0);
+    assert(!gpu_prop("apple,m3-handoff-version", NULL));
+}
+
 static void t8122_27_start_refused_diag(void)
 {
     /* A refused start keeps chosen.asahi,t8122-gpu-power-diag=1 as before. */
@@ -2771,6 +3202,24 @@ static const struct {
     void (*fn)(void);
 } scenarios[] = {
 #ifdef G15_FW26
+#ifdef G15_NEW
+    {"t6030-27-handoff", t6030_27_handoff},
+    {"t6030-27-handoff-a000", t6030_27_handoff_a000},
+    {"t6030-27-afr-already-on", t6030_27_afr_already_on},
+    {"t6030-27-missing-alias", t6030_27_missing_alias},
+    {"t6030-27-incompatible-alias", t6030_27_incompatible_alias},
+    {"t6030-27-unknown-image", t6030_27_unknown_image},
+    {"t6030-27-identity-failure", t6030_27_identity_failure},
+    {"t6030-27-unlisted-board-default", t6030_27_unlisted_board_default},
+    {"t6030-27-owner-disabled", t6030_27_owner_disabled},
+    {"t6030-27-config-lost", t6030_27_config_lost},
+    {"t6030-27-full-fdt", t6030_27_full_fdt},
+    {"t6030-27-closure-restore-fail", t6030_27_closure_restore_fail},
+    {"t6030-27-reserve-partial-overlap", t6030_27_reserve_partial_overlap},
+    {"t8122-27-diag-release-failure", t8122_27_diag_release_failure},
+    {"t8122-27-reserve-failure", t8122_27_reserve_failure},
+    {"t6030-27-reserve-failure", t6030_27_reserve_failure},
+#endif
     {"t8122-25-calibrated", t8122_25_calibrated},
     {"t8122-25-wrong-input-compat", t8122_25_wrong_input_compat},
     {"t8122-25-short-calibration", t8122_25_short_calibration},
@@ -2794,12 +3243,16 @@ static const struct {
     {"t8122-27-start", t8122_27_start},
     {"t8122-27-start-t8122-mailbox", t8122_27_start_t8122_mailbox},
     {"t8122-27-start-values-absent", t8122_27_start_values_absent},
+    {"t8122-27-start-fast-die-absent", t8122_27_start_fast_die_absent},
+    {"t8122-27-start-coredump-absent", t8122_27_start_coredump_absent},
     {"t8122-27-start-value-malformed", t8122_27_start_value_malformed},
+    {"t8122-27-start-value-zero", t8122_27_start_value_zero},
     {"t8122-27-start-no-pmp", t8122_27_start_no_pmp},
     {"t8122-27-start-no-power-domain", t8122_27_start_no_power_domain},
     {"t8122-27-start-other-mailbox", t8122_27_start_other_mailbox},
     {"t8122-27-start-owner-off", t8122_27_start_owner_off},
     {"t8122-27-start-identity-mismatch", t8122_27_start_identity_mismatch},
+    {"t8122-27-restore-failure", t8122_27_restore_failure},
     {"t8122-27-start-refused-diag", t8122_27_start_refused_diag},
 #endif
     {"t6030-dry", t6030_dry},
@@ -2836,6 +3289,7 @@ static const struct {
     {"t8122-small-dt", t8122_small_dt},
     {"t8122-with-diag-optin", t8122_with_diag_optin},
     {"t8122-powered-identity", t8122_powered_identity},
+    {"t8122-diag-release-failure", t8122_diag_release_failure},
     {"t8122-powered-identity-counts", t8122_powered_identity_counts},
     {"t8122-powered-identity-counts2", t8122_powered_identity_counts2},
     {"t8122-powered-identity-counts-fault", t8122_powered_identity_counts_fault},
@@ -2864,7 +3318,7 @@ static const struct {
     {"t8122-j613-standin-fuse-off", t8122_j613_standin_fuse_off},
     {"t8122-j613-standin-fuse-on", t8122_j613_standin_fuse_on},
     {"t8122-j613-standin-fuse-on-fault", t8122_j613_standin_fuse_on_fault},
-    {"t8122-standin-fuse-unreadable", t8122_standin_fuse_unreadable},
+    {"t8122-standin-fuse-not-air", t8122_standin_fuse_not_air},
     {"t8122-j615-full14", t8122_j615_full14},
     {"t8122-air-per-mac-power", t8122_air_per_mac_power},
     {"t8122-j615-full14-unknown-image", t8122_j615_full14_unknown_image},

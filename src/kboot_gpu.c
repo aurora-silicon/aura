@@ -44,6 +44,64 @@ struct aux_perf_states {
     struct aux_perf_state states[];
 };
 
+/* M4 Pro/Max: state zero is off and all clusters share a frequency ladder. */
+static bool t6040_cluster_states_valid(const struct perf_state *states, u32 len, u32 count,
+                                       u32 tables)
+{
+    if (!states || len != count * tables * sizeof(*states))
+        return false;
+    for (u32 j = 0; j < tables; j++)
+        if (states[j * count].freq)
+            return false;
+    for (u32 j = 0; j < tables; j++)
+        for (u32 i = 1; i < count; i++)
+            if (!states[j * count + i].freq || states[j * count + i].freq != states[i].freq ||
+                states[j * count + i].volt < 400 || states[j * count + i].volt > 1300)
+                return false;
+    return true;
+}
+
+static bool t6040_aux_states_valid(const struct aux_perf_states *aux, u32 len)
+{
+    if (!aux || len < sizeof(*aux) || aux->dies != 1 || aux->count < 2 ||
+        aux->count > MAX_PSTATES || len < sizeof(*aux) + aux->count * sizeof(aux->states[0]))
+        return false;
+    for (u32 i = 0; i < aux->count; i++)
+        if (!aux->states[i].freq || aux->states[i].volt < 400000 || aux->states[i].volt > 1300000)
+            return false;
+    return true;
+}
+
+/* Firmware ranges must be disjoint 16K pages in the 42-bit physical address space. */
+static bool t6040_region_valid(const u64 *base, const u64 *size, size_t i)
+{
+    if (!base[i] || !size[i] || ((base[i] | size[i]) & (SZ_16K - 1)) || base[i] >= (1ULL << 42) ||
+        size[i] > (1ULL << 42) - base[i])
+        return false;
+    for (size_t j = 0; j < i; j++)
+        if (base[i] < base[j] + size[j] && base[j] < base[i] + size[i])
+            return false;
+    return true;
+}
+
+/* Both selector maps must climb in Hz. The relative-B scale uses map A in whole MHz. */
+static bool t6040_relative_frequencies(const struct perf_state *states, const u32 *index_a,
+                                       const u32 *index_b, int count, u32 base, u32 *relative)
+{
+    for (int i = 2; i < count; i++)
+        if (states[index_a[i]].freq <= states[index_a[i - 1]].freq ||
+            states[index_b[i]].freq <= states[index_b[i - 1]].freq)
+            return false;
+
+    u32 floor_mhz = states[index_a[base]].freq / 1000000;
+    u32 span_mhz = states[index_a[count - 1]].freq / 1000000 - floor_mhz;
+    if (!span_mhz)
+        return false;
+    for (int i = base; i < count; i++)
+        relative[i] = 100ULL * (states[index_a[i]].freq / 1000000 - floor_mhz) / span_mhz;
+    return true;
+}
+
 int32_t rust_gpu_initdata_size(uint32_t compat_maj, uint32_t compat_min, size_t *data_a,
                                size_t *data_b, size_t *globals);
 
@@ -423,18 +481,25 @@ static int dt_set_resvmem(void *dt, const char *path, u64 base, u64 size)
     return 0;
 }
 
+/* Return the missing or invalid component so each handoff can report its own failure. */
+static const char *gpu_adt_region(int sgx, const char *name, u64 *base, u64 *size)
+{
+    char prop[64];
+    snprintf(prop, sizeof(prop), "%s-base", name);
+    if (ADT_GETPROP(adt, sgx, prop, base) != sizeof(*base) || !*base)
+        return "base";
+    snprintf(prop, sizeof(prop), "%s-size", name);
+    if (ADT_GETPROP(adt, sgx, prop, size) != sizeof(*size) || !*size)
+        return "size";
+    return NULL;
+}
+
 static int dt_set_region(void *dt, int sgx, const char *name, const char *path)
 {
     u64 base, size;
-    char prop[64];
-
-    snprintf(prop, sizeof(prop), "%s-base", name);
-    if (ADT_GETPROP(adt, sgx, prop, &base) < 0 || !base)
-        bail("ADT: GPU: failed to find %s property\n", prop);
-
-    snprintf(prop, sizeof(prop), "%s-size", name);
-    if (ADT_GETPROP(adt, sgx, prop, &size) < 0 || !size)
-        bail("ADT: GPU: failed to find %s property\n", prop);
+    const char *bad = gpu_adt_region(sgx, name, &base, &size);
+    if (bad)
+        bail("ADT: GPU: failed to find %s-%s property\n", name, bad);
 
     return dt_set_resvmem(dt, path, base, size);
 }
@@ -507,7 +572,7 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
  * - marks the gpu node disabled before it does anything else,
  * - positively identifies the loaded GPU firmware as the 14.8.3 ABI before it touches any GPU
  *   register (drm/asahi only accepts apple,firmware-compat = <14 8 3> for G15),
- * - length/range checks every ADT input (no ADT_GETPROP: it copies before checking the length),
+ * - length/range checks every ADT input (ADT_GETPROP copies only an exact-sized property),
  * - touches no GPU hardware and leaves the node disabled unless boot.bin carries the opt-in config
  *   line chosen.asahi,t6030-gpu=1 (aura cannot tell which kernel will boot, so this is per
  *   boot.bin); without it, it only runs and logs the firmware/ADT/DT checks (dry run),
@@ -576,8 +641,12 @@ struct g15_soc {
      * it recursively and checks that it is off again.
      */
     bool power_closure;
+    /* Firmware admission requires a /chosen witness from the powered GPU identity read. */
+    bool publish_powered_identity;
     /* Also accept the firmware images firmware.c lists as experimental */
     bool fw_experimental;
+    /* A kernel-owned handoff (or memory reservation when the image is unknown). */
+    int (*handoff)(void *dt, const struct fw_version_info *image);
     /* Add the ADT's power-management values to the gpu node, see g15_power_props[] */
     bool power_props;
     /*
@@ -636,22 +705,12 @@ static int g15_guard_end(int before)
 
 static int g15_adt_u32(int node, const char *name, u32 *val)
 {
-    u32 len = 0;
-    const void *p = adt_getprop(adt, node, name, &len);
-    if (!p || len != sizeof(*val))
-        return -1;
-    memcpy(val, p, sizeof(*val));
-    return 0;
+    return ADT_GETPROP(adt, node, name, val) == sizeof(*val) ? 0 : -1;
 }
 
 static int g15_adt_u64(int node, const char *name, u64 *val)
 {
-    u32 len = 0;
-    const void *p = adt_getprop(adt, node, name, &len);
-    if (!p || len != sizeof(*val))
-        return -1;
-    memcpy(val, p, sizeof(*val));
-    return 0;
+    return ADT_GETPROP(adt, node, name, val) == sizeof(*val) ? 0 : -1;
 }
 
 /*
@@ -745,15 +804,9 @@ static int g15_get_pstates(const struct g15_soc *soc, int sgx, u32 *count_out, u
 
 static int g15_get_region(void *dt, int sgx, struct g15_region *r)
 {
-    char prop[64];
-
-    snprintf(prop, sizeof(prop), "%s-base", r->adt_name);
-    if (g15_adt_u64(sgx, prop, &r->base) || !r->base)
-        bail("ADT: GPU: missing or invalid %s\n", prop);
-
-    snprintf(prop, sizeof(prop), "%s-size", r->adt_name);
-    if (g15_adt_u64(sgx, prop, &r->size) || !r->size)
-        bail("ADT: GPU: missing or invalid %s\n", prop);
+    const char *bad = gpu_adt_region(sgx, r->adt_name, &r->base, &r->size);
+    if (bad)
+        bail("ADT: GPU: missing or invalid %s-%s\n", r->adt_name, bad);
 
     /*
      * The UAT maps these with 16K pages and the TTBAT base must be 16K aligned; the
@@ -1329,11 +1382,11 @@ static int g15_set_float_array(void *dt, const char *name, float val, int count)
     if (count > MAX_CLUSTERS)
         bail("FDT: GPU: g15_set_float_array() with too many values\n");
 
-    for (int i = 0; i < count; i++) {
-        u32 raw;
-        memcpy(&raw, &val, sizeof(raw));
-        data[i] = cpu_to_fdt32(raw);
-    }
+    u32 raw;
+    memcpy(&raw, &val, sizeof(raw));
+    fdt32_t cell = cpu_to_fdt32(raw);
+    for (int i = 0; i < count; i++)
+        data[i] = cell;
 
     int gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0)
@@ -1985,6 +2038,7 @@ static const struct g15_soc g15_soc_t6030 = {
     .cores_per_cluster = G15S_CORES_PER_CLUSTER,
     .clusters = T6030_MAX_CLUSTERS,
     .mask2_bits = 16,
+    .handoff = dt_set_gpu_t6030_27,
     .read_leak = g15s_read_leak,
     .calc_power = calc_power_t6030,
 };
@@ -2000,6 +2054,7 @@ static const struct g15_soc g15_soc_t8122 = {
     .dies = 1,
     .mask2_bits = 32,
     .power_closure = true,
+    .publish_powered_identity = true,
 };
 
 /*
@@ -2019,6 +2074,7 @@ static const struct g15_soc g15_soc_t8122_standin = {
     .dies = 1,
     .mask2_bits = 32,
     .power_closure = true,
+    .publish_powered_identity = true,
     .fw_experimental = true,
     .power_props = true,
     .read_leak = g15g_standin_read_leak,
@@ -2121,28 +2177,20 @@ static int g15_probed_hw(void *dt, int gpu, const struct g15_soc *soc, u32 *core
     return soc->read_leak(soc, leak);
 }
 
-/* 25G83 calibration on the scratch DT: this Mac's ADT and fuse, no unit tables.
- * The G15S-derived power model remains experimental. Release every power vote
- * after the bounded identity read; Linux owns firmware admission and startup.
- *
- * The kernel's T8122 admission requires the bounded powered-identity witness
- * in /chosen/asahi,t8122-gpu-powered-identity. Reserve it (probe-result
- * NOT_RUN) before power-on, retain g15_read_hw()'s genuine guarded read of
- * this boot's ID/core-mask registers, and publish it only after the SGX
- * power vote is confirmed released. The caller runs this on a scratch copy
- * of the DT, so any failure here discards the reserved node together with
- * the rest of the handoff and leaves the GPU disabled.
+/*
+ * Calibrate on the scratch DT before Linux starts the firmware. Take the OPPs
+ * and SRAM voltages from this Mac and release SGX after the bounded identity read.
+ * T8122 also requires the powered-identity witness for firmware admission.
  */
-int dt_gpu_t8122_26_calibrate(void *dt)
+static int dt_gpu_g15_calibrate(void *dt, const struct g15_soc *soc)
 {
     int gpu = fdt_path_offset(dt, "gpu"), sgx = adt_path_offset(adt, "/arm-io/sgx");
     u32 count, tables, clusters, enabled, cores[G15_MAX_CLUSTERS], power[MAX_PSTATES];
     const struct perf_state *ps;
     struct g15_power_values pv;
     struct t8122_powered_identity identity = {.result = T8122_ID_NOT_RUN};
-    if (gpu < 0 || sgx < 0 || !t8122_fuse_valid ||
-        g15_get_pstates(&g15_soc_t8122_standin, sgx, &count, &tables, &ps) ||
-        g15_get_power_props(sgx, count, tables, ps, &pv))
+    if (gpu < 0 || sgx < 0 || g15_get_pstates(soc, sgx, &count, &tables, &ps) ||
+        (soc->power_props && g15_get_power_props(sgx, count, tables, ps, &pv)))
         return -1;
     int len;
     const fdt32_t *ref = fdt_getprop(dt, gpu, "operating-points-v2", &len);
@@ -2150,43 +2198,64 @@ int dt_gpu_t8122_26_calibrate(void *dt)
         return -1;
     u32 opps = fdt32_ld(ref);
     /* Reserve the witness before power-on; never replace an input witness. */
-    if (t8122_full_identity_prepare(dt) < 0) {
+    if (soc->publish_powered_identity && t8122_full_identity_prepare(dt) < 0) {
         printf("FDT: GPU: T8122 25G83 powered identity node unavailable; GPU stays disabled\n");
         return -1;
     }
     gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0)
         return -1;
-    bool previous = t8122_fuse_use;
-    t8122_fuse_use = true;
+
+    /*
+     * On T8122 (power_closure == true) SGX starts off and is verified off after release.
+     * On T6030 (power_closure == false) GFX's parent AFR is always on, so restore the
+     * closure registers to their pre-probe state instead of requiring the whole closure off.
+     */
+    struct t6031_closure closure;
+    if (!soc->power_closure && t6031_closure_get("/arm-io/sgx", &closure)) {
+        printf("FDT: GPU: %s 27.2: SGX power closure did not resolve; GPU stays disabled\n",
+               soc->name);
+        return -1;
+    }
     g15_powered = false;
     float leak;
-    int ret =
-        g15_read_hw(dt, gpu, &g15_soc_t8122_standin, cores, &clusters, &enabled, &leak, &identity);
-    t8122_fuse_use = previous;
-    if (g15_powered && (pmgr_adt_power_disable_recursive("/arm-io/sgx") ||
-                        pmgr_adt_power_is_off("/arm-io/sgx") != 1)) {
-        printf("FDT: GPU: T8122 25G83 failed to release SGX power vote; GPU stays disabled\n");
-        ret = -1;
+    int ret = g15_read_hw(dt, gpu, soc, cores, &clusters, &enabled, &leak,
+                          soc->publish_powered_identity ? &identity : NULL);
+    bool restore_fail = false;
+    if (g15_powered) {
+        restore_fail = soc->power_closure ? (pmgr_adt_power_disable_recursive("/arm-io/sgx") ||
+                                             pmgr_adt_power_is_off("/arm-io/sgx") != 1)
+                                          : (t6031_closure_restore(&closure) != 0);
+        if (restore_fail) {
+            printf("FDT: GPU: %s failed to release SGX power vote; GPU stays disabled\n",
+                   soc->name);
+            ret = -1;
+        }
     }
     g15_powered = false;
+    if (restore_fail)
+        return GPU26_ERR_FATAL;
     if (ret || tables > clusters)
         return -1;
-    /* Power is confirmed off: publish the real read, PASS last. */
-    if (t8122_full_identity_publish(dt, &identity)) {
-        printf("FDT: GPU: T8122 25G83 powered identity publication failed; GPU stays disabled\n");
-        return -1;
+    if (soc->publish_powered_identity) {
+        /* Power is confirmed off: publish the real read, PASS last. */
+        if (t8122_full_identity_publish(dt, &identity)) {
+            printf(
+                "FDT: GPU: T8122 25G83 powered identity publication failed; GPU stays disabled\n");
+            return -1;
+        }
+        printf("FDT: GPU: T8122 25G83 powered identity result %u: ID_VERSION 0x%08x ID_COUNTS_1 "
+               "0x%08x core masks 0x%x 0x%x 0x%x\n",
+               identity.result, identity.id_version, identity.id_counts_1, identity.core_mask[0],
+               identity.core_mask[1], identity.core_mask[2]);
     }
-    printf("FDT: GPU: T8122 25G83 powered identity result %u: ID_VERSION 0x%08x ID_COUNTS_1 "
-           "0x%08x core masks 0x%x 0x%x 0x%x\n",
-           identity.result, identity.id_version, identity.id_counts_1, identity.core_mask[0],
-           identity.core_mask[1], identity.core_mask[2]);
-    calc_power_t8122_standin(count, ps, leak, enabled, power);
+    soc->calc_power(count, ps, leak, enabled, power);
     if (power[count - 1] < 1000 || g15_set_opps(dt, opps, count, tables, clusters, ps, power) ||
-        g15_set_power_props(dt, &pv) ||
+        (soc->power_props && g15_set_power_props(dt, &pv)) ||
         g15_set_float_array(dt, "apple,core-leak-coef", leak, clusters) ||
         g15_set_float_array(dt, "apple,sram-leak-coef", 0.0f, clusters))
         return -1;
+
     u32 sram_len;
     const struct perf_state *sram = adt_getprop(adt, sgx, "perf-states-sram", &sram_len);
     if (!sram || sram_len != sizeof(*sram) * count * tables)
@@ -2199,58 +2268,33 @@ int dt_gpu_t8122_26_calibrate(void *dt)
         fdt32_t voltage[G15_MAX_CLUSTERS];
         for (u32 t = 0; t < clusters; t++) {
             u32 mv = t < tables ? sram[t * count + i].volt : 0;
-            voltage[t] = cpu_to_fdt32((mv ? mv : sram[i].volt) * 1000);
+            mv = mv ? mv : sram[i].volt;
+            if (mv > G15_PS_MAX_MV)
+                return -1;
+            voltage[t] = cpu_to_fdt32(mv * 1000);
         }
         if (fdt_setprop(dt, node, "opp-microvolt-sram", voltage, clusters * sizeof(fdt32_t)))
             return -1;
         i++;
     }
-    gpu = fdt_path_offset(dt, "gpu");
-    if (i != (int)count || gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,gpu-power-model", 1))
+    return i == (int)count ? 0 : -1;
+}
+
+int dt_gpu_t8122_26_calibrate(void *dt)
+{
+    if (!t8122_fuse_valid)
+        return -1;
+    bool previous = t8122_fuse_use;
+    t8122_fuse_use = true;
+    int ret = dt_gpu_g15_calibrate(dt, &g15_soc_t8122_standin);
+    t8122_fuse_use = previous;
+    if (ret)
+        return ret;
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,gpu-power-model", 1))
         return -1;
     return fdt_setprop_string(dt, gpu, "apple,j613-gpu-power-model",
                               "g15s-fuse-scaled-experimental");
-}
-
-/*
- * 27.2 start values the kernel takes from the GPU node rather than its own literals, each copied
- * as it is and only when this Mac's ADT has it (one cell when present; a malformed one fails):
- * - apple,fast-die0-target: /arm-io/sgx gpu-fast-die0-target (degrees C);
- * - apple,coredump-copy-buffer: /arm-io/gfx-asc/iop-gfx-nub coredump-copy-buffer (bytes, the
- *   host's firmware crash-copy buffer).
- */
-int dt_gpu_t8122_27_machine_values(void *dt)
-{
-    static const struct {
-        const char *path, *adt, *dt, *what;
-    } values[] = {
-        {"/arm-io/sgx", "gpu-fast-die0-target", "apple,fast-die0-target", "fast-die0 target"},
-        {"/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer", "apple,coredump-copy-buffer",
-         "coredump copy buffer"},
-    };
-    bool have[ARRAY_SIZE(values)];
-    u32 val[ARRAY_SIZE(values)];
-    for (size_t i = 0; i < ARRAY_SIZE(values); i++) {
-        int node = adt_path_offset(adt, values[i].path);
-        u32 len = 0;
-        have[i] = node >= 0 && adt_getprop(adt, node, values[i].adt, &len) != NULL;
-        if (have[i] && g15_adt_u32(node, values[i].adt, &val[i]))
-            bail("ADT: GPU: T8122 malformed %s (len %u)\n", values[i].adt, len);
-        int gpu = fdt_path_offset(dt, "gpu");
-        if (gpu < 0 || (have[i] && fdt_setprop_u32(dt, gpu, values[i].dt, val[i])))
-            bail("FDT: GPU: T8122 cannot set %s\n", values[i].dt);
-    }
-    printf("FDT: GPU: T8122 27.2 machine values: %s ", values[0].what);
-    if (have[0])
-        printf("%u C", val[0]);
-    else
-        printf("absent");
-    printf(", %s ", values[1].what);
-    if (have[1])
-        printf("0x%x bytes\n", val[1]);
-    else
-        printf("absent\n");
-    return 0;
 }
 
 /* Whether /chosen has `name` = "1" */
@@ -2259,7 +2303,20 @@ static bool g15_optin(void *dt, const char *name)
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
     const char *optin = chosen >= 0 ? fdt_getprop(dt, chosen, name, &len) : NULL;
-    return optin && len == 2 && !strcmp(optin, "1");
+    return optin && len == 2 && optin[0] == '1' && !optin[1];
+}
+
+int dt_gpu_t6030_27_calibrate(void *dt)
+{
+    if (kboot_config_lost())
+        bail("FDT: GPU: T6030 27.2: config line lost; GPU stays disabled\n");
+    int chosen = fdt_path_offset(dt, "/chosen"), len;
+    const char *intent = chosen < 0 ? NULL : fdt_getprop(dt, chosen, g15_soc_t6030.optin, &len);
+    if (!intent && chosen >= 0)
+        intent = fdt_getprop(dt, chosen, "asahi,m3-defaults", &len);
+    if (intent && (len != 2 || intent[0] != '1' || intent[1]))
+        bail("FDT: GPU: T6030 27.2: GPU disabled by chosen config\n");
+    return dt_gpu_g15_calibrate(dt, &g15_soc_t6030);
 }
 
 /*
@@ -2289,6 +2346,9 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
      */
     const struct fw_version_info *gfx_fw =
         soc->family_fw ? g15_t6031_fw : firmware_gfx_version_ex(soc->chip, soc->fw_experimental);
+    if (soc->handoff && (!gfx_fw || gfx_fw->version != V14_8_3))
+        return soc->handoff(dt, gfx_fw);
+
     bool have_model = soc->read_leak && soc->calc_power;
     if (!have_model)
         printf("FDT: GPU: the %s leakage fuse and power model are not known yet\n", soc->gpu_name);
@@ -2369,9 +2429,8 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
     }
 
     /* Reserve the full14 witness before power-on; GPU26 uses its separate path. */
-    bool publish_identity = soc->chip == T8122;
     struct t8122_powered_identity identity = {0};
-    if (publish_identity && t8122_full_identity_prepare(dt) < 0)
+    if (soc->publish_powered_identity && t8122_full_identity_prepare(dt) < 0)
         bail("FDT: GPU: full-start T8122 identity node unavailable\n");
     gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0)
@@ -2385,7 +2444,7 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
         if (g15_probed_hw(dt, gpu, soc, core_count, &clusters, &enabled_cores, &leak))
             return -1;
     } else if (g15_read_hw(dt, gpu, soc, core_count, &clusters, &enabled_cores, &leak,
-                           publish_identity ? &identity : NULL)) {
+                           soc->publish_powered_identity ? &identity : NULL)) {
         return -1;
     }
     if (perf_state_table_count > clusters)
@@ -2463,7 +2522,7 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
         if (g15_set_mbox_status(dt, mbox_ph, "okay"))
             return -1;
     }
-    if (publish_identity && t8122_full_identity_publish(dt, &identity))
+    if (soc->publish_powered_identity && t8122_full_identity_publish(dt, &identity))
         bail("FDT: GPU: full-start T8122 identity publication failed\n");
     if (g15_set_status(dt, "gpu", "okay"))
         return -1;
@@ -2472,7 +2531,7 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
     return 0;
 }
 
-/* Never fails: on any problem the gpu node is left disabled and the boot continues. */
+/* Continue with graphics disabled only if the fallback can safely hand memory to Linux. */
 static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
 {
     /* Per-kboot state: nothing of the firmware segment description is in this DT yet */
@@ -2482,12 +2541,12 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
     int gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0) {
         printf("FDT: GPU: gpu alias not found in device tree\n");
-        return 0;
+        return soc->handoff ? soc->handoff(dt, NULL) : 0;
     }
 
     if (fdt_node_check_compatible(dt, gpu, soc->compatible)) {
         printf("FDT: GPU: gpu node is not %s, leaving it alone\n", soc->compatible);
-        return 0;
+        return soc->handoff ? soc->handoff(dt, NULL) : 0;
     }
 
     /* Disabled until everything below has succeeded */
@@ -2495,6 +2554,8 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
         printf("FDT: GPU: cannot mark the gpu node disabled, not setting up the %s GPU\n",
                soc->name);
         g15_disable(dt);
+        if (soc->handoff && soc->handoff(dt, NULL) == GPU26_ERR_FATAL)
+            return -1;
         return 0;
     }
 
@@ -2515,7 +2576,7 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
     if (ret) {
         if (ret < 0)
             printf("FDT: GPU: %s GPU setup failed, leaving the gpu node disabled\n", soc->name);
-        if (soc->chip == T8122)
+        if (soc->publish_powered_identity)
             t8122_full_identity_invalidate(dt);
         g15_disable(dt);
         if (g15_powered) {
@@ -2528,6 +2589,8 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
             if (!off)
                 printf("FDT: GPU: failed to power the GPU back off\n");
         }
+        if (ret == GPU26_ERR_FATAL)
+            return -1;
     }
 
     return 0;
@@ -2759,10 +2822,10 @@ static int dt_set_gpu_t6031(void *dt)
  * T8122 handoff checks. Power is voted on solely for bounded ID/core-mask
  * reads, then voted off before Linux starts. Neither GPU nor mailbox is enabled.
  */
-void t8122_read_powered_identity(void *dt, int gpu)
+int t8122_read_powered_identity(void *dt, int gpu)
 {
     if (!t8122_power_probe_opted_in(dt))
-        return;
+        return 0;
 
     int sgx_path[8];
     u64 sgx_base, sgx_size, dt_sgx;
@@ -2771,7 +2834,7 @@ void t8122_read_powered_identity(void *dt, int gpu)
         g15_dt_reg_by_name(dt, gpu, "sgx", &dt_sgx) || !sgx_base || sgx_base != dt_sgx ||
         sgx_size < G15_SGX_CORE_MASK + 12) {
         printf("FDT: GPU: T8122 powered identity preflight rejected SGX window\n");
-        return;
+        return 0;
     }
 
     /* The SGX gates are virtual on T8122; their real GFX parent must be off
@@ -2779,14 +2842,14 @@ void t8122_read_powered_identity(void *dt, int gpu)
      */
     if (pmgr_adt_power_is_off("/arm-io/sgx") != 1) {
         printf("FDT: GPU: T8122 SGX power closure was not off; skipping probe\n");
-        return;
+        return 0;
     }
 
     /* Reserve all result properties before powering hardware. */
     int node = t8122_identity_node(dt);
     if (node < 0) {
         printf("FDT: GPU: T8122 powered identity result node unavailable\n");
-        return;
+        return 0;
     }
 
     static const struct t8122_power_probe_ops ops = {
@@ -2798,20 +2861,28 @@ void t8122_read_powered_identity(void *dt, int gpu)
     if (identity.result == T8122_ID_POWER_OFF_FAILED)
         printf("FDT: GPU: T8122 failed to release SGX power vote\n");
 
-    if (t8122_identity_set_u32(dt, node, "id-version", identity.id_version) ||
-        t8122_identity_set_u32(dt, node, "core-mask-0", identity.core_mask[0]) ||
-        t8122_identity_set_u32(dt, node, "core-mask-1", identity.core_mask[1]) ||
-        t8122_identity_set_u32(dt, node, "core-mask-2", identity.core_mask[2]) ||
-        t8122_identity_set_u32(dt, node, "id-counts-1", identity.id_counts_1) ||
-        t8122_identity_set_u32(dt, node, "id-counts-2", identity.id_counts_2) ||
-        t8122_identity_set_u32(dt, node, "probe-result", identity.result))
-        printf("FDT: GPU: T8122 could not publish powered identity result\n");
+    static const char *const properties[] = {
+        "id-version",  "core-mask-0", "core-mask-1",  "core-mask-2",
+        "id-counts-1", "id-counts-2", "probe-result",
+    };
+    const u32 values[] = {
+        identity.id_version,  identity.core_mask[0], identity.core_mask[1], identity.core_mask[2],
+        identity.id_counts_1, identity.id_counts_2,  identity.result,
+    };
+    /* Publish the result only after all the register values are in place. */
+    for (size_t i = 0; i < ARRAY_SIZE(properties); i++) {
+        if (t8122_identity_set_u32(dt, node, properties[i], values[i])) {
+            printf("FDT: GPU: T8122 could not publish powered identity result\n");
+            break;
+        }
+    }
     printf("FDT: GPU: T8122 bounded powered identity result %u; GPU and ASC remain disabled\n",
            identity.result);
     printf("FDT: GPU: T8122 powered identity: ID_VERSION 0x%08x ID_COUNTS_1 0x%08x ID_COUNTS_2 "
            "0x%08x core masks 0x%x 0x%x 0x%x\n",
            identity.id_version, identity.id_counts_1, identity.id_counts_2, identity.core_mask[0],
            identity.core_mask[1], identity.core_mask[2]);
+    return identity.result == T8122_ID_POWER_OFF_FAILED ? GPU26_ERR_FATAL : 0;
 }
 
 static bool t8122_identity_matches_j613(void *dt)
@@ -2939,11 +3010,7 @@ static int dt_set_gpu_t8122(void *dt)
         return 0;
     }
 
-    int chosen = fdt_path_offset(dt, "/chosen");
-    int len = 0;
-    const char *optin =
-        chosen >= 0 ? fdt_getprop(dt, chosen, "asahi,t8122-gpu-handoff-diag", &len) : NULL;
-    if (!optin || len != 2 || strcmp(optin, "1"))
+    if (!g15_optin(dt, "asahi,t8122-gpu-handoff-diag"))
         return 0;
 
     /* Never carry a compatibility claim from an input DT into a diagnostic boot.
@@ -3015,7 +3082,9 @@ static int dt_set_gpu_t8122(void *dt)
 
     printf("FDT: GPU: T8122 UAT and firmware reservations supplied from ADT; "
            "GPU and ASC remain disabled\n");
-    t8122_read_powered_identity(dt, gpu);
+    int ret = t8122_read_powered_identity(dt, gpu);
+    if (ret)
+        return ret;
     t8122_admit_image_metadata(dt, &image);
     t8122_enable_asc_preflight(dt);
     return 0;
@@ -3063,7 +3132,8 @@ static bool t8142_gpu_firmware_role_known(const char *path, u32 text_size, const
         return false;
 
     u32 len = 0;
-    const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+    const struct adt_segment_ranges *seg =
+        __builtin_assume_aligned(adt_getprop(adt, node, "segment-ranges", &len), 4);
     if (!seg || len != 2 * sizeof(*seg) || seg[0].size != text_size || !seg[0].phys)
         return false;
     const char *names = adt_getprop(adt, node, "segment-names", &len);
@@ -3132,12 +3202,7 @@ static int g17_set_fw_data(void *dt, int sgx, const u64 data_base[2], const u64 
     if (fdt_path_offset(dt, path) < 0)
         return 0;
     for (int i = 0; i < 2; i++) {
-        char prop[64];
-        snprintf(prop, sizeof(prop), "%s-base", ro[i]);
-        if (ADT_GETPROP(adt, sgx, prop, &ro_base[i]) != sizeof(u64) || !ro_base[i])
-            return 0;
-        snprintf(prop, sizeof(prop), "%s-size", ro[i]);
-        if (ADT_GETPROP(adt, sgx, prop, &ro_size[i]) != sizeof(u64) || !ro_size[i])
+        if (gpu_adt_region(sgx, ro[i], &ro_base[i], &ro_size[i]))
             return 0;
         if (ro_base[i] != data_base[i] + data_size[i] || ro_size[i] > UINT64_MAX - ro_base[i] ||
             (ro_size[i] & (SZ_16K - 1)))
@@ -3171,13 +3236,8 @@ static int g17_set_data_span(void *dt, int sgx)
     if (node < 0)
         return 0;
     for (int i = 0; i < 2; i++) {
-        char prop[64];
-        snprintf(prop, sizeof(prop), "%s-base", data[i]);
-        bool ok = ADT_GETPROP(adt, sgx, prop, &base[i]) == sizeof(u64);
-        snprintf(prop, sizeof(prop), "%s-size", data[i]);
-        ok = ok && ADT_GETPROP(adt, sgx, prop, &size[i]) == sizeof(u64);
-        if (!ok || !base[i] || !size[i] || ((base[i] | size[i]) & (SZ_16K - 1)) ||
-            base[i] > UINT64_MAX - size[i]) {
+        if (gpu_adt_region(sgx, data[i], &base[i], &size[i]) ||
+            ((base[i] | size[i]) & (SZ_16K - 1)) || base[i] > UINT64_MAX - size[i]) {
             printf("FDT: GPU: no valid %s in the ADT, leaving %s disabled\n", data[i], path);
             return 0;
         }
@@ -3231,7 +3291,8 @@ static int g17_set_fw_text(void *dt)
         if (node < 0)
             return 0;
         u32 len = 0;
-        const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+        const struct adt_segment_ranges *seg =
+            __builtin_assume_aligned(adt_getprop(adt, node, "segment-ranges", &len), 4);
         const char *names = adt_getprop(adt, node, "segment-names", NULL);
         if (!seg || len < sizeof(*seg) || !names || strncmp(names, "__TEXT;", 7))
             return 0;
@@ -3313,14 +3374,9 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
     size_t nregions = ARRAY_SIZE(regions) - (soc->firmware_data ? 0 : 2);
     u64 base[ARRAY_SIZE(regions)], size[ARRAY_SIZE(regions)];
     for (size_t i = 0; i < nregions; i++) {
-        char prop[64];
-        snprintf(prop, sizeof(prop), "%s-base", regions[i].name);
-        if (ADT_GETPROP(adt, sgx, prop, &base[i]) != sizeof(u64))
-            goto disable;
-        snprintf(prop, sizeof(prop), "%s-size", regions[i].name);
-        if (ADT_GETPROP(adt, sgx, prop, &size[i]) != sizeof(u64) || !base[i] || !size[i] ||
-            (base[i] & (SZ_16K - 1)) || (size[i] & (SZ_16K - 1)) ||
-            base[i] > UINT64_MAX - size[i] || fdt_path_offset(dt, regions[i].path) < 0)
+        if (gpu_adt_region(sgx, regions[i].name, &base[i], &size[i]) || (base[i] & (SZ_16K - 1)) ||
+            (size[i] & (SZ_16K - 1)) || base[i] > UINT64_MAX - size[i] ||
+            fdt_path_offset(dt, regions[i].path) < 0)
             goto disable;
         for (size_t j = 0; j < i; j++)
             if (base[i] < base[j] + size[j] && base[j] < base[i] + size[i])
@@ -3388,14 +3444,14 @@ disable:
 static float t6040_f32(u32 w)
 {
     float f;
-    memcpy(&f, &w, sizeof(f));
+    __builtin_memcpy(&f, &w, sizeof(f));
     return f;
 }
 
 static double t6040_f64(u64 w)
 {
     double d;
-    memcpy(&d, &w, sizeof(d));
+    __builtin_memcpy(&d, &w, sizeof(d));
     return d;
 }
 
@@ -3632,15 +3688,17 @@ static int t6040_opp_table(void *dt, int gpu, const char *prop, u32 count, int v
 }
 
 static const struct {
-    const char *name;
-    const char *path;
+    const char *name; /* reserved-memory path */
+    const char *base_prop;
+    const char *size_prop;
 } t6040_regions[] = {
-    {"gfx-handoff", "/reserved-memory/uat-handoff"},
-    {"gfx-shared-l2-region", "/reserved-memory/uat-l2-pagetables"},
-    {"gfx-shared-region", "/reserved-memory/uat-pagetables"},
-    {"gpu-region", "/reserved-memory/uat-ttbs"},
-    {"gfx-data", "/reserved-memory/gpu-fw-data"},
-    {NULL, "/reserved-memory/gpu-fw-text"},
+    {"/reserved-memory/uat-handoff", "gfx-handoff-base", "gfx-handoff-size"},
+    {"/reserved-memory/uat-l2-pagetables", "gfx-shared-l2-region-base",
+     "gfx-shared-l2-region-size"},
+    {"/reserved-memory/uat-pagetables", "gfx-shared-region-base", "gfx-shared-region-size"},
+    {"/reserved-memory/uat-ttbs", "gpu-region-base", "gpu-region-size"},
+    {"/reserved-memory/gpu-fw-data", "gfx-data-base", "gfx-data-size"},
+    {"/reserved-memory/gpu-fw-text", NULL, NULL},
 };
 
 /*
@@ -3657,7 +3715,8 @@ int gpu_fw_layout(int sgx, struct gpu_fw_layout *fw)
     int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
     if (asc < 0)
         return -1;
-    const struct adt_segment_ranges *seg = adt_getprop(adt, asc, "segment-ranges", &len);
+    const struct adt_segment_ranges *seg =
+        __builtin_assume_aligned(adt_getprop(adt, asc, "segment-ranges", &len), 4);
     if (!seg || (len != 2 * sizeof(*seg) && len != 3 * sizeof(*seg)))
         return -1;
     fw->seg = seg;
@@ -3724,29 +3783,15 @@ static int dt_set_gpu_t6040(void *dt)
 
     /* Operating point 0 is the off state; every other one is checked here before any use. */
     const struct perf_state *states = adt_getprop(adt, sgx, "perf-states", &len);
-    if (!states || len != count * tables * sizeof(*states))
+    if (!t6040_cluster_states_valid(states, len, count, tables))
         goto disable;
-    for (u32 j = 0; j < tables; j++)
-        if (states[j * count].freq)
-            goto disable;
-    for (u32 j = 0; j < tables; j++)
-        for (u32 i = 1; i < count; i++)
-            if (!states[j * count + i].freq || states[j * count + i].freq != states[i].freq ||
-                states[j * count + i].volt < 400 || states[j * count + i].volt > 1300)
-                goto disable;
 
     const struct aux_perf_states *aux[2];
     const char *aux_name[2] = {"cs-perf-states", "afr-perf-states"};
     for (int j = 0; j < 2; j++) {
         aux[j] = adt_getprop(adt, sgx, aux_name[j], &len);
-        if (!aux[j] || len < sizeof(*aux[j]) || aux[j]->dies != 1 || aux[j]->count < 2 ||
-            aux[j]->count > MAX_PSTATES ||
-            len < sizeof(*aux[j]) + aux[j]->count * sizeof(aux[j]->states[0]))
+        if (!t6040_aux_states_valid(aux[j], len))
             goto disable;
-        for (u32 i = 0; i < aux[j]->count; i++)
-            if (!aux[j]->states[i].freq || aux[j]->states[i].volt < 400000 ||
-                aux[j]->states[i].volt > 1300000)
-                goto disable;
     }
 
     /* Base policy defaults to the first active state, as in the T6040 power policy.
@@ -3770,13 +3815,9 @@ static int dt_set_gpu_t6040(void *dt)
     /* The reserved regions, the OPP tables and the GPU node must all take the fill. */
     u64 region_base[ARRAY_SIZE(t6040_regions)], region_size[ARRAY_SIZE(t6040_regions)];
     for (size_t i = 0; i < ARRAY_SIZE(t6040_regions); i++) {
-        char prop[64];
-        if (t6040_regions[i].name) {
-            snprintf(prop, sizeof(prop), "%s-base", t6040_regions[i].name);
-            if (ADT_GETPROP(adt, sgx, prop, &region_base[i]) != sizeof(u64))
-                goto disable;
-            snprintf(prop, sizeof(prop), "%s-size", t6040_regions[i].name);
-            if (ADT_GETPROP(adt, sgx, prop, &region_size[i]) != sizeof(u64))
+        if (t6040_regions[i].base_prop) {
+            if (ADT_GETPROP(adt, sgx, t6040_regions[i].base_prop, &region_base[i]) != sizeof(u64) ||
+                ADT_GETPROP(adt, sgx, t6040_regions[i].size_prop, &region_size[i]) != sizeof(u64))
                 goto disable;
         } else {
             region_base[i] = fw.text_base;
@@ -3788,15 +3829,9 @@ static int dt_set_gpu_t6040(void *dt)
                 goto disable;
             region_size[4] += fw.ro_size;
         }
-        if (!region_base[i] || !region_size[i] || (region_base[i] & (SZ_16K - 1)) ||
-            (region_size[i] & (SZ_16K - 1)) || region_base[i] > UINT64_MAX - region_size[i] ||
-            region_base[i] + region_size[i] > (1ULL << 42) ||
-            fdt_path_offset(dt, t6040_regions[i].path) < 0)
+        if (!t6040_region_valid(region_base, region_size, i) ||
+            fdt_path_offset(dt, t6040_regions[i].name) < 0)
             goto disable;
-        for (size_t j = 0; j < i; j++)
-            if (region_base[i] < region_base[j] + region_size[j] &&
-                region_base[j] < region_base[i] + region_size[i])
-                goto disable;
     }
     int table =
         t6040_opp_table(dt, gpu, "operating-points-v2", count, T6040_CLUSTERS * sizeof(u32));
@@ -3850,16 +3885,12 @@ static int dt_set_gpu_t6040(void *dt)
             goto disable;
     }
 
-    /* Both maps must climb in frequency, so the B ladder below cannot wrap. */
-    for (int i = 2; i < n; i++)
-        if (states[index_a[i]].freq <= states[index_a[i - 1]].freq ||
-            states[index_b[i]].freq <= states[index_b[i - 1]].freq)
-            goto disable;
+    u32 rel_b[T6040_OPPS] = {0};
+    if (!t6040_relative_frequencies(states, index_a, index_b, n, base_pstate, rel_b))
+        goto disable;
 
-    /* Maximum power of each logical A state, and the relative tables. State 0 stays at 0. */
-    u32 power[T6040_MAP_STATES] = {0}, freq[T6040_MAP_STATES] = {0};
-    for (int i = 1; i < n; i++)
-        freq[i] = states[index_a[i]].freq / 1000000;
+    /* Maximum power of each logical A state. State 0 stays at 0. */
+    u32 power[T6040_MAP_STATES] = {0};
     for (int i = 1; i < n; i++) {
         const struct perf_state *s = &states[index_a[i]];
         u32 c = min((u32)i, (u32)aux[0]->count - 1);
@@ -3877,15 +3908,12 @@ static int dt_set_gpu_t6040(void *dt)
     }
 
     /* Keep the unpopulated selector slots explicit and zero in the handoff. */
-    u32 rel_a[T6040_OPPS] = {0}, rel_b[T6040_OPPS] = {0};
-    u64 span_p = power[n - 1] - power[0], span_f = freq[n - 1] - freq[base_pstate];
-    if (!span_p || !span_f)
+    u32 rel_a[T6040_OPPS] = {0};
+    u64 span_p = power[n - 1] - power[0];
+    if (!span_p)
         goto disable;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; i++)
         rel_a[i] = (u32)(100ULL * (power[i] - power[0]) / span_p);
-        rel_b[i] =
-            i < (int)base_pstate ? 0 : (u32)(100ULL * (freq[i] - freq[base_pstate]) / span_f);
-    }
 
     /* Everything is validated. Fill the GPU node, then publish the reserved regions last. */
     int opp;
@@ -3920,7 +3948,7 @@ static int dt_set_gpu_t6040(void *dt)
 
     while (touched < ARRAY_SIZE(t6040_regions)) {
         size_t r = touched++;
-        if (dt_set_resvmem(dt, t6040_regions[r].path, region_base[r], region_size[r]))
+        if (dt_set_resvmem(dt, t6040_regions[r].name, region_base[r], region_size[r]))
             goto disable;
     }
 
@@ -3935,7 +3963,7 @@ static int dt_set_gpu_t6040(void *dt)
 disable:
     /* A region published before a failure would stay reserved for a disabled GPU. */
     for (size_t r = 0; r < touched; r++) {
-        int node = fdt_path_offset(dt, t6040_regions[r].path);
+        int node = fdt_path_offset(dt, t6040_regions[r].name);
         if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
             return -1;
     }
@@ -4046,29 +4074,15 @@ static int dt_set_gpu_t6041(void *dt)
 
     /* Operating point 0 is the off state; every cluster runs the same clocks. */
     const struct perf_state *states = adt_getprop(adt, sgx, "perf-states", &len);
-    if (!states || len != count * tables * sizeof(*states))
+    if (!t6040_cluster_states_valid(states, len, count, tables))
         goto disable;
-    for (u32 j = 0; j < tables; j++)
-        if (states[j * count].freq)
-            goto disable;
-    for (u32 j = 0; j < tables; j++)
-        for (u32 i = 1; i < count; i++)
-            if (!states[j * count + i].freq || states[j * count + i].freq != states[i].freq ||
-                states[j * count + i].volt < 400 || states[j * count + i].volt > 1300)
-                goto disable;
 
     const struct aux_perf_states *aux[2];
     const char *aux_name[2] = {"cs-perf-states", "afr-perf-states"};
     for (int j = 0; j < 2; j++) {
         aux[j] = adt_getprop(adt, sgx, aux_name[j], &len);
-        if (!aux[j] || len < sizeof(*aux[j]) || aux[j]->dies != 1 || aux[j]->count < 2 ||
-            aux[j]->count > MAX_PSTATES ||
-            len < sizeof(*aux[j]) + aux[j]->count * sizeof(aux[j]->states[0]))
+        if (!t6040_aux_states_valid(aux[j], len))
             goto disable;
-        for (u32 i = 0; i < aux[j]->count; i++)
-            if (!aux[j]->states[i].freq || aux[j]->states[i].volt < 400000 ||
-                aux[j]->states[i].volt > 1300000)
-                goto disable;
     }
 
     u32 base_pstate = 1;
@@ -4093,13 +4107,9 @@ static int dt_set_gpu_t6041(void *dt)
 
     u64 region_base[ARRAY_SIZE(t6040_regions)], region_size[ARRAY_SIZE(t6040_regions)];
     for (size_t i = 0; i < ARRAY_SIZE(t6040_regions); i++) {
-        char prop[64];
-        if (t6040_regions[i].name) {
-            snprintf(prop, sizeof(prop), "%s-base", t6040_regions[i].name);
-            if (ADT_GETPROP(adt, sgx, prop, &region_base[i]) != sizeof(u64))
-                goto disable;
-            snprintf(prop, sizeof(prop), "%s-size", t6040_regions[i].name);
-            if (ADT_GETPROP(adt, sgx, prop, &region_size[i]) != sizeof(u64))
+        if (t6040_regions[i].base_prop) {
+            if (ADT_GETPROP(adt, sgx, t6040_regions[i].base_prop, &region_base[i]) != sizeof(u64) ||
+                ADT_GETPROP(adt, sgx, t6040_regions[i].size_prop, &region_size[i]) != sizeof(u64))
                 goto disable;
         } else {
             region_base[i] = fw.text_base;
@@ -4111,15 +4121,9 @@ static int dt_set_gpu_t6041(void *dt)
                 goto disable;
             region_size[4] += fw.ro_size;
         }
-        if (!region_base[i] || !region_size[i] || (region_base[i] & (SZ_16K - 1)) ||
-            (region_size[i] & (SZ_16K - 1)) || region_base[i] > UINT64_MAX - region_size[i] ||
-            region_base[i] + region_size[i] > (1ULL << 42) ||
-            fdt_path_offset(dt, t6040_regions[i].path) < 0)
+        if (!t6040_region_valid(region_base, region_size, i) ||
+            fdt_path_offset(dt, t6040_regions[i].name) < 0)
             goto disable;
-        for (size_t j = 0; j < i; j++)
-            if (region_base[i] < region_base[j] + region_size[j] &&
-                region_base[j] < region_base[i] + region_size[i])
-                goto disable;
     }
     int table =
         t6040_opp_table(dt, gpu, "operating-points-v2", count, T6041_CLUSTERS * sizeof(u32));
@@ -4154,21 +4158,9 @@ static int dt_set_gpu_t6041(void *dt)
             goto disable;
     }
 
-    for (int i = 2; i < n; i++)
-        if (states[index_a[i]].freq <= states[index_a[i - 1]].freq ||
-            states[index_b[i]].freq <= states[index_b[i - 1]].freq)
-            goto disable;
-
-    u32 freq[T6040_MAP_STATES] = {0};
-    for (int i = 1; i < n; i++)
-        freq[i] = states[index_a[i]].freq / 1000000;
     u32 rel_b[T6040_OPPS] = {0};
-    u64 span_f = freq[n - 1] - freq[base_pstate];
-    if (!span_f)
+    if (!t6040_relative_frequencies(states, index_a, index_b, n, base_pstate, rel_b))
         goto disable;
-    for (int i = 0; i < n; i++)
-        rel_b[i] =
-            i < (int)base_pstate ? 0 : (u32)(100ULL * (freq[i] - freq[base_pstate]) / span_f);
 
     /* Everything is validated. Fill the GPU node, then publish the reserved regions last. */
     int opp;
@@ -4199,7 +4191,7 @@ static int dt_set_gpu_t6041(void *dt)
 
     while (touched < ARRAY_SIZE(t6040_regions)) {
         size_t r = touched++;
-        if (dt_set_resvmem(dt, t6040_regions[r].path, region_base[r], region_size[r]))
+        if (dt_set_resvmem(dt, t6040_regions[r].name, region_base[r], region_size[r]))
             goto disable;
     }
 
@@ -4215,7 +4207,7 @@ static int dt_set_gpu_t6041(void *dt)
 disable:
     /* A region published before a failure would stay reserved for a disabled GPU. */
     for (size_t r = 0; r < touched; r++) {
-        int node = fdt_path_offset(dt, t6040_regions[r].path);
+        int node = fdt_path_offset(dt, t6040_regions[r].name);
         if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
             return -1;
     }
@@ -4499,6 +4491,32 @@ static const struct fw_version_info *gpu_initdata_compat(void)
     }
 }
 
+/*
+ * Keep iBoot's UAT carveouts reserved and leave the GPU disabled, without touching its power state
+ * or publishing an ABI.
+ */
+static int gpu_leave_disabled(void *dt, int sgx)
+{
+    if (dt_set_region(dt, sgx, "gfx-handoff", "/reserved-memory/uat-handoff") ||
+        dt_set_region(dt, sgx, "gfx-shared-region", "/reserved-memory/uat-pagetables") ||
+        dt_set_region(dt, sgx, "gpu-region", "/reserved-memory/uat-ttbs"))
+        return -1;
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0)
+        return 0;
+    printf("FDT: GPU: no initdata layout for firmware %s; GPU disabled, boot continues\n",
+           os_firmware.string);
+    return fdt_setprop_string(dt, gpu, "status", "disabled");
+}
+
+static void gpu_log_leakage(const char *label, const float *values, u32 count)
+{
+    printf("FDT: GPU: %s leakage table: ", label);
+    for (u32 i = 0; i < count; i++)
+        printf("%d.%03d ", (int)values[i], ((int)(values[i] * 1000) % 1000));
+    printf("\n");
+}
+
 int dt_set_gpu(void *dt)
 {
     if (chip_id == T8152) {
@@ -4525,6 +4543,7 @@ int dt_set_gpu(void *dt)
         return dt_set_gpu_t6041(dt);
 
     bool has_cs_afr = false;
+    bool has_sram_pstates = true;
     int (*calc_power)(u32 count, u32 table_count, const struct perf_state *core,
                       const struct perf_state *sram, const struct aux_perf_states *cs, u32 *max_pwr,
                       float *core_leak, float *sram_leak, float *cs_leak, float *afr_leak);
@@ -4535,6 +4554,7 @@ int dt_set_gpu(void *dt)
 
     switch (chip_id) {
         case T8103:
+            has_sram_pstates = false;
             calc_power = calc_power_t8103;
             break;
         case T6022:
@@ -4573,7 +4593,7 @@ int dt_set_gpu(void *dt)
             int dcp = fdt_path_offset(dt, "dcp"), len;
             const fdt32_t *profile =
                 dcp < 0 ? NULL : fdt_getprop(dt, dcp, "apple,j613-25g83-profile", &len);
-            /* 27.2 (26B123) firmware: the handoff publication only; it leaves the GPU disabled. */
+            /* 27.2 (26B123) firmware: the handoff publication, and the GPU start when described. */
             if ((profile && len == 4 && fdt32_ld(profile) == 1) || os_firmware.version == V27_2) {
                 t8122_leak_fuse_export(dt);
                 return dt_set_gpu_t8122_26(dt);
@@ -4591,15 +4611,13 @@ int dt_set_gpu(void *dt)
     }
 
     /* check for old-style downstream compatibles */
+    static const char *const downstream_compat[] = {
+        "apple,agx-t8103", "apple,agx-t8112", "apple,agx-t6000", "apple,agx-t6001",
+        "apple,agx-t6002", "apple,agx-t6020", "apple,agx-t6021", "apple,agx-t6022",
+    };
     bool downstream_dtb = false;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t8103") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t8112") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6000") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6001") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6002") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6020") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6021") == 0;
-    downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6022") == 0;
+    for (size_t i = 0; i < ARRAY_SIZE(downstream_compat); i++)
+        downstream_dtb |= !fdt_node_check_compatible(dt, gpu, downstream_compat[i]);
 
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
     if (sgx < 0)
@@ -4609,38 +4627,47 @@ int dt_set_gpu(void *dt)
     size_t data_a_size, data_b_size, globals_size;
 
     /*
-     * Without an initdata layout for this firmware (T8112's G14G on 27.2), the GPU cannot be
-     * started. Keep iBoot's carveouts reserved and leave the GPU disabled, without touching its
-     * power state or publishing an ABI, instead of refusing the whole boot.
+     * Without an initdata layout for this firmware (T8112's G14G on 27.2), aura cannot set the
+     * GPU up, so it is left disabled instead of refusing the whole boot. The exception is a loaded
+     * image that firmware_gfx_version() identifies, which the kernel starts itself from the
+     * handoff (dt_set_gpu_g14g_handoff()): the operating points are published below as usual,
+     * then the handoff. A kernel without a backend for that firmware refuses the GPU node at
+     * probe. Any other image, any operating-point or ADT problem on the handoff path, or a
+     * handoff the ADT does not describe leaves the GPU disabled; the boot continues.
      */
+    const struct fw_version_info *handoff = NULL;
     if (rust_gpu_initdata_size(compat->num[0], compat->num[1], &data_a_size, &data_b_size,
                                &globals_size) == -1) {
-        if (dt_set_region(dt, sgx, "gfx-handoff", "/reserved-memory/uat-handoff") ||
-            dt_set_region(dt, sgx, "gfx-shared-region", "/reserved-memory/uat-pagetables") ||
-            dt_set_region(dt, sgx, "gpu-region", "/reserved-memory/uat-ttbs"))
-            return -1;
-        gpu = fdt_path_offset(dt, "gpu");
-        if (gpu < 0)
-            return 0;
-        printf("FDT: GPU: no initdata layout for firmware %s; GPU disabled, boot continues\n",
-               os_firmware.string);
-        return fdt_setprop_string(dt, gpu, "status", "disabled");
+        handoff = downstream_dtb ? firmware_gfx_version(chip_id) : NULL;
+        if (!handoff)
+            return gpu_leave_disabled(dt, sgx);
     }
+
+    /* On the handoff path a failure below leaves the GPU disabled instead of failing the boot. */
+#define gpu_fail(...)                                                                              \
+    do {                                                                                           \
+        printf(__VA_ARGS__);                                                                       \
+        if (handoff) {                                                                             \
+            printf("FDT: GPU: firmware %s handoff refused\n", handoff->string);                    \
+            return gpu_leave_disabled(dt, sgx);                                                    \
+        }                                                                                          \
+        return -1;                                                                                 \
+    } while (0)
 
     u32 perf_state_count;
     if (ADT_GETPROP(adt, sgx, "perf-state-count", &perf_state_count) < 0 || !perf_state_count)
-        bail("ADT: GPU: missing perf-state-count\n");
+        gpu_fail("ADT: GPU: missing perf-state-count\n");
 
     u32 perf_state_table_count;
     if (ADT_GETPROP(adt, sgx, "perf-state-table-count", &perf_state_table_count) < 0 ||
         !perf_state_table_count)
-        bail("ADT: GPU: missing perf-state-table-count\n");
+        gpu_fail("ADT: GPU: missing perf-state-table-count\n");
 
     if (perf_state_count > MAX_PSTATES)
-        bail("ADT: GPU: perf-state-count too large\n");
+        gpu_fail("ADT: GPU: perf-state-count too large\n");
 
     if (perf_state_table_count > MAX_CLUSTERS)
-        bail("ADT: GPU: perf-state-table-count too large\n");
+        gpu_fail("ADT: GPU: perf-state-table-count too large\n");
 
     u32 perf_states_len;
     const struct perf_state *perf_states, *perf_states_sram;
@@ -4649,21 +4676,28 @@ int dt_set_gpu(void *dt)
     perf_states = adt_getprop(adt, sgx, "perf-states", &perf_states_len);
     if (!perf_states ||
         perf_states_len != sizeof(*perf_states) * perf_state_count * perf_state_table_count)
-        bail("ADT: GPU: invalid perf-states length\n");
+        gpu_fail("ADT: GPU: invalid perf-states length\n");
 
     perf_states_sram = adt_getprop(adt, sgx, "perf-states-sram", &perf_states_len);
+    /*
+     * The 27.2 backend takes each operating point's SRAM voltage from the handoff on SoCs whose
+     * ADT publishes perf-states-sram (T8112); T8103 has no such table and derives SRAM voltage
+     * from apple,min-sram-microvolt in the device tree.
+     */
+    if (handoff && has_sram_pstates && !perf_states_sram)
+        gpu_fail("ADT: GPU: perf-states-sram missing\n");
     if (perf_states_sram &&
         perf_states_len != sizeof(*perf_states) * perf_state_count * perf_state_table_count)
-        bail("ADT: GPU: invalid perf-states-sram length\n");
+        gpu_fail("ADT: GPU: invalid perf-states-sram length\n");
 
     perf_states_afr = adt_getprop(adt, sgx, "afr-perf-states", NULL);
     perf_states_cs = adt_getprop(adt, sgx, "cs-perf-states", NULL);
 
     if (has_cs_afr && !perf_states_cs)
-        bail("ADT: GPU: cs-perf-states not found\n");
+        gpu_fail("ADT: GPU: cs-perf-states not found\n");
 
     if (has_cs_afr && !perf_states_afr)
-        bail("ADT: GPU: afr-perf-states not found\n");
+        gpu_fail("ADT: GPU: afr-perf-states not found\n");
 
     u32 max_pwr[MAX_PSTATES];
     float core_leak[MAX_CLUSTERS];
@@ -4673,51 +4707,35 @@ int dt_set_gpu(void *dt)
 
     if (calc_power(perf_state_count, perf_state_table_count, perf_states, perf_states_sram,
                    perf_states_cs, max_pwr, core_leak, sram_leak, cs_leak, afr_leak))
-        return -1;
+        gpu_fail("FDT: GPU: power table calculation failed\n");
 
     printf("FDT: GPU: Max power table: ");
     for (u32 i = 0; i < perf_state_count; i++) {
         printf("%d ", max_pwr[i]);
     }
-    printf("\nFDT: GPU: Core leakage table: ");
-    for (u32 i = 0; i < perf_state_table_count; i++) {
-        printf("%d.%03d ", (int)core_leak[i], ((int)(core_leak[i] * 1000) % 1000));
-    }
-    printf("\nFDT: GPU: SRAM leakage table: ");
-    for (u32 i = 0; i < perf_state_table_count; i++) {
-        printf("%d.%03d ", (int)sram_leak[i], ((int)(sram_leak[i] * 1000) % 1000));
-    }
     printf("\n");
-
+    gpu_log_leakage("Core", core_leak, perf_state_table_count);
+    gpu_log_leakage("SRAM", sram_leak, perf_state_table_count);
     if (has_cs_afr) {
-        printf("FDT: GPU: CS leakage table: ");
-        for (u32 i = 0; i < dies; i++) {
-            printf("%d.%03d ", (int)cs_leak[i], ((int)(cs_leak[i] * 1000) % 1000));
-        }
-        printf("\n");
-
-        printf("FDT: GPU: AFR leakage table: ");
-        for (u32 i = 0; i < dies; i++) {
-            printf("%d.%03d ", (int)afr_leak[i], ((int)(afr_leak[i] * 1000) % 1000));
-        }
-        printf("\n");
+        gpu_log_leakage("CS", cs_leak, dies);
+        gpu_log_leakage("AFR", afr_leak, dies);
     }
 
     if (downstream_dtb) {
         if (fdt_set_float_array(dt, gpu, "apple,core-leak-coef", core_leak, perf_state_table_count))
-            return -1;
+            gpu_fail("FDT: GPU: cannot set leakage coefficients\n");
 
         if (fdt_set_float_array(dt, gpu, "apple,sram-leak-coef", sram_leak, perf_state_table_count))
-            return -1;
+            gpu_fail("FDT: GPU: cannot set leakage coefficients\n");
 
         int len;
         const fdt32_t *opps_ph = fdt_getprop(dt, gpu, "operating-points-v2", &len);
         if (!opps_ph || len != 4)
-            bail("FDT: GPU: operating-points-v2 not found\n");
+            gpu_fail("FDT: GPU: operating-points-v2 not found\n");
 
         int opps = fdt_node_offset_by_phandle(dt, fdt32_ld(opps_ph));
         if (opps < 0)
-            bail("FDT: GPU: node for phandle %u not found\n", fdt32_ld(opps_ph));
+            gpu_fail("FDT: GPU: node for phandle %u not found\n", fdt32_ld(opps_ph));
 
         u32 i = 0;
         int opp;
@@ -4730,23 +4748,24 @@ int dt_set_gpu(void *dt)
             }
 
             if (i >= perf_state_count)
-                bail("FDT: GPU: Expected %d operating points, but found more\n", perf_state_count);
+                gpu_fail("FDT: GPU: Expected %d operating points, but found more\n",
+                         perf_state_count);
 
             if (fdt_setprop_inplace(dt, opp, "opp-microvolt", &volts,
                                     sizeof(u32) * perf_state_table_count))
-                bail("FDT: GPU: Failed to set opp-microvolt for PS %d\n", i);
+                gpu_fail("FDT: GPU: Failed to set opp-microvolt for PS %d\n", i);
 
             if (fdt_setprop_inplace_u64(dt, opp, "opp-hz", perf_states[i].freq))
-                bail("FDT: GPU: Failed to set opp-hz for PS %d\n", i);
+                gpu_fail("FDT: GPU: Failed to set opp-hz for PS %d\n", i);
 
             if (fdt_setprop_inplace_u32(dt, opp, "opp-microwatt", max_pwr[i]))
-                bail("FDT: GPU: Failed to set opp-microwatt for PS %d\n", i);
+                gpu_fail("FDT: GPU: Failed to set opp-microwatt for PS %d\n", i);
 
             i++;
         }
 
         if (i != perf_state_count)
-            bail("FDT: GPU: Expected %d operating points, but found %d\n", perf_state_count, i);
+            gpu_fail("FDT: GPU: Expected %d operating points, but found %d\n", perf_state_count, i);
 
         if (has_cs_afr) {
             int ret = fdt_set_aux_opp(dt, gpu, "apple,cs-opp", perf_states_cs, dies);
@@ -4764,6 +4783,15 @@ int dt_set_gpu(void *dt)
             if (fdt_set_float_array(dt, gpu, "apple,afr-leak-coef", afr_leak, dies))
                 return -1;
         }
+    }
+
+#undef gpu_fail
+
+    if (handoff) {
+        if (!dt_set_gpu_g14g_handoff(dt, handoff))
+            return 0;
+        printf("FDT: GPU: firmware %s handoff not published\n", handoff->string);
+        return gpu_leave_disabled(dt, sgx);
     }
 
     if (dt_set_region(dt, sgx, "gfx-handoff", "/reserved-memory/uat-handoff"))

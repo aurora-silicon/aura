@@ -66,6 +66,12 @@ jobs:
         run: dnf install -y --setopt=install_weak_deps=False clang llvm lld rust rust-src cargo make python3 git
       - uses: actions/checkout@v7
       - name: Stage 1 room
+        # rpmbuild's %build exports Fedora's RUSTFLAGS (%build_rustflags); aura must link the
+        # same Stage 1 with them set.
+        env:
+          RUSTFLAGS: >-
+            -Copt-level=3 -Cdebuginfo=2 -Ccodegen-units=1 -Cstrip=none -Cforce-frame-pointers=yes
+            -Clink-arg=-specs=/usr/lib/rpm/redhat/redhat-package-notes --cap-lints=warn
         run: sh tools/stage1_size.sh fedora USE_CLANG=1 BUILTIN_LOGO=aurora BUILDSTD=1
 
   alarm:
@@ -103,7 +109,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
+      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32.0.0
       - name: Stage 1 room
         run: |
           nix build --impure -L --out-link stage1-size --expr '

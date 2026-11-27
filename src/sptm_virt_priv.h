@@ -18,7 +18,9 @@ extern volatile u64 sptm_virt_bss_canary;
 extern u64 sptm_virt_flags;
 extern u32 sptm_virt_cpu_entries[MAX_CPUS];
 int sptm_virt_layout(struct sptm_virt_layout *out);
+u64 sptm_virt_image_va_offset(void);
 void sptm_virt_cpu_enters_xnu(int cpu);
+void sptm_virt_usb_pump(void);
 extern u32 sptm_virt_wfi_watch;
 
 /* sptm_virt_gl.c */
@@ -115,6 +117,9 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr);
 
 /* sptm_virt_gpu.c */
 void sptm_virt_gpu_setup(void);
+void sptm_virt_sep_setup(void);       /* sptm_virt_sep.c */
+bool sptm_virt_s2r_ring_ensure(void); /* sptm_virt_s2r.c */
+void sptm_virt_s2r_rec_raw(u64 pa, u64 val, u64 tag, bool write);
 
 #ifdef AURACTL
 /* auractl (sptm_virt_ctl.c, src/auractl_abi.h) */
