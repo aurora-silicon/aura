@@ -64,11 +64,23 @@ static u32 reg_len_override;
 /* pci-bridge0's apcie-port and reg (phys.hi first), each with its length; 0 is absent. */
 static u32 bridge_port, bridge_port_len, bridge_reg[5], bridge_reg_len;
 static u32 phy_ctrl, port_ctrl, appclk;
+/* /arm-io/ans, and whether it has nvme-secure-bar (an ANS on the APCIe block) */
+static int ans_present, ans_secure_bar;
+/* The RC window's word at +4, and how often it was read and written */
+#define RC_MISC 0x394000004ULL
+static u32 rc_misc;
+static int rc_misc_reads, rc_misc_writes;
 static int adt_path_offset(const void *a, const char *path)
 {
     if (!strcmp(path, "/arm-io/apcie")) return 1;
     if (!strcmp(path, "/arm-io/apcie/pci-bridge0")) return 2;
+    if (!strcmp(path, "/arm-io/ans") && ans_present) return 3;
     return -1;
+}
+static const void *adt_get_property(const void *a, int node, const char *prop)
+{
+    return node == 3 && !strcmp(prop, "nvme-secure-bar") && ans_secure_bar ? &ans_secure_bar
+                                                                           : NULL;
 }
 static int adt_path_offset_trace(const void *a, const char *path, int *trace)
 {
@@ -146,11 +158,19 @@ static u32 read32(u64 addr)
     if (addr == PHY + 4) return 0x11;
     if (addr == PORT_PHY) return port_ctrl;
     if (addr == PORT + 0x800) return appclk;
+    if (addr == RC_MISC) {
+        rc_misc_reads++;
+        return rc_misc;
+    }
     return 0;
 }
 static void write32(u64 addr, u32 val)
 {
     access_mmio(addr);
+    if (addr == RC_MISC) {
+        rc_misc_writes++;
+        rc_misc = val;
+    }
     if (addr == PHY || addr == PORT_PHY) {
         u32 *ctrl = addr == PHY ? &phy_ctrl : &port_ctrl;
         if ((*ctrl & 0x10) && !(val & 0x10)) assert((*ctrl & 0xf) == 0xf);
@@ -229,6 +249,19 @@ static void reset_model(void)
     regs[7][1] = 0x8000;
     phy_ctrl = port_ctrl = 0x10;
     appclk = 0;
+    ans_present = 1;
+    ans_secure_bar = 0;
+    rc_misc = 0;
+    rc_misc_reads = rc_misc_writes = 0;
+    pcie_set_os_restores_apcie(false);
+}
+/* A system sleep: the hardware loses its state, aura's memory keeps controllers[]. */
+static void power_cycle(void)
+{
+    powered = common_mode = rc_ready = port_tunables = 0;
+    reset_delay = pll = auspma = port_run = 0;
+    phy_ctrl = port_ctrl = 0x10;
+    appclk = 0;
 }
 static void expect_failure(void)
 {
@@ -282,6 +315,56 @@ int main(void)
     controller_compat = "apcie,t8132";
     fail_tunable = 1;
     assert(pcie_init() == -1 && pll == 1 && auspma == 0 && !port_run);
+
+    /*
+     * After a system sleep: the controller that came up at boot comes up again from the node it
+     * came up from, with the same MMIO accesses and polls, and nothing else is tried. A step that
+     * fails fails the whole bring-up; with nothing up at boot there is nothing to bring back.
+     */
+    reset_model();
+    chip_id = 0x8132;
+    controller_compat = "apcie,t8132";
+    rc_misc = 0x5;
+    assert(pcie_init() == 0 && !strcmp(controllers[APCIE].up_path, "/arm-io/apcie"));
+    assert(!controllers[APCIE_GE0].up_path && !controllers[APCIE_GE1].up_path);
+    /* Boot writes the RC word without reading it, as it always has. */
+    assert(rc_misc == 0 && rc_misc_reads == 0 && rc_misc_writes == 1);
+    /* Replayed: no tables for the OS and an ANS off the APCIe block (T8103). */
+    assert(pcie_needs_sleep_reinit());
+    int boot_accesses = accesses, boot_polls = polls;
+    power_cycle();
+    /* Left clear by the sleep: read, not written. */
+    assert(pcie_reinit_after_sleep() == 0 && pcie_initialized && port_run);
+    assert(controllers[APCIE].initialized && controllers[APCIE].active_ports == 1);
+    assert(rc_misc_reads == 1 && rc_misc_writes == 1);
+    assert(accesses == 2 * boot_accesses && polls == 2 * boot_polls);
+    /* Left set: read, then cleared. */
+    power_cycle();
+    rc_misc = 0x5;
+    assert(pcie_reinit_after_sleep() == 0 && rc_misc == 0);
+    assert(rc_misc_reads == 2 && rc_misc_writes == 2);
+    /* Not replayed: an OS that got the tables, an ANS on the APCIe block, or no ANS. */
+    pcie_set_os_restores_apcie(true);
+    assert(!pcie_needs_sleep_reinit());
+    pcie_set_os_restores_apcie(false);
+    ans_secure_bar = 1;
+    assert(!pcie_needs_sleep_reinit() && !pcie_sleep_reinit_possible());
+    ans_secure_bar = 0;
+    ans_present = 0;
+    assert(!pcie_needs_sleep_reinit() && !pcie_sleep_reinit_possible());
+    ans_present = 1;
+    assert(pcie_needs_sleep_reinit());
+    power_cycle();
+    fail_poll = polls + 1;
+    assert(pcie_reinit_after_sleep() == -1 && !pcie_initialized);
+    reset_model();
+    assert(pcie_reinit_after_sleep() == -1 && accesses == 0);
+    /*
+     * PCIe up without a controller set up here (T6050's own bring-up): nothing to replay, even
+     * with no tables handed over and an ANS off the APCIe block.
+     */
+    pcie_initialized = true;
+    assert(pcie_sleep_reinit_possible() && !pcie_needs_sleep_reinit());
 
     /*
      * ANS through its storage gates alone: no APCIe block power or MMIO, so the GP ports (N1 on

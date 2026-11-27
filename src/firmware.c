@@ -384,6 +384,11 @@ static const struct gfx_fw_image gfx_fw_images[] = {
                                        0xa1, 0x37, 0x61, 0xc4, 0xa7, 0x3d, 0x66, 0x6a},
      0x5d54a, 0x1e8, 0x64000, true},
     /*
+     * T8103 (M1, G13G): the headerless image iBoot loads on macOS 27.2 (26B131), seen on the
+     * MacBook Air (J313). Linux's g14_v27_2 backend starts it.
+     */
+    {T8103, V27_2, "g13g 27.2", {0}, 0, 0, 0x50000, false, "2FF15E57-6B75-3421-922F-EE7EE927AC22"},
+    /*
      * T8112 (M2, G14G): the headerless image iBoot loads on macOS 27.2 (26B123), seen on the
      * MacBook Air (J413). Linux's g14_v27_2 backend starts it.
      */

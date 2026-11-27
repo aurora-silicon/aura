@@ -27,6 +27,8 @@ bool dart_t8110_is_locked(uintptr_t base, u64 size);
 void dart_lock_adt(const char *path, int instance);
 dart_dev_t *dart_init_fdt(void *dt, u32 phandle, int device, bool keep_pts);
 dart_dev_t *dart_init_fdt_locked(void *dt, u32 phandle, int device);
+int dart_fdt_t8110_window(void *dt, u32 phandle, u64 *base, u64 *size);
+int dart_fdt_t8110_translating(void *dt, u32 phandle, u32 sid);
 int dart_collect_locked_tables(dart_dev_t *dart, u64 dram_base, u64 dram_size, u64 *pages,
                                size_t capacity, size_t *count);
 int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_base);
@@ -37,6 +39,7 @@ bool dart_unmap_checked(dart_dev_t *dart, uintptr_t iova, size_t len);
 void dart_free_l2(dart_dev_t *dart, uintptr_t iova);
 void *dart_translate(dart_dev_t *dart, uintptr_t iova);
 void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova);
+void *dart_translate_range(dart_dev_t *dart, uintptr_t iova, size_t size);
 int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram_base, u64 dram_size,
                            int (*visit)(u64 iova, u64 paddr, void *opaque), void *opaque);
 bool dart_is_locked(dart_dev_t *dart);

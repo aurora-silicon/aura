@@ -15,6 +15,7 @@ extern struct iodev_ops iodev_usb_ops;
 
 void usb_init(void);
 void usb_hpm_restore_irqs(bool force);
+void usb_hpm_fresh_attach(void);
 void usb_iodev_init(void);
 bool usb_iodev_shutdown(void);
 bool usb_iodev_shutdown_except(iodev_id_t keep);

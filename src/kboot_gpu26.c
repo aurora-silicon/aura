@@ -97,6 +97,8 @@ struct gpu26_target {
     int (*calibrate)(void *dt);
     bool fast_die;
     bool exact_regions;
+    bool zero_data_flag_3seg; /* __DATA flags in the 3-segment layout (0 on G13, 0x10 on G14/G15) */
+    bool sram_optional;
 };
 
 static const struct gpu26_target t8122_target = {
@@ -216,8 +218,11 @@ static int gpu26_read_adt(const struct gpu26_target *t, struct t8122_gpu_fw *fw)
         /* Without a fixed base, the segments only have to run on from the first one. */
         if (!i && !next_va && s.iova && !(s.iova & (SZ_16K - 1)))
             next_va = s.iova;
+        u32 expected_flag = (segments == 3 && i == 1 && t->zero_data_flag_3seg)
+                                ? 0
+                                : t8122_gpu_layouts[segments].flags[i];
         if (s.phys != s.remap || !s.size || s.size & (SZ_16K - 1) || s.size > T8122_GPU_MAX_SEG ||
-            s.unk != t8122_gpu_layouts[segments].flags[i])
+            s.unk != expected_flag)
             bail("ADT: GPU: %s gfx-asc segment %d is not a plain preloaded segment\n", t->tag, i);
         if (s.iova != next_va)
             bail("ADT: GPU: %s firmware segment %d at unexpected VA 0x%lx (expected 0x%lx)\n",
@@ -878,13 +883,23 @@ int dt_set_gpu_t6030_27(void *dt, const struct fw_version_info *image)
 }
 
 /*
- * G14G (T8112) on firmware whose GPU interface the kernel starts itself (on 27.2, Linux's
- * g14_v27_2 backend). The caller has identified the image iBoot loaded (firmware_gfx_version())
- * and has no initdata layout for it, and has already published the operating points. The ADT
- * must describe the same handoff as on T8122: four UAT regions in /arm-io/sgx and the preloaded
- * gfx-asc segments, the __DATA_SHARED_RO tail matching the sgx gfx-data-shared-ro pair. Their
- * firmware VAs are not fixed here: they must follow on from the first segment's.
+ * G13G (T8103) and G14G (T8112) on firmware whose GPU interface the kernel starts itself (on 27.2,
+ * Linux's g14_v27_2 backend). The caller has identified the image iBoot loaded
+ * (firmware_gfx_version()) and has no initdata layout for it, and has already published the
+ * operating points. The ADT must describe the same handoff as on T8122: four UAT regions in
+ * /arm-io/sgx and the preloaded gfx-asc segments, the __DATA_SHARED_RO tail matching the sgx
+ * gfx-data-shared-ro pair. Their firmware VAs are not fixed here: they must follow on from the
+ * first segment's.
  */
+static const struct gpu26_target g13g_target = {
+    .tag = "G13G",
+    .sgx_compat = "gpu,t8103",
+    .gpu_compat = "apple,agx-g13g",
+    .mbox_compat = "apple,asc-mailbox-v4",
+    .zero_data_flag_3seg = true,
+    .sram_optional = true,
+};
+
 static const struct gpu26_target g14g_target = {
     .tag = "G14G",
     .sgx_compat = "gpu,t8112",
@@ -902,43 +917,66 @@ struct g14g_handoff {
 static int g14g_gpu_publish(void *dt, void *arg)
 {
     const struct g14g_handoff *h = arg;
+    const char *tag = h->fw.t->tag;
 
     if (gpu26_publish_regions(dt, &h->fw))
         return -1;
 
     /*
-     * The kernel's 27.2 backend reads the SRAM voltage of each operating point from
-     * /chosen/aurora-gpu-resources/sgx adt-perf-states-sram, the ADT property as it is.
+     * On SoCs whose ADT carries perf-states-sram (T8112), the kernel's 27.2 backend reads each
+     * operating point's SRAM voltage from /chosen/aurora-gpu-resources/sgx adt-perf-states-sram.
+     * T8103 has no perf-states-sram in its ADT and uses apple,min-sram-microvolt instead.
      */
-    int chosen = fdt_path_offset(dt, "/chosen");
-    int res = chosen < 0 ? chosen : fdt_subnode_offset(dt, chosen, "aurora-gpu-resources");
-    if (chosen >= 0 && res == -FDT_ERR_NOTFOUND)
-        res = fdt_add_subnode(dt, chosen, "aurora-gpu-resources");
-    int sgx = res < 0 ? res : fdt_subnode_offset(dt, res, "sgx");
-    if (res >= 0 && sgx == -FDT_ERR_NOTFOUND)
-        sgx = fdt_add_subnode(dt, res, "sgx");
-    if (sgx < 0 || fdt_setprop(dt, sgx, "adt-perf-states-sram", h->sram, h->sram_len))
-        bail("FDT: GPU: G14G cannot publish /chosen/aurora-gpu-resources/sgx\n");
+    if (h->sram && h->sram_len) {
+        int chosen = fdt_path_offset(dt, "/chosen");
+        int res = chosen < 0 ? chosen : fdt_subnode_offset(dt, chosen, "aurora-gpu-resources");
+        if (chosen >= 0 && res == -FDT_ERR_NOTFOUND)
+            res = fdt_add_subnode(dt, chosen, "aurora-gpu-resources");
+        int sgx = res < 0 ? res : fdt_subnode_offset(dt, res, "sgx");
+        if (res >= 0 && sgx == -FDT_ERR_NOTFOUND)
+            sgx = fdt_add_subnode(dt, res, "sgx");
+        if (sgx < 0 || fdt_setprop(dt, sgx, "adt-perf-states-sram", h->sram, h->sram_len))
+            bail("FDT: GPU: %s cannot publish /chosen/aurora-gpu-resources/sgx\n", tag);
+    }
 
     if (gpu26_publish_version(dt, h->fw.t, h->image) || gpu26_enable(dt, (void *)h->fw.t))
         return -1;
 
+    /*
+     * The firmware keeps running through suspend-to-idle, so pmgr must retain the GPU domain
+     * across system sleep instead of gating it under the live ASC.
+     */
+    int domain = gpu26_phandle_node(dt, h->fw.t, "power-domains");
+    if (domain < 0 || fdt_setprop_empty(dt, domain, "apple,sleep-retained"))
+        bail("FDT: GPU: %s cannot mark the GPU power domain apple,sleep-retained\n", tag);
+
     for (int i = 0; i < T8122_GPU_REGIONS; i++)
-        printf("FDT: GPU: G14G %s: 0x%lx+0x%lx (no-map)\n", t8122_gpu_names[i], h->fw.base[i],
+        printf("FDT: GPU: %s %s: 0x%lx+0x%lx (no-map)\n", tag, t8122_gpu_names[i], h->fw.base[i],
                h->fw.size[i]);
-    printf("FDT: GPU: G14G firmware %s handoff published, GPU enabled\n", h->image->string);
+    printf("FDT: GPU: %s firmware %s handoff published, GPU enabled\n", tag, h->image->string);
     return 0;
 }
 
 int dt_set_gpu_g14g_handoff(void *dt, const struct fw_version_info *image)
 {
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    if (sgx < 0)
+        return -1;
+
+    const struct gpu26_target *target;
+    if (adt_is_compatible(adt, sgx, g13g_target.sgx_compat))
+        target = &g13g_target;
+    else if (adt_is_compatible(adt, sgx, g14g_target.sgx_compat))
+        target = &g14g_target;
+    else
+        return -1;
+
     struct g14g_handoff h = {.image = image};
 
-    if (gpu26_read_adt(&g14g_target, &h.fw))
+    if (gpu26_read_adt(target, &h.fw))
         return -1;
-    int sgx = adt_path_offset(adt, "/arm-io/sgx");
-    h.sram = sgx < 0 ? NULL : adt_getprop(adt, sgx, "perf-states-sram", &h.sram_len);
-    if (!h.sram || !h.sram_len)
-        bail("ADT: GPU: G14G perf-states-sram missing; handoff refused\n");
+    h.sram = adt_getprop(adt, sgx, "perf-states-sram", &h.sram_len);
+    if (!target->sram_optional && (!h.sram || !h.sram_len))
+        bail("ADT: GPU: %s perf-states-sram missing; handoff refused\n", target->tag);
     return t8122_fdt_transaction(dt, g14g_gpu_publish, &h);
 }

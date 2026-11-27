@@ -79,17 +79,17 @@ static const struct t6050_port {
 #define DBI_RO_WR_EN   0x8bc
 
 /* PCI config space */
-#define PCI_COMMAND               0x04
-#define PCI_PRIMARY_BUS           0x18
-#define PCI_CAPABILITY_LIST       0x34
-#define PCI_CAP_ID_EXP            0x10
-#define PCI_EXP_LNKCAP            0x0c
-#define PCI_EXP_LNKCTL            0x10
-#define PCI_EXP_LNKSTA            0x12
-#define PCI_EXP_LNKCAP2           0x2c
-#define PCI_EXP_LNKCAP2_SLS_8_0GB BIT(3)
-#define PCI_EXP_LNKCTL2           0x30
-#define PCI_CFG_SIZE              0x1000
+#define PCI_COMMAND         0x04
+#define PCI_PRIMARY_BUS     0x18
+#define PCI_CAPABILITY_LIST 0x34
+#define PCI_CAP_ID_EXP      0x10
+#define PCI_EXP_LNKCAP      0x0c
+#define PCI_EXP_LNKCTL      0x10
+#define PCI_EXP_LNKSTA      0x12
+#define PCI_EXP_LNKCAP2     0x2c
+#define PCI_EXP_LNKCAP2_SLS GENMASK(7, 1)
+#define PCI_EXP_LNKCTL2     0x30
+#define PCI_CFG_SIZE        0x1000
 
 #define GPIO_PERST_MASK  0x27f
 #define GPIO_PERST_LOW   0x202
@@ -113,7 +113,8 @@ struct port_regs {
     u64 perst;
     u32 refclk_to_perst_us;
     u64 dart;
-    u32 bus; /* its root port's secondary bus, once numbered (F) */
+    u32 bus;   /* its root port's secondary bus, once numbered (F) */
+    u32 speed; /* its root port's Target Link Speed, read back (F) */
     bool up;
     bool absent; /* no bridge for it in this board's ADT */
 };
@@ -495,7 +496,39 @@ static int find_pcie_cap(u64 rp)
     FAIL("no PCI Express capability on the root port\n");
 }
 
-/* D: root-port DBI tunables and the Gen3 x1 policy, in the order Apple's driver uses */
+/*
+ * The Target Link Speed for a port: what its ADT bridge sets (pcie_adt_link_speed(), the rule
+ * pcie.c applies on the other Apple PCIe hosts), else, for a bridge with no "maximum-link-speed",
+ * the fastest the root port supports, which pcie.c leaves such a port at too. The link then trains
+ * at the fastest speed both ends have (J775D: 16 GT/s on port 2, the RTL8127A's fastest; the ports
+ * whose bridges set 3 stay at 8 GT/s). It never asks for a speed the root port does not support.
+ */
+static int target_link_speed(const struct port_regs *pp, u32 lnkcap2)
+{
+    u32 sls = FIELD_GET(PCI_EXP_LNKCAP2_SLS, lnkcap2);
+    int bridge = adt_path_offset(adt, pp->bridge);
+    u32 top = 0, speed;
+
+    for (u32 s = 1; s <= 7; s++)
+        if (sls & BIT(s - 1))
+            top = s;
+    if (bridge < 0 || !top || !(sls & BIT(0)))
+        FAIL("no bridge, or link speeds 0x%x\n", sls);
+    if (pcie_adt_link_speed(bridge, &speed) < 0) {
+        speed = top;
+    } else if (!speed) {
+        FAIL("maximum-link-speed 0\n");
+    } else if (speed > top) {
+        printf("pcie-t6050: port %d: the ADT's speed %u is above the root port's %u\n", pp->p->port,
+               speed, top);
+        speed = top;
+    }
+    if (!(sls & BIT(speed - 1)))
+        FAIL("speed %u not supported (0x%x)\n", speed, sls);
+    return speed;
+}
+
+/* D: root-port DBI tunables, then an x1 link at the ADT's speed */
 static int stage_d(const struct port_regs *pp)
 {
     static const struct {
@@ -516,13 +549,19 @@ static int stage_d(const struct port_regs *pp)
         TRY(rmw("shadow select", rp + DBI_SHADOW_SEL, 3 << 24, shadows[i].sel));
         TRY(apply_tunables(pp->bridge, shadows[i].prop, rp, PCI_CFG_SIZE, NO_CHECK));
     }
+    /*
+     * Of the equalization controls only the Gen3 bit is set here; the 16 and 32 GT/s rates get what
+     * their shadow tunables carry. Links up to 16 GT/s have been seen to train with equalization
+     * complete (the J775D's RTL8127A); a 32 GT/s endpoint would be the first run at a higher rate.
+     */
     TRY(rmw("Gen3 EQ", rp + DBI_GEN3_EQ, 0, BIT(0)));
-    if (!(read32(rp + cap + PCI_EXP_LNKCAP2) & PCI_EXP_LNKCAP2_SLS_8_0GB))
-        FAIL("Gen3 not advertised\n");
+    int speed = target_link_speed(pp, read32(rp + cap + PCI_EXP_LNKCAP2));
+    TRY(speed);
     u16 lnkctl2 = read16(rp + cap + PCI_EXP_LNKCTL2);
-    write16(rp + cap + PCI_EXP_LNKCTL2, (lnkctl2 & ~0xf) | 3);
-    if ((read16(rp + cap + PCI_EXP_LNKCTL2) & 0xf) != 3)
+    write16(rp + cap + PCI_EXP_LNKCTL2, (lnkctl2 & ~0xf) | speed);
+    if ((read16(rp + cap + PCI_EXP_LNKCTL2) & 0xf) != (u16)speed)
         FAIL("target link speed did not take\n");
+    printf("pcie-t6050: port %d target link speed Gen%d\n", pp->p->port, speed);
     TRY(rmw("link width 1", rp + DBI_LINK_WIDTH, 0x3f << 16, 1 << 16));
     TRY(rmw("lanes 1", rp + DBI_GEN2_CTRL, 0x1f << 8, 1 << 8));
     TRY(rmw("link cap x1", rp + cap + PCI_EXP_LNKCAP, 0x3f << 4, 1 << 4));
@@ -598,6 +637,8 @@ static int stage_f(struct port_regs *pp)
     TRY(cap);
     u16 lnksta = read16(rp + cap + PCI_EXP_LNKSTA);
     printf("pcie-t6050: port %d link Gen%d x%d\n", pp->p->port, lnksta & 0xf, (lnksta >> 4) & 0x3f);
+    /* What stage D set, or, on an adopted port, what its boot loader set: the tree carries it */
+    pp->speed = read16(rp + cap + PCI_EXP_LNKCTL2) & 0xf;
     /* An adopted port keeps its number; a new one takes the lowest no up port has. Either may
      * change when the up ports are renumbered (pcie_t6050_init). */
     u32 buses = read32(rp + PCI_PRIMARY_BUS);
@@ -856,6 +897,46 @@ static int t6050_port_renumber(void *dt, int rp, u32 bus)
 }
 
 /*
+ * The link speed policy, for Linux to train a port by when it trains one itself (a root-port reset,
+ * a port the boot loader left down): "max-link-speed" on the port's root port node. An up port gets
+ * the target it was trained to, a port this code does not bring up (J775D port 1, the SD reader)
+ * the ADT's speed for it (pcie_adt_link_speed()); a port with neither gets none. The binding's
+ * values stop at 4 (16 GT/s), which a target above it is lowered to. The property is a hint: a
+ * failed write is logged and the boot goes on (Linux then trains the port at 8 GT/s).
+ */
+static void t6050_max_link_speed(void *dt, int port, u32 speed)
+{
+    int rp = t6050_port_node(dt, port);
+
+    if (rp == -FDT_ERR_NOTFOUND || !speed)
+        return;
+    /* The pci-bus-common binding allows 1-4: revisit this if it grows a 32 GT/s value */
+    speed = min(speed, 4u);
+    /* A hint: without it Linux trains the port at 8 GT/s, so a failed write never stops the boot */
+    if (rp < 0 || fdt_setprop_u32(dt, rp, "max-link-speed", speed))
+        printf("pcie-t6050: port %d: could not put max-link-speed %u in the tree\n", port, speed);
+    else
+        printf("pcie-t6050: port %d max-link-speed %u in the tree\n", port, speed);
+}
+
+static void t6050_publish_speeds(void *dt)
+{
+    for (int port = 0; port < T6050_GP_PORTS; port++) {
+        char bridge[40];
+        u32 speed = 0;
+
+        for (size_t i = 0; i < ARRAY_SIZE(ports); i++)
+            if (ports[i].port == port && pr[i].up)
+                speed = pr[i].speed;
+        snprintf(bridge, sizeof(bridge), "%s/pci-bridge%d", apcie_path, port);
+        int node = adt_path_offset(adt, bridge);
+        if (!speed && node >= 0 && pcie_adt_link_speed(node, &speed) < 0)
+            speed = 0;
+        t6050_max_link_speed(dt, port, speed);
+    }
+}
+
+/*
  * Make the handed-over tree match the ports as they are. The tree numbers each root port node's
  * bus (its bus-range, its functions' reg, its apcie0 iommu-map entry) for the ports a default boot
  * brings up; Linux numbers the buses itself (see the top of this file). So:
@@ -942,5 +1023,6 @@ int pcie_t6050_handoff_fdt(void *dt)
                    ports[i].port, ports[i].port);
         }
     }
+    t6050_publish_speeds(dt);
     return 0;
 }

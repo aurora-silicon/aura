@@ -669,9 +669,13 @@ void usb_init(void)
         return;
 
     /* This PHY requires a deferred carrier transition; normal boots never
-     * enter this fallback path before handing over to the OS. */
+     * enter this fallback path before handing over to the OS. The schedule
+     * takes 1 to 15 s (usb_cdc_state_schedule()); a shorter delay is refused,
+     * which left a host-less proxy here with no carrier and without the CDC
+     * watchdog (usb_cdc_arm_watchdog()) that resets a proxy nobody opens. */
     if (chip_id == T8140) {
-        if (!usb_cdc_ready() && !usb_cdc_owns_carrier() && usb_cdc_schedule(0, 0, BIT(1) | BIT(2)))
+        if (!usb_cdc_ready() && !usb_cdc_owns_carrier() &&
+            usb_cdc_schedule(1000, 0, BIT(1) | BIT(2)))
             printf("usb: unable to schedule proxy transport\n");
         return;
     }
@@ -731,6 +735,41 @@ void usb_hpm_restore_irqs(bool force)
         return;
 
     tps6598x_foreach_hpm(usb_hpm_restore_irqs_match, usb_hpm_restore_irqs_one, &force);
+}
+
+/*
+ * Hand a guest the USB-C ports it owns as a power-on would: cold reset each one's controller, then
+ * give back the interrupt masks usb_init() saved. A port keeps its PD contract and alternate mode
+ * across a SoC reset, so without this the guest's port is still in whatever DisplayPort state the
+ * previous OS left (mode, lanes, HPD), and macOS reconfigures it while its display coprocessor is
+ * already reading the sink. After the reset the port attaches from scratch under the guest's own
+ * driver, as on a cold boot. Ports aura still uses are skipped, like usb_hpm_restore_irqs(false).
+ */
+static int usb_hpm_fresh_attach_one(char *hpm_path, tps6598x_dev_t *tps, void *unused)
+{
+    (void)unused;
+    int idx = hpm_idx(hpm_path);
+
+    if (tps6598x_cold_reset(tps) || tps6598x_wait_app(tps, 2000)) {
+        printf("usb: %s did not come back from a cold reset\n", hpm_path);
+        return 0;
+    }
+    if (tps6598x_powerup(tps) < 0)
+        printf("usb: tps6598x_powerup failed for %s\n", hpm_path);
+    if (tps6598x_restore_irqs(tps, &tps6598x_irq_state[idx]))
+        printf("usb: unable to restore IRQ masks for %s\n", hpm_path);
+    printf("usb: %s cold reset for the guest\n", hpm_path);
+    return 0;
+}
+
+void usb_hpm_fresh_attach(void)
+{
+    if (adt_path_offset(adt, "/arm-io/otgphyctrl") > 0 &&
+        adt_path_offset(adt, "/arm-io/usb-complex") > 0)
+        return;
+
+    bool force = false;
+    tps6598x_foreach_hpm(usb_hpm_restore_irqs_match, usb_hpm_fresh_attach_one, &force);
 }
 
 void usb_iodev_init(void)

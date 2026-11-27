@@ -58,6 +58,8 @@ pick() { # pick <first line regex> <last line regex>
     pick '^static const char [*]excluded_pmp_props' '^};'
     pick '^static bool skip_pmp_prop[(]' '^}'
     pick '^static int adt_get_u32_exact[(]' '^}'
+    pick '^static int dt_fill_pmp_from_node[(]' '^}'
+    pick '^static int dt_fill_pmp_from[(]' '^}'
     pick '^static int dt_fill_pmp[(]' '^}'
     pick '^struct pmp_values_soc [{]' '^};'
     pick '^static const struct pmp_values_soc pmp_values_t6031 = [{]' '^};'
@@ -65,7 +67,7 @@ pick() { # pick <first line regex> <last line regex>
     pick '^static int dt_set_pmp_t6031[(]' '^}'
     printf 'void host_pmp_t6031(void *d)\n{\n    dt = d;\n    dt_set_pmp_t6031();\n}\n'
 } > "$tmp/src/kboot_pmp_t6031_copy.c"
-for f in dt_fill_pmp dt_pass_pmp dt_set_pmp_t6031 pmp_values_t6031; do
+for f in dt_fill_pmp_from_node dt_fill_pmp_from dt_fill_pmp dt_pass_pmp dt_set_pmp_t6031 pmp_values_t6031; do
     grep -q "$f" "$tmp/src/kboot_pmp_t6031_copy.c" || {
         echo "FAIL: $f not found in src/kboot.c"
         exit 1
@@ -73,7 +75,13 @@ for f in dt_fill_pmp dt_pass_pmp dt_set_pmp_t6031 pmp_values_t6031; do
 done
 
 # The code under test next to the host stand-ins, so that its #include "utils.h" finds them
-for f in kboot_display_handoff.c kboot_gpu.c kboot_gpu26.c kboot_gpu_t6031.c \
+while IFS= read -r f; do
+    case "$f" in ""|"#"*) continue ;; esac
+    cp "src/$f" "$tmp/src/"
+    h="${f%.c}.h"
+    [ -f "src/$h" ] && cp "src/$h" "$tmp/src/"
+done < "$root/tests/display-handoff-sources.txt"
+for f in kboot_gpu.c kboot_gpu26.c kboot_gpu_t6031.c \
     kboot_gpu_t8122_power.c kboot_t6031.c firmware.c pmgr.c; do
     cp "src/$f" "$tmp/src/"
 done

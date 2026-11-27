@@ -4542,6 +4542,7 @@ int dt_set_gpu(void *dt)
         return dt_set_gpu_t6041(dt);
 
     bool has_cs_afr = false;
+    bool has_sram_pstates = true;
     int (*calc_power)(u32 count, u32 table_count, const struct perf_state *core,
                       const struct perf_state *sram, const struct aux_perf_states *cs, u32 *max_pwr,
                       float *core_leak, float *sram_leak, float *cs_leak, float *afr_leak);
@@ -4552,6 +4553,7 @@ int dt_set_gpu(void *dt)
 
     switch (chip_id) {
         case T8103:
+            has_sram_pstates = false;
             calc_power = calc_power_t8103;
             break;
         case T6022:
@@ -4676,8 +4678,12 @@ int dt_set_gpu(void *dt)
         gpu_fail("ADT: GPU: invalid perf-states length\n");
 
     perf_states_sram = adt_getprop(adt, sgx, "perf-states-sram", &perf_states_len);
-    /* The 27.2 backend takes each operating point's SRAM voltage from the handoff. */
-    if (handoff && !perf_states_sram)
+    /*
+     * The 27.2 backend takes each operating point's SRAM voltage from the handoff on SoCs whose
+     * ADT publishes perf-states-sram (T8112); T8103 has no such table and derives SRAM voltage
+     * from apple,min-sram-microvolt in the device tree.
+     */
+    if (handoff && has_sram_pstates && !perf_states_sram)
         gpu_fail("ADT: GPU: perf-states-sram missing\n");
     if (perf_states_sram &&
         perf_states_len != sizeof(*perf_states) * perf_state_count * perf_state_table_count)

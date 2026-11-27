@@ -87,13 +87,26 @@ echo "G15 GPU setup: $same scenarios identical to $base (DT, bus and PMGR traces
 build_disp() { # build_disp <tree> <out>
     tree=$1 out=$2
     mkdir -p "$out/src"
-    cp "$tree/src/kboot_display_handoff.c" tests/t8122_display_host.c \
-        tests/t8122_display_host/*.h "$out/src/"
+    disp_srcs=""
+    if [ -f "$tree/tests/display-handoff-sources.txt" ]; then
+        while IFS= read -r f; do
+            case "$f" in ""|"#"*) continue ;; esac
+            cp "$tree/src/$f" "$out/src/"
+            h="${f%.c}.h"
+            [ -f "$tree/src/$h" ] && cp "$tree/src/$h" "$out/src/"
+            disp_srcs="$disp_srcs $out/src/$f"
+        done < "$tree/tests/display-handoff-sources.txt"
+    else
+        cp "$tree/src/kboot_display_handoff.c" "$out/src/"
+        disp_srcs="$out/src/kboot_display_handoff.c"
+    fi
+    cp tests/t8122_display_host.c tests/t8122_display_host/*.h "$out/src/"
+    # shellcheck disable=SC2086
     ${CC:-cc} -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-function \
         -Wno-unused-parameter -Wno-sign-compare -Wno-format-truncation \
         -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
         -I"$out/src" -I"$tree/src" \
-        "$out/src/t8122_display_host.c" "$out/src/kboot_display_handoff.c" \
+        "$out/src/t8122_display_host.c" $disp_srcs \
         "$tree"/src/libfdt/fdt.c "$tree"/src/libfdt/fdt_ro.c "$tree"/src/libfdt/fdt_rw.c \
         "$tree"/src/libfdt/fdt_wip.c "$tree"/src/libfdt/fdt_sw.c \
         "$tree"/src/libfdt/fdt_empty_tree.c "$tree"/src/libfdt/fdt_strerror.c \

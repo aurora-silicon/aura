@@ -10,7 +10,8 @@ libfdt. Covered:
   2. both M1 Max encoders are handed over, each from its own ADT node;
   3. an M1 Max encoder whose ADT node is absent, not preloaded or has a bad segment list is
      disabled, and encoder 0 is not;
-  4. an encoder whose preloaded copy differs from encoder 0's is disabled; the CRCs stay;
+  4. an encoder whose preloaded copy differs from encoder 0's is still handed over with its own
+     per-node CRCs, while /chosen keeps encoder 0's CRCs untouched;
   5. the M1 Ultra: two dies with the same die-local addresses, each node matched to the ADT
      encoder at its translated address;
   6. the M2 encoder's DART window base is read from the DART named after its ADT encoder;
@@ -32,7 +33,10 @@ libfdt. Covered:
      its physical address, 16K-aligned offsets inside the 32-bit DART; a node whose fallback
      compatible is another encoder's first is handed over once; an encoder 0 whose dart-ave0
      filter dapf.c failed to program is left off, one dapf.c skipped is programmed here (and left
-     off if that fails), and dart-ave keeps its inherited filter.
+     off if that fails), and dart-ave keeps its inherited filter;
+  13. both M4 Max (T6041, J616c) encoders with the live J616c ADT layout and differing per-instance
+     CRCs are handed over with per-node CRCs, /chosen keeps ave0's CRCs, and dart-ave1's DAPF
+     handles already-programmed, skipped, and failed dapf.c states.
 
 The harness also runs one DTB against an ADT modelled from it (`dtb <in> <out> <mode>`), which
 compares two versions of the handoff on a kernel's device trees.
@@ -117,15 +121,16 @@ static bool dapf_keeps_inherited(const char *path)
  * dapf.c's dapf_entries hold encoder 0's filter, dart-ave0: dapf_init_fdt() programs it, or fails
  * (failing_entry), or skips it (skipped_entry: a tree without the "ave" alias, as on T6041).
  */
-static const char *failing_entry, *skipped_entry;
+static const char *failing_entry, *skipped_entry, *programmed_entry;
 static bool dapf_failed(const char *path)
 {
     return failing_entry && !strcmp(path, failing_entry);
 }
 static bool dapf_programmed(const char *path)
 {
-    return !strcmp(path, "/arm-io/dart-ave0") && !dapf_failed(path) &&
-           !(skipped_entry && !strcmp(path, skipped_entry));
+    bool listed = !strcmp(path, "/arm-io/dart-ave0") ||
+                  (programmed_entry && !strcmp(path, programmed_entry));
+    return listed && !dapf_failed(path) && !(skipped_entry && !strcmp(path, skipped_entry));
 }
 /* dapf.c's predicate: dart-ave (one encoder, M2 through M5) keeps the filter iBoot left. */
 static bool dapf_ave_filter_inherited(const char *path)
@@ -400,6 +405,7 @@ static void tree(int dies)
     failing_dart = NULL;
     failing_entry = NULL;
     skipped_entry = NULL;
+    programmed_entry = NULL;
     chip_id = 0;
 }
 
@@ -487,6 +493,12 @@ static const char *chosen(const char *prop)
     return s ? s : "";
 }
 
+static const char *node_prop(int die, u64 addr, const char *prop)
+{
+    const char *s = fdt_getprop(dt, enc(die, addr), prop, NULL);
+    return s ? s : "";
+}
+
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\nlog:\n%s\n", __FILE__, __LINE__, #c, logbuf); exit(1); } } while (0)
 
 #define M1_ENC0 0x40d100000ULL
@@ -514,6 +526,8 @@ static int scenarios(void)
     CHECK(iova(0, M1_ENC0) == 0); /* the 6070 firmware runs from DART address zero */
     CHECK(!strcmp(chosen("aurora,ave-text-crc32"), "460c7a7c"));
     CHECK(!strcmp(chosen("aurora,ave-data-crc32"), "12345678"));
+    CHECK(!strcmp(node_prop(0, M1_ENC0, "aurora,ave-text-crc32"), "460c7a7c"));
+    CHECK(!strcmp(node_prop(0, M1_ENC0, "aurora,ave-data-crc32"), "12345678"));
     CHECK(!strstr(logbuf, "AVE"));
     puts("PASS: M1 Pro encoder handed over from ADT ave0");
 
@@ -571,16 +585,23 @@ static int scenarios(void)
     CHECK(!strcmp(status(0, M1_ENC0), "disabled") && firmware(0, M1_ENC1, 0) == b->seg[0].phys);
     puts("PASS: encoder 0 absent: disabled, encoder 1 handed over");
 
-    /* 4: encoder 1's copy differs: it is disabled, encoder 0's CRCs stay. */
+    /* 4: encoder 1's copy differs: both are handed over with per-node CRCs, /chosen stays enc 0. */
     m1max();
-    add_encoder("ave0", M1_ENC0);
-    add_encoder("ave1", M1_ENC1)->crc[1] = 0xdeadbeef;
+    a = add_encoder("ave0", M1_ENC0);
+    b = add_encoder("ave1", M1_ENC1);
+    b->crc[0] = 0xcafebabe;
+    b->crc[1] = 0xdeadbeef;
     CHECK(!dt_set_ave());
-    CHECK(!strcmp(status(0, M1_ENC0), "okay") && !strcmp(status(0, M1_ENC1), "disabled"));
-    CHECK(!firmware(0, M1_ENC1, 0));
+    CHECK(!strcmp(status(0, M1_ENC0), "okay") && !strcmp(status(0, M1_ENC1), "okay"));
+    CHECK(firmware(0, M1_ENC0, 0) == a->seg[0].phys && firmware(0, M1_ENC1, 0) == b->seg[0].phys);
+    CHECK(firmware(0, M1_ENC0, 1) == a->seg[1].phys && firmware(0, M1_ENC1, 1) == b->seg[1].phys);
+    CHECK(!strcmp(node_prop(0, M1_ENC0, "aurora,ave-text-crc32"), "460c7a7c"));
+    CHECK(!strcmp(node_prop(0, M1_ENC0, "aurora,ave-data-crc32"), "12345678"));
+    CHECK(!strcmp(node_prop(0, M1_ENC1, "aurora,ave-text-crc32"), "cafebabe"));
+    CHECK(!strcmp(node_prop(0, M1_ENC1, "aurora,ave-data-crc32"), "deadbeef"));
+    CHECK(!strcmp(chosen("aurora,ave-text-crc32"), "460c7a7c"));
     CHECK(!strcmp(chosen("aurora,ave-data-crc32"), "12345678"));
-    CHECK(strstr(logbuf, "differs from the encoder already handed over"));
-    puts("PASS: a differing firmware copy is refused, the published CRCs kept");
+    puts("PASS: differing encoder 1 copy gets per-node CRCs while /chosen keeps encoder 0");
 
     /* 5: the M1 Ultra: die 1 repeats die 0's die-local addresses. */
     tree(2);
@@ -928,6 +949,69 @@ static int scenarios(void)
     CHECK(!dt_set_ave_dapf() && !programmed[0]);
     puts("PASS: T8140 inherited filters preserved");
 #endif
+
+    /*
+     * 13: M4 Max (T6041, J616c) live ADT layout: ave0 at 0x283100000 and ave1 at 0x285100000,
+     * each preloaded with TEXT 0x14c000 and DATA 0x130000 at dart-ave{0,1} vm-base 0x10000000000,
+     * with differing per-instance DATA CRCs (observed across boots on J616c).
+     */
+#define T6041_AVE0 0x283100000ULL
+#define T6041_AVE1 0x285100000ULL
+#define M4_VM_BASE 0x10000000000ULL
+    tree(1);
+    encoder2(0, "apple,t6041-ave", "apple,ave", T6041_AVE1, "okay");
+    encoder2(0, "apple,t6041-ave", "apple,ave", T6041_AVE0, "okay");
+    a = add_encoder("ave0", T6041_AVE0);
+    a->seg[0] = (struct adt_segment_ranges){0x10000a98000ULL, 0, M4_VM_BASE, 0x14c000, 1};
+    a->seg[1] = (struct adt_segment_ranges){0x10001d64000ULL, 0x14c000, M4_VM_BASE + 0x14c000,
+                                            0x130000, 0};
+    a->crc[0] = 0x9a080cad;
+    a->crc[1] = 0x7db0b5d4;
+    b = add_encoder("ave1", T6041_AVE1);
+    b->seg[0] = (struct adt_segment_ranges){0x10000be4000ULL, 0, M4_VM_BASE, 0x14c000, 1};
+    b->seg[1] = (struct adt_segment_ranges){0x10001e94000ULL, 0x14c000, M4_VM_BASE + 0x14c000,
+                                            0x130000, 0};
+    b->crc[0] = 0x9a080cad;
+    b->crc[1] = 0x75616d2c;
+    add_dart("dart-ave0", M4_VM_BASE);
+    add_dart("dart-ave1", M4_VM_BASE);
+    CHECK(!dt_set_ave());
+    CHECK(!strcmp(status(0, T6041_AVE0), "okay") && !strcmp(status(0, T6041_AVE1), "okay"));
+    CHECK(firmware(0, T6041_AVE0, 0) == 0x10000a98000ULL);
+    CHECK(firmware(0, T6041_AVE0, 1) == 0x10001d64000ULL);
+    CHECK(firmware(0, T6041_AVE1, 0) == 0x10000be4000ULL);
+    CHECK(firmware(0, T6041_AVE1, 1) == 0x10001e94000ULL);
+    CHECK(iova_at(0, T6041_AVE0, 0) == M4_VM_BASE &&
+          iova_at(0, T6041_AVE0, 1) == M4_VM_BASE + 0x14c000);
+    CHECK(iova_at(0, T6041_AVE1, 0) == M4_VM_BASE &&
+          iova_at(0, T6041_AVE1, 1) == M4_VM_BASE + 0x14c000);
+    CHECK(!strcmp(node_prop(0, T6041_AVE0, "aurora,ave-text-crc32"), "9a080cad"));
+    CHECK(!strcmp(node_prop(0, T6041_AVE0, "aurora,ave-data-crc32"), "7db0b5d4"));
+    CHECK(!strcmp(node_prop(0, T6041_AVE1, "aurora,ave-text-crc32"), "9a080cad"));
+    CHECK(!strcmp(node_prop(0, T6041_AVE1, "aurora,ave-data-crc32"), "75616d2c"));
+    CHECK(!strcmp(chosen("aurora,ave-text-crc32"), "9a080cad"));
+    CHECK(!strcmp(chosen("aurora,ave-data-crc32"), "7db0b5d4"));
+    CHECK(strstr(logbuf, "video-codec@283100000 handed over from ADT /arm-io/ave0"));
+    CHECK(strstr(logbuf, "video-codec@285100000 handed over from ADT /arm-io/ave1"));
+    puts("PASS: J616c (T6041) ave0 and ave1 handed over with per-node CRCs");
+
+#ifndef NO_AVE_DAPF
+    /* Both dart-ave0 and dart-ave1 already programmed by dapf.c (ave + ave1 aliases present). */
+    CHECK(!fdt_pack(dt));
+    programmed_entry = "/arm-io/dart-ave1";
+    CHECK(!dt_set_ave_dapf() && !programmed[0]);
+    CHECK(!strcmp(status(0, T6041_AVE0), "okay") && !strcmp(status(0, T6041_AVE1), "okay"));
+    /* dart-ave1 skipped by dapf.c (no ave1 alias): programmed here instead. */
+    programmed_entry = NULL;
+    CHECK(!dt_set_ave_dapf() && !strcmp(programmed, "/arm-io/dart-ave1 "));
+    CHECK(!strcmp(status(0, T6041_AVE1), "okay"));
+    /* dart-ave1 failed in dapf.c: ave1 is left off without retrying, ave0 stays on. */
+    programmed[0] = 0;
+    failing_entry = "/arm-io/dart-ave1";
+    CHECK(dt_set_ave_dapf() == 1 && !programmed[0]);
+    CHECK(!strcmp(status(0, T6041_AVE0), "okay") && !strcmp(status(0, T6041_AVE1), "disabled"));
+    puts("PASS: J616c (T6041) dart-ave1 DAPF handles programmed, skipped and failed dapf.c states");
+#endif
     return 0;
 }
 
@@ -1075,4 +1159,4 @@ def test_ave_handoff(tmp_path):
     binary = build(tmp_path, (repo / "src/kboot.c").read_text())
     run = subprocess.run([str(binary)], capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
-    assert run.stdout.count("PASS:") == 36, run.stdout
+    assert run.stdout.count("PASS:") == 38, run.stdout
