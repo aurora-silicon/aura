@@ -137,9 +137,18 @@ bool wdt_boot_watchdog_armed(void)
     return wdt_boot_armed;
 }
 
+/* A host has synced with this stage: a later stop in the proxy must not arm the boot watchdog. */
+static bool wdt_host_seen;
+
+bool wdt_host_was_attached(void)
+{
+    return wdt_host_seen;
+}
+
 /* Only the boot watchdog: a trial's or a host-armed one is not ours to disarm. */
 void wdt_host_attached(void)
 {
+    wdt_host_seen = true;
     if (!wdt_boot_armed)
         return;
     wdt_boot_armed = false;
