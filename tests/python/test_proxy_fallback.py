@@ -15,6 +15,9 @@ Ways it can fail, and the check for each:
 5. The window outlives the trial watchdog, which would then reset the Mac with no log line.
 6. A stage that is not a trial waits or reboots (it must stop in the proxy as before), or a trial
    with a host in the window reboots under it.
+8. A plain boot that stops in the proxy stays there for good: it must arm the boot watchdog first,
+   but never under a host that has already attached, on a debug boot, or over a boot watchdog
+   that is already running (Stage 1's).
 7. A handoff failure leaves the panel dark (FB_SILENT_MODE), or a CDC transition still scheduled
    runs from the window's usb_cdc_poll() after USB was shut down for the handoff.
 """
@@ -201,10 +204,21 @@ FALLBACK = r'''
 #include <string.h>
 typedef unsigned int u32;
 #define WDT_TRIAL_SECONDS 178
-static bool trial, host, boot_wdt, arm_fails;
-static unsigned waited, reboots, trial_arms;
+#define WDT_BOOT_SECONDS 178
+static bool trial, host, boot_wdt, arm_fails, host_seen, debug;
+static unsigned waited, reboots, trial_arms, boot_arms;
 static bool aura_trial_enabled(void) { return trial; }
+static bool aura_debug_enabled(void) { return debug; }
 static bool wdt_boot_watchdog_armed(void) { return boot_wdt; }
+static bool wdt_host_was_attached(void) { return host_seen; }
+static int wdt_arm_boot(void)
+{
+    boot_arms++;
+    if (arm_fails)
+        return -1;
+    boot_wdt = true;
+    return 0;
+}
 static int wdt_arm_trial(void)
 {
     trial_arms++;
@@ -219,7 +233,8 @@ static bool uartproxy_wait_host(unsigned int ms)
 __attribute__((noreturn)) static void flush_and_reboot(void)
 {
     reboots++;
-    printf("ret=reboot waited=%u reboots=%u arms=%u\n", waited, reboots, trial_arms);
+    printf("ret=reboot waited=%u reboots=%u arms=%u boot=%u\n", waited, reboots, trial_arms,
+           boot_arms);
     exit(0);
 }
 @HEADER@
@@ -230,14 +245,18 @@ int main(int argc, char **argv)
     host = atoi(argv[2]);
     boot_wdt = atoi(argv[3]);
     arm_fails = atoi(argv[4]);
+    host_seen = atoi(argv[5]);
+    debug = atoi(argv[6]);
     bool r = proxy_fallback("NVMe handoff failed");
-    printf("ret=%d waited=%u reboots=%u arms=%u\n", r, waited, reboots, trial_arms);
+    printf("ret=%d waited=%u reboots=%u arms=%u boot=%u\n", r, waited, reboots, trial_arms,
+           boot_arms);
     return 0;
 }
 '''
 
 
-def _fallback(tmp_path, trial, host, boot_wdt=False, arm_fails=False):
+def _fallback(tmp_path, trial, host, boot_wdt=False, arm_fails=False, host_seen=False,
+              debug=False):
     header = (ROOT / "src/proxy_fallback.h").read_text()
     header = header[header.index("#define PROXY_FALLBACK_HOST_MS"):]
     header = header[:header.index("\n")]
@@ -249,40 +268,65 @@ def _fallback(tmp_path, trial, host, boot_wdt=False, arm_fails=False):
     subprocess.run([*host_cc(), "-std=gnu11", "-Wall", "-Werror", "-Wno-unused-function",
                     "-Wno-unused-parameter", str(src), "-o", str(exe)], check=True)
     out = subprocess.run([str(exe), str(int(trial)), str(int(host)), str(int(boot_wdt)),
-                          str(int(arm_fails))], check=True,
+                          str(int(arm_fails)), str(int(host_seen)), str(int(debug))], check=True,
                          capture_output=True, text=True).stdout
     return dict(item.split("=") for item in out.strip().splitlines()[-1].split())
 
 
-def test_not_a_trial_keeps_the_proxy_without_waiting(tmp_path):
+def test_plain_boot_arms_the_boot_watchdog_and_keeps_the_proxy(tmp_path):
+    """A Stage 2 disarmed Stage 1's boot watchdog at its start: a stop in the proxy arms it
+    again, without waiting or rebooting, so the Mac restarts unless a host attaches."""
     for host in (False, True):
-        for boot_wdt in (False, True):
-            assert _fallback(tmp_path, False, host, boot_wdt) == {
-                "ret": "0", "waited": "0", "reboots": "0", "arms": "0"}
+        assert _fallback(tmp_path, False, host) == {
+            "ret": "0", "waited": "0", "reboots": "0", "arms": "0", "boot": "1"}
+
+
+def test_plain_boot_leaves_a_running_boot_watchdog(tmp_path):
+    """Stage 1's own boot watchdog still runs: nothing to arm (and no fresh period)."""
+    assert _fallback(tmp_path, False, False, boot_wdt=True) == {
+        "ret": "0", "waited": "0", "reboots": "0", "arms": "0", "boot": "0"}
+
+
+def test_plain_boot_never_arms_under_a_host_or_on_a_debug_boot(tmp_path):
+    for kw in ({"host_seen": True}, {"debug": True}):
+        assert _fallback(tmp_path, False, False, **kw) == {
+            "ret": "0", "waited": "0", "reboots": "0", "arms": "0", "boot": "0"}, kw
+
+
+def test_plain_boot_keeps_the_proxy_when_the_watchdog_cannot_be_armed(tmp_path):
+    assert _fallback(tmp_path, False, False, arm_fails=True) == {
+        "ret": "0", "waited": "0", "reboots": "0", "arms": "0", "boot": "1"}
+
+
+def test_a_host_marks_itself_before_the_boot_watchdog_check():
+    """wdt_host_attached() records the host even when no boot watchdog runs, so a stage whose
+    host synced (a proxy window, a proxy request) never arms one under it later."""
+    fn = _body((ROOT / "src/wdt.c").read_text(), "void wdt_host_attached(void)")
+    assert fn.index("wdt_host_seen = true;") < fn.index("if (!wdt_boot_armed)")
 
 
 def test_trial_without_a_host_reboots_after_the_window(tmp_path):
     assert _fallback(tmp_path, True, False) == {"ret": "reboot", "waited": "15000",
-                                                 "reboots": "1", "arms": "0"}
+                                                 "reboots": "1", "arms": "0", "boot": "0"}
 
 
 def test_trial_with_a_host_keeps_the_proxy(tmp_path):
     assert _fallback(tmp_path, True, True) == {"ret": "1", "waited": "15000", "reboots": "0",
-                                                "arms": "0"}
+                                                "arms": "0", "boot": "0"}
 
 
 def test_stage1_trial_turns_its_boot_watchdog_into_the_trial_watchdog(tmp_path):
     """A Stage 1 that took the trial marker still runs its boot watchdog, which the first host
     turns off. The window must run under the trial watchdog, armed before a host can attach."""
     assert _fallback(tmp_path, True, True, boot_wdt=True) == {
-        "ret": "1", "waited": "15000", "reboots": "0", "arms": "1"}
+        "ret": "1", "waited": "15000", "reboots": "0", "arms": "1", "boot": "0"}
     assert _fallback(tmp_path, True, False, boot_wdt=True) == {
-        "ret": "reboot", "waited": "15000", "reboots": "1", "arms": "1"}
+        "ret": "reboot", "waited": "15000", "reboots": "1", "arms": "1", "boot": "0"}
 
 
 def test_stage1_trial_without_a_trial_watchdog_reboots_without_a_window(tmp_path):
     assert _fallback(tmp_path, True, True, boot_wdt=True, arm_fails=True) == {
-        "ret": "reboot", "waited": "0", "reboots": "1", "arms": "1"}
+        "ret": "reboot", "waited": "0", "reboots": "1", "arms": "1", "boot": "0"}
 
 
 def test_the_trial_watchdog_is_armed_before_the_host_window():
