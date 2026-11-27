@@ -47,6 +47,8 @@ static void dc_cvac_range(const void *p, size_t n)
 static u32 chip_id = 0x8112, adt_version = 2, regs[12], secondary_value, reconfig_value;
 static u64 primary = 0x1000, primary_size = 0x4000, secondary_size = 4, reconfig_size = 4;
 static bool has_simple_reconfig;
+/* m1n1.wdt=keep is not given: wdt_disable_at_start() is wdt_disable() */
+static bool boot_wdt_keep_enabled(void) { return false; }
 static unsigned writes, disables;
 static int adt_dummy;
 static void *adt = &adt_dummy;
@@ -197,7 +199,7 @@ def function_body(source, signature):
 
 def test_stage1_arms_it_after_disarming_iboot_and_stage2_does_not():
     body = function_body((ROOT / 'src/main.c').read_text(), 'void aura_main(void)')
-    disable = body.index('wdt_disable();')
+    disable = body.index('wdt_disable_at_start();')
     arm = body.index('wdt_arm_boot()')
     assert disable < arm < body.index('run_actions();')
     guard = body.rindex('#if', 0, arm)

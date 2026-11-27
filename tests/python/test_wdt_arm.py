@@ -36,6 +36,8 @@ static int adt_dummy;
 static void *adt = &adt_dummy;
 static void dc_cvac_range(const void *p, size_t n)
 { (void)p; (void)n; cache_cleans++; }
+/* m1n1.wdt=keep is not given: wdt_disable_at_start() is wdt_disable() */
+static bool boot_wdt_keep_enabled(void) { return false; }
 static int adt_path_offset_trace(void *a, const char *p, int *trace)
 { (void)a; (void)p; (void)trace; return 1; }
 static const void *adt_getprop(void *a, int node, const char *key, u32 *len)

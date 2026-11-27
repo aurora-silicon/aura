@@ -2,6 +2,7 @@
 
 #include "wdt.h"
 #include "adt.h"
+#include "boot_options.h"
 #include "memory.h"
 #include "types.h"
 #include "utils.h"
@@ -23,6 +24,7 @@
 #define WDT_RECONFIG_WD2  (1u << 4)
 
 static u64 wdt_base = 0;
+static bool wdt_kept;
 static u64 wdt_reconfig = 0;
 
 static void wdt_set_addrs(u64 primary, u64 reconfig)
@@ -87,6 +89,7 @@ static u32 wdt_arm_wd2(u64 primary, u64 reconfig, u32 ticks)
 
 void wdt_disable(void)
 {
+    wdt_kept = false;
     int path[8];
     int node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
 
@@ -128,6 +131,38 @@ void wdt_disable(void)
         write32(wdt_2nd, 0);
         printf("Secondary WDT disabled\n");
     }
+}
+
+/*
+ * m1n1.wdt=keep: a first stage that is not aura (the J716s' A/B m1n1 stage 1 arms 150 s) armed the
+ * watchdog for this stage, so that a hang before the OS takes it over resets the Mac, iBoot counts
+ * a failed boot and that stage boots its fallback. Leave the primary and the secondary as they
+ * are if the primary is armed; otherwise disable both as usual. Nothing in aura feeds it: as on an
+ * aura-try trial, a host that needs longer than the period disarms it (P_WDT_DISABLE), and every
+ * other disarm or re-arm in this stage ends the keep.
+ */
+void wdt_disable_at_start(void)
+{
+    int path[8];
+    u64 base = 0, size = 0, reconfig = 0;
+    int node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
+
+    if (boot_wdt_keep_enabled() && node >= 0 && !adt_get_reg(adt, path, "reg", 0, &base, &size) &&
+        base && (read32(base + WDT_CTL) & WDT_CTL_RESET_EN)) {
+        wdt_set_addrs(base, wdt_has_simple_reconfig(node, path, size, &reconfig) ? reconfig : 0);
+        wdt_kept = true;
+        printf("Primary WDT register @ 0x%lx\n", wdt_base);
+        printf("Primary WDT left armed (m1n1.wdt=keep)\n");
+        return;
+    }
+    if (boot_wdt_keep_enabled())
+        printf("WDT: m1n1.wdt=keep, but the watchdog is not armed\n");
+    wdt_disable();
+}
+
+bool wdt_left_armed(void)
+{
+    return wdt_kept;
 }
 
 void wdt_reboot(void)
@@ -249,6 +284,7 @@ static int wdt_arm(unsigned seconds)
         return -1;
 
     u32 alarm = seconds * 24000000u;
+    wdt_kept = false;
 
     /*
      * On wdt-version >= 3 machines reporting simple-reconfig-wdog-support with a 4-byte reg[3],

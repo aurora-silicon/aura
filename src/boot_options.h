@@ -13,6 +13,8 @@ void boot_options_set_stage1(bool stage1);
 bool aura_proxy_enabled(void);
 bool aura_trial_enabled(void);
 void boot_options_set_trial(bool trial);
+/* m1n1.wdt=keep is in the boot arguments: leave the watchdog an earlier stage armed */
+bool boot_wdt_keep_enabled(void);
 /* Add a whole-word option to a NUL-terminated line of capacity bytes; false if it does not fit */
 bool boot_options_append(char *line, size_t capacity, const char *option);
 #endif

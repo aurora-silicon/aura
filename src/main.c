@@ -429,7 +429,7 @@ void aura_main(void)
     aic_init();
     smp_init();
 #endif
-    wdt_disable();
+    wdt_disable_at_start();
     if (aura_trial_enabled() && wdt_arm_trial())
         printf("WDT: could not arm the trial watchdog\n");
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
