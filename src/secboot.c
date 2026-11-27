@@ -208,6 +208,26 @@ bool secboot_enforcing(void)
 #endif
 }
 
+/*
+ * An earlier aura stage's policy, from the chosen.aurora,measure-N lines it appends
+ * (stage;policy;...). Only a loading stage adds them (secboot_sign.py refuses to sign an image that
+ * carries one), so a Stage 2 built without checks still knows that the stage which verified it
+ * enforced, and then refuses what it cannot verify either: ESP boot= files and a next stage
+ * without a verified trailer. Its own payloads came in the image that stage verified.
+ */
+static bool inherited_enforce;
+
+void secboot_note_chosen(const char *line)
+{
+    static const char prefix[] = "chosen.aurora,measure-";
+    if (strncmp(line, prefix, sizeof(prefix) - 1))
+        return;
+    const char *f = strchr(line, '=');
+    f = f ? strchr(f + 1, ';') : NULL;
+    if (f && !strncmp(f + 1, "enforce;", 8))
+        inherited_enforce = true;
+}
+
 static const char *policy_name(void)
 {
 #ifdef SECBOOT_CHECKS
@@ -363,8 +383,9 @@ bool secboot_host_proxy_allowed(void)
 bool secboot_allow_unverified(const char *what)
 {
     all_verified = false;
-    if (secboot_enforcing()) {
-        printf("secboot: %s cannot be verified; refusing it under policy enforce\n", what);
+    if (secboot_enforcing() || inherited_enforce) {
+        printf("secboot: %s cannot be verified; refusing it under policy enforce%s\n", what,
+               secboot_enforcing() ? "" : " (the stage that loaded this one enforced)");
         return false;
     }
     UNUSED(what);
@@ -405,6 +426,10 @@ int secboot_check_chainload(void *image, size_t *size, char **vars, size_t *var_
     int ret = settle(m, "next stage");
     if (ret)
         return ret;
+    if (inherited_enforce && m->verdict != SECBOOT_VERIFIED) {
+        printf("secboot: refusing next stage: the stage that loaded this one enforced\n");
+        return -1;
+    }
     *size = covered;
 
     /* The next stage records it as its first entry (secboot_export_fdt). */
