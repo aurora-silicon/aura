@@ -156,6 +156,12 @@ static void *decompress_xz(void *p, size_t size)
     return ((u8 *)p) + source_len;
 }
 
+/* The payload's device tree for this machine, once one is found; NULL before. */
+const void *payload_fdt(void)
+{
+    return fdt;
+}
+
 static void *load_fdt(void *p, size_t size)
 {
     int rank = payload_profile_rank(p, firmware_os_components() == V26_6_2);

@@ -274,9 +274,18 @@ void run_actions(void)
                "  Check that the file this Stage 1 names exists on its EFI partition.\n"
                "  Hold the power button to shut down, then hold it again to choose another "
                "system.\n");
-    if (stage1_config_target() && wdt_boot_watchdog_armed())
+    if (stage1_config_target() && wdt_boot_watchdog_armed()) {
+        /*
+         * A failed NVMe session stays failed until a reboot (nvme.c), so no host action short of
+         * one reads the Stage 2 either: restart soon instead of after the whole boot watchdog
+         * period. A host still gets the time to attach, and its sync disarms the watchdog.
+         */
+        unsigned restart_s = WDT_BOOT_SECONDS;
+        if (nvme_io_failed() && !wdt_boot_watchdog_shorten(WDT_NVME_RESTART_SECONDS))
+            restart_s = WDT_NVME_RESTART_SECONDS;
         printf("  Without a host, this Mac restarts by itself within %u s to try again.\n",
-               WDT_BOOT_SECONDS);
+               restart_s);
+    }
 
     if (payload_action == STAGE1_PAYLOAD_HALT)
         panic("Stage 1: no safe proxy carrier after CDC failure\n");

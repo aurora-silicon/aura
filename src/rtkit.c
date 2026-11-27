@@ -926,6 +926,18 @@ bool rtkit_boot_warm(rtkit_dev_t *rtk, u32 last_mask)
     return rtkit_boot_internal(rtk, RTKIT_WARM_TIMEOUT_US, true, last_mask);
 }
 
+/*
+ * A cold start as rtkit_boot(), with the power states waited for a bounded time. It follows a
+ * reset of an IOP that an idle may have left with its receive side off, so that is turned on
+ * as well.
+ */
+bool rtkit_boot_wait(rtkit_dev_t *rtk)
+{
+    rtk->inherited = false;
+    asc_i2a_enable(rtk->asc, true);
+    return rtkit_boot_internal(rtk, RTKIT_IOP_POWER_TIMEOUT, false, 0);
+}
+
 /* Boot the IOP, or adopt the session of one a previous stage left running. Such
  * an IOP already completed HELLO/EPMAP and does not repeat them, so the only
  * accepted evidence is a CPU that was running before the wakeup and no HELLO

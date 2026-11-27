@@ -25,7 +25,7 @@ CASES = {
 def test_ans_warm_start(tmp_path, case):
     stale, pwr, sart, hs, bs, expected = CASES[case]
     source = Path(os.environ.get("NVME_SOURCE", Path(__file__).resolve().parents[2] / "src/nvme.c")).read_text()
-    start = source.index("/*\n * Discard what an earlier owner left in the receive mailbox")
+    start = source.index("/*\n * The ANS types that take a PMGR reset")
     body = source[start:source.index("/* A write or flush, timed:")]
     harness = r'''
 #include <stdbool.h>
@@ -39,6 +39,10 @@ typedef uint64_t u64;
 #define USEC_PER_SEC 1000000
 #define NVME_BOOT_STATUS 0x1300
 #define NVME_BOOT_STATUS_OK 0xde71ce55
+#define NVME_CC 0x14
+#define NVME_CSTS 0x1c
+#define NVME_CSTS_CFS BIT(1)
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 typedef int asc_dev_t;
 typedef int rtkit_dev_t;
 typedef int sart_dev_t;
@@ -53,6 +57,8 @@ static sart_dev_t *nvme_sart = &sart;
 static struct sart_entry nvme_sart_saved[16];
 static int nvme_sart_saved_cnt = 9;
 static u64 nvme_base, nvme_boot_ticks;
+static int nvme_die;
+static void *adt;
 static int stale = @STALE@, drained, boots;
 static const char *why = "";
 static u64 get_ticks(void) { return 1; }
@@ -76,6 +82,19 @@ static bool rtkit_boot_warm(rtkit_dev_t *r, u32 mask)
     if (stale || @HS@) { why = "handshake"; return false; }
     return true;
 }
+static int adt_path_offset(void *a, const char *p) { return 1; }
+static bool adt_is_compatible(void *a, int n, const char *c) { return false; }
+static const void *payload_fdt(void) { return NULL; }
+static int fdt_node_offset_by_compatible(const void *f, int s, const char *c) { return -1; }
+static bool asc_cpu_running(asc_dev_t *a) { return false; }
+static void asc_cpu_stop(asc_dev_t *a) {}
+static int pcie_ans_power_off(void) { return 0; }
+static void pmgr_reset(int die, const char *name) { why = "reset"; }
+static rtkit_dev_t *rtkit_init(const char *n, asc_dev_t *a, void *d, void *i, sart_dev_t *s, bool sram)
+{ return &rtkit; }
+static void rtkit_stop(rtkit_dev_t *r) {}
+static void rtkit_free(rtkit_dev_t *r) {}
+static bool rtkit_boot_wait(rtkit_dev_t *r) { why = "cold"; return false; }
 static int poll32(u64 a, u32 m, u32 v, unsigned t) { if (@BS@) why = "boot_status"; return @BS@ ? -1 : 0; }
 ''' + body + r'''
 int main(void)
