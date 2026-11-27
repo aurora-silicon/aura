@@ -13372,6 +13372,7 @@ T6050_SLEEP_INIT static void dt_set_t6050_sleep(void)
     dt_set_t6050_sleep_prop(node, "apple,pinctrl-skip-pins", pins, npins);
 }
 
+#ifdef ESP_STAGE2
 /*
  * Single-die T6050 system cache handoff (apple,t6050-mcc).
  *
@@ -13381,6 +13382,9 @@ T6050_SLEEP_INIT static void dt_set_t6050_sleep(void)
  * (/arm-io/mcc and /chosen/lock-regs/amcc), verified against the parent bus ranges, and set
  * status = "okay". Already-enabled nodes (such as two-die M5 Ultra) are left alone; any missing
  * or inconsistent ADT or DT property leaves the node disabled with its original reg intact.
+ *
+ * Built into the ESP Stage 2 only: Stage 1 has no room for it (#511). A direct Stage 1 boot
+ * leaves the node disabled, so the system level cache stays off there.
  */
 #define T6050_MCC_PLANE_SIZE 0x4000ULL
 #define T6050_MCC_MAX_PLANES 64U
@@ -13669,6 +13673,7 @@ err:
     free(buf);
     printf("FDT: T6050 MCC: %s; leaving disabled\n", why);
 }
+#endif /* ESP_STAGE2 */
 
 void kboot_set_initrd(void *start, size_t size)
 {
@@ -14632,7 +14637,9 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_t6040_sleep_dcpext())
         return -1;
     dt_set_t6050_sleep();
+#ifdef ESP_STAGE2
     dt_set_t6050_mcc();
+#endif
 #ifndef RELEASE
     if (dt_transfer_virtios())
         return 1;
