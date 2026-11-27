@@ -73,7 +73,13 @@ for f in dt_fill_pmp dt_pass_pmp dt_set_pmp_t6031 pmp_values_t6031; do
 done
 
 # The code under test next to the host stand-ins, so that its #include "utils.h" finds them
-for f in kboot_display_handoff.c kboot_gpu.c kboot_gpu26.c kboot_gpu_t6031.c \
+while IFS= read -r f; do
+    case "$f" in ""|"#"*) continue ;; esac
+    cp "src/$f" "$tmp/src/"
+    h="${f%.c}.h"
+    [ -f "src/$h" ] && cp "src/$h" "$tmp/src/"
+done < "$root/tests/display-handoff-sources.txt"
+for f in kboot_gpu.c kboot_gpu26.c kboot_gpu_t6031.c \
     kboot_gpu_t8122_power.c kboot_t6031.c firmware.c pmgr.c; do
     cp "src/$f" "$tmp/src/"
 done

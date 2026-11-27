@@ -181,6 +181,9 @@ int usb_cdc_cancel(void)
 void usb_cdc_cleanup(void)
 {
     usb_iodev_shutdown();
+    /* USB is down: a transition still scheduled must not run from a later usb_cdc_poll(). */
+    if (cdc.state == USB_CDC_SCHEDULED)
+        cdc.state = USB_CDC_IDLE;
     if (watchdog_armed) {
         wdt_disable();
         watchdog_armed = false;

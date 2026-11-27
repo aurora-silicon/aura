@@ -152,6 +152,31 @@ enum stage1_proxy_result uartproxy_wait_stage1(unsigned int timeout_ms)
     }
 }
 
+/*
+ * A bounded wait for a host on any proxy iodev, for a stage that would otherwise stop in the proxy
+ * with nobody to drive it (proxy_fallback.c). A host's sync word ends it early, and the proxy then
+ * runs presynced on that iodev.
+ */
+bool uartproxy_wait_host(unsigned int timeout_ms)
+{
+    u64 start = ticks_to_msecs(get_ticks());
+
+    while (ticks_to_msecs(get_ticks()) - start < timeout_ms) {
+        usb_cdc_poll();
+        for (iodev_id_t i = 0; i < IODEV_MAX; i++) {
+            if (i == IODEV_DOCKCHANNEL_UART && usb_cdc_owns_carrier())
+                continue;
+            if (uartproxy_sync_iodev(i)) {
+                presynced_iodev = i;
+                wdt_host_attached();
+                return true;
+            }
+        }
+        mdelay(1);
+    }
+    return false;
+}
+
 int uartproxy_run_presynced(void)
 {
     if (presynced_iodev == IODEV_MAX)

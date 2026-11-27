@@ -14,7 +14,7 @@ import subprocess
 import sys
 
 import pytest
-from host_compiler import host_cc
+from host_compiler import display_handoff_sources, host_cc
 
 ROOT = Path(__file__).resolve().parents[2]
 LIBFDT = ["fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_wip.c", "fdt_sw.c", "fdt_empty_tree.c",
@@ -45,6 +45,13 @@ def build_host(tmp, unknown_profile=False, host_source="t6041_display_host.c"):
         assert ".os_fw = V26_6_2," in record
         code = code[:start] + record.replace(".os_fw = V26_6_2,", ".os_fw = V_UNKNOWN,") + code[end:]
     (src / "kboot_display_handoff.c").write_text(code)
+    handoff_srcs = display_handoff_sources(ROOT)
+    for name in handoff_srcs:
+        if name != "kboot_display_handoff.c":
+            shutil.copy(ROOT / "src" / name, src)
+        hdr = ROOT / "src" / name.replace(".c", ".h")
+        if hdr.exists():
+            shutil.copy(hdr, src)
     shutil.copy(ROOT / "tests/t6041_display_host.c", src)
     if host_source != "t6041_display_host.c":
         shutil.copy(ROOT / "tests" / host_source, src)
@@ -56,7 +63,7 @@ def build_host(tmp, unknown_profile=False, host_source="t6041_display_host.c"):
          "-Wno-format", "-Wno-format-truncation", "-fsanitize=address,undefined",
          "-fno-omit-frame-pointer", "-fno-sanitize-recover=undefined",
          "-I", str(src), "-I", str(ROOT / "src"),
-         str(src / host_source), str(src / "kboot_display_handoff.c"),
+         str(src / host_source), *(str(src / name) for name in handoff_srcs),
          *(str(ROOT / "src/libfdt" / f) for f in LIBFDT), "-o", str(binary)],
         check=True,
     )

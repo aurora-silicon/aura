@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 /*
  * Host test of the T6030 display ADT facts (src/kboot_display_facts.c) and of the atc-phy3 lane
  * tunable rule (src/kboot_atc.c). Synthetic ADTs in the boot loader's binary layout, an ADT
@@ -317,6 +317,23 @@ const char *adt_get_name(const void *a, int node)
     const char *n = adt_getprop(a, node, "name", NULL);
     CHECK(n);
     return n;
+}
+
+bool adt_is_compatible(const void *a, int node, const char *compat)
+{
+    u32 len = 0;
+    const char *c = adt_getprop(a, node, "compatible", &len);
+
+    while (c && len) {
+        size_t n = strnlen(c, len);
+        if (n == strlen(compat) && !memcmp(c, compat, n))
+            return true;
+        if (n + 1 > len)
+            break;
+        c += n + 1;
+        len -= n + 1;
+    }
+    return false;
 }
 
 bool adt_is_compatible_at(const void *a, int node, const char *compat, size_t index)

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT AND GPL-2.0-only
 # Host test of the T6030 display ADT facts (src/kboot_display_facts.c) and of the atc-phy3 lane
 # tunable rule (src/kboot_atc.c).
 #
@@ -29,6 +30,7 @@ build() { # build <kboot_atc.c> <out>
         "$root"/src/libfdt/fdt.c "$root"/src/libfdt/fdt_ro.c "$root"/src/libfdt/fdt_rw.c \
         "$root"/src/libfdt/fdt_wip.c "$root"/src/libfdt/fdt_sw.c "$root"/src/libfdt/fdt_addresses.c \
         "$root"/src/libfdt/fdt_empty_tree.c "$root"/src/libfdt/fdt_strerror.c \
+        "$root"/src/libfdt/fdt_addresses.c \
         -Wl,--wrap=malloc -o "$out/t6030-display-host"
 }
 

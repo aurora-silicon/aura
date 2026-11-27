@@ -61,15 +61,24 @@ void iovad_shutdown(iova_domain_t *iovad, dart_dev_t *dart)
         free(blk_free);
     }
 
-    if (dart)
-        for (u64 addr = iovad->base; addr < iovad->limit; addr += SZ_32M)
-            dart_free_l2(dart, addr);
+    /* Count the L2 tables instead of stepping an address up to the limit:
+     * past a limit in the last table below 2^64 the address wraps to 0. */
+    if (dart) {
+        u64 tables = (iovad->limit - iovad->base - 1) / SZ_32M + 1;
+
+        for (u64 i = 0; i < tables; i++)
+            dart_free_l2(dart, iovad->base + i * SZ_32M);
+    }
 
     free(iovad);
 }
 
 bool iova_reserve(iova_domain_t *iovad, u64 iova, size_t sz)
 {
+    /* a zero-size range holds no page, whatever its address */
+    if (sz == 0)
+        return true;
+
     /* Widen to whole pages from the range's end, so an unaligned range that
      * straddles a page boundary keeps both pages. */
     const u64 top = ALIGN_DOWN(UINT64_MAX, SZ_16K);
@@ -83,7 +92,7 @@ bool iova_reserve(iova_domain_t *iovad, u64 iova, size_t sz)
     /* page 0 is never handed out */
     if (iova == 0)
         iova = SZ_16K;
-    /* nothing left: a zero-size range, or one inside page 0 */
+    /* nothing left: the range was inside page 0 */
     if (end <= iova)
         return true;
     sz = end - iova;
@@ -150,6 +159,12 @@ bool iova_reserve(iova_domain_t *iovad, u64 iova, size_t sz)
 
 u64 iova_alloc(iova_domain_t *iovad, size_t sz)
 {
+    /* Nothing to hand out for 0, and a size that rounds up past SIZE_MAX
+     * would become 0: both would match the first free block without taking
+     * anything from it. */
+    if (sz == 0 || sz > ALIGN_DOWN(SIZE_MAX, SZ_16K))
+        return 0;
+
     sz = ALIGN_UP(sz, SZ_16K);
 
     struct iova_block *blk_prev = NULL;
