@@ -3587,25 +3587,48 @@ DCPEXT_XTEXT static bool dcpext_chain_off(const struct pmgr_gate *g, int depth)
 }
 
 /*
- * /arm-io/<name> provably does not run, nor its pipe: it has ADT clock-gates and each of them is
- * under physical PMGR devices (its pipe's domains) and off with everything above it
- * (dcpext_chain_off()). Without clock-gates, with one that has no physical device above it, or
- * with one that is on or cannot be read, it may.
+ * Cell count of /arm-io/<name>'s ADT clock-gates property, or -1 if absent, empty, not a whole
+ * number of 32-bit cells, or over DCP6_GATES_MAX cells. Sets *bytes to the property length when
+ * present. pmgr_adt_gate() truncates trailing bytes, so callers validate the whole list first.
+ */
+DCPEXT_XTEXT static int dcpext_clock_gates(const char *name, char *path, size_t path_len,
+                                           u32 *bytes)
+{
+    u32 len = 0;
+    int node;
+
+    *bytes = 0;
+    if (snprintf(path, path_len, "/arm-io/%s", name) >= (int)path_len)
+        return -1;
+    node = adt_path_offset(adt, path);
+    if (node < 0 || !adt_getprop(adt, node, "clock-gates", &len))
+        return -1;
+    *bytes = len;
+    if (!len || len % sizeof(u32) || len / sizeof(u32) > DCP6_GATES_MAX)
+        return -1;
+    return (int)(len / sizeof(u32));
+}
+
+/*
+ * /arm-io/<name> provably does not run, nor its pipe: its ADT clock-gates list is well-formed and
+ * non-empty, and each entry is under physical PMGR devices (its pipe's domains) and off with
+ * everything above it (dcpext_chain_off()). Without valid clock-gates, with one that has no
+ * physical device above it, or with one that is on or cannot be read, it may.
  */
 DCPEXT_XTEXT static bool dcpext_not_running(const char *name)
 {
     char path[DCP6_NAME_LEN + 16];
-    u32 n;
+    u32 bytes;
+    int ngates = dcpext_clock_gates(name, path, sizeof(path), &bytes);
 
-    snprintf(path, sizeof(path), "/arm-io/%s", name);
-    for (n = 0; n < DCP6_GATES_MAX; n++) {
+    if (ngates < 0)
+        return false;
+    for (u32 n = 0; n < (u32)ngates; n++) {
         struct pmgr_gate g;
-        if (pmgr_adt_gate(path, "clock-gates", n, &g) < 0)
-            break;
-        if (!dcpext_chain_off(&g, 0))
+        if (pmgr_adt_gate(path, "clock-gates", n, &g) < 0 || !dcpext_chain_off(&g, 0))
             return false;
     }
-    return n > 0 && n < DCP6_GATES_MAX;
+    return true;
 }
 
 #ifdef ESP_STAGE2
@@ -3736,14 +3759,18 @@ DCPEXT_XTEXT static int dcpext_powered(const char *name, const char *what)
 {
     struct dcpext_ps ps[DCP6_PS_MAX];
     char path[DCP6_NAME_LEN + 16];
-    u32 val[DCP6_PS_MAX];
-    int n = 0;
+    u32 val[DCP6_PS_MAX], bytes;
+    int n = 0, ngates = dcpext_clock_gates(name, path, sizeof(path), &bytes);
 
-    snprintf(path, sizeof(path), "/arm-io/%s", name);
-    for (u32 i = 0; i < DCP6_GATES_MAX; i++) {
+    if (ngates < 0) {
+        if (bytes)
+            bail("%s: ADT clock-gates is malformed (%u bytes)\n", what, bytes);
+        bail("%s: no ADT clock-gates to check its power by\n", what);
+    }
+    for (u32 i = 0; i < (u32)ngates; i++) {
         struct pmgr_gate g;
         if (pmgr_adt_gate(path, "clock-gates", i, &g) < 0)
-            break;
+            bail("%s: clock-gates[%u] could not be read\n", what, i);
         if (dcpext_ps_add(ps, &n, &g, 0, what, i))
             return -1;
     }

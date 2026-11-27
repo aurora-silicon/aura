@@ -424,9 +424,10 @@ int main(int argc, char **argv)
     size_t slen = strlen(s);
     bool off = slen > 4 && !strcmp(s + slen - 4, "-off");
     if (off || is(s, "fw27-one-running") || is(s, "fw27-power-unknown") ||
-        is(s, "fw27-pmgr-faults") || is(s, "fw27-no-clock-gates"))
+        is(s, "fw27-pmgr-faults") || is(s, "fw27-no-clock-gates") ||
+        is(s, "fw27-truncated-clock-gates"))
         processor_off(0);
-    if (off)
+    if (off || is(s, "fw27-truncated-clock-gates"))
         processor_off(1);
     if (!legacy && !off)
         for (int i = 0; i < 2; i++) {
@@ -458,6 +459,14 @@ int main(int argc, char **argv)
         region_of(T8132_PMGR)->base = 0x7f0000000ULL; /* nothing answers at the power states */
     if (is(s, "fw27-no-clock-gates"))
         prop_drop("/arm-io/dcpext1", "clock-gates");
+    if (is(s, "fw27-truncated-clock-gates")) {
+        u8 cg[6] = {0};
+        u32 gate = pm_sys(1) + 2;
+        memcpy(cg, &gate, sizeof(gate));
+        cg[4] = 0x11;
+        cg[5] = 0x22;
+        prop_set("/arm-io/dcpext1", "clock-gates", cg, sizeof(cg));
+    }
     if (is(s, "fw27-dart-unlocked"))
         poke32(pipe_dart[1] + 0x200, 0x1e0); /* unlocked with a live stream: still walked */
     if (is(s, "fw27-dart-faults"))
@@ -594,7 +603,7 @@ FDT_SCENARIOS = [
     "fw27", "fw27-refused", "fw27-one-running", "fw27-no-alias", "fw27-dart-unlocked",
     "fw27-prepopulated", "fw27-no-dt-ext",
     "fw27-overlap", "fw27-pipe-left-on", "fw27-power-unknown", "fw27-pmgr-faults",
-    "fw27-no-clock-gates", "fw27-dart-faults", "fw27-refused-dt-full",
+    "fw27-no-clock-gates", "fw27-truncated-clock-gates", "fw27-dart-faults", "fw27-refused-dt-full",
     # their CPUs off, with no PMGR parent to tell their pipes' power: they may run, no boot
     "fw27-cpu-off-no-parent",
     "fw27-pipe-no-mappers", "fw27-no-dt-ext-pipe-no-mappers", "fw27-ext-no-mappers",

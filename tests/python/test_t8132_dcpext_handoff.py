@@ -138,6 +138,10 @@ REASONS = {
     "j713-off-nothing-kept": [H0, "dcpext1: DISPEXT1_CPU is not requested (0x0)",
                               "dcpext1 memory: not running, its pipe neither (its power domains are off): "
                               "nothing to keep"],
+    "j713-truncated-clock-gates": [H0, "dcpext1: ADT clock-gates is malformed (6 bytes)",
+                                   "dcpext1 memory: ADT clock-gates is malformed (6 bytes)",
+                                   "dcpext1 memory: may run but is not powered as a running one: its 2 DART(s) not read",
+                                   K(1, 6, 0), NB],
     "j713-auto-off-kept": [H0, "dcpext1: DISPEXT1_CPU is not requested (0x10000000)", K(1, 6, 0), NB],
     "j713-internal-incomplete-kept": ["internal DCP handoff not complete: external processors not handed over",
                                       K(0, 6, 4), K(1, 6, 4)],
@@ -197,9 +201,9 @@ ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-
                "j713-table-small-memreserve", "j713-tables-in-ram-refused", "j713-table-in-carveout",
                "j713-extra-child-dart", "j713-iommu-cells-2", "j713-refused-segs-kept",
                "j713-refused-pipe-kept", "j713-refused-power-kept", "j713-refused-image-kept",
-               "j713-refused-unlocked-kept", "j713-off-nothing-kept", "j713-auto-off-kept",
-               "j713-no-adt-node-kept", "j713-pipe-left-on", "j713-refused-ready",
-               "j713-pipe-no-mappers", "j713-ext-no-mappers"}
+               "j713-refused-unlocked-kept", "j713-off-nothing-kept", "j713-truncated-clock-gates",
+               "j713-auto-off-kept", "j713-no-adt-node-kept", "j713-pipe-left-on",
+               "j713-refused-ready", "j713-pipe-no-mappers", "j713-ext-no-mappers"}
 # Processors that are not handed over keep their memory, with their own lines (" memory: ")
 
 

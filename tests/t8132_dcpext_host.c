@@ -722,6 +722,7 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-refused-image-kept", "J713: dcpext1 runs another image: refused, memory kept"},
     {"j713-refused-unlocked-kept", "J713: dcpext0's live, unlocked DART: refused, its tables kept"},
     {"j713-off-nothing-kept", "J713: DISPEXT1_CPU power-gated: not running, nothing kept"},
+    {"j713-truncated-clock-gates", "J713: dcpext1 clock-gates has an off gate and a partial second cell"},
     {"j713-auto-off-kept", "J713: DISPEXT1_CPU gated but under auto power: memory kept"},
     {"j713-internal-incomplete-kept", "J713: internal handoff incomplete: both kept, none published"},
     {"j713-fw27-no-uuid", "J713 27.2, internal nub without uuid: refused, kept, no 26.6.2 marker"},
@@ -771,6 +772,7 @@ static const char *const t8132_no_boot[] = {
     "j713-refused-pipe-kept",      /* no ADT pipe holds dcpext1 */
     "j713-refused-power-kept",
     "j713-auto-off-kept",    /* DARTs not readable */
+    "j713-truncated-clock-gates",
     "j713-no-adt-node-kept", /* no ADT pipe holds dcpext1 */
     "j713-pipe-left-on",
     "j713-cpu-off-no-parent", /* CPU off, nothing tells its pipe's power: the pipe may run */
@@ -1171,16 +1173,25 @@ int main(int argc, char **argv)
         ext_tables_in_ram(1);
     }
     if (is(s, "j713-refused-power-kept") || is(s, "j713-off-nothing-kept") ||
-        is(s, "j713-auto-off-kept")) {
+        is(s, "j713-truncated-clock-gates") || is(s, "j713-auto-off-kept")) {
         ext_segs_in_ram(1);
         ext_tables_in_ram(1);
         u16 sys = pm_sys(1);
-        if (is(s, "j713-refused-power-kept"))
+        if (is(s, "j713-refused-power-kept")) {
             poke32(ps_reg(sys + 1), 0x0f); /* FE: target on, actual off */
-        else if (is(s, "j713-auto-off-kept"))
+        } else if (is(s, "j713-auto-off-kept")) {
             poke32(ps_reg(sys + 2), 0x10000000u);
-        else
+        } else if (is(s, "j713-truncated-clock-gates")) {
+            u8 cg[6] = {0};
+            u32 gate = sys + 2;
+            memcpy(cg, &gate, sizeof(gate));
+            cg[4] = 0x11;
+            cg[5] = 0x22;
+            prop_set("/arm-io/dcpext1", "clock-gates", cg, sizeof(cg));
             ext_off(1);
+        } else {
+            ext_off(1);
+        }
     }
     if (is(s, "j713-refused-image-kept")) {
         prop_str("/arm-io/dcpext1/iop-dcpext1-nub", "uuid", UUID_X);
@@ -1427,8 +1438,8 @@ int main(int argc, char **argv)
     }
     if (is(s, "j713-refused-segs-kept") || is(s, "j713-refused-pipe-kept") ||
         is(s, "j713-refused-power-kept") || is(s, "j713-refused-image-kept") ||
-        is(s, "j713-off-nothing-kept") || is(s, "j713-auto-off-kept") ||
-        is(s, "j713-no-adt-node-kept")) {
+        is(s, "j713-off-nothing-kept") || is(s, "j713-truncated-clock-gates") ||
+        is(s, "j713-auto-off-kept") || is(s, "j713-no-adt-node-kept")) {
         bool off = is(s, "j713-off-nothing-kept");
         check_ext(in, dt, 0, false);
         check(ext_untouched(in, dt, 1), "dcpext1 is not published (no uuid, version, clocks, "
@@ -1438,7 +1449,8 @@ int main(int argc, char **argv)
         bool unmatched = is(s, "j713-no-adt-node-kept");
         check_oslogs(dt, true, !unmatched, false);
         if (is(s, "j713-refused-segs-kept") || is(s, "j713-refused-power-kept") ||
-            is(s, "j713-refused-image-kept") || is(s, "j713-auto-off-kept") || unmatched)
+            is(s, "j713-truncated-clock-gates") || is(s, "j713-refused-image-kept") ||
+            is(s, "j713-auto-off-kept") || unmatched)
             check(ext_segs_kept(dt, 1) && resv_count(dt, "dcpext-firmware@") == 2 + unmatched,
                   "dcpext1's __DATA and heap in RAM are reserved, no-map (%d)",
                   resv_count(dt, "dcpext-firmware@"));
