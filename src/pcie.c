@@ -611,10 +611,19 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off, 
         for (int phy = 0; phy < state->num_phys; phy++) {
             u64 ctrl = state->phy_base[phy] + APCIE_PHY_CTRL;
             set32(ctrl, state->pcie_regs->phy_ctrl_reset);
+            /*
+             * No boot has shown yet that both acknowledges always fall within 50 ms. Until one
+             * has, a late one is logged and the power-off goes on, as before: stopping here would
+             * end every such boot's handoff in the proxy.
+             */
             clear32(ctrl, APCIE_PHY_CTRL_CLK1REQ);
-            poll32(ctrl, APCIE_PHY_CTRL_CLK1ACK, 0, 50000);
+            if (poll32(ctrl, APCIE_PHY_CTRL_CLK1ACK, 0, 50000))
+                printf("pcie: Timeout dropping PHY %d CLK1 (0x%x); powering ANS off anyway\n", phy,
+                       read32(ctrl));
             clear32(ctrl, APCIE_PHY_CTRL_CLK0REQ);
-            poll32(ctrl, APCIE_PHY_CTRL_CLK0ACK, 0, 50000);
+            if (poll32(ctrl, APCIE_PHY_CTRL_CLK0ACK, 0, 50000))
+                printf("pcie: Timeout dropping PHY %d CLK0 (0x%x); powering ANS off anyway\n", phy,
+                       read32(ctrl));
             /* PHY control keeps its value through the power cycle: take the PHY down whole. */
             clear32(ctrl, pcie_phy_up(state));
             clear32(state->phy_base[phy] + 4, 0x10);
@@ -1131,6 +1140,66 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off, 
     return 0;
 }
 
+u32 pcie_adt_perst_to_config_ms(const char *bridge)
+{
+    int node = adt_path_offset(adt, bridge);
+    u32 ms = 0;
+
+    if (node < 0 || ADT_GETPROP(adt, node, "perst-to-config", &ms) < 0)
+        ms = 0;
+    /* A function answers config space within PCIE_RESET_READY_MS of reset; a longer ADT value is
+     * bad data. */
+    if (ms > PCIE_RESET_READY_MS) {
+        printf("pcie: %s perst-to-config %u ms is over the %u ms reset-ready bound; using %u ms\n",
+               bridge, ms, PCIE_RESET_READY_MS, PCIE_RESET_READY_MS);
+        ms = PCIE_RESET_READY_MS;
+    }
+    return max(ms, (u32)PCIE_RESET_TO_CONFIG_MS);
+}
+
+int pcie_wait_config_ready(u64 cfg, u32 *id)
+{
+    u64 timeout = timeout_calculate(PCIE_RESET_READY_MS * 1000);
+
+    while (true) {
+        u32 vendor = (*id = read32(cfg)) & 0xffff;
+
+        /* All ones: no completion; 0x0001: Request Retry Status */
+        if (vendor != 0xffff && vendor != 0x0001)
+            return 0;
+        if (timeout_expired(timeout)) {
+            printf("pcie: function at 0x%lx not ready after %u ms (0x%08x)\n", (unsigned long)cfg,
+                   PCIE_RESET_READY_MS, *id);
+            return -1;
+        }
+        udelay(100);
+    }
+}
+
+int pcie_adt_perst_gpio(const char *bridge, u64 *addr)
+{
+    struct {
+        u32 phandle, fourcc, pin, flags;
+    } perst;
+    int gpio_path[8];
+    u32 gpio_phandle;
+    u64 base, span;
+    int node = adt_path_offset(adt, bridge);
+    int gpio = adt_path_offset_trace(adt, "/arm-io/gpio0", gpio_path);
+
+    /* function-perst = GPIO(pin, flags) of /arm-io/gpio0, its fourcc "OIPG" in ADT byte order */
+    if (node < 0 || gpio < 0 ||
+        adt_getprop_copy(adt, node, "function-perst", &perst, sizeof(perst)) < 0 ||
+        perst.fourcc != 0x4750494f || ADT_GETPROP(adt, gpio, "AAPL,phandle", &gpio_phandle) < 0 ||
+        gpio_phandle != perst.phandle || adt_get_reg(adt, gpio_path, "reg", 0, &base, &span) ||
+        span < 4 * ((u64)perst.pin + 1)) {
+        printf("pcie: cannot resolve %s function-perst\n", bridge);
+        return -1;
+    }
+    *addr = base + 4 * perst.pin;
+    return 0;
+}
+
 int pcie_init(void)
 {
     bool success = false;
@@ -1275,7 +1344,7 @@ static const u8 t6050_ans_on[] = {6, 5, 4, 1, 3, 0, 2};
 
 /*
  * T8142 (J704/J813/J815: same gates, ids and parents in their 27.2.1 ADTs), the storage half of
- * AppleT8142PCIe's power-down: ST0_AUS5 then ST0_AUS5_AON (its CLK0REQ-down step), then of its
+ * the traced macOS power-down: ST0_AUS5 then ST0_AUS5_AON (its CLK0REQ-down step), then of its
  * gate loop the ones on ANS's side, APCIE_SYS_ST, APCIE_ST and ANS. Its power-up raises the gates
  * in ADT order, which is the reverse. APCIE_GP, APCIE_SYS_GP and APCIE_PHY_SW stay up for N1 (and
  * J704's second port): macOS leaves PHY_SW on with APCIE_SYS_ST off too.

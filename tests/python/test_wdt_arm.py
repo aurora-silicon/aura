@@ -249,7 +249,7 @@ def test_dt_set_wdt_reconfig(tmp_path):
     func = definition(kboot, 'static void dt_set_wdt_reconfig(void)')
     prepare = definition(kboot, 'int kboot_prepare_dt(void *fdt)')
     assert 'dt_set_wdt_reconfig();' in prepare
-    assert prepare.index('dt_set_trial_watchdog();') < prepare.index('dt_set_wdt_reconfig();')
+    assert prepare.index('dt_set_trial_watchdog()') < prepare.index('dt_set_wdt_reconfig();')
 
     code = PRELUDE + r'''
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))

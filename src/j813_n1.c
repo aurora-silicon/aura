@@ -3,7 +3,7 @@
 /*
  * J813 (T8142, MacBook Air M5): train the PCIe link to the N1 Wi-Fi/Bluetooth
  * module on apcie port 0, so Linux can use the root port as a generic ECAM
- * host. The sequence follows macOS 25G76 AppleT8142PCIe / APCIECoreRCGen4:
+ * host. The sequence follows the traced bring-up on this machine:
  * AUS5 PHY power-up, root complex, N1 reset, port reset, refclk buffer,
  * PERST, root complex init and LTSSM.
  *
@@ -14,6 +14,7 @@
 
 #include "j813_n1.h"
 #include "adt.h"
+#include "pcie.h"
 #include "pmgr.h"
 #include "smc.h"
 #include "tunables.h"
@@ -34,6 +35,13 @@
 #define PORT_PERST    0x82c
 
 #define DBI_RO_WR 0x8bc
+
+/* SMC endpoint reset level hold, per level (j813_endpoint_reset()) */
+#define N1_RESET_SETTLE_MS 50
+
+/* function-perst pad: output (bits 3:1 = 1), data bit 0 high releases PERST# */
+#define GPIO_PERST_MODE_MASK 0xf
+#define GPIO_PERST_RELEASE   0x3
 
 /* ADT GPIO(pin, flags) function: the GPIO controller's phandle, 'GPIO', then its arguments */
 #define GPIO_FOURCC_GPIO 0x4750494f /* "OIPG" in ADT byte order */
@@ -137,7 +145,7 @@ static int j813_endpoint_reset(const struct j813_endpoint *ep)
         return -1;
     for (u32 level = 0; level < 2 && !ret; level++) {
         ret = smc_adt_function_write(smc, &ep->reset, level);
-        mdelay(50);
+        mdelay(N1_RESET_SETTLE_MS);
     }
     smc_shutdown(smc);
     return ret;
@@ -160,10 +168,17 @@ static int j813_n1_link(void)
         return -1;
     u64 phycommon = phy + PHY_COMMON_OFF;
 
+    int bridge = adt_path_offset(adt, APCIE_PORT);
+    u32 refclk_to_perst_us;
+    if (bridge < 0 || ADT_GETPROP(adt, bridge, "t-refclk-to-perst", &refclk_to_perst_us) < 0) {
+        printf("j813-n1: %s has no t-refclk-to-perst\n", APCIE_PORT);
+        return -1;
+    }
+
     if (pmgr_adt_power_enable(APCIE))
         return -1;
 
-    /* _apcieGPInit: PHY tunables, reference PLL. */
+    /* PHY tunables, reference PLL. */
     if (j813_tunables(APCIE, "apcie-phy-tunables", phy) ||
         j813_wait(phycommon, BIT(31), BIT(31), 1000000, "refpll_clk_good"))
         return -1;
@@ -192,7 +207,7 @@ static int j813_n1_link(void)
     if (j813_tunables(APCIE, "apcie-axi2af-tunables", axi))
         return -1;
 
-    /* _enableRootComplex */
+    /* Root complex run, then its ready bit */
     write32(rc + 0x54, 0x140);
     set32(rc + 0x50, BIT(0));
     if (j813_wait(rc + 0x58, BIT(0), BIT(0), 250000, "gtb_initialized"))
@@ -202,9 +217,10 @@ static int j813_n1_link(void)
         printf("j813-n1: SMC radio reset release failed\n");
         return -1;
     }
-    mdelay(100);
+    /* The N1 is out of its SMC reset: T_PVPERL before PERST# is released below. */
+    mdelay(PCIE_CEM_T_PVPERL_MS);
 
-    /* APCIECoreRCGen4Port::_resetPortHardware */
+    /* Port register reset table */
     static const u32 port_reset[][2] = {
         {0x88, 0x110},       {0x148, 0xffffffff}, {0x210, 0xffffffff}, {0x84, 0},
         {0x104, 0xfffffff0}, {0x124, 0x100},      {0x16c, 0},          {0x13c, 0},
@@ -217,7 +233,7 @@ static int j813_n1_link(void)
         return -1;
     set32(port + PORT_APPCLK, BIT(0));
 
-    /* APCIECoreRCGen4Port::_initializeRefclkBuffer (port PHY lane reg 0) */
+    /* Port refclk buffer (port PHY lane reg 0) */
     set32(lane, BIT(0));
     if (j813_wait(lane, BIT(2), BIT(2), 100000, "refclk buffer (1)"))
         return -1;
@@ -228,16 +244,17 @@ static int j813_n1_link(void)
     udelay(1000);
     set32(lane, BIT(9));
     set32(lane, BIT(10));
-    udelay(1000); /* t-refclk-to-perst */
+    /* refclk to PERST#: the bridge's t-refclk-to-perst */
+    udelay(max(refclk_to_perst_us, (u32)APCIE_REFCLK_TO_PERST_MIN_US));
 
     set32(port + PORT_PERST, BIT(0));
-    mask32(ep.perst, 0xf, 0x3);
+    mask32(ep.perst, GPIO_PERST_MODE_MASK, GPIO_PERST_RELEASE);
     if (j813_wait(port + PORT_PIPE_STS, BIT(0), BIT(0), 100000, "lane pipe reset") ||
         j813_wait(port + PORT_STATUS, BIT(0), BIT(0), 250000, "port RUN") ||
         j813_wait(port + PORT_LINKSTS, BIT(2), 0, 500000, "port idle"))
         return -1;
 
-    /* _initializeRootComplex: root port DBI tunables, then the LTSSM. */
+    /* Root port DBI tunables, then the LTSSM. */
     set32(ecam + DBI_RO_WR, BIT(0));
     if (j813_tunables(APCIE_PORT, "pcie-rc-tunables", ecam) ||
         j813_tunables(APCIE_PORT, "pcie-rc-gen3-shadow-tunables", ecam) ||
@@ -253,9 +270,11 @@ static int j813_n1_link(void)
      * config space (J813/J815: Apple's N1, 106b; J704: a Broadcom BCM4388, 14e4).
      */
     write32(ecam + 0x18, 0x00010100);
-    mdelay(100);
+    mdelay(pcie_adt_perst_to_config_ms(APCIE_PORT));
+    u32 ident;
+    if (pcie_wait_config_ready(ecam + 0x100000, &ident))
+        return -1;
     u32 linksts = read32(port + PORT_LINKSTS);
-    u32 ident = read32(ecam + 0x100000);
     u16 vendor = ident & 0xffff;
     printf("j813-n1: link up (0x%x), endpoint %04x:%04x\n", linksts, vendor, ident >> 16);
     return ((linksts & BIT(0)) && vendor != 0xffff && vendor != 0x0000) ? 0 : -1;

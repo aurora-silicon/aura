@@ -1030,10 +1030,10 @@ static int dt_reserve_secondary_ro(void)
  * watchdog over and services it from its own loops, so a U-Boot that waits forever (on a disk it
  * cannot reach, say) would never be reset. Tell it to leave the watchdog alone on a trial boot.
  */
-static void dt_set_trial_watchdog(void)
+static int dt_set_trial_watchdog(void)
 {
     if (!aura_trial_enabled())
-        return;
+        return 0;
     /* The compatibles U-Boot's apple_wdt driver binds to */
     static const char *const compat[] = {"apple,t8103-wdt", "apple,wdt"};
     for (size_t i = 0; i < ARRAY_SIZE(compat); i++) {
@@ -1041,12 +1041,16 @@ static void dt_set_trial_watchdog(void)
         while ((node = fdt_node_offset_by_compatible(dt, node, compat[i])) >= 0) {
             if (fdt_getprop(dt, node, "u-boot,noautostart", NULL))
                 continue;
+            /*
+             * Unmarked, U-Boot would feed the watchdog forever and a trial that hangs in it would
+             * never reset. Refuse the payload: the trial path reboots into the configured Stage 2.
+             */
             if (fdt_setprop(dt, node, "u-boot,noautostart", NULL, 0))
-                printf("FDT: couldn't mark the watchdog for the trial\n");
-            else
-                printf("FDT: trial boot: U-Boot leaves the watchdog to the trial budget\n");
+                bail("FDT: couldn't mark the watchdog for the trial\n");
+            printf("FDT: trial boot: U-Boot leaves the watchdog to the trial budget\n");
         }
     }
+    return 0;
 }
 
 static bool dt_ranges_identity_covers(int parent, u64 addr, u64 size)
@@ -11067,6 +11071,24 @@ static int dt_reserve_t8132_aop_windows(const char *path)
 }
 
 /*
+ * Take an AOP node out of the OS's tree after its handoff failed. That failure is often a full
+ * DT, where growing status to "disabled" fails too: overwrite "okay" in place with "fail" (same
+ * length, no new space; Linux treats anything but "okay" as unavailable) and only grow the
+ * property when the node has no "okay" to overwrite.
+ */
+static int dt_disable_aop(const char *path)
+{
+    int node = fdt_path_offset(dt, path);
+    if (node < 0)
+        return -1;
+    int len;
+    const char *status = fdt_getprop(dt, node, "status", &len);
+    if (status && len == sizeof("okay") && !memcmp(status, "okay", len))
+        return fdt_setprop_inplace(dt, node, "status", "fail", sizeof("fail")) ? -1 : 0;
+    return fdt_setprop_string(dt, node, "status", "disabled") ? -1 : 0;
+}
+
+/*
  * J713 and J604: iBoot leaves the AOP halted, its DART's DAPF empty, its
  * external code (__ETEXT) in DRAM at a fixed address and its log (__OS_LOG) at
  * a new one every boot. When the OS asks for the AOP's handoff, program the
@@ -11078,7 +11100,6 @@ static int dt_reserve_t8132_aop_windows(const char *path)
 static int dt_set_t8132_aop(const char *path)
 {
     const char *why;
-    int node;
 
     if (fdt_node_check_compatible(dt, 0, "apple,j713") &&
         fdt_node_check_compatible(dt, 0, "apple,j604"))
@@ -11121,8 +11142,7 @@ static int dt_set_t8132_aop(const char *path)
 
 disable:
     printf("FDT: %s: disabling the AOP: %s\n", path, why);
-    node = fdt_path_offset(dt, path);
-    if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
+    if (dt_disable_aop(path))
         bail("FDT: %s: cannot disable the AOP\n", path);
     return 0;
 }
@@ -11169,6 +11189,28 @@ static void dt_set_aop_motion_cal(const char *path)
             printf("FDT: %s/%s: %d of %d calibration properties\n", path, services[i], copied,
                    (int)ARRAY_SIZE(props));
     }
+}
+
+/*
+ * The AOP's DRAM firmware segments could not be reserved (or only some of them), so they are
+ * free RAM to the OS. An AOP iBoot left halted is only started by the OS, from those segments:
+ * take it out of the OS's tree. An AOP that is already running (or whose CPU cannot be read)
+ * executes from those pages now, and disabling its node would not stop it: refuse the handoff.
+ */
+static int dt_aop_segments_unreserved(const char *path)
+{
+    asc_dev_t *asc = asc_init("/arm-io/aop");
+    if (!asc)
+        bail("FDT: %s: AOP firmware segments not reserved and its CPU state is unknown\n", path);
+    bool running = asc_cpu_running(asc);
+    asc_free(asc);
+    if (running)
+        bail("FDT: %s: AOP firmware segments not reserved while the AOP runs from them\n", path);
+
+    printf("FDT: %s: AOP firmware segments not reserved, disabling the halted AOP\n", path);
+    if (dt_disable_aop(path))
+        bail("FDT: %s: cannot disable the AOP\n", path);
+    return 0;
 }
 
 /*
@@ -11418,9 +11460,8 @@ static int dt_set_aop_firmware(void)
         return dt_aop_locked_dart_handoff(anode, path);
 
     if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true))
-        printf("FDT: %s: reserving the AOP firmware segments failed\n", path);
-    else
-        printf("FDT: %s: AOP firmware segments reserved\n", path);
+        return dt_aop_segments_unreserved(path);
+    printf("FDT: %s: AOP firmware segments reserved\n", path);
 
     return 0;
 }
@@ -14226,7 +14267,8 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_chosen())
         return -1;
-    dt_set_trial_watchdog();
+    if (dt_set_trial_watchdog())
+        return -1;
     dt_set_wdt_reconfig();
     if (dt_check_trial_esp())
         return -1;
