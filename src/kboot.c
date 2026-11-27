@@ -11192,6 +11192,28 @@ static void dt_set_aop_motion_cal(const char *path)
 }
 
 /*
+ * The AOP's DRAM firmware segments could not be reserved (or only some of them), so they are
+ * free RAM to the OS. An AOP iBoot left halted is only started by the OS, from those segments:
+ * take it out of the OS's tree. An AOP that is already running (or whose CPU cannot be read)
+ * executes from those pages now, and disabling its node would not stop it: refuse the handoff.
+ */
+static int dt_aop_segments_unreserved(const char *path)
+{
+    asc_dev_t *asc = asc_init("/arm-io/aop");
+    if (!asc)
+        bail("FDT: %s: AOP firmware segments not reserved and its CPU state is unknown\n", path);
+    bool running = asc_cpu_running(asc);
+    asc_free(asc);
+    if (running)
+        bail("FDT: %s: AOP firmware segments not reserved while the AOP runs from them\n", path);
+
+    printf("FDT: %s: AOP firmware segments not reserved, disabling the halted AOP\n", path);
+    if (dt_disable_aop(path))
+        bail("FDT: %s: cannot disable the AOP\n", path);
+    return 0;
+}
+
+/*
  * The OS AOP node: the enabled node with an "apple,<soc>-aop" compatible.
  * Every SoC has one AOP, so no table of SoCs is needed to find it.
  */
@@ -11220,28 +11242,6 @@ static int dt_find_aop(char *path, size_t size)
         return node;
     }
     return -1;
-}
-
-/*
- * The AOP's DRAM firmware segments could not be reserved (or only some of them), so they are
- * free RAM to the OS. An AOP iBoot left halted is only started by the OS, from those segments:
- * take it out of the OS's tree. An AOP that is already running (or whose CPU cannot be read)
- * executes from those pages now, and disabling its node would not stop it: refuse the handoff.
- */
-static int dt_aop_segments_unreserved(const char *path)
-{
-    asc_dev_t *asc = asc_init("/arm-io/aop");
-    if (!asc)
-        bail("FDT: %s: AOP firmware segments not reserved and its CPU state is unknown\n", path);
-    bool running = asc_cpu_running(asc);
-    asc_free(asc);
-    if (running)
-        bail("FDT: %s: AOP firmware segments not reserved while the AOP runs from them\n", path);
-
-    printf("FDT: %s: AOP firmware segments not reserved, disabling the halted AOP\n", path);
-    if (dt_disable_aop(path))
-        bail("FDT: %s: cannot disable the AOP\n", path);
-    return 0;
 }
 
 /*
