@@ -3451,9 +3451,14 @@ static const struct {
 #define T6050_STATUS    "asahi,t6050-dcp-handoff"
 #define T6050_TCR_WANT  (DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_FOUR_LEVEL)
 #define T6050_TCR_MASK  (T6050_TCR_WANT | DART_T8110_TCR_BYPASS_DART)
-/* Runs once per boot: size over speed, and out of .text where it fits (aura.ld) */
-#define T6050_INIT __attribute__((minsize, noinline, section(".init.t6050")))
-#define T6050_TEXT __attribute__((minsize, noinline))
+/* Runs once per boot: size over speed, and out of .text into .rodata.xtext (AURA_XTEXT) */
+#ifdef __clang__
+#define T6050_MINSIZE __attribute__((minsize))
+#else
+#define T6050_MINSIZE
+#endif
+#define T6050_INIT T6050_MINSIZE AURA_XTEXT
+#define T6050_TEXT T6050_MINSIZE AURA_XTEXT
 
 /*
  * Nodes, by device tree path; the first five are enabled by the handoff. T6050_PMC: the PMC

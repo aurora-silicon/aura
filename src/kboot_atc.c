@@ -1423,8 +1423,13 @@ struct t6050_atc_tunable {
     u32 offset;
 };
 
-#define T6050_ATC      __attribute__((minsize, noinline))
-#define T6050_ATC_INIT __attribute__((minsize, noinline, section(".init.t6050")))
+#ifdef __clang__
+#define T6050_ATC_MINSIZE __attribute__((minsize))
+#else
+#define T6050_ATC_MINSIZE
+#endif
+#define T6050_ATC      T6050_ATC_MINSIZE AURA_XTEXT
+#define T6050_ATC_INIT T6050_ATC_MINSIZE AURA_XTEXT
 
 static const struct t6050_atc_tunable t6050_atc_tunables[] = {
     {"tunable_ATC0AXI2AF", "apple,tunable-axi2af", "axi2af", 41, 0},
