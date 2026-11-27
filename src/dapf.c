@@ -33,14 +33,15 @@ struct dapf_segment {
 static_assert(sizeof(struct dapf_segment) == 32, "Invalid segment-ranges entry size");
 
 /*
- * The CPU DART of video encoder N is /arm-io/dart-ave<N>, the encoder /arm-io/ave<N>. Return the
- * encoder's name ("ave<N>") for such a DART name, or NULL.
+ * The CPU DART of video encoder N is /arm-io/dart-ave<N>, the encoder /arm-io/ave<N>; that of a
+ * SoC's one encoder is /arm-io/dart-ave, the encoder /arm-io/ave. Return the encoder's name
+ * ("ave<N>" or "ave") for such a DART name, or NULL.
  */
 static const char *dapf_ave_of_dart(const char *name)
 {
     const char *p;
 
-    if (!name || strncmp(name, "dart-ave", 8) || !name[8])
+    if (!name || strncmp(name, "dart-ave", 8))
         return NULL;
     for (p = name + 8; *p; p++)
         if (*p < '0' || *p > '9')
@@ -724,10 +725,25 @@ bool dapf_failed(const char *path)
  * dart-ave, the CPU DART of the one encoder of the M2 through M5 and T8152 (ADT ave), is in
  * neither dapf_entries nor programmed by kboot.c: its filter is the one iBoot left, which admits
  * the encoder's preloaded firmware (rows on M2, M3 and M4).
+ *
+ * The M1's dart-ave is not: like the M1 Pro's dart-ave0 it is a T8020-type DART whose filter the
+ * ADT gives as filter-data-instance-0, and nothing before the OS programs it. The J313's admits
+ * TEXT at its physical address, where iBoot points the encoder's code base, and the window its
+ * firmware reaches the DART through; left as it was, the coprocessor got no further than RUN.
+ * kboot.c programs that filter, like every further encoder's.
  */
 bool dapf_ave_filter_inherited(const char *path)
 {
-    return !strcmp(path, "/arm-io/dart-ave");
+    if (strcmp(path, "/arm-io/dart-ave"))
+        return false;
+
+    int node = adt_path_offset(adt, path);
+    if (node >= 0 &&
+        (adt_is_compatible(adt, node, "dart,t8020") ||
+         adt_is_compatible(adt, node, "dart,t6000")) &&
+        adt_getprop(adt, node, "filter-data-instance-0", NULL))
+        return false;
+    return true;
 }
 
 /*
