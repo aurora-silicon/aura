@@ -646,7 +646,7 @@ static void s2r_rtc_setup(void)
         {
             const char *name = adt_get_name(adt, bus);
             int pmu = bus;
-            if (strncmp(name, "nub-spmi", 8))
+            if (!name || strncmp(name, "nub-spmi", 8))
                 continue;
             ADT_FOREACH_CHILD(adt, pmu)
             {
@@ -1362,6 +1362,8 @@ static void s2r_hook_full(void)
             ADT_FOREACH_CHILD(adt, node)
             {
                 const char *name = adt_get_name(adt, node);
+                if (!name)
+                    continue;
                 const char *what =
                     (sptm_virt_s2r_extra & 0x10) && !strcmp(name, "aic")         ? "aic"
                     : (sptm_virt_s2r_extra & 0x20) && !strncmp(name, "dart-", 5) ? "dart"
@@ -1598,7 +1600,7 @@ static void s2r_t6050_coproc(bool mem)
     ADT_FOREACH_CHILD(adt, node)
     {
         const char *name = adt_get_name(adt, node);
-        if (sptm_virt_s2r_cp_skip_ans && !strcmp(name, "ans"))
+        if (!name || (sptm_virt_s2r_cp_skip_ans && !strcmp(name, "ans")))
             continue;
         if (s2r_cp_compat(node, "iop,ascwrap") || s2r_cp_compat(node, "iop-sep,ascwrap")) {
             s2r_cp_reg(name, 0, "asc", 0, 0x4000);

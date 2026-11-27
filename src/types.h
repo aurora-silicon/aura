@@ -20,10 +20,15 @@ typedef int16_t s16;
 typedef int32_t s32;
 typedef int64_t s64;
 
-typedef u64 uintptr_t;
-typedef s64 ptrdiff_t;
+/*
+ * The compiler's own types, as <stdint.h> and <stddef.h> declare them: on LLP64-style hosts
+ * (macOS) uint64_t is unsigned long long but uintptr_t is unsigned long, so spelling them as
+ * u64/s64 is a conflicting redefinition when host tests build this code against the host libc.
+ */
+typedef __UINTPTR_TYPE__ uintptr_t;
+typedef __PTRDIFF_TYPE__ ptrdiff_t;
 
-typedef s64 ssize_t;
+typedef __PTRDIFF_TYPE__ ssize_t;
 
 #endif
 

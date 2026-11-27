@@ -12162,7 +12162,8 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
 
     int acnt = 0, phcnt = 0;
     u64 *addrs = calloc(max_devs, sizeof(u64));
-    u32 *phandles = calloc(max_devs * 5, sizeof(u32)); // Allow up to 5 extra nodes per device
+    int max_phandles = max_devs * 5; // Allow up to 5 extra nodes per device
+    u32 *phandles = calloc(max_phandles, sizeof(u32));
     if (!addrs || !phandles)
         bail_cleanup("FDT: out of memory\n");
 
@@ -12189,7 +12190,7 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
     ADT_FOREACH_CHILD(adt, node)
     {
         const char *name = adt_get_name(adt, node);
-        if (strncmp(name, adt_prefix, adt_prefix_len))
+        if (!name || strncmp(name, adt_prefix, adt_prefix_len))
             continue;
 
         if (name[adt_prefix_len] && (name[adt_prefix_len] < '0' || name[adt_prefix_len] > '9'))
@@ -12243,11 +12244,10 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
             if (status && !strcmp(status, "disabled"))
                 continue;
 
-            const fdt64_t *reg = fdt_getprop(dt, node, "reg", NULL);
-            if (!reg)
+            u64 addr;
+            if (!dt_reg_address(dt, soc, node, &addr))
                 bail_cleanup("FDT: failed to get reg property of %s\n", name);
-
-            u64 addr = dt_translate(ranges, reg);
+            addr = dt_translate_address(ranges, addr);
 
             int i;
             for (i = 0; i < acnt; i++)
@@ -12256,25 +12256,31 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
             if (i < acnt)
                 continue;
 
-            int iommus_size;
-            const fdt32_t *iommus = fdt_getprop(dt, node, "iommus", &iommus_size);
-            if (iommus) {
-                if (iommus_size & 7 || iommus_size > 4 * 8) {
-                    printf("FDT: bad iommus property for %s/%s\n", path, name);
-                } else {
-                    for (int i = 0; i < iommus_size / 8; i++)
-                        phandles[phcnt++] = fdt32_ld(&iommus[i * 2]);
+            /*
+             * Its DARTs and PHYs, once each: devices share them, and the payload's tree decides
+             * how many missing devices there are, so the list must not outgrow its allocation.
+             */
+            static const char *const supplier_props[] = {"iommus", "phys"};
+            for (size_t p = 0; p < ARRAY_SIZE(supplier_props); p++) {
+                int refs_size;
+                const fdt32_t *refs = fdt_getprop(dt, node, supplier_props[p], &refs_size);
+                if (!refs)
+                    continue;
+                if (refs_size & 7 || refs_size > 4 * 8) {
+                    printf("FDT: bad %s property for %s/%s\n", supplier_props[p], path, name);
+                    continue;
                 }
-            }
-
-            int phys_size;
-            const fdt32_t *phys = fdt_getprop(dt, node, "phys", &phys_size);
-            if (phys) {
-                if (phys_size & 7 || phys_size > 4 * 8) {
-                    printf("FDT: bad phys property for %s/%s\n", path, name);
-                } else {
-                    for (int i = 0; i < phys_size / 8; i++)
-                        phandles[phcnt++] = fdt32_ld(&phys[i * 2]);
+                for (int i = 0; i < refs_size / 8; i++) {
+                    u32 supplier = fdt32_ld(&refs[i * 2]);
+                    int j = 0;
+                    while (j < phcnt && phandles[j] != supplier)
+                        j++;
+                    if (j < phcnt)
+                        continue;
+                    if (phcnt >= max_phandles)
+                        bail_cleanup("FDT: too many suppliers of missing %s/%s* devices\n", path,
+                                     dt_prefix);
+                    phandles[phcnt++] = supplier;
                 }
             }
 
@@ -12680,7 +12686,7 @@ static int dt_set_t8132_lifecycle(void)
     ADT_FOREACH_CHILD(adt, bus)
     {
         const char *name = adt_get_name(adt, bus);
-        if (strncmp(name, "nub-spmi", 8) && strncmp(name, "spmi", 4))
+        if (!name || (strncmp(name, "nub-spmi", 8) && strncmp(name, "spmi", 4)))
             continue;
 
         int dev = bus;

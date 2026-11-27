@@ -26,7 +26,7 @@ static int pmu_find_scratchpad(char *path, size_t path_len, u8 *addr, u16 *scrpa
     ADT_FOREACH_CHILD(adt, bnode)
     {
         const char *bus = adt_get_name(adt, bnode);
-        if (strncmp(bus, "nub-spmi", 8) && strncmp(bus, "spmi", 4))
+        if (!bus || (strncmp(bus, "nub-spmi", 8) && strncmp(bus, "spmi", 4)))
             continue;
 
         int node = bnode;

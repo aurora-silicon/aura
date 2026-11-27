@@ -15,6 +15,7 @@ import gzip
 import importlib.util
 import os
 import shutil
+import struct
 import subprocess
 from pathlib import Path
 
@@ -54,6 +55,10 @@ AIR = ("asahi,t8122-dcp", "asahi,t8122-gpu", "asahi,t8122-gpu-power-standin",
 GPU_ON = b"chosen.asahi,t8122-gpu=1\n"
 GPU_OFF = b"chosen.asahi,t8122-gpu=0\n"
 LOST = b"m1n1.config-lost=1\n"
+# A v17 devicetree header whose structure block lies outside its 0x48 bytes: magic, totalsize,
+# off_dt_struct, off_dt_strings, off_mem_rsvmap, version, last_comp_version, boot_cpuid_phys,
+# size_dt_strings, size_dt_struct, then an empty reserve map
+BAD_DTB = struct.pack(">10I", 0xd00dfeed, 0x48, 0x1000, 0x38, 0x28, 17, 16, 0, 0, 0x10) + bytes(32)
 STAGE2 = ["plain", "stage2"]               # stage2: CHAINLOADING + ESP_STAGE2, as packaged
 
 
@@ -620,6 +625,8 @@ LOSSES = {
     "swallowed-line": lambda build: GPU_ON + b"junk\n" + GPU_OFF,
     "unknown-after-config": lambda build: GPU_ON + b"\x01\x02\x03\x04unknown\x00" + GPU_OFF,
     "unknown-after-kernel": lambda build: b"\x01\x02\x03\x04unknown\x00" + GPU_OFF,
+    "bad-devicetree-after-config": lambda build: GPU_ON + BAD_DTB + GPU_OFF,
+    "bad-devicetree-after-kernel": lambda build: BAD_DTB + GPU_OFF,
     "marker-line": lambda build: GPU_ON + LOST,
 }
 

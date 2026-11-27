@@ -9,6 +9,7 @@ typedef unsigned long u64;
 _Static_assert(sizeof(u64)==8,"64-bit host required");
 typedef uint32_t u32;
 static void *dt, *adt;
+#define ARRAY_SIZE(s) (sizeof(s) / sizeof((s)[0]))
 #define bail_cleanup(...) do { fprintf(stderr,__VA_ARGS__); goto err; } while(0)
 #define bail(...) do { fprintf(stderr,__VA_ARGS__); return -1; } while(0)
 #define ADT_GETPROP(a,b,c,d) (-1)
@@ -16,11 +17,12 @@ static void *dt, *adt;
 static int adt_path_offset_trace(void *a,const char *s,int *p) { p[0]=1;p[1]=0;return 0; }
 static const char *adt_get_name(void *a,int n) { return n==1?"usb-drd0":"usb-drd1"; }
 static int adt_get_reg(void *a,int *p,const char *s,int r,u64 *v,void *x) { *v=p[1]==1?0x702280000ULL:0xb02280000ULL; return 0; }
-#define PMGR_DIE_OFFSET 0x2000000000ULL
+static u64 pmgr_die_stride(void) { return 0x2000000000ULL; }
 #define DT_MAX_RANGES 1
 struct dt_ranges_tbl { int unused; };
 static void dt_parse_ranges(void *d,int n,struct dt_ranges_tbl *r) {}
-static u64 dt_translate(struct dt_ranges_tbl *r,const fdt64_t *p) { return fdt64_to_cpu(*p); }
+static u64 dt_translate_address(struct dt_ranges_tbl *r,u64 a) { return a; }
+static int dt_reg_address(void *d,int b,int n,u64 *a) { const fdt64_t *p=fdt_getprop(d,n,"reg",NULL); if (!p) return 0; *a=fdt64_to_cpu(*p); return 1; }
 
 /* PRODUCTION ROUTINE */
 
