@@ -8,7 +8,7 @@ from host_compiler import host_cc
 REPO = Path(__file__).resolve().parents[2]
 LIBFDT = REPO / "src/libfdt"
 LIBFDT_SOURCES = ("fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_wip.c", "fdt_sw.c", "fdt_strerror.c",
-                  "fdt_empty_tree.c", "fdt_addresses.c")
+                  "fdt_empty_tree.c")
 
 
 def definition(source, signature):
@@ -23,7 +23,7 @@ def run(tmp_path, name, code, expect):
     command = host_cc() + ["-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                            "-Wno-unused-function", "-fsanitize=undefined",
                            "-fno-sanitize-recover=all", "-I", str(LIBFDT), str(path)]
-    command += [str(LIBFDT / f) for f in LIBFDT_SOURCES] + ["-o", str(binary)]
+    command += [str(LIBFDT / f) for f in (*LIBFDT_SOURCES, "fdt_addresses.c")] + ["-o", str(binary)]
     built = subprocess.run(command, capture_output=True, text=True)
     assert built.returncode == 0, built.stdout + built.stderr
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30)
