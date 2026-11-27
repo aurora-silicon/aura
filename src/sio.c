@@ -51,9 +51,10 @@ static void mapping_fixup(struct sio_data *siodata)
     }
 }
 
-static void *add_fwdata(struct sio_data *siodata, size_t size, u32 param_id)
+static void *add_fwdata(struct sio_data *siodata, struct sio_fwparam *params, int *nparams,
+                        size_t size, u32 param_id)
 {
-    if (siodata->num_fwparams + 1 >= MAX_FWPARAMS)
+    if (*nparams + 1 >= MAX_FWPARAMS)
         return NULL;
 
     u64 iova;
@@ -62,13 +63,13 @@ static void *add_fwdata(struct sio_data *siodata, size_t size, u32 param_id)
     if (!p)
         return NULL;
 
-    struct sio_fwparam *param = &siodata->fwparams[siodata->num_fwparams];
+    struct sio_fwparam *param = &params[*nparams];
     param->key = param_id;
     param->value = iova >> 12;
     param++;
     param->key = param_id + 1;
     param->value = size;
-    siodata->num_fwparams += 2;
+    *nparams += 2;
 
     return p;
 }
@@ -301,6 +302,117 @@ int find_key_index(const char *keylist[], u32 needle)
     return i;
 }
 
+/* Builds one rule's table from the SIO's ADT node and appends its parameters to params. */
+static int add_rule(struct sio_data *siodata, int node, struct copy_rule *rule,
+                    struct sio_fwparam *params, int *nparams)
+{
+    u32 len;
+
+    if (!rule->prop) {
+        if (!add_fwdata(siodata, params, nparams, rule->blobsize, rule->fw_param))
+            return -1;
+
+        return 0;
+    }
+
+    const u8 *adt_blob = adt_getprop(adt, node, rule->prop, &len);
+    if (!adt_blob) {
+        printf("%s: missing ADT property '%s'\n", __func__, rule->prop);
+        return -1;
+    }
+
+    if (!rule->keyed) {
+        /* An empty property (T6050's asio-ascwrap-tunables) sends no parameter. */
+        if (!len)
+            return 0;
+        u8 *sio_blob = add_fwdata(siodata, params, nparams, len, rule->fw_param);
+        if (!sio_blob)
+            return -1;
+        memcpy8(sio_blob, (void *)adt_blob, len);
+        return 0;
+    }
+
+    int nkeys = find_key_index(rule->keys, 0);
+    int stride = rule->blobsize + (rule->irq ? 4 : 0);
+    u8 *sio_blob = add_fwdata(siodata, params, nparams, nkeys * stride, rule->fw_param);
+    if (!sio_blob)
+        return -1;
+
+    if (rule->irq && !rule->irq_present) {
+        u32 none = ~0u;
+
+        for (int k = 0; k < nkeys; k++)
+            memcpy8(sio_blob + k * stride + rule->blobsize, &none, sizeof(none));
+    }
+
+    if (len % (rule->blobsize + 4) != 0) {
+        printf("%s: bad length %d of ADT property '%s', expected multiple of %d + 4\n", __func__,
+               len, rule->prop, rule->blobsize);
+        return -1;
+    }
+
+    for (u32 off = 0; off + rule->blobsize <= len; off += (rule->blobsize + 4)) {
+        const u8 *p = &adt_blob[off];
+        u32 key = *((u32 *)p);
+        int key_idx = find_key_index(rule->keys, key);
+
+        if (key_idx >= nkeys) {
+            printf("%s: unknown key %x found in ADT property '%s'\n", __func__, key, rule->prop);
+            return -1;
+        }
+
+        memcpy8(sio_blob + (key_idx * stride), (void *)(p + 4), rule->blobsize);
+        if (rule->irq_present) {
+            u32 none = ~0u;
+
+            memcpy8(sio_blob + key_idx * stride + rule->blobsize, &none, sizeof(none));
+        }
+    }
+    return 0;
+}
+
+/*
+ * Adds the second parameter list for a low-window SIO firmware that reports protocol 10: T6030's
+ * shim records and device types, the other tables shared with the earlier list. The list is
+ * optional, so a failure undoes it and leaves the earlier tables as they were.
+ */
+static int add_v10_list(struct sio_data *siodata, int node)
+{
+    int num_fwdata = siodata->num_fwdata;
+    u64 last_size = num_fwdata ? siodata->fwdata[num_fwdata - 1].size : 0;
+
+    for (int i = 0; i < (int)ARRAY_SIZE(copy_rules_v10); i++) {
+        struct copy_rule *rule = &copy_rules_v10[i];
+
+        if (rule->fw_param == PARAM_DMASHIM_DATA || rule->fw_param == PARAM_DEVICE_TYPE) {
+            if (add_rule(siodata, node, rule, siodata->fwparams_v10, &siodata->num_fwparams_v10))
+                goto undo;
+            continue;
+        }
+        /* The other tables are the same in both layouts. */
+        for (int j = 0; j + 1 < siodata->num_fwparams; j += 2) {
+            if (siodata->fwparams[j].key != (u32)rule->fw_param)
+                continue;
+            if (siodata->num_fwparams_v10 + 1 >= MAX_FWPARAMS)
+                goto undo;
+            siodata->fwparams_v10[siodata->num_fwparams_v10++] = siodata->fwparams[j];
+            siodata->fwparams_v10[siodata->num_fwparams_v10++] = siodata->fwparams[j + 1];
+        }
+    }
+    printf("sio: and the T6030 tables for protocol 10\n");
+    return 0;
+
+undo:
+    /* The top-of-memory allocator can't give the memory back; it just goes unused. */
+    for (int i = num_fwdata; i < MAX_FWDATA; i++)
+        siodata->fwdata[i] = (struct sio_mapping){0};
+    if (num_fwdata)
+        siodata->fwdata[num_fwdata - 1].size = last_size;
+    siodata->num_fwdata = num_fwdata;
+    siodata->num_fwparams_v10 = 0;
+    return -1;
+}
+
 struct sio_data *sio_setup_fwdata(const char *adt_path)
 {
     struct sio_data *siodata = calloc(1, sizeof(struct sio_data));
@@ -338,72 +450,20 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
     }
     printf("sio: %s tables at 0x%lx\n", layout, siodata->iova_base);
 
-    for (int i = 0; i < nrules; i++) {
-        struct copy_rule *rule = &rules[i];
-        u32 len;
-
-        if (!rule->prop) {
-            if (!add_fwdata(siodata, rule->blobsize, rule->fw_param))
-                goto err;
-
-            continue;
-        }
-
-        const u8 *adt_blob = adt_getprop(adt, node, rule->prop, &len);
-        if (!adt_blob) {
-            printf("%s: missing ADT property '%s'\n", __func__, rule->prop);
-            goto err;
-        }
-
-        if (!rule->keyed) {
-            /* An empty property (T6050's asio-ascwrap-tunables) sends no parameter. */
-            if (!len)
-                continue;
-            u8 *sio_blob = add_fwdata(siodata, len, rule->fw_param);
-            if (!sio_blob)
-                goto err;
-            memcpy8(sio_blob, (void *)adt_blob, len);
-            continue;
-        }
-
-        int nkeys = find_key_index(rule->keys, 0);
-        int stride = rule->blobsize + (rule->irq ? 4 : 0);
-        u8 *sio_blob = add_fwdata(siodata, nkeys * stride, rule->fw_param);
-        if (!sio_blob)
+    for (int i = 0; i < nrules; i++)
+        if (add_rule(siodata, node, &rules[i], siodata->fwparams, &siodata->num_fwparams))
             goto err;
 
-        if (rule->irq && !rule->irq_present) {
-            u32 none = ~0u;
-
-            for (int k = 0; k < nkeys; k++)
-                memcpy8(sio_blob + k * stride + rule->blobsize, &none, sizeof(none));
-        }
-
-        if (len % (rule->blobsize + 4) != 0) {
-            printf("%s: bad length %d of ADT property '%s', expected multiple of %d + 4\n",
-                   __func__, len, rule->prop, rule->blobsize);
-            goto err;
-        }
-
-        for (u32 off = 0; off + rule->blobsize <= len; off += (rule->blobsize + 4)) {
-            const u8 *p = &adt_blob[off];
-            u32 key = *((u32 *)p);
-            int key_idx = find_key_index(rule->keys, key);
-
-            if (key_idx >= nkeys) {
-                printf("%s: unknown key %x found in ADT property '%s'\n", __func__, key,
-                       rule->prop);
-                goto err;
-            }
-
-            memcpy8(sio_blob + (key_idx * stride), (void *)(p + 4), rule->blobsize);
-            if (rule->irq_present) {
-                u32 none = ~0u;
-
-                memcpy8(sio_blob + key_idx * stride + rule->blobsize, &none, sizeof(none));
-            }
-        }
-    }
+    /*
+     * Which layout a low-window SIO firmware takes follows the protocol it reports when it starts,
+     * and only the OS sees that: the M2's 13.5 firmware reports protocol 9 and takes the earlier
+     * tables; its 27.2 firmware, with the same ADT, reports protocol 10 and takes T6030's (given
+     * the earlier ones, it crashes at its first DMA channel configuration). Build both: the
+     * earlier tables, and a second parameter list with T6030's shim records and device types in
+     * place of the earlier ones. The OS sends the list for the protocol the firmware reports.
+     */
+    if (rules == copy_rules && add_v10_list(siodata, node))
+        printf("sio: no tables for protocol 10; the earlier ones stand\n");
 
     mapping_fixup(siodata);
 

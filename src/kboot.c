@@ -17,6 +17,7 @@
 #include "display.h"
 #include "dockchannel_uart.h"
 #include "exception.h"
+#include "fdt_disable.h"
 #include "firmware.h"
 #include "heapblock.h"
 #include "iodev.h"
@@ -47,10 +48,25 @@
 #include "usb_dwc3.h"
 #include "utils.h"
 #include "vsprintf.h"
+#include "wdt.h"
 #include "xnuboot.h"
 
 #include "libfdt/libfdt.h"
 #include "tinf/tinf.h"
+
+/*
+ * The ADT reader checks each property header's four-byte alignment. Its value
+ * follows the 36-byte header, so even packed firmware records can be read a
+ * word at a time. A u64 within a record still need not be eight-byte aligned.
+ */
+__typeof__(adt_getprop) adt_getprop __attribute__((assume_aligned(4)));
+
+/* Share libfdt's strlen + property write across the boot-time fixups. */
+#undef fdt_setprop_string
+static int fdt_setprop_string(void *fdt, int node, const char *name, const char *value)
+{
+    return fdt_setprop(fdt, node, name, value, strlen(value) + 1);
+}
 
 #define MAX_CHOSEN_PARAMS 16
 #define MAX_UBOOT_CONFIGS 4
@@ -727,6 +743,18 @@ static int dt_set_s2r_mailbox(int node)
         return 0;
     }
 
+    /*
+     * A wake may have to set PCIe up again before the OS runs (smp_s2r_pcie_reinit()), which it
+     * does only under a watchdog that can still reset the SoC. kboot sets PCIe up after this, so
+     * decide from the ADT alone whether that step can come up at all.
+     */
+    if (pcie_sleep_reinit_possible() && !wdt_s2r_guard_supported()) {
+        printf("FDT: no S2R mailbox: no watchdog for the wake's PCIe bring-up\n");
+        fdt_setprop_string(dt, node, "aurora,s2r-unavailable",
+                           "no watchdog for the wake's PCIe bring-up");
+        return 0;
+    }
+
     u64 mailbox = smp_s2r_publish();
     if (fdt_setprop_u64(dt, node, "aurora,s2r-mailbox", mailbox))
         bail("FDT: couldn't set aurora,s2r-mailbox\n");
@@ -795,6 +823,29 @@ static int dt_reserve_retained_span(u64 start, u64 end)
         start = gap_end;
     }
     return 0;
+}
+
+/*
+ * The retained heap/high-water reservations cover gaps between boot objects too. Record only
+ * the exact entries produced for those envelopes, so firmware-owned RTBuddySeg log pages can
+ * acquire no-map names without weakening checks against other memory reservations. An entry
+ * that does not fit is not recorded: a log inside it is then left unnamed.
+ */
+static struct {
+    u64 base, size;
+} retained_rsv[16];
+static unsigned retained_rsv_count;
+
+static void dt_record_retained_rsv(int first)
+{
+    int count = fdt_num_mem_rsv(dt);
+    for (int i = first; i < count; i++) {
+        if (retained_rsv_count == ARRAY_SIZE(retained_rsv) ||
+            fdt_get_mem_rsv(dt, i, &retained_rsv[retained_rsv_count].base,
+                            &retained_rsv[retained_rsv_count].size))
+            break;
+        retained_rsv_count++;
+    }
 }
 
 /*
@@ -994,6 +1045,103 @@ static void dt_set_trial_watchdog(void)
                 printf("FDT: couldn't mark the watchdog for the trial\n");
             else
                 printf("FDT: trial boot: U-Boot leaves the watchdog to the trial budget\n");
+        }
+    }
+}
+
+static bool dt_ranges_identity_covers(int parent, u64 addr, u64 size)
+{
+    int ranges_len = 0;
+    const u8 *ranges = fdt_getprop(dt, parent, "ranges", &ranges_len);
+    if (!ranges || ranges_len == 0)
+        return true;
+
+    int grand = fdt_parent_offset(dt, parent);
+    if (grand < 0 || fdt_address_cells(dt, grand) != 2)
+        return false;
+
+    const int stride = 3 * (int)sizeof(fdt64_t);
+    if (ranges_len % stride != 0)
+        return false;
+
+    for (int off = 0; off < ranges_len; off += stride) {
+        fdt64_t triple[3];
+        memcpy(triple, ranges + off, sizeof(triple));
+        u64 child = fdt64_to_cpu(triple[0]);
+        u64 paddr = fdt64_to_cpu(triple[1]);
+        u64 len = fdt64_to_cpu(triple[2]);
+        if (child == paddr && addr >= child && size <= len && addr - child <= len - size)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Publish the ADT's simple-reconfig routing register (reg[3]) onto the Linux watchdog DT node
+ * whenever the ADT selects the WD2 simple-reconfig path (wdt-version >= 3 with
+ * simple-reconfig-wdog-support) and the DT node lacks a "reconfig" entry. Keeps the ADT as the
+ * single source so Linux's apple_wdt adopts WD2 on every v3+ simple-reconfig SoC (including T8142
+ * if its static DTS lists only the primary window), while leaving wdt-version 2 SoCs on WD1.
+ */
+static void dt_set_wdt_reconfig(void)
+{
+    u64 primary = 0, reconfig = 0;
+    if (!wdt_simple_reconfig_reg(&primary, &reconfig))
+        return;
+
+    static const char *const compat[] = {"apple,t8103-wdt", "apple,wdt"};
+    for (size_t i = 0; i < ARRAY_SIZE(compat); i++) {
+        int node = -1;
+        while ((node = fdt_node_offset_by_compatible(dt, node, compat[i])) >= 0) {
+            if (fdt_stringlist_search(dt, node, "reg-names", "reconfig") >= 0)
+                continue;
+            int parent = fdt_parent_offset(dt, node);
+            if (parent < 0 || fdt_address_cells(dt, parent) != 2 || fdt_size_cells(dt, parent) != 2)
+                continue;
+            int reg_len = 0;
+            const void *reg = fdt_getprop(dt, node, "reg", &reg_len);
+            if (!reg || reg_len < 2 * (int)sizeof(fdt64_t))
+                continue;
+            fdt64_t orig_reg[2];
+            memcpy(orig_reg, reg, sizeof(orig_reg));
+            if (fdt64_to_cpu(orig_reg[0]) != primary)
+                continue;
+            if (reg_len != 2 * (int)sizeof(fdt64_t) || fdt64_to_cpu(orig_reg[1]) < 0x30) {
+                printf("FDT: watchdog @ 0x%lx skipped: unexpected reg shape (len=%d)\n", primary,
+                       reg_len);
+                continue;
+            }
+            if (!dt_ranges_identity_covers(parent, primary, 0x30) ||
+                !dt_ranges_identity_covers(parent, reconfig, 4)) {
+                printf("FDT: watchdog @ 0x%lx skipped: parent ranges does not cover reconfig\n",
+                       primary);
+                continue;
+            }
+            bool has_names = fdt_getprop(dt, node, "reg-names", NULL) != NULL;
+            if (has_names && fdt_stringlist_count(dt, node, "reg-names") != 1) {
+                printf("FDT: watchdog @ 0x%lx skipped: unexpected reg-names count\n", primary);
+                continue;
+            }
+            fdt64_t cells[2];
+            fdt64_st(&cells[0], reconfig);
+            fdt64_st(&cells[1], 4);
+            if (fdt_appendprop(dt, node, "reg", cells, sizeof(cells)) < 0) {
+                printf("FDT: couldn't append watchdog reconfig reg\n");
+                continue;
+            }
+            int ret;
+            if (has_names) {
+                ret = fdt_appendprop_string(dt, node, "reg-names", "reconfig");
+            } else {
+                static const char names[] = "wdt\0reconfig";
+                ret = fdt_setprop(dt, node, "reg-names", names, sizeof(names));
+            }
+            if (ret < 0) {
+                fdt_setprop(dt, node, "reg", orig_reg, sizeof(orig_reg));
+                printf("FDT: couldn't publish watchdog reg-names\n");
+            } else {
+                printf("FDT: published watchdog reconfig reg @ 0x%lx\n", reconfig);
+            }
         }
     }
 }
@@ -3333,9 +3481,25 @@ static int dt_find_dart_by_address(u64 address)
     return found;
 }
 
+/* The size of a DART node's first register window, or 0 if its device tree does not give one. */
+static u64 dt_dart_window(int dart)
+{
+    int parent = fdt_parent_offset(dt, dart);
+    int ac = parent < 0 ? -1 : fdt_address_cells(dt, parent);
+    int sc = parent < 0 ? -1 : fdt_size_cells(dt, parent);
+    int len;
+    const fdt32_t *reg = fdt_getprop(dt, dart, "reg", &len);
+
+    if (!reg || ac < 1 || sc < 1 || sc > 2 || len < (int)((ac + sc) * sizeof(*reg)))
+        return 0;
+    if (sc == 1)
+        return fdt32_ld(&reg[ac]);
+    return ((u64)fdt32_ld(&reg[ac]) << 32) | fdt32_ld(&reg[ac + 1]);
+}
+
 static int dt_copy_dart_tunable(int adt_node, const char *adt_name, u64 address)
 {
-    const struct adt_tunable_info tunable = {
+    struct adt_tunable_info tunable = {
         .adt_name = adt_name,
         .fdt_name = "apple,tunable",
         .reg_size = 0x4000,
@@ -3349,6 +3513,13 @@ static int dt_copy_dart_tunable(int adt_node, const char *adt_name, u64 address)
     }
     if (fdt_getprop(dt, dart, tunable.fdt_name, NULL))
         return 0;
+    /*
+     * Every row must fall inside the DART's register window as its device tree node gives it
+     * (the T8152 USB4 DARTs have rows past 0x4000 in a 0xc000 one). Without one, 0x4000.
+     */
+    u64 window = dt_dart_window(dart);
+    if (window)
+        tunable.reg_size = window;
     if (dt_append_dart_tunable(adt_node, dart, &tunable)) {
         /* The converter can have appended valid rows before rejecting one. */
         fdt_delprop(dt, dart, tunable.fdt_name);
@@ -3365,7 +3536,11 @@ static int dt_copy_dart_tunable(int adt_node, const char *adt_name, u64 address)
  * from a consumer's phandle order: ADT reg[N] and the DT DART's translated
  * register address must name the same physical window.
  */
-static void dt_copy_dart_tunables(void)
+/*
+ * Copy every ADT DART table to the enabled DART at its address that has none. With @only (a
+ * NULL-terminated list of ADT node name prefixes), only those ADT DARTs are copied.
+ */
+static void dt_copy_dart_tunables(const char *const *only)
 {
     int path[8];
     int arm_io = adt_path_offset_trace(adt, "/arm-io", path);
@@ -3390,6 +3565,14 @@ static void dt_copy_dart_tunables(void)
 
         if (!name || strncmp(name, "dart-", 5))
             continue;
+        if (only) {
+            const char *const *prefix = only;
+
+            while (*prefix && strncmp(name, *prefix, strlen(*prefix)))
+                prefix++;
+            if (!*prefix)
+                continue;
+        }
         path[depth] = node;
 
         for (unsigned int instance = 0; instance < 64; instance++) {
@@ -4618,6 +4801,54 @@ static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits)
 }
 
 /*
+ * MTP firmware gets RTKit buffers through its own mapper. Give the OS and any
+ * intervening boot stage the DMA window iBoot described for it when the MTP
+ * node is enabled, uses a matching T8110 DART, and has no explicit DT range.
+ */
+static int dt_set_mtp_dma_window(void)
+{
+    int mtp = fdt_node_offset_by_compatible(dt, -1, "apple,mtp");
+    if (mtp < 0)
+        return 0;
+    const char *status = fdt_getprop(dt, mtp, "status", NULL);
+    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+        return 0;
+
+    int dart = dt_get_iommu_node(mtp, 0);
+    if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart") ||
+        fdt_getprop(dt, dart, "apple,dma-range", NULL))
+        return 0;
+
+    int asc = adt_path_offset(adt, "/arm-io/mtp");
+    int trace[8];
+    int adart = adt_path_offset_trace(adt, "/arm-io/dart-mtp", trace);
+    if (asc < 0 || adart < 0)
+        return 0;
+
+    u64 base, size, adt_mmio, mmio, mmio_size;
+    if (ADT_GETPROP(adt, adart, "vm-base", &base) != sizeof(base) ||
+        ADT_GETPROP(adt, adart, "vm-size", &size) != sizeof(size) || !size ||
+        ((base | size) & (SZ_16K - 1)) || adt_get_reg(adt, trace, "reg", 0, &adt_mmio, NULL) < 0 ||
+        dt_device_dart_mmio(mtp, asc, &mmio, &mmio_size) || mmio != adt_mmio ||
+        mmio_size < DART_T8110_PARAMS3 + sizeof(u32))
+        return 0;
+
+    u32 bits = FIELD_GET(DART_T8110_PARAMS3_VA_WIDTH, read32(mmio + DART_T8110_PARAMS3));
+    if (bits < 32 || bits > 44)
+        return 0;
+    u64 limit = 1ULL << bits;
+    if (base >= limit || size > limit - base)
+        return 0;
+
+    fdt64_t range[] = {cpu_to_fdt64(base), cpu_to_fdt64(size)};
+    int ret = fdt_setprop(dt, dart, "apple,dma-range", range, sizeof(range));
+    if (ret)
+        bail("FDT: MTP DART DMA window: %s\n", fdt_strerror(ret));
+    printf("FDT: MTP DART DMA window 0x%lx+0x%lx\n", base, size);
+    return 0;
+}
+
+/*
  * Reserve the firmware segments of an ASC coprocessor from its ADT
  * segment-ranges and attach them to its FDT node. With dram_only, segments
  * outside DRAM (such as the coprocessor's own SRAM, which the OS maps as MMIO)
@@ -5367,7 +5598,8 @@ static int dt_set_ave_dapf(void)
  * since iBoot loaded it, so it may start the preloaded firmware itself.
  */
 static const char *const ane_compatibles[] = {
-    "apple,t6041-ane", "apple,t6050-ane", "apple,t8132-ane", "apple,t8140-ane", "apple,t8142-ane",
+    "apple,t6041-ane", "apple,t6050-ane", "apple,t8122-ane",
+    "apple,t8132-ane", "apple,t8140-ane", "apple,t8142-ane",
 };
 
 static int dt_ane_fill_region(int resv, uint32_t phandle, const char *kind, u64 phys, u64 size)
@@ -5424,8 +5656,16 @@ static int dt_set_ane_node(int node, const char *compat)
         goto disable;
     }
 
-    u32 preloaded;
-    if (ADT_GETPROP(adt, anode, "pre-loaded", &preloaded) != sizeof(preloaded) || preloaded != 1) {
+    u32 preloaded = 0;
+    bool is_preloaded =
+        ADT_GETPROP(adt, anode, "pre-loaded", &preloaded) == sizeof(preloaded) && preloaded == 1;
+    if (!is_preloaded) {
+        int nub = adt_subnode_offset(adt, anode, "iop-ane-nub");
+        if (nub >= 0 && ADT_GETPROP(adt, nub, "pre-loaded", &preloaded) == sizeof(preloaded) &&
+            preloaded == 1)
+            is_preloaded = true;
+    }
+    if (!is_preloaded) {
         reason = "firmware not preloaded";
         goto disable;
     }
@@ -8005,12 +8245,15 @@ static bool dt_display_phys_reserved(u64 phys, u64 size)
  * physical field differs from the active DART translation (__OS_LOG).
  * IOVA-only reservations avoid overlapping physical reserved-memory nodes
  * when a segment is already contained in a carveout or the framebuffer.
+ * The external DCPs share the layout (their __TEXT is the internal DCP's). For
+ * one of those only a DART that iBoot left locked is inspected: an unlocked
+ * DART belongs to a coprocessor iBoot did not start, and initialising a view
+ * of it would program it.
  */
-static int dt_reserve_m5_display_segments(void)
+static int dt_reserve_m5_display_segments(const char *alias, const char *nub_path, bool external)
 {
-    const char *alias = "dcp";
     int owner = fdt_path_offset(dt, alias);
-    int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
+    int nub = adt_path_offset(adt, nub_path);
     int chosen = adt_path_offset(adt, "/chosen");
     u64 dram, dram_size;
     u32 len = 0;
@@ -8026,9 +8269,17 @@ static int dt_reserve_m5_display_segments(void)
     if (!segments || !len || len % sizeof(*segments) || len / sizeof(*segments) > 64)
         bail("ADT: invalid M5 display segment inventory\n");
     u32 owner_phandle = fdt_get_phandle(dt, owner);
-    dart_dev_t *dart = dt_init_dart_by_node(owner, 0);
+    dart_dev_t *dart = NULL;
+    if (external) {
+        int iommus_len;
+        const fdt32_t *iommus = fdt_getprop(dt, owner, "iommus", &iommus_len);
+        if (iommus && iommus_len >= 8)
+            dart = dart_init_fdt_locked(dt, fdt32_ld(&iommus[0]), fdt32_ld(&iommus[1]));
+    } else {
+        dart = dt_init_dart_by_node(owner, 0);
+    }
     if (!dart)
-        bail("FDT: cannot inspect M5 display firmware translations\n");
+        bail("FDT: cannot inspect %s firmware translations\n", alias);
 
     u64 total = 0;
     for (u32 i = 0; i < len / sizeof(*segments); i++) {
@@ -8045,7 +8296,13 @@ static int dt_reserve_m5_display_segments(void)
          * reach it then, so there is no live mapping to preserve.
          */
         if (segments[i].remap == segments[i].phys && !dart_translate_silent(dart, start)) {
-            printf("FDT: M5 display segment %u at 0x%lx (0x%x bytes) is not mapped, skipped\n", i,
+            printf("FDT: %s segment %u at 0x%lx (0x%x bytes) is not mapped, skipped\n", alias, i,
+                   start, segments[i].size);
+            continue;
+        }
+        /* An idle external DCP may list a segment its DART does not map yet. */
+        if (external && !dart_translate_silent(dart, start)) {
+            printf("FDT: %s segment %u at 0x%lx (0x%x bytes) is not mapped, skipped\n", alias, i,
                    start, segments[i].size);
             continue;
         }
@@ -8066,10 +8323,10 @@ static int dt_reserve_m5_display_segments(void)
             char name[64];
             int node;
             if (!reserved) {
-                snprintf(name, sizeof(name), "dcp-firmware@%lx", phys);
+                snprintf(name, sizeof(name), "%s-firmware@%lx", alias, phys);
                 node = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, phys, count);
             } else {
-                snprintf(name, sizeof(name), "dcp-iova-%lx", iova);
+                snprintf(name, sizeof(name), "%s-iova-%lx", alias, iova);
                 int parent = fdt_path_offset(dt, "/reserved-memory");
                 node = fdt_add_subnode(dt, parent, name);
                 if (node < 0)
@@ -8089,10 +8346,326 @@ static int dt_reserve_m5_display_segments(void)
             offset += count;
         }
     }
-    printf("FDT: reserved live M5 display firmware segments (%lu bytes)\n", total);
+    printf("FDT: %s: reserved live firmware segments (%lu bytes)\n", alias, total);
 err:
     dart_shutdown(dart);
     return ret;
+}
+
+/*
+ * T8142 external display processors (J813/J815: dcpext0 and dcpext1 behind the
+ * two USB-C ports; J704: dcpext1 also feeds HDMI). iBoot preloads each with the
+ * internal DCP's image and leaves it running idle, its firmware DART locked.
+ * Such a processor is handed over like the internal one, so that the kernel can
+ * adopt the session and light a display that is plugged in later. The hand-off
+ * follows dmitzsaz's J704 work (aura 3f296895, 9b440447).
+ *
+ * Every step is optional: a processor that fails a check stays disabled, and
+ * with it its Type-C routes, so the USB-C ports keep working as plain USB.
+ * The result of each attempt is recorded in /chosen (aurora,dcpextN-handoff),
+ * where it survives a boot without a serial console.
+ */
+static struct disp_mapping dcpext0_reserved_regions_t8142[] = {
+    {"region-id-73", "dcpext0_data", true, false, false},
+    {"region-id-74", "region74", true, false, false},
+};
+
+static struct disp_mapping dcpext1_reserved_regions_t8142[] = {
+    {"region-id-88", "dcpext1_data", true, false, false},
+    {"region-id-89", "region89", true, false, false},
+};
+
+/* Indexed like dcpext_aliases[]; a controller without an entry is refused. */
+static struct disp_mapping *const dcpext_reserved_regions_t8142[ARRAY_SIZE(dcpext_aliases)] = {
+    [1] = dcpext0_reserved_regions_t8142,
+    [2] = dcpext1_reserved_regions_t8142,
+};
+
+static const char *t8142_dcpext_result;
+
+/*
+ * Reserve the page tables of a locked stream. A two-level 16K T8110 stream has
+ * one root and at most 2048 L2 tables. With !required, a stream that is not
+ * locked or has no translating root is idle and has nothing to keep (0). Once
+ * a translating root is seen, every failure returns -1: the DART may still be
+ * walking a table that would otherwise be left to the kernel.
+ */
+static int dt_reserve_t8142_stream_tables(u32 provider, u32 sid, bool required)
+{
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram, size;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &size) != sizeof(size))
+        return -1;
+    /* Read before a DART view is made, so a view that fails is not taken as idle. */
+    int translating = dart_fdt_t8110_translating(dt, provider, sid);
+    if (translating <= 0)
+        return translating < 0 || required ? -1 : 0;
+    dart_dev_t *dart = dart_init_fdt_locked(dt, provider, sid);
+    if (!dart)
+        return -1;
+    const size_t capacity = 1 + SZ_16K / sizeof(u64);
+    u64 *pages = malloc(capacity * sizeof(*pages));
+    size_t count = 0;
+    int ret = pages ? dart_collect_locked_tables(dart, dram, size, pages, capacity, &count) : -1;
+    dart_shutdown(dart);
+    /* Tables remain CPU-mapped: the kernel may extend an inherited root. */
+    for (size_t i = 0; !ret && i < count; i++)
+        if (fdt_add_mem_rsv(dt, pages[i], SZ_16K))
+            ret = -1;
+    if (pages)
+        free(pages);
+    return ret;
+}
+
+struct t8142_stream_pages {
+    u64 mapped, outside;
+    u64 first_iova, first_paddr;
+};
+
+/* A physical page the kernel will not hand out: a no-map reservation or a /memreserve/. */
+static bool dt_t8142_page_kept(u64 paddr)
+{
+    if (dt_display_phys_reserved(paddr, SZ_16K))
+        return true;
+    for (int i = 0, n = fdt_num_mem_rsv(dt); i < n; i++) {
+        u64 base, size;
+        if (!fdt_get_mem_rsv(dt, i, &base, &size) && paddr >= base && size >= SZ_16K &&
+            paddr - base <= size - SZ_16K)
+            return true;
+    }
+    return false;
+}
+
+static int dt_t8142_stream_page(u64 iova, u64 paddr, void *opaque)
+{
+    struct t8142_stream_pages *pages = opaque;
+
+    pages->mapped++;
+    if (!dt_t8142_page_kept(paddr) && !pages->outside++) {
+        pages->first_iova = iova;
+        pages->first_paddr = paddr;
+    }
+    return 0;
+}
+
+/*
+ * The scanout and PIODMA streams of a frontend iBoot left translating may still be read by the
+ * hardware after the hand-off (a display lit at boot keeps scanning out). Every page they map
+ * must already be kept from the kernel: inside the carve-outs, the firmware segments or another
+ * reservation. A stream that does not translate maps nothing (0); a page outside refuses (-1).
+ */
+static int dt_t8142_stream_pages_kept(const char *alias, u32 provider, u32 sid)
+{
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram, size, base, window;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &size) != sizeof(size))
+        return -1;
+    int translating = dart_fdt_t8110_translating(dt, provider, sid);
+    if (translating <= 0)
+        return translating < 0 ? -1 : 0;
+    struct t8142_stream_pages pages = {0};
+    /* dart_fdt_t8110_translating() bounded sid by the T8110's 256 streams. */
+    if (dart_fdt_t8110_window(dt, provider, &base, &window) ||
+        dart_walk_locked_t8110(base, window, (u8)sid, dram, size, dt_t8142_stream_page, &pages))
+        return -1;
+    if (pages.outside) {
+        printf("FDT: %s: sid %u maps %lu of %lu pages outside reserved memory (first iova 0x%lx -> "
+               "0x%lx)\n",
+               alias, sid, pages.outside, pages.mapped, pages.first_iova, pages.first_paddr);
+        return -1;
+    }
+    printf("FDT: %s: sid %u maps %lu pages, all inside reserved memory\n", alias, sid,
+           pages.mapped);
+    return 0;
+}
+
+static int dt_t8142_node_okay(u32 phandle)
+{
+    int node = fdt_node_offset_by_phandle(dt, phandle);
+    return node < 0 ? -1 : fdt_setprop_string(dt, node, "status", "okay");
+}
+
+/* Enable the PMGR chain above a node; the islands have one parent each. */
+static int dt_t8142_enable_power_domains(u32 phandle, unsigned int depth)
+{
+    int node = fdt_node_offset_by_phandle(dt, phandle), len;
+    if (node < 0 || depth > 8)
+        return -1;
+    const fdt32_t *domains = fdt_getprop(dt, node, "power-domains", &len);
+    if (!domains)
+        return len == -FDT_ERR_NOTFOUND ? 0 : -1;
+    for (int i = 0; i < len / (int)sizeof(*domains); i++) {
+        node = fdt_node_offset_by_phandle(dt, phandle);
+        domains = fdt_getprop(dt, node, "power-domains", &len);
+        if (!domains || i >= len / (int)sizeof(*domains))
+            return -1;
+        u32 parent = fdt32_ld(&domains[i]);
+        int supplier = fdt_node_offset_by_phandle(dt, parent);
+        const fdt32_t *cells =
+            supplier < 0 ? NULL : fdt_getprop(dt, supplier, "#power-domain-cells", NULL);
+        if (!cells || fdt32_ld(cells) || dt_t8142_enable_power_domains(parent, depth + 1) ||
+            dt_t8142_node_okay(parent))
+            return -1;
+    }
+    return 0;
+}
+
+static int dt_set_t8142_dcpext(unsigned int n)
+{
+    if (n >= ARRAY_SIZE(dcpext_aliases))
+        return -1;
+    const char *alias = dcpext_aliases[n];
+    char nub[48], path[160];
+    int len;
+
+    t8142_dcpext_result = "no device tree node";
+    int node = fdt_path_offset(dt, alias);
+    if (node < 0 || fdt_get_path(dt, node, path, sizeof(path)))
+        return -1;
+    /*
+     * The power-domain walk below finds the node again by phandle, as the tree
+     * moves under it. dtc gives a node one only when something refers to it,
+     * and nothing refers to a dcpext node, so give it one here.
+     */
+    u32 owner = fdt_get_phandle(dt, node);
+    if (!owner && (fdt_generate_phandle(dt, &owner) || fdt_setprop_u32(dt, node, "phandle", owner)))
+        return -1;
+    node = fdt_path_offset(dt, path);
+    const fdt32_t *prop = node < 0 ? NULL : fdt_getprop(dt, node, "iommus", &len);
+    if (!prop || len != 8)
+        return -1;
+    u32 fw_dart = fdt32_ld(&prop[0]), fw_sid = fdt32_ld(&prop[1]);
+
+    /* The PIODMA stream of the external display's frontend DART. */
+    u32 pio_dart = 0, pio_sid = 0;
+    int piodma = fdt_subnode_offset(dt, node, "piodma");
+    prop = piodma < 0 ? NULL : fdt_getprop(dt, piodma, "iommus", &len);
+    if (prop && len == 8) {
+        pio_dart = fdt32_ld(&prop[0]);
+        pio_sid = fdt32_ld(&prop[1]);
+    }
+
+    prop = fdt_getprop(dt, node, "mboxes", &len);
+    u32 mbox = prop && len == 4 ? fdt32_ld(prop) : 0;
+    if (!mbox || !pio_dart)
+        return -1;
+
+    t8142_dcpext_result = "not started by iBoot";
+    snprintf(nub, sizeof(nub), "/arm-io/%s/iop-%s-nub", alias, alias);
+    int adt_nub = adt_path_offset(adt, nub);
+    u32 running = 0;
+    if (adt_nub < 0 || !adt_getprop(adt, adt_nub, "segment-ranges", NULL) ||
+        (ADT_GETPROP(adt, adt_nub, "running", &running) == sizeof(running) && running != 1))
+        return -1;
+
+    t8142_dcpext_result = "not powered";
+    if (!dt_j713_dcpext_powered(alias))
+        return -1;
+
+    t8142_dcpext_result = "firmware DART not locked or not translating";
+    if (dt_reserve_t8142_stream_tables(fw_dart, fw_sid, true))
+        return -1;
+    /* Idle scanout and PIODMA roots have no mappings yet; keep what exists. */
+    t8142_dcpext_result = "scanout or PIODMA tables not reserved";
+    if (dt_reserve_t8142_stream_tables(pio_dart, pio_sid, false) ||
+        dt_reserve_t8142_stream_tables(pio_dart, 0, false))
+        return -1;
+
+    t8142_dcpext_result = "carveout reservation failed";
+    if (!dcpext_reserved_regions_t8142[n] ||
+        dt_carveout_reserved_regions(alias, NULL, NULL, dcpext_reserved_regions_t8142[n], 2))
+        return -1;
+
+    t8142_dcpext_result = "firmware segment reservation failed";
+    if (dt_reserve_m5_display_segments(alias, nub, true))
+        return -1;
+
+    t8142_dcpext_result = "scanout or PIODMA maps memory that is not reserved";
+    if (dt_t8142_stream_pages_kept(alias, pio_dart, 0) ||
+        dt_t8142_stream_pages_kept(alias, pio_dart, pio_sid))
+        return -1;
+
+    t8142_dcpext_result = "firmware version not published";
+    if (dt_set_dcp_firmware(alias))
+        return -1;
+
+    t8142_dcpext_result = "device tree update failed";
+    /* The external frontend scans out through the display subsystem. */
+    int display = fdt_path_offset(dt, "disp0");
+    if (display < 0)
+        return -1;
+    /* A tree may list the frontend in disp0 already (the J704's does). */
+    bool listed = false;
+    prop = fdt_getprop(dt, display, "iommus", &len);
+    for (int i = 0; prop && i + 1 < len / (int)sizeof(*prop); i += 2)
+        listed |= fdt32_ld(&prop[i]) == pio_dart && !fdt32_ld(&prop[i + 1]);
+    fdt32_t scanout[2] = {cpu_to_fdt32(pio_dart), 0};
+    if (!listed && fdt_appendprop(dt, display, "iommus", scanout, sizeof(scanout)))
+        return -1;
+    if (dt_t8142_enable_power_domains(owner, 0) || dt_t8142_enable_power_domains(mbox, 0) ||
+        dt_t8142_enable_power_domains(fw_dart, 0) || dt_t8142_enable_power_domains(pio_dart, 0) ||
+        dt_t8142_node_okay(mbox) || dt_t8142_node_okay(fw_dart) || dt_t8142_node_okay(pio_dart))
+        return -1;
+
+    /* Routes and controller together: a route on a disabled DCP stalls its port. */
+    node = fdt_path_offset(dt, path);
+    int routes = node < 0 ? node : fdt_subnode_offset(dt, node, "typec-routes");
+    if (routes >= 0) {
+        char names[4][32];
+        size_t count = 0;
+        int route;
+        fdt_for_each_subnode(route, dt, routes)
+        {
+            const char *name = fdt_get_name(dt, route, &len);
+            if (!name || len < 0 || (size_t)len >= sizeof(names[0]) || count == ARRAY_SIZE(names))
+                return -1;
+            /* A route the board file marks "reserved" is not offered yet. */
+            const char *status = fdt_getprop(dt, route, "status", NULL);
+            if (status && !strcmp(status, "reserved"))
+                continue;
+            memcpy(names[count++], name, len + 1);
+        }
+        for (size_t i = 0; i < count; i++) {
+            char rpath[224];
+            snprintf(rpath, sizeof(rpath), "%s/typec-routes/%s", path, names[i]);
+            int rnode = fdt_path_offset(dt, rpath);
+            if (rnode < 0 || fdt_setprop_string(dt, rnode, "status", "okay"))
+                return -1;
+        }
+    } else if (routes != -FDT_ERR_NOTFOUND) {
+        return -1;
+    }
+    node = fdt_path_offset(dt, path);
+    if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
+        return -1;
+    t8142_dcpext_result = "okay";
+    return 0;
+}
+
+/* After the internal DCP: each external one in its own transaction. */
+static void dt_set_t8142_dcpexts(void)
+{
+    for (unsigned int n = 0; n < ARRAY_SIZE(dcpext_aliases); n++) {
+        const char *alias = dcpext_aliases[n];
+        int node = fdt_path_offset(dt, alias), len = 0;
+        if (node < 0)
+            continue;
+        const char *status = fdt_getprop(dt, node, "status", &len);
+        if (!status || strcmp(status, "disabled") ||
+            fdt_node_check_compatible(dt, node, "apple,t8142-dcpext"))
+            continue;
+        t8142_dcpext_result = "refused";
+        if (dt_display_transaction(dt_set_t8142_dcpext, n) && !strcmp(t8142_dcpext_result, "okay"))
+            t8142_dcpext_result = "refused";
+        printf("FDT: %s handoff: %s\n", alias, t8142_dcpext_result);
+        char property[40];
+        snprintf(property, sizeof(property), "aurora,%s-handoff", alias);
+        int chosen = fdt_path_offset(dt, "/chosen");
+        if (chosen >= 0)
+            fdt_setprop_string(dt, chosen, property, t8142_dcpext_result);
+    }
 }
 
 /*
@@ -8863,6 +9436,17 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
     u32 len = 0, flen = 0;
     const u8 *raw_ids = disp < 0 ? NULL : adt_getprop(adt, disp, "clock-ids", &len);
     const u8 *freq = arm < 0 ? NULL : adt_getprop(adt, arm, "clock-frequencies", &flen);
+    /*
+     * An empty list (every T602x disp0/dispext<n> on 27.2) says the firmware takes no provider
+     * clocks. Publish it as such: without apple,clock-ids the kernel refuses a firmware-27 DCP.
+     * The display clock the node already has stays its own.
+     */
+    if (raw_ids && !len) {
+        int ret = fdt_setprop_empty(dt, node, "apple,clock-ids");
+        if (!ret)
+            printf("FDT: %s: no firmware clocks in %s; empty apple,clock-ids\n", alias, adt_engine);
+        return ret;
+    }
     u32 nclk = raw_ids ? len / sizeof(u32) : 0;
     if (!nclk || len % sizeof(u32) || nclk > 8 || !freq || flen % sizeof(u32)) {
         printf("FDT: %s: no firmware clocks in the ADT; left unchanged\n", alias);
@@ -8933,6 +9517,362 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
     if (!ret)
         printf("FDT: %s: %u firmware clocks published from %s\n", alias, nclk, adt_engine);
     return ret;
+}
+
+/*
+ * Every display processor the tree names: dcp runs /arm-io/disp0 and dcpext<n> runs
+ * /arm-io/dispext<n>; a tree with one external processor calls it dcpext (dispext0).
+ */
+static void dt_set_dcp_fw27_clocks_all(void)
+{
+    if (dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
+        printf("FDT: dcp: publishing the firmware clocks failed\n");
+    for (size_t n = 0; n < ARRAY_SIZE(dcpext_aliases); n++) {
+        char engine[24];
+        snprintf(engine, sizeof(engine), "/arm-io/dispext%u", n ? (unsigned)(n - 1) : 0);
+        if (dt_set_dcp_fw27_clocks(dcpext_aliases[n], engine))
+            printf("FDT: %s: publishing the firmware clocks failed\n", dcpext_aliases[n]);
+    }
+}
+
+static bool fw_log_overlaps(u64 a, u64 size, u64 b, u64 bytes)
+{
+    return size && bytes && a < b + bytes && b < a + size;
+}
+
+/*
+ * The os-log nodes this pass added. Two logs can share a 16K page: the second then meets the
+ * first one's node and grows it to cover both. Each __OS_LOG segment of the ADT adds at most one
+ * node and a merge only removes, so the segment count bounds the entries. The record is fixed
+ * storage, so the optional pass never allocates: an ADT that lists more segments than it holds
+ * keeps every log as it was.
+ */
+#define FW_LOG_NAMED_MAX 256
+static struct fw_log_extent {
+    u64 base, size;
+} fw_log_named[FW_LOG_NAMED_MAX];
+static unsigned fw_log_named_count;
+
+/* Whether /reserved-memory node @node, with the one reg entry @a+@s, is one this pass added */
+static bool dt_fw_log_ours(int node, u64 a, u64 s, int len)
+{
+    char name[32];
+    const char *have = fdt_get_name(dt, node, NULL);
+    if (len != (int)(2 * sizeof(fdt64_t)) || !have)
+        return false;
+    snprintf(name, sizeof(name), "os-log@%lx", a);
+    if (strcmp(have, name))
+        return false;
+    for (unsigned j = 0; j < fw_log_named_count; j++)
+        if (fw_log_named[j].base == a && fw_log_named[j].size == s)
+            return true;
+    return false;
+}
+
+/*
+ * Whether the firmware log [base, base + size) can be named no-map: 1 when an enabled
+ * /reserved-memory node that is not reusable already holds all of it, 0 when it can be added,
+ * 2 when it can be added by growing the os-log nodes this pass added that it overlaps to
+ * [*lo, *hi), the extent that covers it and them, and -1 when it overlaps a reusable
+ * /reserved-memory node, part of any other one, the OS's execute window, a live boot allocation
+ * or a memory reservation other than the retained heap and image envelopes.
+ */
+static int dt_fw_log_check(u64 base, u64 size, u64 *lo, u64 *hi)
+{
+    int resv = fdt_path_offset(dt, "/reserved-memory"), node;
+    bool ours = false;
+    *lo = base;
+    *hi = base + size;
+    if (resv < 0)
+        bail("FDT: no /reserved-memory for the firmware logs\n");
+    fdt_for_each_subnode(node, dt, resv)
+    {
+        /* Linux reserves a node only when it is available: no status, or "okay" or "ok". */
+        const char *status = fdt_stringlist_get(dt, node, "status", 0, NULL);
+        if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+            continue;
+        int len;
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        if (!reg)
+            continue;
+        if (len <= 0 || len % (2 * sizeof(*reg)))
+            bail("FDT: reserved-memory/%s has a malformed reg\n", fdt_get_name(dt, node, NULL));
+        /* The OS hands a reusable node's pages to its page allocator: it does not hold a log. */
+        bool reusable = fdt_getprop(dt, node, "reusable", NULL);
+        /* Linux reserves only a node's first reg entry; the others hold nothing. */
+        u64 a = fdt64_ld(&reg[0]), s = fdt64_ld(&reg[1]);
+        if (s > UINT64_MAX - a || !fw_log_overlaps(base, size, a, s))
+            continue;
+        if (reusable)
+            bail("FDT: firmware log 0x%lx+0x%lx lies in reusable reserved-memory/%s\n", base, size,
+                 fdt_get_name(dt, node, NULL));
+        if (base >= a && size <= a + s - base)
+            return 1;
+        if (dt_fw_log_ours(node, a, s, len)) {
+            *lo = a < *lo ? a : *lo;
+            *hi = a + s > *hi ? a + s : *hi;
+            ours = true;
+            continue;
+        }
+        bail("FDT: firmware log 0x%lx+0x%lx straddles reserved-memory/%s\n", base, size,
+             fdt_get_name(dt, node, NULL));
+    }
+
+    if (in_exec_window(base, size))
+        bail("FDT: firmware log 0x%lx+0x%lx lies in the OS's execute window\n", base, size);
+    u64 high_water = heapblock_high_water();
+    if (high_water < cur_boot_args.top_of_kernel_data ||
+        fw_log_overlaps(base, size, (u64)_base, (u64)_end - (u64)_base) ||
+        (relocated_from && cur_boot_args.top_of_kernel_data > relocated_from &&
+         fw_log_overlaps(base, size, relocated_from,
+                         cur_boot_args.top_of_kernel_data - relocated_from)) ||
+        fw_log_overlaps(base, size, cur_boot_args.top_of_kernel_data,
+                        high_water - cur_boot_args.top_of_kernel_data))
+        bail("FDT: firmware log 0x%lx+0x%lx overlaps a live boot allocation\n", base, size);
+
+    for (int i = 0; i < fdt_num_mem_rsv(dt); i++) {
+        u64 a, s;
+        if (fdt_get_mem_rsv(dt, i, &a, &s) || s > UINT64_MAX - a)
+            return -1;
+        if (!fw_log_overlaps(base, size, a, s))
+            continue;
+        bool envelope = false;
+        for (unsigned j = 0; j < retained_rsv_count; j++)
+            envelope |= a == retained_rsv[j].base && s == retained_rsv[j].size;
+        if (!envelope || base < a || size > a + s - base)
+            bail("FDT: firmware log 0x%lx+0x%lx overlaps memory reservation 0x%lx+0x%lx\n", base,
+                 size, a, s);
+    }
+    return ours ? 2 : 0;
+}
+
+static bool fw_log_inside(unsigned j, u64 lo, u64 hi)
+{
+    return fw_log_named[j].base >= lo && fw_log_named[j].base < hi &&
+           fw_log_named[j].size <= hi - fw_log_named[j].base;
+}
+
+/*
+ * Grow the lowest os-log node this pass added inside [lo, hi) to all of it, renamed to
+ * os-log@<lo>, and remove the other ones it now covers. Nothing changes when the rename or the
+ * reg fails.
+ */
+static int dt_fw_log_merge(u64 lo, u64 hi)
+{
+    int resv = fdt_path_offset(dt, "/reserved-memory"), keep = -1;
+    if (resv < 0)
+        return -1;
+    for (unsigned j = 0; j < fw_log_named_count; j++)
+        if (fw_log_inside(j, lo, hi) &&
+            (keep < 0 || fw_log_named[j].base < fw_log_named[keep].base))
+            keep = j;
+    if (keep < 0)
+        return -1;
+
+    char name[32], old[32];
+    snprintf(old, sizeof(old), "os-log@%lx", fw_log_named[keep].base);
+    snprintf(name, sizeof(name), "os-log@%lx", lo);
+    int node = fdt_subnode_offset(dt, resv, old);
+    if (node < 0)
+        return -1;
+    if (lo != fw_log_named[keep].base) {
+        if (fdt_subnode_offset(dt, resv, name) != -FDT_ERR_NOTFOUND)
+            bail("FDT: reserved-memory/%s already exists: left as it was\n", name);
+        if (fdt_set_name(dt, node, name))
+            return -1;
+    }
+    fdt64_t reg[2] = {cpu_to_fdt64(lo), cpu_to_fdt64(hi - lo)};
+    if (fdt_setprop(dt, node, "reg", reg, sizeof(reg))) {
+        fdt_set_name(dt, node, old);
+        return -1;
+    }
+
+    unsigned n = 0;
+    for (unsigned j = 0; j < fw_log_named_count; j++) {
+        if ((int)j == keep) {
+            fw_log_named[n].base = lo;
+            fw_log_named[n++].size = hi - lo;
+            continue;
+        }
+        if (!fw_log_inside(j, lo, hi)) {
+            fw_log_named[n++] = fw_log_named[j];
+            continue;
+        }
+        /* Covered by the grown node now: a node left by a failed delete is only redundant. */
+        snprintf(old, sizeof(old), "os-log@%lx", fw_log_named[j].base);
+        resv = fdt_path_offset(dt, "/reserved-memory");
+        node = resv < 0 ? resv : fdt_subnode_offset(dt, resv, old);
+        if (node >= 0)
+            fdt_del_node(dt, node);
+    }
+    fw_log_named_count = n;
+    return 0;
+}
+
+/* Whether segment @idx of a "name;name;..." segment-names list is @want */
+static bool adt_segment_named(const char *names, u32 len, u32 idx, const char *want)
+{
+    u32 i = 0;
+    while (idx--) {
+        while (i < len && names[i] && names[i] != ';')
+            i++;
+        if (i >= len || names[i] != ';')
+            return false;
+        i++;
+    }
+    size_t n = strlen(want);
+    return i + n <= len && !memcmp(names + i, want, n) &&
+           (i + n == len || names[i + n] == ';' || !names[i + n]);
+}
+
+/* The segments of ADT node @at that dt_reserve_fw_logs_of() considers: flags 0xa, __OS_LOG */
+static u32 adt_count_fw_logs(int at)
+{
+    u32 len = 0, names_len = 0, n = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, at, "segment-ranges", &len);
+    const char *names = adt_getprop(adt, at, "segment-names", &names_len);
+    if (!seg || !len || len % sizeof(*seg) || !names)
+        return 0;
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        struct adt_segment_ranges r;
+        memcpy(&r, &seg[i], sizeof(r));
+        n += r.unk == 0xa && r.size && adt_segment_named(names, names_len, i, "__OS_LOG");
+    }
+    return n;
+}
+
+/* Name each __OS_LOG segment of ADT node @at no-map inside [ram_start, ram_end); counts what was
+ * named, held or left. */
+static void dt_reserve_fw_logs_of(int at, u64 owner, u64 owner_size, u64 ram_start, u64 ram_end,
+                                  int count[3])
+{
+    u32 len = 0, names_len = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, at, "segment-ranges", &len);
+    const char *names = adt_getprop(adt, at, "segment-names", &names_len);
+    if (!seg || !len || len % sizeof(*seg) || !names)
+        return;
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        struct adt_segment_ranges r;
+        memcpy(&r, &seg[i], sizeof(r));
+        if (r.unk != 0xa || !r.size || !adt_segment_named(names, names_len, i, "__OS_LOG"))
+            continue;
+        if (r.phys > UINT64_MAX - r.size - (SZ_16K - 1))
+            continue;
+        u64 base = ALIGN_DOWN(r.phys, SZ_16K);
+        u64 end = ALIGN_UP(r.phys + r.size, SZ_16K), size = end - base;
+        if (base < owner || end > owner + owner_size) {
+            printf("FDT: %s __OS_LOG 0x%lx+0x%x is outside RTBuddySeg: left unnamed\n",
+                   adt_get_name(adt, at), r.phys, r.size);
+            count[2]++;
+            continue;
+        }
+        if (base < ram_start || end > ram_end) {
+            printf("FDT: %s __OS_LOG 0x%lx+0x%x is outside OS RAM: left unnamed\n",
+                   adt_get_name(adt, at), r.phys, r.size);
+            count[2]++;
+            continue;
+        }
+        u64 lo, hi;
+        int held = dt_fw_log_check(base, size, &lo, &hi);
+        if (held == 1 || held < 0) {
+            count[held > 0 ? 1 : 2]++;
+            continue;
+        }
+        /* It shares a 16K page with a log named before it: grow that one's node over both. */
+        if (held == 2) {
+            count[dt_fw_log_merge(lo, hi) ? 2 : 0]++;
+            continue;
+        }
+        /* Never true: the pass checked that the record holds every __OS_LOG segment. */
+        if (fw_log_named_count >= ARRAY_SIZE(fw_log_named)) {
+            count[2]++;
+            continue;
+        }
+        char name[32];
+        snprintf(name, sizeof(name), "os-log@%lx", base);
+        /* A node of that name the scan let pass (a disabled one) is not ours to rewrite. */
+        int resv = fdt_path_offset(dt, "/reserved-memory");
+        if (resv < 0 || fdt_subnode_offset(dt, resv, name) != -FDT_ERR_NOTFOUND) {
+            printf("FDT: reserved-memory/%s already exists: left as it was\n", name);
+            count[2]++;
+            continue;
+        }
+        /* On failure, remove what this call added: the name was free before it. */
+        if (dt_get_or_add_reserved_mem(name, "apple,os-log", true, base, size) < 0) {
+            resv = fdt_path_offset(dt, "/reserved-memory");
+            int node = resv < 0 ? resv : fdt_subnode_offset(dt, resv, name);
+            if (node >= 0)
+                fdt_del_node(dt, node);
+            count[2]++;
+            continue;
+        }
+        fw_log_named[fw_log_named_count].base = base;
+        fw_log_named[fw_log_named_count++].size = size;
+        count[0]++;
+    }
+}
+
+/*
+ * The coprocessors write their __OS_LOG segments, where those segments lie in the ADT's RTBuddySeg
+ * extent, from before aura starts. Wherever that extent lies in the OS's RAM (after MTE tag
+ * storage has been carved out in dt_set_memory()), name each log no-map ("apple,os-log") that no
+ * /reserved-memory node holds yet. A log that cannot be named safely is left as it was; nothing
+ * here stops the boot. The ADT's owner nodes and their nubs repeat the same segments: the second
+ * is already held.
+ */
+static void dt_reserve_rtbuddyseg_logs(void)
+{
+    u64 owner[2];
+    int map = adt_path_offset(adt, "/chosen/memory-map");
+    if (map < 0 || !adt_getprop(adt, map, "RTBuddySeg", NULL))
+        return;
+    u64 ram_start = cur_boot_args.phys_base, ram_size = cur_boot_args.mem_size;
+    int mem = fdt_path_offset(dt, "/memory");
+    int mlen = 0;
+    const fdt64_t *mreg = mem < 0 ? NULL : fdt_getprop(dt, mem, "reg", &mlen);
+    if (mreg && mlen >= 2 * (int)sizeof(*mreg)) {
+        ram_start = fdt64_ld(&mreg[0]);
+        ram_size = fdt64_ld(&mreg[1]);
+    }
+    if (!ram_size || ram_start > UINT64_MAX - ram_size)
+        return;
+    u64 ram_end = ram_start + ram_size;
+    if (ADT_GETPROP_ARRAY(adt, map, "RTBuddySeg", owner) < 0 || !owner[1] ||
+        owner[0] > UINT64_MAX - owner[1] || owner[0] >= ram_end ||
+        owner[0] + owner[1] <= ram_start) {
+        printf("FDT: RTBuddySeg is malformed or outside RAM: firmware logs left as they were\n");
+        return;
+    }
+    int count[3] = {0}, dev = adt_path_offset(adt, "/arm-io");
+    if (dev < 0)
+        return;
+    /* Every segment can add one node: the record of the added ones must hold all of them. */
+    u64 segs = 0;
+    ADT_FOREACH_CHILD(adt, dev)
+    {
+        segs += adt_count_fw_logs(dev);
+        int nub = adt_first_child_offset(adt, dev);
+        for (int k = adt_get_child_count(adt, dev); k--; nub = adt_next_sibling_offset(adt, nub))
+            segs += adt_count_fw_logs(nub);
+    }
+    if (segs > ARRAY_SIZE(fw_log_named)) {
+        printf("FDT: %lu firmware log segments exceed the record of %lu: left as they were\n", segs,
+               (u64)ARRAY_SIZE(fw_log_named));
+        return;
+    }
+    fw_log_named_count = 0;
+    dev = adt_path_offset(adt, "/arm-io");
+    ADT_FOREACH_CHILD(adt, dev)
+    {
+        dt_reserve_fw_logs_of(dev, owner[0], owner[1], ram_start, ram_end, count);
+        int nub = adt_first_child_offset(adt, dev);
+        for (int k = adt_get_child_count(adt, dev); k--; nub = adt_next_sibling_offset(adt, nub))
+            dt_reserve_fw_logs_of(nub, owner[0], owner[1], ram_start, ram_end, count);
+    }
+    fw_log_named_count = 0;
+    printf("FDT: RTBuddySeg firmware logs: %d named no-map, %d already reserved, %d left as they "
+           "were\n",
+           count[0], count[1], count[2]);
 }
 
 static int dt_set_display(void)
@@ -9079,10 +10019,7 @@ static int dt_set_display(void)
         return ret;
 
     /* Without them the firmware-27 DCP does not start, but the rest of the boot does. */
-    if (dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
-        printf("FDT: dcp: publishing the firmware clocks failed\n");
-    if (dt_set_dcp_fw27_clocks("dcpext", "/arm-io/dispext0"))
-        printf("FDT: dcpext: publishing the firmware clocks failed\n");
+    dt_set_dcp_fw27_clocks_all();
 
     /*
      * Ignore errors for dcpext firmware reservation, nodes should be disabled
@@ -9099,8 +10036,13 @@ static int dt_set_display(void)
     ret = dt_vram_reserved_region(disp_cfg ? disp_cfg->dcp_alias : "dcp", "disp0");
     if (ret)
         return ret;
-    if (!fdt_node_check_compatible(dt, 0, "apple,t8142"))
-        return dt_reserve_m5_display_segments();
+    if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
+        ret = dt_reserve_m5_display_segments("dcp", "/arm-io/dcp/iop-dcp-nub", false);
+        if (ret)
+            return ret;
+        /* Never fatal: a refused external DCP only stays disabled. */
+        dt_set_t8142_dcpexts();
+    }
     return 0;
 }
 
@@ -9378,6 +10320,41 @@ static bool skip_pmp_prop(const char *prop_name)
     return false;
 }
 
+/* The high bit of the ADT property size is a flag. */
+static u32 pmp_prop_size(const struct adt_property *prop)
+{
+    return prop->size & 0x7fffffff;
+}
+
+static const char *const pmp_bootargs[] = {"dram-channel-disable", "pmc-msg-disabled",
+                                           "soc-chip-variant"};
+
+/* Count each property as new, including its name in the string table. */
+static size_t pmp_fdt_prop_space(size_t name_len, size_t value_len)
+{
+    return sizeof(struct fdt_property) + ALIGN_UP(value_len, 4) + name_len + 1;
+}
+
+static size_t pmp_alias_space(int pmp_iop_anode)
+{
+    size_t need = pmp_fdt_prop_space(strlen("apple,board-id"), sizeof(u32)) +
+                  pmp_fdt_prop_space(strlen("apple,dram-vendor-id"), sizeof(u32)) +
+                  pmp_fdt_prop_space(strlen("apple,dram-capacity"), sizeof(u32)) +
+                  pmp_fdt_prop_space(strlen("status"), sizeof("okay"));
+
+    for (size_t i = 0; i < ARRAY_SIZE(pmp_bootargs); i++)
+        need += pmp_fdt_prop_space(strlen("apple,") + strlen(pmp_bootargs[i]), sizeof(u32));
+
+    ADT_FOREACH_PROPERTY(adt, pmp_iop_anode, prop)
+    {
+        if (skip_pmp_prop(prop->name))
+            continue;
+        need +=
+            pmp_fdt_prop_space(strlen("apple,tunable-") + strlen(prop->name), pmp_prop_size(prop));
+    }
+    return need;
+}
+
 /* Reads a u32 ADT property only if it is exactly four bytes long. */
 static int adt_get_u32_exact(int node, const char *name, u32 *val)
 {
@@ -9427,7 +10404,7 @@ static int dt_fill_pmp(int pmp_node)
             continue;
         char prop_name[128];
         snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
-        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
+        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, pmp_prop_size(prop)))
             bail("FDT: failed to transfer pmp tunable\n");
     }
     return 0;
@@ -9472,6 +10449,29 @@ static int dt_set_pmp(void)
         bail("ADT: failed to get dram vendor id\n");
     ADT_GETPROP(adt, pmp_iop_anode, "dram-capacity", &dram_capacity);
 
+    /* Check the whole alias handoff before writing any PMP data. */
+    size_t total = fdt_totalsize(dt);
+    size_t strings_offset = fdt_off_dt_strings(dt);
+    size_t strings_size = fdt_size_dt_strings(dt);
+    if (strings_offset > total || strings_size > total - strings_offset)
+        bail("FDT: invalid strings block while checking the PMP handoff\n");
+
+    size_t need = pmp_alias_space(pmp_iop_anode);
+    size_t free_space = total - strings_offset - strings_size;
+    if (need > free_space) {
+        int status_len;
+        const char *status = fdt_getprop(dt, pmp_node, "status", &status_len);
+
+        /* An absent status also enables the node. */
+        if ((!status || status_len != sizeof("disabled") ||
+             memcmp(status, "disabled", sizeof("disabled"))) &&
+            fdt_setprop_string(dt, pmp_node, "status", "disabled"))
+            bail("FDT: cannot disable pmp after handoff shortfall\n");
+        printf("FDT: pmp left disabled: handoff needs up to %zu bytes, %zu free\n", need,
+               free_space);
+        return 0;
+    }
+
     if (fdt_setprop_u32(dt, pmp_node, "apple,board-id", board_id))
         bail("FDT: failed to set board id\n");
     if (fdt_setprop_u32(dt, pmp_node, "apple,dram-vendor-id", dram_vendor_id))
@@ -9486,7 +10486,7 @@ static int dt_set_pmp(void)
             continue;
         char prop_name[128];
         snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
-        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
+        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, pmp_prop_size(prop)))
             bail("FDT: failed to transfer pmp tunable");
     }
 
@@ -9495,8 +10495,6 @@ static int dt_set_pmp(void)
      * apple,<name>; the firmware's default for each is 0. iBoot sets them where they
      * apply, e.g. a J616s has dram-channel-disable 0xffff0000.
      */
-    static const char *const pmp_bootargs[] = {"dram-channel-disable", "pmc-msg-disabled",
-                                               "soc-chip-variant"};
     for (size_t i = 0; i < ARRAY_SIZE(pmp_bootargs); i++) {
         u32 val;
         char arg_name[64];
@@ -9511,7 +10509,8 @@ static int dt_set_pmp(void)
     }
 
     pmp_node = fdt_path_offset(dt, "pmp");
-    fdt_setprop_string(dt, pmp_node, "status", "okay");
+    if (fdt_setprop_string(dt, pmp_node, "status", "okay"))
+        bail("FDT: failed to enable pmp after handoff\n");
     return 0;
 }
 
@@ -9874,6 +10873,17 @@ static int dt_set_sio_fwdata(const char *adt_path, const char *fdt_alias)
             bail_cleanup("FDT: couldn't append to SIO parameters\n");
     }
 
+    /* The parameters for a firmware that reports protocol 10, where they differ */
+    for (int i = 0; i < siodata->num_fwparams_v10; i++) {
+        struct sio_fwparam *param = &siodata->fwparams_v10[i];
+
+        if (fdt_appendprop_u32(dt, node, "apple,sio-firmware-params-v10", param->key))
+            bail_cleanup("FDT: couldn't append to SIO parameters\n");
+
+        if (fdt_appendprop_u32(dt, node, "apple,sio-firmware-params-v10", param->value))
+            bail_cleanup("FDT: couldn't append to SIO parameters\n");
+    }
+
 err:
     free(siodata);
     return 0;
@@ -10082,6 +11092,172 @@ static int dt_find_aop(char *path, size_t size)
 }
 
 /*
+ * Reserve [paddr, paddr + size) as a no-map RAM-only node under /reserved-memory without calling
+ * bail() on error, so the caller can decide whether a failure disables a halted coprocessor or
+ * stops the boot. Returns 1 when an existing no-map reservation already covers the range (leaving
+ * it untouched), 0 when a new node was added, or -1 on a conflicting/overlapping reservation or an
+ * FDT error (removing any half-built node with fdt_nop_node()).
+ */
+static int dt_try_reserve_ram_mem(const char *node_name, const char *compat, u64 paddr, u64 size)
+{
+    int resv_node = fdt_path_offset(dt, "/reserved-memory");
+    if (resv_node < 0 || !size || paddr > UINT64_MAX - size)
+        return -1;
+
+    u64 end = paddr + size;
+    bool covered = false;
+    int sub;
+    fdt_for_each_subnode(sub, dt, resv_node)
+    {
+        const char *sname = fdt_get_name(dt, sub, NULL);
+        bool same_name = sname && !strcmp(sname, node_name);
+        int rlen = 0;
+        const fdt64_t *reg = fdt_getprop(dt, sub, "reg", &rlen);
+
+        if (!reg || rlen != 16) {
+            if (same_name) {
+                printf("FDT: /reserved-memory/%s already exists without a valid reg\n", node_name);
+                return -1;
+            }
+            continue;
+        }
+        u64 base = fdt64_ld(&reg[0]), count = fdt64_ld(&reg[1]);
+        if (!count || base > UINT64_MAX - count) {
+            if (same_name) {
+                printf("FDT: /reserved-memory/%s has an invalid reg\n", node_name);
+                return -1;
+            }
+            continue;
+        }
+        u64 send = base + count;
+        if (paddr >= send || end <= base) {
+            if (same_name) {
+                printf("FDT: /reserved-memory/%s already exists for [0x%lx, +0x%lx)\n", node_name,
+                       base, count);
+                return -1;
+            }
+            continue;
+        }
+        if (fdt_getprop(dt, sub, "no-map", NULL) && paddr >= base && end <= send) {
+            covered = true;
+            continue;
+        }
+        printf("FDT: [0x%lx, +0x%lx) conflicts with /reserved-memory/%s [0x%lx, +0x%lx)\n", paddr,
+               size, sname ? sname : "?", base, count);
+        return -1;
+    }
+    if (covered)
+        return 1;
+
+    int node = fdt_add_subnode(dt, resv_node, node_name);
+    if (node < 0)
+        return -1;
+
+    uint32_t phandle;
+    u64 reg[2] = {cpu_to_fdt64(paddr), cpu_to_fdt64(size)};
+    if (fdt_generate_phandle(dt, &phandle) || fdt_setprop_u32(dt, node, "phandle", phandle) ||
+        fdt_setprop(dt, node, "reg", reg, sizeof(reg)) ||
+        fdt_setprop_string(dt, node, "compatible", compat) ||
+        fdt_setprop_empty(dt, node, "no-map")) {
+        fdt_nop_node(dt, node);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Reserve, RAM only, every firmware segment of the ADT AOP @anode that lies in the OS's memory.
+ * On a locked DART the OS keeps the firmware's own mappings, so the segments get no IOVA, but the
+ * pages under them must not be reused while the AOP uses them (its log, which iBoot places in the
+ * OS's memory at a new address every boot, and which the locked tables do not map at handoff, so
+ * the ADT's phys field is its only description). The nodes are named as the segment reservation
+ * names them. Segments are rounded out to 16K pages; a segment list longer than 64 entries, a
+ * wrapping address/size, a segment in the OS's memory outside the ADT's DRAM, a conflicting
+ * /reserved-memory node, or a full tree fails the reservation.
+ */
+static int dt_reserve_aop_os_ram(int anode, const char *path)
+{
+    u64 lo = kboot_ram_base(), ram_size = kboot_ram_size(), dram, dram_size;
+    int chosen = adt_path_offset(adt, "/chosen");
+    u32 len = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, anode, "segment-ranges", &len);
+
+    if (!seg || !len)
+        return 0;
+    if (!ram_size || lo > UINT64_MAX - ram_size || len % sizeof(*seg) || len / sizeof(*seg) > 64 ||
+        chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size ||
+        dram > UINT64_MAX - dram_size) {
+        printf("FDT: %s: the ADT's segment list or DRAM bounds are not usable\n", path);
+        return -1;
+    }
+    u64 hi = lo + ram_size, dram_end = dram + dram_size;
+
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        struct adt_segment_ranges r;
+        memcpy(&r, &seg[i], sizeof(r));
+        if (!r.size)
+            continue;
+        if (r.phys > UINT64_MAX - (u64)r.size) {
+            printf("FDT: %s: firmware segment [0x%lx, +0x%x) wraps\n", path, r.phys, r.size);
+            return -1;
+        }
+        u64 raw_end = r.phys + (u64)r.size;
+        if (raw_end > UINT64_MAX - (SZ_16K - 1)) {
+            printf("FDT: %s: firmware segment [0x%lx, +0x%x) wraps on 16K rounding\n", path, r.phys,
+                   r.size);
+            return -1;
+        }
+        u64 start = ALIGN_DOWN(r.phys, SZ_16K);
+        u64 end = ALIGN_UP(raw_end, SZ_16K);
+        u64 size = end - start;
+        if (start >= hi || end <= lo)
+            continue;
+        if (start < dram || end > dram_end) {
+            printf("FDT: %s: firmware segment [0x%lx, +0x%lx) is outside DRAM\n", path, start,
+                   size);
+            return -1;
+        }
+
+        char name[64];
+        snprintf(name, sizeof(name), "asc-firmware@%lx", start);
+        int ret = dt_try_reserve_ram_mem(name, "apple,asc-mem", start, size);
+        if (ret < 0)
+            return -1;
+        if (ret > 0)
+            printf("FDT: %s: firmware segment [0x%lx, +0x%lx) is already reserved no-map\n", path,
+                   start, size);
+        else
+            printf("FDT: %s: firmware segment [0x%lx, +0x%lx) is in the OS's memory: reserved, RAM "
+                   "only\n",
+                   path, start, size);
+    }
+    return 0;
+}
+
+static int dt_aop_locked_dart_handoff(int anode, const char *path)
+{
+    printf("FDT: %s: preserving firmware mappings in locked DART\n", path);
+    if (!dt_reserve_aop_os_ram(anode, path))
+        return 0;
+
+    asc_dev_t *asc = asc_init("/arm-io/aop");
+    bool running = !asc || asc_cpu_running(asc);
+    if (asc)
+        asc_free(asc);
+    if (running)
+        bail("FDT: %s: the AOP is running and its firmware RAM cannot be reserved\n", path);
+
+    char found_path[64];
+    int node = dt_find_aop(found_path, sizeof(found_path));
+    /* fdt_disable_node() needs no space: this cannot fail on the node just found */
+    if (node < 0 || fdt_disable_node(dt, node))
+        bail("FDT: %s: cannot keep the AOP off\n", path);
+    printf("FDT: %s: its firmware RAM could not be reserved: AOP kept off\n", path);
+    return 0;
+}
+
+/*
  * The AOP's accelerometer and gyroscope services wait for their calibration, which the ADT
  * carries on every AOP. iBoot starts the AOP firmware and leaves the part that does not run
  * from the AOP's own SRAM in DRAM, where the ADT lists its segments: the external code
@@ -10118,13 +11294,17 @@ static int dt_set_aop_firmware(void)
         return 0;
     }
 
-    /* Linux keeps the firmware roots when this DART's TTBR/TCR lock is set. */
+    /*
+     * Linux keeps the firmware roots when this DART's TTBR/TCR lock is set. The RAM under any
+     * segment in the OS's memory is still reserved; without that the firmware would write into
+     * pages the OS reuses. If the reservation fails, a halted AOP is kept off, which needs no
+     * space (fdt_disable_node()): the OS then never starts it, and its firmware never writes
+     * those pages. A running AOP writes them whatever the tree says, so then no boot is safe.
+     */
     u64 dart_base, dart_size;
     if (!dt_device_dart_mmio(node, anode, &dart_base, &dart_size) &&
-        dart_t8110_is_locked(dart_base, dart_size)) {
-        printf("FDT: %s: preserving firmware mappings in locked DART\n", path);
-        return 0;
-    }
+        dart_t8110_is_locked(dart_base, dart_size))
+        return dt_aop_locked_dart_handoff(anode, path);
 
     if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true))
         printf("FDT: %s: reserving the AOP firmware segments failed\n", path);
@@ -10616,7 +11796,7 @@ static int dt_set_isp(void)
 }
 
 /*
- * J713 and J604: iBoot loads the camera firmware, and the kernel starts it as iBoot left it. The
+ * T8132: iBoot loads the camera firmware, and the kernel starts it as iBoot left it. The
  * segments move with the boot firmware, so the device tree describes the ISP disabled, with empty
  * placeholders isp-firmware-text and isp-firmware-data and an isp-heap window for the
  * firmware's main memory. Fill the placeholders from this boot's ADT isp segment-ranges: reg,
@@ -10811,19 +11991,22 @@ static int dt_set_j713_isp_one(unsigned int unused)
 }
 
 /*
- * Only a disabled ISP with the placeholders is a handoff target. A tree without them (no camera,
- * or a kernel that reserves the firmware itself and enables the ISP) is left as it is. A refused
- * handoff leaves the camera disabled; the boot goes on.
+ * Only a disabled ISP with the placeholders is a handoff target, on any T8132 machine: the tree
+ * asks for the handoff by describing the ISP disabled with isp-firmware-text, isp-firmware-data
+ * and the isp-heap window, as t8132-isp.dtsi does for every T8132 laptop. A tree without them (no
+ * camera, or a kernel that reserves the firmware itself and enables the ISP) is left as it is. A
+ * refused handoff leaves the camera disabled; the boot goes on.
  */
 static void dt_set_j713_isp(void)
 {
-    if (chip_id != T8132 || (fdt_node_check_compatible(dt, 0, "apple,j713") &&
-                             fdt_node_check_compatible(dt, 0, "apple,j604")))
-        return; /* No other M4 board's camera handoff is qualified. */
+    if (chip_id != T8132)
+        return;
     int isp = fdt_node_offset_by_compatible(dt, -1, "apple,t8132-isp");
     const char *status = isp < 0 ? NULL : fdt_getprop(dt, isp, "status", NULL);
     if (!status || strcmp(status, "disabled") ||
-        fdt_path_offset(dt, "/reserved-memory/isp-firmware-text") < 0)
+        fdt_path_offset(dt, "/reserved-memory/isp-firmware-text") < 0 ||
+        fdt_path_offset(dt, "/reserved-memory/isp-firmware-data") < 0 ||
+        fdt_path_offset(dt, "/reserved-memory/isp-heap") < 0)
         return;
     if (dt_display_transaction(dt_set_j713_isp_one, 0))
         printf("FDT: J713 ISP handoff refused; keeping the camera disabled\n");
@@ -12134,6 +13317,11 @@ void kboot_set_config_lost(void)
     chosen_lost = true;
 }
 
+bool kboot_config_lost(void)
+{
+    return chosen_lost;
+}
+
 void kboot_delete_chosen(const char *name)
 {
     if (!name)
@@ -12567,10 +13755,32 @@ static int dt_prepare_t8152(void)
         return -1;
     if (dt_set_mac_addresses())
         return -1;
+    /*
+     * USB-C: the ATC PHYs', USB4 routers', PCIe-C and their DARTs' tunables and the routers'
+     * DROMs, from this Mac's ADT, for the nodes the device tree links by alias (atcphyN,
+     * usb4-N-*: ADT acioN/apciecN/atc-phyN). Fail-soft: a port without them stays off in Linux.
+     */
+    if (kboot_setup_atc(dt))
+        printf("FDT: T8152 ATC tunables not set\n");
+    if (dt_set_acio_tunables())
+        printf("FDT: T8152 USB4 router tunables not set\n");
+    if (dt_set_pcie_tunables())
+        printf("FDT: T8152 PCIe-C tunables not set\n");
+    /*
+     * Only the USB4 routers' and PCIe-C DARTs: the other T8152 DARTs are locked or
+     * firmware-owned, and their device tree describes them without a table.
+     */
+    static const char *const usb4_darts[] = {"dart-acio", "dart-apciec", NULL};
+    dt_copy_dart_tunables(usb4_darts);
     if (dt_set_fb2_t8152())
         return -1;
+    /*
+     * After dt_set_memory() so MTE tag storage has been carved out and /memory carries the
+     * resulting RAM bounds. No-map log nodes do not alter /memory.
+     */
     if (dt_set_memory())
         return -1;
+    dt_reserve_rtbuddyseg_logs();
     if (fdt_pack(dt))
         bail("FDT: fdt_pack() failed\n");
 
@@ -12677,6 +13887,7 @@ int kboot_prepare_dt(void *fdt)
 
     dt_ready = false;
     dt_retained_live_dcp = false;
+    retained_rsv_count = 0;
 
     if (!ctxr_exec_os_may_start())
         return -1;
@@ -12780,8 +13991,11 @@ int kboot_prepare_dt(void *fdt)
                 bail("FDT: retained heap extent overflows\n");
             u64 heap_start = ALIGN_DOWN(image_end, SZ_16K);
             u64 heap_end = ALIGN_UP(heap_top, SZ_16K);
+            int heap_rsv = fdt_num_mem_rsv(dt);
             if (heap_end > ram_end || dt_reserve_retained_span(heap_start, heap_end))
                 bail("FDT: couldn't reserve retained heap\n");
+            if (heap_rsv >= 0)
+                dt_record_retained_rsv(heap_rsv);
             image_end = heap_start;
             live_rtkit_hi = heap_end;
             printf("FDT: retained heap [0x%lx, 0x%lx)\n", heap_start, heap_end);
@@ -12790,8 +14004,11 @@ int kboot_prepare_dt(void *fdt)
     /* The loader-allocated buffers of a DCP handed on running must lie in what is kept. */
     live_rtkit_lo = image_start;
     live_rtkit_hi = max(live_rtkit_hi, image_end);
+    int img_rsv = fdt_num_mem_rsv(dt);
     if (dt_reserve_retained_span(image_start, image_end))
         bail("FDT: couldn't add reservation for aura and inherited high-water\n");
+    if (img_rsv >= 0)
+        dt_record_retained_rsv(img_rsv);
 
     /*
      * T8152: keep everything below this image as well (the earlier stage and
@@ -12893,6 +14110,7 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_chosen())
         return -1;
     dt_set_trial_watchdog();
+    dt_set_wdt_reconfig();
     if (dt_check_trial_esp())
         return -1;
     secboot_export_fdt(dt);
@@ -12979,6 +14197,8 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_aop_firmware())
         return -1;
+    if (dt_set_mtp_dma_window())
+        return -1;
     if (dt_set_isp())
         return -1;
     dt_set_j713_isp();
@@ -13019,6 +14239,15 @@ int kboot_prepare_dt(void *fdt)
      */
     if (dt_set_memory())
         return -1;
+    /*
+     * After the display, sleep, firmware and MTE reservations above, so that it checks logs
+     * against the resulting RAM bounds and never trips kboot_mte_reserve(). No-map log nodes do
+     * not alter /memory. The J614s SEP split below only cuts sep-firmware around the no-map nodes
+     * inside it; a log inside sep-firmware is held by it and one that only partly lies in it is
+     * refused, so no node named here is cut. The J614s ISP finish in kboot_boot() reserves
+     * nothing.
+     */
+    dt_reserve_rtbuddyseg_logs();
     if (dt_set_smbios_firmware())
         return -1;
 
@@ -13060,7 +14289,7 @@ int kboot_prepare_dt(void *fdt)
         bail("FDT: J813 N1 preparation failed\n");
 
     /* Fail-soft: one malformed or unmatched ADT table must not stop boot. */
-    dt_copy_dart_tunables();
+    dt_copy_dart_tunables(NULL);
 
     /* T8140 PCIe status is known only after pcie_init() in kboot_boot(). */
     if (chip_id != T8140 && fdt_pack(dt))
@@ -13251,8 +14480,10 @@ int kboot_boot(void *kernel)
         return -1;
     }
     /* Linux's deep sleep needs them to bring ANS's APCIe block back. */
-    if (!ret && pcie_apcie_tables_fdt(dt, dt_bufsize) < 0)
+    int apcie_tables = ret ? 0 : pcie_apcie_tables_fdt(dt, dt_bufsize);
+    if (apcie_tables < 0)
         printf("kboot: APCIe tables not published; deep sleep stays refused\n");
+    pcie_set_os_restores_apcie(apcie_tables > 0);
     if (chip_id == T8140) {
         if (ret < 0) {
             printf("kboot: refusing T8140 handoff after partial PCIe setup\n");

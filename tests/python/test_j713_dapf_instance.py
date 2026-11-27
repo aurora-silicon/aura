@@ -120,8 +120,6 @@ static int fdt_stringlist_search(const void *dt,int id,const char *key,const cha
  if(!strcmp(key,"linux-enablement-mac,dapf-halted-handoff"))return (halted_requested&(1U<<(n-4)))?0:-1;
  return ((!strcmp(key,"linux-enablement-mac,dapf-handoff")?requested:power_requested)&(1U<<(n-4)))?0:-1;
 }
-static int fdt_node_check_compatible(const void *dt,int node,const char *compat)
-{(void)dt;(void)node;(void)compat;return 0;}
 '''
 
 TESTS = r'''
@@ -200,6 +198,10 @@ int main(void) {
  reset();halted_requested=2;assert(dapf_init_j713((void *)1)==1);
  assert(asc_inits==1&&!asc_frees);preserved();
  reset();assert(dapf_init_j713((void *)1)==1);assert(!asc_inits);preserved();
+ /* The tree, not a board list, decides: every T8132 tree reaches dapf_init_j713(). */
+ reset();assert(dapf_init_fdt((void *)1)==1);
+ reset();handoff=false;assert(!dapf_init_fdt((void *)1));preserved();
+ reset();assert(!dapf_init_fdt(NULL));preserved();
  /* The central T8132 branch is the only change to the legacy flow. */
  reset();chip_id=0x8110;dart_gates=true;assert(!dapf_init("/arm-io/dart-aop",1));
  assert(filter_writes==5*(nodes[0].config_len/52)&&dart_enables==1&&disables==1);
@@ -253,6 +255,7 @@ def test_j713_instance_and_power_flow(tmp_path):
         ("inactive consumer", 'if (powered <= 0)', 'if (powered <= 0 && false)'),
         ("halted check", "bool running = !asc || asc_cpu_running(asc);",
          "bool running = !asc || (asc_cpu_running(asc) && false);"),
+        ("tree decides", "return fdt ? dapf_init_j713((void *)fdt) : 0;", "return 0;"),
     ]
     for title, old, new in controls:
         bad = harness.replace(old, new, 1)

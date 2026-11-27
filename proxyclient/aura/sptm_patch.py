@@ -11,6 +11,10 @@ import struct
 
 NOP = 0xD503201F
 MTE_MARKER = b"sptm_init_mte_boundaries"
+# An SPTM that checks the CTRR/CTXR ranges iBoot locked (M4 and later) carries this function name.
+# One that locks CTRR itself (ctrr_lock_boot, earlier SoCs) has no such checks to patch: aura
+# answers its CTRR lock reads as locked (sptm_virt_gl.c), so it leaves the ranges alone.
+CTXR_MARKER = b"ctXr_check_all_regions"
 
 
 def mask(word):
@@ -108,7 +112,8 @@ def _b(src, dst):
 def plan(image, entry_off):
     """The patches for one SPTM image: a dict with
     patches: [(what, offset from entry, mask, expected, replacement)],
-    ctrr_stash_off: SPTM's CTRR stash offset (aura's sptm_virt_ctrr_stash_off),
+    ctrr_stash_off: SPTM's CTRR stash offset (aura's sptm_virt_ctrr_stash_off; 0 if it has no
+        CTXR checks),
     mte: (offset from entry, expected words, replacement words) or None.
     Raises SptmPatchError if a site is missing or not unique."""
     words = _words(image)
@@ -120,19 +125,22 @@ def plan(image, entry_off):
 
     i = _one(words, APSTS, "APSTS poll") + 5
     patch("APSTS poll", i, NOP)
-    c = _one(words, CTRR, "CTRR check") + 6
-    tail = _branch_target(words, c)  # the check's success tail
-    patch("CTRR check", c, _b(c, tail))
-    r = _one(words, CTRR_RESET, "CTRR reset-path check") + 8
-    patch("CTRR reset-path check", r, _b(r, tail))
-    x = _one(words, CTXR_LOCK, "ctXr lock check")
-    for k in (3, 6, 9, 12):
-        patch("ctXr lock check", x + k, NOP)
-    a = _one(words, AMCC, "AMCC CTRR match")
-    for k in (8, 11, 26, 29):
-        patch("AMCC CTRR match", a + k, NOP)
-    # The stash SPTM keeps its expected CTRR bounds in: the offset its AMCC check loads them from.
-    stash = ((words[a + 3] >> 10) & 0xFFF) * 8
+    stash = 0
+    if CTXR_MARKER in image:
+        c = _one(words, CTRR, "CTRR check") + 6
+        tail = _branch_target(words, c)  # the check's success tail
+        patch("CTRR check", c, _b(c, tail))
+        r = _one(words, CTRR_RESET, "CTRR reset-path check") + 8
+        patch("CTRR reset-path check", r, _b(r, tail))
+        x = _one(words, CTXR_LOCK, "ctXr lock check")
+        for k in (3, 6, 9, 12):
+            patch("ctXr lock check", x + k, NOP)
+        a = _one(words, AMCC, "AMCC CTRR match")
+        for k in (8, 11, 26, 29):
+            patch("AMCC CTRR match", a + k, NOP)
+        # The stash SPTM keeps its expected CTRR bounds in: the offset its AMCC check loads them
+        # from.
+        stash = ((words[a + 3] >> 10) & 0xFFF) * 8
 
     mte = None
     if MTE_MARKER in image:

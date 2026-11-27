@@ -1664,6 +1664,12 @@ static bool s2r_ring_alloc(u64 ring_bytes)
     return true;
 }
 
+/* A ring for a tracer that has no sleep path (the SEP trace): the big one, if none exists. */
+bool sptm_virt_s2r_ring_ensure(void)
+{
+    return sptm_virt_s2r_ring || s2r_ring_alloc(S2R_RING_BYTES_BIG);
+}
+
 /* A missing sleep profile must not disable link keeping or passive live recording. */
 static void s2r_no_sleep_setup(bool cdc, u64 flags, const char *missing)
 {

@@ -15,4 +15,5 @@ typedef int32_t s32;
 typedef int64_t s64;
 #define PACKED    __attribute__((packed))
 #define UNUSED(x) (void)(x)
+#define AURA_XTEXT
 #endif
