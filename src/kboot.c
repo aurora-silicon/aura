@@ -9952,6 +9952,17 @@ static int dt_set_display_t8142(void)
 {
     if (!fdt_get_alias(dt, "dcp"))
         return 0;
+#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
+    /*
+     * A Stage 1 chains the Stage 2 that hands the display over, and has no room
+     * for the handoff below the DCP log buffer. A kernel it boots itself keeps
+     * the boot framebuffer, as after a refused handoff.
+     */
+    dt_t8142_handoff_result("dcp", "not in Stage 1");
+    if (dt_refuse_t8142_display())
+        bail("FDT: cannot withdraw the T8142 display nodes\n");
+    return 0;
+#endif
     /* A refused session may still DMA; its proven RAM/table reservations stay. */
     const char *result = "translation reservation failed";
     if (kboot_t8142_display_reserve(dt) == 0) {
