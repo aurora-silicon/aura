@@ -63,8 +63,8 @@ READELF = tool("llvm-readelf", "aarch64-linux-gnu-readelf", "readelf")
 OBJCOPY = tool("llvm-objcopy", "aarch64-linux-gnu-objcopy", "objcopy")
 
 
-def assemble(tmp_path):
-    obj = tmp_path / "image.o"
+def assemble(tmp_path, source=IMAGE, name="image"):
+    obj = tmp_path / f"{name}.o"
     clang = shutil.which("clang")
     if clang:
         cmd = [clang, "--target=aarch64-linux-gnu", "-c", "-x", "assembler", "-", "-o", str(obj)]
@@ -73,7 +73,7 @@ def assemble(tmp_path):
         if not gcc:
             pytest.skip("needs an AArch64 assembler")
         cmd = [gcc, "-c", "-x", "assembler", "-", "-o", str(obj)]
-    subprocess.run(cmd, input=IMAGE, text=True, check=True)
+    subprocess.run(cmd, input=source, text=True, check=True)
     return obj
 
 

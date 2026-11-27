@@ -44,18 +44,24 @@ class LinkedProgram:
 
         addrs = self._load_elf_symbols(self.base_object, self.u.proxy.get_base())
 
-        # sanity check: compare the .rela table between ELF and aura image on target
-        rela_base = addrs["_rela_start"]
-        rela_length = addrs["_rela_end"] - rela_base
-        rela_target = self.u.iface.readmem(rela_base, rela_length)
+        # sanity check: compare the relocation tables between ELF and aura image on target
+        # (apply_relr() and apply_rela() only read them, so they match the file)
+        for section, start, end in ((".relr.dyn", "_relr_start", "_relr_end"),
+                                    (".rela.dyn", "_rela_start", "_rela_end")):
+            if start not in addrs:
+                continue
+            length = addrs[end] - addrs[start]
+            if not length:
+                continue
+            table_target = self.u.iface.readmem(addrs[start], length)
 
-        tmp = os.path.join(tempfile.mkdtemp(), "bin")
-        path = os.path.join(self.SOURCE_ROOT, self.base_object)
-        run_tool(_toolchain.OBJCOPY, "-O", "binary", path, tmp, "--only-section=.rela.dyn")
-        rela_objfile = open(tmp, "rb").read()
+            tmp = os.path.join(tempfile.mkdtemp(), "bin")
+            path = os.path.join(self.SOURCE_ROOT, self.base_object)
+            run_tool(_toolchain.OBJCOPY, "-O", "binary", path, tmp, f"--only-section={section}")
+            table_objfile = open(tmp, "rb").read()
 
-        if rela_objfile[:len(rela_target)] != rela_target:
-            raise Exception(f"Mismatch between {self.base_object} and image on target")
+            if table_objfile[:length] != table_target:
+                raise Exception(f"Mismatch between {self.base_object} and image on target")
 
     def aura_is_macho(self):
         p = self.u.proxy

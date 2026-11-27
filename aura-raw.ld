@@ -65,6 +65,15 @@ SECTIONS {
         *(.rodata.*)
         . = ALIGN(8);
     } :rodata
+    /*
+     * The relative relocations, packed as RELR when the linker can (Makefile LD_RELR) and
+     * applied by apply_relr() (startup.c). Anything left unpacked stays in .rela.dyn below.
+     */
+    .relr.dyn : {
+        _relr_start = .;
+        *(.relr.dyn)
+        _relr_end = .;
+    } :rodata
     .rela.dyn : {
         _rela_start = .;
         *(.rela)

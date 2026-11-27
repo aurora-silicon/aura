@@ -286,6 +286,13 @@ _start:
 
     adrp x0, _base
     mov x20, x0
+    adrp x1, _relr_start
+    add x1, x1, :lo12:_relr_start
+    adrp x2, _relr_end
+    add x2, x2, :lo12:_relr_end
+    bl apply_relr
+
+    mov x0, x20
     adrp x1, _rela_start
     add x1, x1, :lo12:_rela_start
     adrp x2, _rela_end

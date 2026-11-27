@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: MIT
 """How much a Stage 1 image can still grow before it reaches the DCP log buffer.
 
-aura-raw.ld puts the code (.init and .text), .rodata + .rela.dyn and .data on 64 KiB steps, and
-everything up to _file_vital_end must end below _file_limit (0x120000, see aura-raw.ld). The link
-fails once it does not. This reports how close a build is, so a change or a toolchain that eats
-the last few KiB fails in CI before a distribution's toolchain trips over it:
+aura-raw.ld puts the code (.init and .text), .rodata + .relr.dyn + .rela.dyn and .data on 64 KiB
+steps, and everything up to _file_vital_end must end below _file_limit (0x120000, see
+aura-raw.ld). The link fails once it does not. This reports how close a build is, so a change or a
+toolchain that eats the last few KiB fails in CI before a distribution's toolchain trips over it:
 
   data   bytes .data can grow before _file_vital_end reaches the limit
   text/rodata
