@@ -62,6 +62,7 @@ void sptm_virt_amx_child(void);
     })
 
 /* sptm_virt_cl4.c */
+void sptm_virt_world_alloc(void);
 bool sptm_virt_in_cl4(void);
 enum {
     SPTM_WEV_GERET,

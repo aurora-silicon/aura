@@ -602,6 +602,9 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
 
     printf("\nSPTM-virt: entering SPTM at 0x%lx, boot_args 0x%lx\n", sptm_entry_pa,
            sptm_handoff_pa);
+    /* Per-CPU state for every cpu-id, in the heap: MAX_CPUS wide it is 90 KiB, too much .bss. */
+    nv2_alloc_cpus();
+    sptm_virt_world_alloc();
     nv2_active = true;
     nv2_guarded = true;
 

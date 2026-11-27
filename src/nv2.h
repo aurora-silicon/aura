@@ -25,6 +25,8 @@ extern bool nv2_probe_active;
  */
 extern bool nv2_guarded;
 
+/* The per-CPU NV2 state, from the heap; before nv2_active is set. */
+void nv2_alloc_cpus(void);
 /* Allocate the per-CPU NV pages; before the OS memory map is fixed. */
 void nv2_prepare(void);
 void nv2_cpu_reset_invalidate(int cpu);

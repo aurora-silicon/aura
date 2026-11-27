@@ -208,7 +208,8 @@ struct nv2_cpu {
     u64 last_unknown; /* key | read << 63 of the latest unemulated register */
 } ALIGNED(64);
 
-static struct nv2_cpu nv2_cpus[MAX_CPUS];
+/* MAX_CPUS entries from the heap (nv2_alloc_cpus): 64 KiB that the image need not carry in .bss. */
+static struct nv2_cpu *nv2_cpus;
 
 /*
  * NV2_TRACE development builds log NV2 events to a per-CPU ring at
@@ -272,6 +273,25 @@ static u8 *nv2_pages[MAX_CPUS];
 static inline struct nv2_cpu *nv2_this(void)
 {
     return &nv2_cpus[smp_id()];
+}
+
+void nv2_alloc_cpus(void)
+{
+    if (nv2_cpus)
+        return;
+    nv2_cpus = memalign(64, MAX_CPUS * sizeof(*nv2_cpus));
+    if (!nv2_cpus)
+        panic("NV2: no memory for the per-CPU state\n");
+    memset(nv2_cpus, 0, MAX_CPUS * sizeof(*nv2_cpus));
+    /*
+     * A core back from reset runs sptm_virt_cpu_reset() with its MMU off until nv2_enter_os()
+     * turns it on, and a synchronous exception in that window reaches nv2_handle_sync().
+     * smp_prepare_guest_resets() cleans the image for such readers, but the heap is outside
+     * it: put the zeroed table and the pointer in DRAM before nv2_active can be set.
+     */
+    dc_cvac_range(nv2_cpus, MAX_CPUS * sizeof(*nv2_cpus));
+    dc_cvac_range(&nv2_cpus, sizeof(nv2_cpus));
+    sysop("dsb sy");
 }
 
 void nv2_prepare(void)
@@ -1710,6 +1730,7 @@ static void nv2_cpu_arm(struct nv2_cpu *c, u64 vncr, u64 avncr, u64 hcr)
 
 __attribute__((used, retain)) u64 nv2_probe_arm(u64 vncr, u64 avncr, u64 hcr)
 {
+    nv2_alloc_cpus();
     nv2_cpu_arm(nv2_this(), vncr, avncr, hcr);
     nv2_this()->scratch = (u64 *)(avncr + SZ_4K);
     msr(SYS_HFGITR_EL2, HFGITR_VMALLE1_ALL);

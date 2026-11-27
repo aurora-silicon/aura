@@ -24,6 +24,8 @@
 #include "sptm_virt.h"
 #include "cpu_regs.h"
 #include "gxf.h"
+#include "malloc.h"
+#include "memory.h"
 #include "nv2.h"
 #include "smp.h"
 #include "sptm_virt_priv.h"
@@ -98,7 +100,21 @@ struct sptm_world_cpu {
     bool cl4_glx_valid;
 };
 
-static struct sptm_world_cpu sptm_world[MAX_CPUS];
+/* MAX_CPUS entries from the heap (sptm_virt_world_alloc), like nv2_cpus. */
+static struct sptm_world_cpu *sptm_world;
+
+void sptm_virt_world_alloc(void)
+{
+    if (sptm_world)
+        return;
+    sptm_world = calloc(MAX_CPUS, sizeof(*sptm_world));
+    if (!sptm_world)
+        panic("SPTM-virt: no memory for the per-CPU world state\n");
+    /* Published to DRAM like nv2_cpus (nv2_alloc_cpus), before nv2_guarded is set. */
+    dc_cvac_range(sptm_world, MAX_CPUS * sizeof(*sptm_world));
+    dc_cvac_range(&sptm_world, sizeof(sptm_world));
+    sysop("dsb sy");
+}
 
 static void glx_save(u64 *b)
 {
