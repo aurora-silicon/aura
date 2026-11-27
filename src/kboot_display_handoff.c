@@ -4775,9 +4775,10 @@ static T6050_TEXT int t6050_ext_version_one(void *dt, int at)
  * engine with no valid ADT match or failing the ADT running/uuid or placement checks is disabled
  * and stripped from any display-subsystem scanout iommus first by t6050_ext_reject(), even on an
  * unknown stub. A node not available (status absent, "okay" or "ok") is t6050_ext_one()'s.
- * Each surviving engine's version edit runs in its own scratch transaction; if allocation,
- * writing, or commit fails, that engine is disabled (or deleted on a packed DT) and stripped
- * from scanout rather than leaving stale apple,firmware-compat enabled.
+ * Each surviving engine's version edit runs in its own scratch transaction; if the live/ADT check
+ * fails during versioning or if allocation, writing, or commit fails, that engine is disabled (or
+ * deleted on a packed DT) and stripped from scanout rather than leaving stale apple,firmware-compat
+ * enabled.
  */
 static T6050_TEXT void t6050_ext_version(void *dt)
 {
@@ -4796,17 +4797,23 @@ static T6050_TEXT void t6050_ext_version(void *dt)
         if (!t6050_available(dt, at))
             continue;
         int n = t6050_ext_index(dt, at, &unique);
-        if (n < 0 || !unique || ((t6050.ext_aura | done) & (1u << n)) || t6050_check_ext_adt(n))
+        if (n < 0 || !unique || ((t6050.ext_aura | done) & (1u << n)))
             continue;
-        done |= 1u << n;
-        if (t6050_ext_version_one(dt, at)) {
+        const char *why = NULL;
+        if (t6050_check_ext_adt(n)) {
+            why = "rejected";
+        } else if (t6050_ext_version_one(dt, at)) {
+            why = "could not take firmware version";
+        } else {
+            done |= 1u << n;
+            count++;
+        }
+        if (why) {
             bool dummy = false;
-            if (t6050_ext_disable(dt, at, n, &dummy, "could not take firmware version") < 0) {
+            if (t6050_ext_disable(dt, at, n, &dummy, why) < 0) {
                 err = -1;
                 break;
             }
-        } else {
-            count++;
         }
         at = -1;
     }

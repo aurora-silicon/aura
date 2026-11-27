@@ -783,6 +783,7 @@ struct fake_ext {
     u32 ps, ctl, prot[2], tcr[2];
     u64 ttbr_l1[2];
     bool ttbr_valid[2], fault;
+    int ctl_fail_after;
 };
 static struct fake_ext exts[3];
 static void reset_adt(void)
@@ -840,6 +841,8 @@ static u32 read32(u64 addr)
         }
         if (addr == exts[i].coproc + ASC_CPU_CONTROL) {
             if (exts[i].fault) { exc_count++; return 0; }
+            if (exts[i].ctl_fail_after > 0 && --exts[i].ctl_fail_after == 0)
+                exts[i].ctl = 0;
             return exts[i].ctl;
         }
         for (int d = 0; d < 2; d++) {
@@ -1448,8 +1451,26 @@ int main(void)
     t6050_ext_version(tree);
     assert(is("/dcpext0", "apple,firmware-compat", &v272));
     assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    /* Passes during t6050_ext_reject(), then stops running before t6050_ext_version() stamps it:
+     * still disabled (or deleted on a packed DT with absent status) and dropped from scanout. */
+    world();
+    os_firmware = v272;
+    exts[1].ctl_fail_after = 2;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    world();
+    os_firmware = v272;
+    assert(!fdt_delprop(tree, fdt_path_offset(tree, "/dcpext1"), "status"));
+    assert(!fdt_pack(tree));
+    exts[1].ctl_fail_after = 2;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert(fdt_path_offset(tree, "/dcpext1") < 0 && has_scanout_dart(PH_DISP0) &&
+           has_scanout_dart(PH_DART0) && !has_scanout_dart(PH_DART1));
+    cases++;
     printf("PASS dcpext version %d cases\n", cases);
     return 0;
 }
 '''
-    run(tmp_path, "ext-version", code, "PASS dcpext version 32 cases")
+    run(tmp_path, "ext-version", code, "PASS dcpext version 34 cases")
