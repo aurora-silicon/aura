@@ -77,6 +77,19 @@ kernelcache; the two twin PAC-key guards match twice and are paired in order. Th
 the RO-zone branch, which T6041's kernelcache of the same release does not have. The workarounds
 were not taken out one by one as on the J616c; all of them were applied on every boot.
 
+### T6050 (K114s, MacBook Pro 14" M5 Pro) with macOS 27.2.1
+
+27.2.1 (26B8132, a K-board build) runs on a K114s to its desktop, with exclaves
+(`AURA_KEEP_EXCLAVES` and the IPSW's `Ap,cL4` bundle and ExclaveOS catalogs), the kernel
+`kernelcache.release.mac17j`. Its `XNU_QUIRKS` entry is the T8142 one ported the same way: every
+site's window matches exactly once (the PAC-key twins twice, paired in order), and the
+mix-and-match skip keeps its `b +0x22`, since the 0x24 words from the site on match too. The
+hides are the J815's. The proxy runs on KIS from the left-back port (`AURA_DEBUG_PORT=1`);
+XNU's console reaches it only with `AURA_XNU_SERIAL=uart0`, so set it or a booting guest looks
+silent. Without exclaves launchd dies with SIGILL after "Early boot complete" (`initproc exited
+-- exit reason namespace 2 subcode 0x4`). With `AURA_KEEP_WIFI` Wi-Fi comes up, and a USB NCM
+Ethernet on a visible port takes the same address as the K114s's Linux.
+
 The code:
 
 | File | What |

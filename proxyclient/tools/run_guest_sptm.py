@@ -346,6 +346,35 @@ XNU_QUIRKS = (
                     0x1400000f),
                    ("task PAC key reprogramming (4)", "BootKC-rx", 0x31708c4, 0x540001e0,
                     0x1400000f))),
+    # T6050's xnu-13432.41.4 (macOS 27.2.1 26B8132, kernelcache.release.mac17j; K114s). The
+    # T8142 26B131 entry above, ported the same way: each site's 48-instruction window
+    # (PC-relative immediates masked) matches exactly once in this kernelcache, the twin PAC-key
+    # guards twice, paired in order. The mix-and-match skip keeps its b +0x22: the 0x24 words from
+    # the site on match the reference under the same masks. rorgn globals from the matched
+    # function's adrp/str pairs. Hides as on the J815. Fingerprint: the RO-zone branch.
+    dict(release=b"xnu-13432.41.4~", fingerprint=("__TEXT_EXEC", 0x3912cfc, 0x540002a9),
+         hide=("/arm-io/apcie", "/arm-io/dart-apcie0", "/arm-io/apcie0-piodma",
+               "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
+               "/arm-io/centauri", "/arm-io/bluetooth", "/arm-io/aop-spmi0/spmi-wifibt"),
+         ro_relax=(("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3912cfc, 0x540002a9,
+                    0x14000015),),
+         rorgn=(("rorgn register read", "BootKC-rx", 0x31572a0, 0x370001a8, 0x1400000d),),
+         rorgn_globals=(0xe88010, 0xe88018),
+         nvram_mutable=(("Image4 storageInit mix-and-match question", "BootKC-rx",
+                         0x29a2294, 0x34000080, 0x14000022),),
+         tc_force=(("trust-cache load result", "BootKC-rx",
+                    0x35ce958, 0x340000e0, 0x14000007),),
+         nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1c7b1c, 0xaa0003e8, 0x52800000),
+                   ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1c7b20, 0x52805840,
+                    0xd65f03c0)),
+         pac_keys=(("task PAC key reprogramming (switch)", "BootKC-rx", 0x2f2834c, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (2)", "BootKC-rx", 0x2f28414, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (3)", "BootKC-rx", 0x2f28614, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (4)", "BootKC-rx", 0x2f288c4, 0x540001e0,
+                    0x1400000f))),
 )
 
 
