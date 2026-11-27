@@ -20,14 +20,6 @@ SECTIONS {
     _text_start = .;
     .init : ALIGN(0x10000) {
         *(.init)
-        /*
-         * The other exception vector tables (VBAR wants them on 2 KiB) right after start.S's, where
-         * what comes before them is fixed. In .text, a few bytes more code before one moved it and
-         * everything after it up 2 KiB, and .text itself started on a 2 KiB step.
-         */
-        *exception_asm.o(.text .text.*)
-        *gxf_asm.o(.text .text.*)
-        *hv/hv_asm.o(.text .text.*)
         *(.init.*)
         /*
          * Code that only runs when aura hosts a guest, or once per boot. .text follows .init

@@ -37,10 +37,9 @@ jobs:
       - name: Stage 1 and ESP Stage 2 room
         env:
           NM: aarch64-linux-gnu-nm
-        # The Makefile's optimization levels, as release.yml builds both stages.
         run: >
           sh tools/stage1_size.sh gcc ARCH=aarch64-linux-gnu- BUILTIN_LOGO=aurora
-          EXTRA_CFLAGS='-Wstack-usage=2048'
+          EXTRA_CFLAGS='-Wstack-usage=2048 -Os'
 
   clang-macos:
     # As a Mac builds aura.

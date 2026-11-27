@@ -43,16 +43,14 @@ jobs:
       # ESP_STAGE2=1 image; the Stage 1 aura.bin must not be composed into an ESP Stage 2.
       - name: Build Stage 1
         run: |
-          # The Makefile's optimization levels (size first), as release.yml builds it.
-          make -j2 ARCH=aarch64-linux-gnu- CHAINLOADING=1 EXTRA_CFLAGS='-Wstack-usage=2048'
+          make -j2 ARCH=aarch64-linux-gnu- CHAINLOADING=1 EXTRA_CFLAGS='-Wstack-usage=2048 -Os'
           mkdir -p out/stage1
           cp build/aura.macho build/aura.bin out/stage1/
 
       - name: Build the ESP Stage 2
         run: |
           make clean
-          # The Makefile's optimization levels (size first), as release.yml builds it.
-          make -j2 ARCH=aarch64-linux-gnu- CHAINLOADING=1 ESP_STAGE2=1 EXTRA_CFLAGS='-Wstack-usage=2048'
+          make -j2 ARCH=aarch64-linux-gnu- CHAINLOADING=1 ESP_STAGE2=1 EXTRA_CFLAGS='-Wstack-usage=2048 -Os'
           mkdir -p out/esp-stage2
           cp build/aura.macho build/aura.bin out/esp-stage2/
 
