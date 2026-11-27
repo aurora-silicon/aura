@@ -99,7 +99,9 @@ static size_t ringbuffer_read(void *b, size_t n, ringbuffer_t *r) {size_t k = r-
 static u64 get_ticks(void) {return now_ms;}
 static u64 ticks_to_msecs(u64 t) {return t;}
 static int close_after = -1, stuck_ms = 0, drain_polls = 0;
+static bool in_events;
 static dwc3_dev_t d;
+static bool usb_dwc3_in_events(dwc3_dev_t *dev) {(void)dev; return in_events;}
 static void usb_dwc3_handle_events(dwc3_dev_t *dev) {
     events_polled++; now_ms += stuck_ms;
     /* A host that reads takes one byte per poll, for drain_polls polls. */
@@ -116,7 +118,7 @@ static ringbuffer_t rb[4];
 static void setup(void) {
     memset(&d, 0, sizeof(d)); memset(hw_owned, 0, sizeof(hw_owned));
     ends = setup_starts = setup_failures = out_arms = in_kicks = events_polled = 0;
-    address = 29; enabled = 63; now_ms = 0; close_after = -1; stuck_ms = 0; drain_polls = 0;
+    address = 29; enabled = 63; now_ms = 0; close_after = -1; stuck_ms = 0; drain_polls = 0; in_events = false;
     chip_id = T8122;
     for (int i = 0; i < 2; i++) {
         d.pipe[i].ready = true; d.pipe[i].host2device = &rb[2 * i]; d.pipe[i].device2host = &rb[2 * i + 1];
@@ -180,6 +182,10 @@ int main(void) {
     usb_dwc3_flush(&d, 0);
     assert(ringbuffer_get_used(&rb[1]) == 60);
     assert(now_ms >= 40 * 50 + CDC_IO_TIMEOUT_MS && now_ms < 40 * 50 + CDC_IO_TIMEOUT_MS + 100);
+    /* From inside event handling it returns at once and does not poll again. */
+    setup(); rb[1] = (ringbuffer_t){0, 100}; drain_polls = 100; in_events = true; events_polled = 0;
+    usb_dwc3_flush(&d, 0);
+    assert(events_polled == 0 && ringbuffer_get_used(&rb[1]) == 100);
 
     /* A read in progress returns short when the pipe closes. */
     setup(); rb[0] = (ringbuffer_t){0, 4}; close_after = 2;
