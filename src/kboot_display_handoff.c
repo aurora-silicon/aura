@@ -3169,12 +3169,19 @@ static bool t6041_headless(void *dt)
 
 static struct dcp6_seg t6041_headless_text;
 
+#if defined(__ELF__) && !__STDC_HOSTED__
+#define DCPEXT_XTEXT __attribute__((section(".rodata.xtext")))
+#else
+#define DCPEXT_XTEXT
+#endif
+#define DCPEXT_ENTRY AURA_XTEXT
+
 /*
  * The text, data and heap placeholders a kernel device tree gives an external processor (node
  * `node`, `name` in the log): memory-region names three distinct, disabled, empty apple,asc-mem
  * nodes, in that order (memory-region-names). Their phandles go to ph[].
  */
-static int dcpext_placeholders(void *dt, int node, const char *name, u32 ph[3])
+DCPEXT_XTEXT static int dcpext_placeholders(void *dt, int node, const char *name, u32 ph[3])
 {
     static const char mr_names[] = "text\0data\0heap";
     static const char *const parts[] = {"text", "data", "heap"};
@@ -3211,8 +3218,8 @@ static int dcpext_placeholders(void *dt, int node, const char *name, u32 ph[3])
  * __OS_LOG is a physical buffer, the others are outside kernel RAM and the carveouts and mapped
  * inside the DART window vm_base+vm_size. None overlaps another.
  */
-static int dcpext_nub_segs(const char *name, int nub, u64 vm_base, u64 vm_size,
-                           struct dcp6_seg segs[DCPEXT6_SEGS])
+DCPEXT_XTEXT static int dcpext_nub_segs(const char *name, int nub, u64 vm_base, u64 vm_size,
+                                        struct dcp6_seg segs[DCPEXT6_SEGS])
 {
     static const u32 flags[DCPEXT6_SEGS] = {SEG_FLAGS_TEXT, SEG_FLAGS_DATA, SEG_FLAGS_OSLOG,
                                             SEG_FLAGS_HEAP};
@@ -3273,9 +3280,9 @@ static int dcpext_nub_segs(const char *name, int nub, u64 vm_base, u64 vm_size,
  * iommu-addresses are in the alias form of the DART window at vm_base. Then
  * apple,firmware-version and apple,firmware-compat. Any failure leaves `dt` half-written.
  */
-static int dcpext_fill_mem(void *dt, const char *dt_path, const char *name,
-                           const struct dcp6_seg segs[DCPEXT6_SEGS], const u32 ph[3],
-                           const char *text_name, bool add_text, u64 vm_base)
+DCPEXT_XTEXT static int dcpext_fill_mem(void *dt, const char *dt_path, const char *name,
+                                        const struct dcp6_seg segs[DCPEXT6_SEGS], const u32 ph[3],
+                                        const char *text_name, bool add_text, u64 vm_base)
 {
     static const char *const parts[] = {"text", "data", "heap"};
     static const int seg_index[] = {SEG_TEXT, SEG_DATA, SEG_3};
@@ -3332,7 +3339,7 @@ static int dcpext_fill_mem(void *dt, const char *dt_path, const char *name,
     return 0;
 }
 
-static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
+DCPEXT_XTEXT static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
 {
     u64 coproc, dart;
     int node = fdt_path_offset(dt, ext->dt_path), len;
@@ -3411,7 +3418,7 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
  * locked). Enable both once an external processor has its firmware memory; the kernel's gate then
  * enables that processor's chain.
  */
-static int dcp6_headless_display(void *dt, const char *compat)
+DCPEXT_ENTRY static int dcp6_headless_display(void *dt, const char *compat)
 {
     int display = fdt_path_offset(dt, "disp0");
     int len;
@@ -3444,7 +3451,7 @@ static int dcp6_headless_display(void *dt, const char *compat)
     return display < 0 ? -1 : fdt_setprop_string(dt, display, "status", "okay");
 }
 
-static void t6041_ext_handoffs(void *dt)
+DCPEXT_ENTRY static void t6041_ext_handoffs(void *dt)
 {
     int panel = fdt_path_offset(dt, "dcp");
     bool panel_handoff = panel >= 0 && fdt_getprop(dt, panel, dcp6.soc->marker, NULL);
@@ -3530,7 +3537,7 @@ static struct {
 } dcpext_kept;
 
 /* An ADT string property (device_type) is `want` */
-static bool dcpext_adt_is(int node, const char *prop, const char *want)
+DCPEXT_XTEXT static bool dcpext_adt_is(int node, const char *prop, const char *want)
 {
     u32 len = 0;
     size_t n = strlen(want);
@@ -3548,7 +3555,7 @@ static bool dcpext_adt_is(int node, const char *prop, const char *want)
  * device above it is not off: nothing tells its pipe's power (dcpext_powered() asks the same).
  * Read only, guarded; what cannot be resolved or read is not off.
  */
-static bool dcpext_chain_off(const struct pmgr_gate *g, int depth)
+DCPEXT_XTEXT static bool dcpext_chain_off(const struct pmgr_gate *g, int depth)
 {
     int above = 0;
 
@@ -3585,7 +3592,7 @@ static bool dcpext_chain_off(const struct pmgr_gate *g, int depth)
  * (dcpext_chain_off()). Without clock-gates, with one that has no physical device above it, or
  * with one that is on or cannot be read, it may.
  */
-static bool dcpext_not_running(const char *name)
+DCPEXT_XTEXT static bool dcpext_not_running(const char *name)
 {
     char path[DCP6_NAME_LEN + 16];
     u32 n;
@@ -3603,7 +3610,7 @@ static bool dcpext_not_running(const char *name)
 
 #ifdef ESP_STAGE2
 /* reg[idx] of /arm-io/<child>, address and size (if `size`), with the /arm-io ranges applied */
-static int dcpext_adt_reg_at(int child, int idx, u64 *addr, u64 *size)
+DCPEXT_XTEXT static int dcpext_adt_reg_at(int child, int idx, u64 *addr, u64 *size)
 {
     const char *name = adt_get_name(adt, child);
     char path[DCP6_NAME_LEN * 2];
@@ -3616,13 +3623,13 @@ static int dcpext_adt_reg_at(int child, int idx, u64 *addr, u64 *size)
 }
 
 /* reg[0] of /arm-io/<child>, with the /arm-io ranges applied */
-static int dcpext_adt_reg(int child, u64 *addr)
+DCPEXT_XTEXT static int dcpext_adt_reg(int child, u64 *addr)
 {
     return dcpext_adt_reg_at(child, 0, addr, NULL);
 }
 
 /* The /arm-io child or grandchild whose AAPL,phandle is `ph`, and its parent */
-static int dcpext_adt_phandle(u32 ph, int *parent)
+DCPEXT_XTEXT static int dcpext_adt_phandle(u32 ph, int *parent)
 {
     int io = adt_path_offset(adt, "/arm-io"), child = io;
     u32 v;
@@ -3651,7 +3658,7 @@ static int dcpext_adt_phandle(u32 ph, int *parent)
  * A DART stream from an iommu-parent phandle: a dart-mapper whose reg is the stream, under a
  * dart,t8110 DART. Returns the DART's offset.
  */
-static int dcpext_adt_stream(u32 ph, u32 *sid)
+DCPEXT_XTEXT static int dcpext_adt_stream(u32 ph, u32 *sid)
 {
     int dart, mapper = dcpext_adt_phandle(ph, &dart);
     if (mapper < 0 || !dcpext_adt_is(mapper, "device_type", "dart-mapper") ||
@@ -3662,7 +3669,7 @@ static int dcpext_adt_stream(u32 ph, u32 *sid)
 #endif /* ESP_STAGE2 */
 
 /* reg[0] of a device tree node whose parent has 2 address and 2 size cells */
-static int dcpext_dt_reg(void *dt, int node, u64 *addr)
+DCPEXT_XTEXT static int dcpext_dt_reg(void *dt, int node, u64 *addr)
 {
     int len, parent = node < 0 ? node : fdt_parent_offset(dt, node);
     const fdt64_t *reg = parent < 0 ? NULL : fdt_getprop(dt, node, "reg", &len);
@@ -3685,8 +3692,8 @@ struct dcpext_ps {
  * Add gate g and every parent above it (both PMGR parents of each device) up to the first virtual
  * one. A register seen both as a gate and as a parent must be on.
  */
-static int dcpext_ps_add(struct dcpext_ps *ps, int *n, const struct pmgr_gate *g, int depth,
-                         const char *name, u32 i)
+DCPEXT_XTEXT static int dcpext_ps_add(struct dcpext_ps *ps, int *n, const struct pmgr_gate *g,
+                                      int depth, const char *name, u32 i)
 {
     if (!g->found || (!depth && g->virt) || depth >= DCP6_GATE_DEPTH)
         bail("%s: clock-gates[%u] does not resolve to PMGR power states\n", name, i);
@@ -3725,7 +3732,7 @@ static int dcpext_ps_add(struct dcpext_ps *ps, int *n, const struct pmgr_gate *g
  * pipe's DART may be read only once there is one. Through the ADT's PMGR table; the power state
  * registers are only read, guarded. `what` names it in the log.
  */
-static int dcpext_powered(const char *name, const char *what)
+DCPEXT_XTEXT static int dcpext_powered(const char *name, const char *what)
 {
     struct dcpext_ps ps[DCP6_PS_MAX];
     char path[DCP6_NAME_LEN + 16];
@@ -3761,7 +3768,7 @@ static int dcpext_powered(const char *name, const char *what)
 }
 
 /* A 16K table page inside the ADT's DRAM */
-static bool dcpext_table_in_dram(u64 page, u64 dram_base, u64 dram_size)
+DCPEXT_XTEXT static bool dcpext_table_in_dram(u64 page, u64 dram_base, u64 dram_size)
 {
     return dram_size >= SZ_16K && !(page & (SZ_16K - 1)) && page >= dram_base &&
            page - dram_base <= dram_size - SZ_16K;
@@ -3773,7 +3780,7 @@ static bool dcpext_table_in_dram(u64 page, u64 dram_base, u64 dram_size)
  * if nothing overlaps it, -1 (logged) on a partial overlap or an overlap with a reservation the OS
  * may map.
  */
-static int dcpext_page_kept(void *dt, u64 page, const char *what, const char *noun)
+DCPEXT_XTEXT static int dcpext_page_kept(void *dt, u64 page, const char *what, const char *noun)
 {
     int n = fdt_num_mem_rsv(dt), kept = 0;
     for (int i = 0; i < n; i++) {
@@ -3815,8 +3822,8 @@ static int dcpext_page_kept(void *dt, u64 page, const char *what, const char *no
  * DART table memory, and need not read back as they are), and `t` has room; returns whether it is
  * in `t` (then it may be read). Any other page is counted in *missed.
  */
-static bool dcpext_keep_page(struct dcpext_tables *t, u64 page, u64 dram_base, u64 dram_size,
-                             int *missed)
+DCPEXT_XTEXT static bool dcpext_keep_page(struct dcpext_tables *t, u64 page, u64 dram_base,
+                                          u64 dram_size, int *missed)
 {
     if (!dcpext_table_in_dram(page, dram_base, dram_size)) {
         (*missed)++;
@@ -3844,8 +3851,8 @@ static bool dcpext_keep_page(struct dcpext_tables *t, u64 page, u64 dram_base, u
  * entries point at, into `t`. A four-level stream's lower levels are not followed (counted in
  * *missed, as is every page dcpext_keep_page() does not take).
  */
-static void dcpext_keep_dart_inner(u64 dart, struct dcpext_tables *t, u64 dram_base, u64 dram_size,
-                                   int *missed)
+DCPEXT_XTEXT static void dcpext_keep_dart_inner(u64 dart, struct dcpext_tables *t, u64 dram_base,
+                                                u64 dram_size, int *missed)
 {
     u32 sids = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS, read32(dart + DART_T8110_PARAMS4));
 
@@ -3875,7 +3882,8 @@ static void dcpext_keep_dart_inner(u64 dart, struct dcpext_tables *t, u64 dram_b
 }
 
 /* dcpext_keep_dart_inner(), guarded: a DART that faults adds nothing (logged, counted) */
-static void dcpext_keep_dart(u64 dart, struct dcpext_tables *t, const char *what, int *missed)
+DCPEXT_XTEXT static void dcpext_keep_dart(u64 dart, struct dcpext_tables *t, const char *what,
+                                          int *missed)
 {
     u64 dram_base, dram_size;
     int before = t->n;
@@ -3906,8 +3914,8 @@ struct dcpext_ref {
  * phandle that does not resolve to a stream of an ADT dart,t8110, and a stream past
  * DCPEXT_REFS_MAX are logged and counted in *missed: the DARTs it uses are then not all known.
  */
-static void dcpext_adt_refs(int src, struct dcpext_ref *refs, int *n, bool pipe, const char *what,
-                            int *missed)
+DCPEXT_XTEXT static void dcpext_adt_refs(int src, struct dcpext_ref *refs, int *n, bool pipe,
+                                         const char *what, int *missed)
 {
     const char *name = adt_get_name(adt, src);
     u32 len = 0;
@@ -3941,7 +3949,7 @@ static void dcpext_adt_refs(int src, struct dcpext_ref *refs, int *n, bool pipe,
 }
 
 /* Whether a reg range of ADT /arm-io child `node`, with the /arm-io ranges applied, holds addr */
-static bool dcpext_adt_holds(int node, u64 addr)
+DCPEXT_XTEXT static bool dcpext_adt_holds(int node, u64 addr)
 {
     u64 base, size;
 
@@ -3958,7 +3966,7 @@ static bool dcpext_adt_holds(int node, u64 addr)
  * dcp's). Its FE and SYS power domains are the processor's clock-gate's PMGR parents, which
  * dcpext_powered() checks. -1 (logged) if no such node, or more than one, holds it.
  */
-static int dcpext_adt_pipe(int child, const char *type, const char *what)
+DCPEXT_XTEXT static int dcpext_adt_pipe(int child, const char *type, const char *what)
 {
     int node = adt_path_offset(adt, "/arm-io"), pipe = -1, n = 0;
     u64 coproc;
@@ -3983,8 +3991,8 @@ static int dcpext_adt_pipe(int child, const char *type, const char *what)
  * (dcpext_adt_pipe()), into refs[]. Returns how many; *pipe is the pipe, or -1. What cannot be
  * found is logged and counted in *missed. No register is read.
  */
-static int dcpext_adt_supply(int child, struct dcpext_ref *refs, int *pipe, const char *what,
-                             int *missed)
+DCPEXT_XTEXT static int dcpext_adt_supply(int child, struct dcpext_ref *refs, int *pipe,
+                                          const char *what, int *missed)
 {
     int n = 0;
 
@@ -3998,7 +4006,7 @@ static int dcpext_adt_supply(int child, struct dcpext_ref *refs, int *pipe, cons
 }
 
 /* The DARTs of refs[] (n of them), each once, into darts[]; returns how many */
-static int dcpext_ref_darts(const struct dcpext_ref *refs, int n, u64 *darts)
+DCPEXT_XTEXT static int dcpext_ref_darts(const struct dcpext_ref *refs, int n, u64 *darts)
 {
     int nd = 0;
 
@@ -4016,7 +4024,7 @@ static int dcpext_ref_darts(const struct dcpext_ref *refs, int n, u64 *darts)
  * The DARTs whose tables an external processor that is not handed over may use
  * (dcpext_adt_supply()), each once. What cannot be found is counted in *missed.
  */
-static int dcpext_keep_darts(int child, u64 *darts, const char *what, int *missed)
+DCPEXT_XTEXT static int dcpext_keep_darts(int child, u64 *darts, const char *what, int *missed)
 {
     struct dcpext_ref refs[DCPEXT_REFS_MAX];
     int pipe;
@@ -4031,8 +4039,9 @@ static int dcpext_keep_darts(int child, u64 *darts, const char *what, int *misse
  * reservation), or one that cannot be reserved, is logged, left and counted in *missed; the others
  * are kept all the same. Returns how many pages were reserved.
  */
-static int dcpext_keep_range(void *dt, u64 base, u64 size, const char *what, const char *noun,
-                             const char *prefix, bool per_page, int *missed)
+DCPEXT_XTEXT static int dcpext_keep_range(void *dt, u64 base, u64 size, const char *what,
+                                          const char *noun, const char *prefix, bool per_page,
+                                          int *missed)
 {
     u64 ram_min = kboot_ram_base(), ram_max = kboot_ram_base() + kboot_ram_size();
     u64 start = base & ~(u64)(SZ_16K - 1), end = ALIGN_UP(base + size, SZ_16K), run = 0,
@@ -4071,7 +4080,8 @@ static int dcpext_keep_range(void *dt, u64 base, u64 size, const char *what, con
  * every one, whatever its flags) from the OS where it is in its RAM. Returns how many pages were
  * reserved; a segment list (logged) or segment that cannot be kept is counted in *missed.
  */
-static int dcpext_keep_segments(void *dt, const char *name, const char *what, int *missed)
+DCPEXT_XTEXT static int dcpext_keep_segments(void *dt, const char *name, const char *what,
+                                             int *missed)
 {
     char nub_path[DCP6_NAME_LEN * 2 + 16];
     u32 len = 0;
@@ -4112,7 +4122,7 @@ static int dcpext_keep_segments(void *dt, const char *name, const char *what, in
  * processor is published, so the kernel does not adopt it. Returns how many references could not
  * be followed or kept: 0 if all of its memory in the OS's RAM is kept.
  */
-static int dcpext_keep(void *dt, int child)
+DCPEXT_XTEXT static int dcpext_keep(void *dt, int child)
 {
     const char *name = adt_get_name(adt, child);
     struct dcpext_tables *t = &dcpext_kept.tables;
@@ -4152,7 +4162,7 @@ static int dcpext_keep(void *dt, int child)
 #endif /* ESP_STAGE2 */
 
 /* Whether the processor at `coproc` (its reg[0]) is handed over */
-static bool dcpext_is_handed(u64 coproc)
+DCPEXT_XTEXT static bool dcpext_is_handed(u64 coproc)
 {
     for (int i = 0; i < dcpext_kept.nhanded; i++)
         if (dcpext_kept.handed[i] == coproc)
@@ -4170,7 +4180,7 @@ static bool dcpext_is_handed(u64 coproc)
  * kernel leaves the processor and its DARTs as iBoot left them. Returns -1 if the tree cannot be
  * edited.
  */
-static int dcpext_withdraw(void *dt)
+DCPEXT_XTEXT static int dcpext_withdraw(void *dt)
 {
     static const char props[][36] = {
         "apple,t8132-dcpext-firmware-ready",
@@ -4218,7 +4228,7 @@ static int dcpext_withdraw(void *dt)
  * RAM is kept, -1 (each reason logged) if not, or if the withdrawal failed: the OS must then not be
  * started, as it could reuse memory a processor or its pipe still uses.
  */
-int dt_keep_dcpext(void *dt)
+DCPEXT_ENTRY int dt_keep_dcpext(void *dt)
 {
     int io = adt_path_offset(adt, "/arm-io"), internal = adt_path_offset(adt, "/arm-io/dcp");
     int child = io, missed = 0;
@@ -4256,7 +4266,7 @@ int dt_keep_dcpext(void *dt)
  * and keeps those (dcpext_keep()). Returns -1 (each reason logged) if one may run or the
  * withdrawal failed: the OS must then not be started.
  */
-int dt_keep_dcpext(void *dt)
+DCPEXT_ENTRY int dt_keep_dcpext(void *dt)
 {
     int io = adt_path_offset(adt, "/arm-io"), internal = adt_path_offset(adt, "/arm-io/dcp");
     int child = io, running = 0;
@@ -4322,7 +4332,7 @@ static struct {
  * The DART window of stream `sid`: the DART has that stream (sid-count) and gives vm-base and
  * vm-size-<sid> (or vm-size when it has no per-stream size).
  */
-static int dcpext_adt_window(int dart, u32 sid, u64 *vm_base, u64 *vm_size)
+DCPEXT_XTEXT static int dcpext_adt_window(int dart, u32 sid, u64 *vm_base, u64 *vm_size)
 {
     char prop[24];
     u32 count;
@@ -4345,7 +4355,7 @@ static int dcpext_adt_window(int dart, u32 sid, u64 *vm_base, u64 *vm_size)
  * iommus and DART must match: the same stream, the DART at the ADT DART's address, and an
  * apple,dma-range equal to the ADT window of that stream.
  */
-static int dcpext_match(void *dt, struct dcpext *x)
+DCPEXT_XTEXT static int dcpext_match(void *dt, struct dcpext *x)
 {
     int node = fdt_path_offset(dt, x->dt_path), io = adt_path_offset(adt, "/arm-io"), len;
     int child = io, n = 0;
@@ -4397,7 +4407,7 @@ static int dcpext_match(void *dt, struct dcpext *x)
  * kernel then keeps its tables instead of resetting it), and the stream translating, not
  * bypassed, through a valid root. Only read, guarded, and only once the DART's power is checked.
  */
-static int dcpext_stream_locked(u64 dart, u32 sid, const char *what)
+DCPEXT_XTEXT static int dcpext_stream_locked(u64 dart, u32 sid, const char *what)
 {
     if (sid >= DART_STREAMS_MAX)
         bail("%s: stream %u is not a DART stream\n", what, sid);
@@ -4424,7 +4434,8 @@ static char dcpext_why[192];
         return -1;                                                                                 \
     } while (0)
 
-static int dcpext_table_add(struct dcpext_tables *t, u64 page, const char *what, u64 dart)
+DCPEXT_XTEXT static int dcpext_table_add(struct dcpext_tables *t, u64 page, const char *what,
+                                         u64 dart)
 {
     int missed = 0;
 
@@ -4436,8 +4447,9 @@ static int dcpext_table_add(struct dcpext_tables *t, u64 page, const char *what,
     return 0;
 }
 
-static int dcpext_dart_tables_inner(u64 dart, const char *what, struct dcpext_tables *t,
-                                    u64 dram_base, u64 dram_size)
+DCPEXT_XTEXT static int dcpext_dart_tables_inner(u64 dart, const char *what,
+                                                 struct dcpext_tables *t, u64 dram_base,
+                                                 u64 dram_size)
 {
     u32 protect = read32(dart + DART_T8110_PROTECT);
     u32 sids = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS, read32(dart + DART_T8110_PARAMS4));
@@ -4500,7 +4512,7 @@ static int dcpext_dart_tables_inner(u64 dart, const char *what, struct dcpext_ta
  * set up must translate through two-level tables in DRAM, whose pages (root and L2) are added to
  * `t` for a reservation. Anything else refuses. Only read, guarded.
  */
-static int dcpext_dart_tables(u64 dart, const char *what, struct dcpext_tables *t)
+DCPEXT_XTEXT static int dcpext_dart_tables(u64 dart, const char *what, struct dcpext_tables *t)
 {
     u64 dram_base, dram_size;
     if (dcp6_dram(&dram_base, &dram_size))
@@ -4521,7 +4533,8 @@ static int dcpext_dart_tables(u64 dart, const char *what, struct dcpext_tables *
  * no reservation holds yet is reserved (no-map, named by its address); one outside that RAM is not
  * the OS's. -1 (logged) at the first one that cannot be kept.
  */
-static int dcpext_reserve_tables(void *dt, const struct dcpext_tables *t, const char *what)
+DCPEXT_XTEXT static int dcpext_reserve_tables(void *dt, const struct dcpext_tables *t,
+                                              const char *what)
 {
     int missed = 0;
 
@@ -4539,8 +4552,8 @@ static int dcpext_reserve_tables(void *dt, const struct dcpext_tables *t, const 
  * from a register: this is checked before any DART is. -1 (logged) if not, or if the description
  * cannot be read whole.
  */
-static int dcpext_node_check(void *dt, int node, const char *what, const struct dcpext_ref *refs,
-                             int n, bool piodma)
+DCPEXT_XTEXT static int dcpext_node_check(void *dt, int node, const char *what,
+                                          const struct dcpext_ref *refs, int n, bool piodma)
 {
     int depth = 0, dev = node, pio = 0;
     if (node < 0)
@@ -4579,8 +4592,8 @@ static int dcpext_node_check(void *dt, int node, const char *what, const struct 
 }
 
 /* The tables of each DART of refs[] (n of them), into `t`: dcpext_dart_tables() */
-static int dcpext_ref_tables(const struct dcpext_ref *refs, int n, const char *what,
-                             struct dcpext_tables *t)
+DCPEXT_XTEXT static int dcpext_ref_tables(const struct dcpext_ref *refs, int n, const char *what,
+                                          struct dcpext_tables *t)
 {
     u64 darts[DCPEXT_REFS_MAX];
     int nd = dcpext_ref_darts(refs, n, darts);
@@ -4601,7 +4614,7 @@ static int dcpext_ref_tables(const struct dcpext_ref *refs, int n, const char *w
  * subsystem's DARTs (scanout and piodma) are collected, to be reserved when the subsystem is
  * enabled. Only read, guarded, and no DART before those checks.
  */
-static int dcpext_display_locked(void *dt)
+DCPEXT_XTEXT static int dcpext_display_locked(void *dt)
 {
     const char *path = fdt_get_alias(dt, "disp0"), *what = "the display subsystem";
     int disp = path ? fdt_path_offset(dt, path) : -1, len, n = 0, missed = 0;
@@ -4629,7 +4642,7 @@ static int dcpext_display_locked(void *dt)
  * Hand one external processor over, into `dt` (a scratch copy): everything is checked against the
  * ADT before the first edit. Returns 0 if published, nonzero (with its reason logged) if not.
  */
-static int dcpext_fill(void *dt, struct dcpext *x)
+DCPEXT_XTEXT static int dcpext_fill(void *dt, struct dcpext *x)
 {
     struct dcp6_seg segs[DCPEXT6_SEGS];
     struct dcpext_ref refs[DCPEXT_REFS_MAX];
@@ -4705,7 +4718,7 @@ static int dcpext_fill(void *dt, struct dcpext *x)
 }
 
 /* The device tree's external processors of a known block, by compatible; returns how many */
-static int dcpext_find(void *dt)
+DCPEXT_XTEXT static int dcpext_find(void *dt)
 {
     dcpext_run.n = 0;
     for (size_t b = 0; b < ARRAY_SIZE(dcpext_blocks); b++) {
@@ -4737,7 +4750,7 @@ static int dcpext_find(void *dt)
  * is not handed over) keep being written whatever happens to their handoff: reserve them, as their
  * own transaction.
  */
-static void dcpext_reserve_oslogs(void *dt)
+DCPEXT_XTEXT static void dcpext_reserve_oslogs(void *dt)
 {
     int io = adt_path_offset(adt, "/arm-io");
 
@@ -4763,7 +4776,7 @@ static void dcpext_reserve_oslogs(void *dt)
  * Hand the external processors over (dt_set_dcpext_handoff(), firmware given its clocks). Each
  * processor handed over is recorded in dcpext_kept.handed[]; every way out says why in one line.
  */
-static void dcpext_hand_over(void *dt, enum dcp_internal internal)
+DCPEXT_XTEXT static void dcpext_hand_over(void *dt, enum dcp_internal internal)
 {
     u32 len = 0, seg_len = 0, names_len = 0;
     int nub = adt_path_offset(adt, DCP6_NUB);
@@ -4886,7 +4899,7 @@ static void dcpext_hand_over(void *dt, enum dcp_internal internal)
  * of it withdrawn, and every one the ADT describes keeps its memory from the OS (dt_keep_dcpext()):
  * it may still run as iBoot left it. If that memory cannot all be kept, -1: the OS must not start.
  */
-int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
+DCPEXT_ENTRY int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
 {
     memset(&dcp6, 0, sizeof(dcp6));
     memset(&dcpext_run, 0, sizeof(dcpext_run));
