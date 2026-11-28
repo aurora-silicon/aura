@@ -13,8 +13,9 @@
  *    (dp-switch-dfp-domain), DPTX target (dp-switch-dfp-endpoint), crossbar output cell
  *    (dp-switch-dfp-port), its ATC PHY (atc-phy), its port's crossbar (dpxbar-parent) and
  *    port-number;
- *  - the port's PD controller: the node below a bus with the same port-number, at its address
- *    on that bus.
+ *  - the port's PD controller: the node below a bus with the same port-number and port-type
+ *    (when both carry one: port numbers count per port type, so a MagSafe controller can share
+ *    a USB-C port's number), at its address on that bus.
  *
  * Every output on the processor's die whose PHY, crossbar and PD controller the tree describes
  * becomes a route, matched by register address: the tree decides which ports Linux may have
@@ -70,8 +71,11 @@ static ROUTES_TEXT int adt_reg_at(const char *path, int idx, u64 *addr)
     return adt_get_reg(adt, trace, "reg", idx, addr, NULL) ? -1 : 0;
 }
 
-/* The PD controller of port `port`: a node below an /arm-io bus with that port-number */
-static ROUTES_TEXT int adt_port_controller(const char *name, u32 port,
+/*
+ * The PD controller of port `port`: a node below an /arm-io bus with that port-number and, if
+ * both the output and the controller name one, the output's port-type (`type`, ~0 for none)
+ */
+static ROUTES_TEXT int adt_port_controller(const char *name, u32 port, u32 type,
                                            struct dcp_typec_port_facts *p)
 {
     int arm = adt_path_offset(adt, "/arm-io"), found = 0;
@@ -89,6 +93,8 @@ static ROUTES_TEXT int adt_port_controller(const char *name, u32 port,
             const u32 *reg = adt_getprop(adt, hpm, "reg", &len);
             if (adt_u32(hpm, "port-number", &v) || v != port || !reg || len < 4)
                 continue;
+            if (type != ~0U && !adt_u32(hpm, "port-type", &v) && v != type)
+                continue; /* another kind of port with the same number */
             char path[64];
             snprintf(path, sizeof(path), "/arm-io/%s", adt_get_name(adt, bus));
             if (adt_reg_at(path, 0, &p->bus))
@@ -97,7 +103,10 @@ static ROUTES_TEXT int adt_port_controller(const char *name, u32 port,
             found++;
         }
     }
-    if (found != 1)
+    if (found != 1 && type != ~0U)
+        rlog("port %u (port-type %u): %d PD controllers in the ADT, not one: no route\n", port,
+             type, found);
+    else if (found != 1)
         rlog("port %u: %d PD controllers in the ADT, not one: no route\n", port, found);
     return found == 1 ? 0 : -1;
 }
@@ -123,7 +132,7 @@ ROUTES_TEXT int dcp_typec_facts_from_adt(const char *adt_engine, struct dcp_type
     int out = arm;
     ADT_FOREACH_CHILD(adt, out)
     {
-        u32 xparent, tunneled, odomain = 0, phy_ph, xbar_ph;
+        u32 xparent, tunneled, odomain = 0, phy_ph, xbar_ph, type = ~0U, v;
         struct dcp_typec_port_facts p = {0};
         char path[64];
 
@@ -134,6 +143,8 @@ ROUTES_TEXT int dcp_typec_facts_from_adt(const char *adt_engine, struct dcp_type
             adt_u32(out, "atc-phy", &phy_ph) || adt_u32(out, "dpxbar-parent", &xbar_ph))
             continue;
         adt_u32(out, "dp-switch-dfp-domain", &odomain);
+        if (!adt_u32(out, "port-type", &v))
+            type = v;
         if (odomain != domain)
             continue;
         if (adt_by_phandle(xbar_ph, path, sizeof(path)) < 0 || adt_reg_at(path, 0, &p.xbar)) {
@@ -146,7 +157,7 @@ ROUTES_TEXT int dcp_typec_facts_from_adt(const char *adt_engine, struct dcp_type
         }
         while (p.nphy < DCP_TYPEC_PHY_REGS && !adt_reg_at(path, p.nphy, &p.phy[p.nphy]))
             p.nphy++;
-        if (!p.nphy || adt_port_controller(name, p.port, &p))
+        if (!p.nphy || adt_port_controller(name, p.port, type, &p))
             continue;
         if (f->nports == DCP_TYPEC_MAX_PORTS) {
             rlog("more than %d DP outputs on die %u: port %u and later not considered\n",

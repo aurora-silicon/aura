@@ -11,7 +11,7 @@ from dcp_typec_routes_harness import run, u32
 XBAR = 406
 
 
-def adt_nodes(duplicate_port=None):
+def adt_nodes(duplicate_port=None, typed_port=None):
     nodes = [{"path": "/arm-io"},
              {"path": "/arm-io/display-crossbar0", "props": {"AAPL,phandle": u32(XBAR)}}]
     atc = [(0, 1, 0, 0x2a3000000, 0x2a324c000), (1, 2, 0, 0x2ab000000, 0x2ab24c000),
@@ -42,6 +42,14 @@ def adt_nodes(duplicate_port=None):
     if duplicate_port:
         nodes.append({"path": "/arm-io/nub-spmi-a2/hpm9", "props": {
             "port-number": u32(duplicate_port), "reg": u32(0x2, 3, 0, 4)}})
+    if typed_port:
+        # Port types on the outputs and controllers (2: USB-C), and a MagSafe controller (17)
+        # that shares the port's number, as on the 14-inch M5 Pro MacBook Pro
+        for node in nodes:
+            if "port-number" in node.get("props", {}):
+                node["props"]["port-type"] = u32(2)
+        nodes.append({"path": "/arm-io/nub-spmi-a2/hpm5", "props": {
+            "port-number": u32(typed_port), "port-type": u32(17), "reg": u32(0x2, 3, 0, 4)}})
     for n, ep, die in ((0, 0, 0), (1, 1, 0), (4, 0, 1)):
         props = {"dp-switch-parent": u32(XBAR), "dp-switch-ufp-endpoint": u32(ep),
                  "dp-switch-ufp-port": u32(0)}
@@ -205,6 +213,11 @@ def test_reserved_phy_and_foreign_display_port_are_left_alone(tmp_path):
 def test_contradictory_adt_routes_nothing_on_that_port(tmp_path):
     out = run(tmp_path, adt_nodes(duplicate_port=3), ENGINES, dt_setup())
     assert "port 3: 2 PD controllers in the ADT, not one" in out and "ROUTES0 2" in out
+
+
+def test_another_port_type_with_the_same_number_is_not_the_controller(tmp_path):
+    out = run(tmp_path, adt_nodes(typed_port=3), ENGINES, dt_setup())
+    assert "PD controllers in the ADT" not in out and "ROUTES0 3" in out
 
 
 def test_a_tree_without_the_request_is_untouched(tmp_path):
