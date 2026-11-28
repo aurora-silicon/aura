@@ -368,8 +368,8 @@ $(BUILD_FP_OBJS): build/%.o: src/%.c
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)$(CC) -c $(BASE_CFLAGS) -MMD -MF $(DEPDIR)/$(*F).d -MQ "$@" -MP -o $@ $<
 
-# Size matters more than speed in these, for the 64 KiB steps below _file_limit (aura-raw.ld).
-# The virtualized SPTM's objects, a development tool, share the read-only segment with .rodata.
+# Size matters more than speed in these, for the room below _file_limit (aura-raw.ld).
+# The virtualized SPTM's objects are a development tool.
 build/sptm_virt.o: CFLAGS += -Oz
 build/sptm_virt_%.o: CFLAGS += -Oz
 # Run-once OS handoff code. kboot_gpu.o, kboot_gpu_t8152.o and kboot_gpu_m4.o use BASE_CFLAGS.

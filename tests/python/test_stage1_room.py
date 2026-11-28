@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""tools/stage1_room.py: the room a Stage 1 link has left, with and without a 64 KiB step
-between .init and .text."""
+"""tools/stage1_room.py: the room a Stage 1 link has left, in the current layout (one 16 KiB-step
+read-execute region) and in older links with 64 KiB steps between .init, .text and .rodata."""
 
 import importlib.util
 import shutil
@@ -14,7 +14,7 @@ spec = importlib.util.spec_from_file_location("stage1_room", ROOT / "tools/stage
 stage1_room = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(stage1_room)
 
-STEP = 0x10000
+STEP = 0x4000
 
 
 def syms(**kw):
@@ -27,6 +27,32 @@ def syms(**kw):
     }
     base.update(kw)
     return base
+
+
+def test_one_code_region():
+    # .init, .text, .rodata and .rela.dyn are one region: only its end and .data count.
+    r, headroom = stage1_room.room(syms(_text_content_start=0x1E000, _layout_step=STEP,
+                                        _rodata_content_end=0xE6840, _data_start=0xE8000,
+                                        _file_vital_end=0xF9010))
+    assert set(r) == {"code", "data"}
+    assert r["code"] == 0xE8000 - 0xE6840
+    assert headroom == r["data"] == 0x120000 - 0xF9010
+
+
+def test_one_code_region_near_the_limit():
+    # Less than a step of data room: a code step would push _file_vital_end past the limit.
+    r, headroom = stage1_room.room(syms(_text_content_start=0x1E000, _layout_step=STEP,
+                                        _rodata_content_end=0x10FF00, _data_start=0x110000,
+                                        _file_vital_end=0x11E000))
+    assert r == {"code": 0x100, "data": 0x2000}
+    assert headroom == 0x100
+
+
+def test_code_region_ending_on_a_step_is_full():
+    r, headroom = stage1_room.room(syms(_text_content_start=0x1E000, _layout_step=STEP,
+                                        _rodata_content_end=0xE8000, _data_start=0xE8000,
+                                        _file_vital_end=0x11F000))
+    assert r["code"] == 0 and headroom == 0
 
 
 def test_text_follows_init():
@@ -66,3 +92,11 @@ def test_built_stage1():
         pytest.skip("not an aura-raw.ld link")
     # .text starts within one page of the end of .init, not on the next 64 KiB step.
     assert s["_text_content_start"] - s["_init_content_end"] < 0x4000
+    if "_layout_step" not in s:
+        return
+    # The read-execute region ends on the first step after .rela.dyn, and .data starts there.
+    step = s["_layout_step"]
+    assert step == STEP
+    assert s["_data_start"] == s["_rodata_end"] == stage1_room.to_step(s["_rodata_content_end"], step)
+    for name in ("_smp_shared_start", "_smp_shared_end", "_file_end", "_stack_top", "_end"):
+        assert s[name] % step == 0, name
