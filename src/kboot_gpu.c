@@ -3601,7 +3601,7 @@ static u32 t6040_cluster_mw(u32 mv, u32 f_mhz, float leak, float active)
     return (u32)p;
 }
 
-static u32 t6040_cs_mw(u32 mv, u32 f_mhz, float leak)
+static u32 t604x_cs_mw(u32 mv, u32 f_mhz, float leak, u64 cs_dyn_bits)
 {
     s32 m;
     float v = t6040_volts(mv, &m);
@@ -3616,7 +3616,7 @@ static u32 t6040_cs_mw(u32 mv, u32 f_mhz, float leak)
     T6040_ROUND(i_static);
 
     double d = t6040_exp(t6040_f64(T6040_D_EXPONENT) * t6040_log((double)v));
-    d = d * t6040_f64(T6040_D_CS_DYN);
+    d = d * t6040_f64(cs_dyn_bits);
     T6040_ROUND(d);
     d = d * (double)f_mhz;
     T6040_ROUND(d);
@@ -3629,6 +3629,11 @@ static u32 t6040_cs_mw(u32 mv, u32 f_mhz, float leak)
     float p = v * i;
     T6040_ROUND(p);
     return (u32)p;
+}
+
+static u32 t6040_cs_mw(u32 mv, u32 f_mhz, float leak)
+{
+    return t604x_cs_mw(mv, f_mhz, leak, T6040_D_CS_DYN);
 }
 
 static int t6040_read32(u64 addr, u32 *val)
@@ -4010,28 +4015,91 @@ int dt_set_gpu_m4(void *dt);
 /*
  * T6041 (M4 Max).
  *
- * Publishes all verified per-unit and per-boot GPU handoff data (apple,t6041-handoff-version = 1):
+ * Publishes per-unit and per-boot GPU calibration handoff data (apple,t6041-handoff-version = 2):
  * - Operating points (16 OPPs, one voltage per cluster), CS and AFR tables, the six UAT/firmware
  *   regions (including optional 27.2 __DATA_SHARED_RO tail) and OS firmware version.
  * - Verified ADT hardware properties: /arm-io/sgx active-mcc-bit-vector (0x3f for 6 MCCs on J616C;
  *   accepts any nonzero 8-bit mask), gpu-perf-base-pstate (default 1), and the five GPU/SoC
  *   temperature-source rows (g0TR..g3TR, r0TR) from /arm-io/aon-ptd ptd_data_table.
+ * - Efuse leakage coefficients from 0x508374000 (verified live on J616C): four packed 14-bit
+ *   per-cluster core fields across 0xc10..0xc14 (bits 1..56, (raw + 1) * 1.5), shared 10-bit SRAM
+ *   across 0xc20..0xc24 (bits 24..33, (raw + 1) * 3.0, replicated across all four clusters),
+ *   13-bit CS at 0xc1c (bits 9..21, raw + 1), and 12-bit AFR at 0xc28 (bits 4..15, (raw + 1) *
+ *   1.5).
  * - Verified SGX registers (powering /arm-io/sgx around the reads and restoring every PMGR mode):
  *   the 40-bit enabled core mask (sgx+0xe01500..0xe01508, published as a u64 apple,core-mask on
- *   T6041 vs u32 on T6040), both 11-state performance maps (sgx+0xe01400 and sgx+0xe01480), and
- *   the relative frequency ladder computed from perf-states.
- *
- * Efuse leakage (apple,{core,sram,cs,afr}-leak-coef), apple,max-power-mw and apple,perf-relative-a
- * are intentionally NOT emitted yet (reserved for handoff version 2): while /arm-io/pmgr reg[46]
- * on J616C maps the same 0x508374000 efuse page as T6040, T6041 has four GPU clusters rather than
- * two so the exact bit offsets inside 0x508374c00..0x508374c40 and the T6041 CS dynamic power
- * constant must be read-verified on live J616C hardware rather than guessed from T6040.
+ *   T6041 vs u32 on T6040) and both 11-state performance maps (sgx+0xe01400 and sgx+0xe01480).
+ * - Computed power ceiling (apple,max-power-mw) and both relative performance ladders
+ *   (apple,perf-relative-a and apple,perf-relative-b) from the T6040 cluster power model and the
+ *   T6041 CS dynamic coefficient.
  *
  * The fill runs only when the device tree enables the GPU. Anything unexpected disables the GPU
  * node again, and the regions and handoff version stay unpublished unless everything succeeded.
  */
-#define T6041_CLUSTERS 4
-#define T6041_AON_ROWS 5
+#define T6041_CLUSTERS     4
+#define T6041_AON_ROWS     5
+#define T6041_MAX_POWER_MW 250000U
+/*
+ * T6041 CS dynamic current coefficient (binary32 11.263f, 0x4134353f, widened to binary64),
+ * solved from the public 40-core T6041 reference (hw/t6041.rs + t6041-j575c.dts: 129,702 mW) and
+ * live 32-core J616C black-box measurements (113,169 mW); reproduces both power ceilings and full
+ * relative-A ladders exactly (exact-match binary32 interval [11.2619276, 11.2646637]).
+ */
+#define T6041_D_CS_DYN 0x402686a7e0000000ULL
+
+static int t6041_leakage_valid(float val)
+{
+    u32 bits;
+
+    memcpy(&bits, &val, sizeof(bits));
+    /*
+     * Positive finite binary32 in [1.0, 65536.0); mirrors the kernel calibration check as
+     * defense-in-depth alongside the zero/all-ones fuse rejection.
+     */
+    return bits >= 0x3f800000U && bits < 0x47800000U;
+}
+
+static int t6041_read_efuse(float core_leak[T6041_CLUSTERS], float sram_leak[T6041_CLUSTERS],
+                            float *cs_leak, float *afr_leak)
+{
+    static const u32 ef_off[6] = {0xc10, 0xc14, 0xc1c, 0xc20, 0xc24, 0xc28};
+    u32 ef[6];
+
+    for (int i = 0; i < 6; i++)
+        if (t6040_read32(T6040_EFUSE + ef_off[i], &ef[i]))
+            return -1;
+
+    u64 core_word = ((u64)ef[1] << 32) | ef[0];
+    u64 sram_word = ((u64)ef[4] << 32) | ef[3];
+    const u32 raw[7] = {
+        (u32)((core_word >> 1) & 0x3fff),
+        (u32)((core_word >> 15) & 0x3fff),
+        (u32)((core_word >> 29) & 0x3fff),
+        (u32)((core_word >> 43) & 0x3fff),
+        (u32)((sram_word >> 24) & 0x3ff),
+        (ef[2] >> 9) & 0x1fff,
+        (ef[5] >> 4) & 0xfff,
+    };
+    static const u32 raw_max[7] = {0x3fff, 0x3fff, 0x3fff, 0x3fff, 0x3ff, 0x1fff, 0xfff};
+    for (int i = 0; i < 7; i++)
+        if (raw[i] == 0 || raw[i] == raw_max[i])
+            return -1;
+
+    float sram = (float)(raw[4] + 1) * 3.0f;
+    float cs = (float)(raw[5] + 1);
+    float afr = (float)(raw[6] + 1) * 1.5f;
+    if (!t6041_leakage_valid(sram) || !t6041_leakage_valid(cs) || !t6041_leakage_valid(afr))
+        return -1;
+    for (int c = 0; c < T6041_CLUSTERS; c++) {
+        core_leak[c] = (float)(raw[c] + 1) * 1.5f;
+        if (!t6041_leakage_valid(core_leak[c]))
+            return -1;
+        sram_leak[c] = sram;
+    }
+    *cs_leak = cs;
+    *afr_leak = afr;
+    return 0;
+}
 
 static int t6041_aon_table(u32 out[T6041_AON_ROWS * 3])
 {
@@ -4068,7 +4136,7 @@ static int t6041_aon_table(u32 out[T6041_AON_ROWS * 3])
     return found == ((1U << T6041_AON_ROWS) - 1) ? 0 : -1;
 }
 
-static int dt_set_gpu_t6041(void *dt)
+static __attribute__((noinline)) int dt_set_gpu_t6041(void *dt)
 {
     int gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0)
@@ -4162,6 +4230,11 @@ static int dt_set_gpu_t6041(void *dt)
         t6040_opp_table(dt, gpu, "apple,afr-opp", aux[1]->count, sizeof(u32)) < 0)
         goto disable;
 
+    /* Read and validate efuse leakage before powering SGX. */
+    float core_leak[T6041_CLUSTERS], sram_leak[T6041_CLUSTERS], cs_leak, afr_leak;
+    if (t6041_read_efuse(core_leak, sram_leak, &cs_leak, &afr_leak))
+        goto disable;
+
     /*
      * The 40-bit core mask and A/B performance-state maps live in SGX MMIO (verified identical
      * offsets to T6040). Power /arm-io/sgx only around the reads and restore every PMGR mode.
@@ -4193,6 +4266,32 @@ static int dt_set_gpu_t6041(void *dt)
     if (!t6040_relative_frequencies(states, index_a, index_b, n, base_pstate, rel_b))
         goto disable;
 
+    /* Maximum power of each logical A state. State 0 stays at 0. */
+    u32 power[T6040_MAP_STATES] = {0};
+    for (int i = 1; i < n; i++) {
+        const struct perf_state *s = &states[index_a[i]];
+        u32 c = min((u32)i, (u32)aux[0]->count - 1);
+        u32 cs = t604x_cs_mw(aux[0]->states[c].volt / 1000, aux[0]->states[c].freq / 1000000,
+                             cs_leak, T6041_D_CS_DYN);
+        for (int j = 0; j < T6041_CLUSTERS; j++) {
+            /* A quarter of the CS power per cluster, truncated as in the reference tables. */
+            float r = (float)active[j] / 10.0f;
+            power[i] += t6040_cluster_mw(s[j * count].volt, s->freq / 1000000, core_leak[j], r) +
+                        cs / T6041_CLUSTERS;
+        }
+        /* A power ladder that falls would put the relative-A table above 100. */
+        if (power[i] < power[i - 1])
+            goto disable;
+    }
+
+    /* Keep the unpopulated selector slots explicit and zero in the handoff. */
+    u32 rel_a[T6040_OPPS] = {0};
+    u64 span_p = power[n - 1] - power[0];
+    if (!span_p || power[n - 1] > T6041_MAX_POWER_MW)
+        goto disable;
+    for (int i = 0; i < n; i++)
+        rel_a[i] = (u32)(100ULL * (power[i] - power[0]) / span_p);
+
     /* Everything is validated. Fill the GPU node, then publish the reserved regions last. */
     int opp;
     u32 i = 0;
@@ -4213,10 +4312,16 @@ static int dt_set_gpu_t6041(void *dt)
     if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware) ||
         fdt_setprop_u32(dt, gpu, "apple,active-mcc-bit-vector", active_mcc) ||
         t6040_set_u32s(dt, gpu, "apple,aon-table", aon_table, ARRAY_SIZE(aon_table)) ||
+        t6040_set_floats(dt, gpu, "apple,core-leak-coef", core_leak, T6041_CLUSTERS) ||
+        t6040_set_floats(dt, gpu, "apple,sram-leak-coef", sram_leak, T6041_CLUSTERS) ||
+        t6040_set_floats(dt, gpu, "apple,cs-leak-coef", &cs_leak, 1) ||
+        t6040_set_floats(dt, gpu, "apple,afr-leak-coef", &afr_leak, 1) ||
         t6040_set_u32s(dt, gpu, "apple,perf-map-a", index_a, count) ||
         t6040_set_u32s(dt, gpu, "apple,perf-map-b", index_b, count) ||
+        t6040_set_u32s(dt, gpu, "apple,perf-relative-a", rel_a, count) ||
         t6040_set_u32s(dt, gpu, "apple,perf-relative-b", rel_b, count) ||
         fdt_setprop_u32(dt, gpu, "apple,perf-base-pstate", base_pstate) ||
+        fdt_setprop_u32(dt, gpu, "apple,max-power-mw", power[n - 1]) ||
         fdt_setprop_u64(dt, gpu, "apple,core-mask", core_mask))
         goto disable;
 
@@ -4227,11 +4332,11 @@ static int dt_set_gpu_t6041(void *dt)
     }
 
     gpu = fdt_path_offset(dt, "gpu");
-    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,t6041-handoff-version", 1))
+    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,t6041-handoff-version", 2))
         goto disable;
 
-    printf("FDT: GPU: T6041 cores %u+%u+%u+%u, MCC mask %#x, top state %u MHz, OS firmware %s\n",
-           active[0], active[1], active[2], active[3], active_mcc, states[count - 1].freq / 1000000,
+    printf("FDT: GPU: T6041 cores %u+%u+%u+%u, MCC mask %#x, max power %u mW, OS firmware %s\n",
+           active[0], active[1], active[2], active[3], active_mcc, power[n - 1],
            os_firmware.string);
     return 0;
 
@@ -4245,7 +4350,7 @@ disable:
     gpu = fdt_path_offset(dt, "gpu");
     if (gpu >= 0 && fdt_setprop_string(dt, gpu, "status", "disabled"))
         return -1;
-    printf("FDT: GPU: invalid T6041 ADT or SGX data, disabling GPU\n");
+    printf("FDT: GPU: invalid T6041 ADT, fuse or SGX data, disabling GPU\n");
     return 0;
 }
 
