@@ -1449,7 +1449,8 @@ static const struct t6050_atc_tunable t6050_atc_tunables[] = {
  */
 #define T6050_ATC_DP_TUNABLES 9
 
-static T6050_ATC int t6050_export_atc(void *dt, int node, u32 port, bool dp)
+/* In .rodata.xtext (types.h): Stage 1's .text has no room left */
+static T6050_ATC AURA_XTEXT int t6050_export_atc(void *dt, int node, u32 port, bool dp)
 {
     char path[24];
     int trace[2][8], src[2], len, parent = fdt_parent_offset(dt, node);
@@ -1500,8 +1501,12 @@ static T6050_ATC_INIT void t6050_clear_atc(void *dt, int node)
         fdt_delprop(dt, node, t6050_atc_tunables[i].fdt_name);
 }
 
-/* All or nothing per port; on failure the PHY is left without tunables, as before. */
-static T6050_ATC_INIT void t6050_setup_atc(void *dt)
+/*
+ * All or nothing per port; on failure the PHY is left without tunables, as before. In
+ * .rodata.xtext (types.h), as t6050_export_atc: Stage 1's .init ends just under the 2 KiB step
+ * that would move .text up.
+ */
+static T6050_ATC AURA_XTEXT void t6050_setup_atc(void *dt)
 {
     static const char *const compat[] = {"apple,t6050-combo-phy", "apple,t6050-dp-phy"};
 
