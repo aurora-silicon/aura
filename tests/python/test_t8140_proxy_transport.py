@@ -1,49 +1,127 @@
 # SPDX-License-Identifier: GPL-2.0-only
-"""usb_init() on a SoC whose USB PHY needs the deferred CDC carrier transition (the T8140 branch)
-schedules that transition for a stage that is about to run the proxy. usb_cdc_schedule() arms the
-CDC watchdog only when the schedule is accepted, and usb_cdc_state_schedule() accepts 1 to 15 s:
-a refused schedule leaves the proxy with no carrier and no watchdog, so a Mac with no host stays
-there until someone holds the power button. Run the real state machine on the arguments usb.c
-passes."""
+"""Exercise the Neo proxy carrier from usb_init through the CDC watchdog.
 
-import ctypes
-import re
+A skipped fallback, invalid delay or refused schedule must not look like a
+working proxy. Guard against leaving a schedule active without its watchdog,
+or scheduling over a debug session or an existing carrier.
+"""
+
+import subprocess
 from pathlib import Path
 
-from test_cdc_state import State, state_lib
+import pytest
+
+from host_compiler import host_cc
+from test_proxy_fallback import _body
+
 
 ROOT = Path(__file__).resolve().parents[2]
+SRC = ROOT / "src"
+
+STUBS = """
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "soc.h"
+#include "usb_cdc_state.h"
+
+#define BIT(n) (1u << (n))
+#define USB_IODEV_COUNT 4
+
+static u32 chip_id = T8140;
+static u32 board_id;
+static struct usb_cdc_state cdc;
+static bool watchdog_armed;
+static bool carrier_owned;
+static bool usb_is_initialized;
+static bool debug;
+static bool watchdog_fails;
+static unsigned watchdog_calls;
+static u64 now_ms = 10;
+
+static bool aura_debug_enabled(void) { return debug; }
+static bool usb_cdc_deferred_usb2(void) { return false; }
+static u64 get_ticks(void) { return now_ms; }
+static u64 ticks_to_msecs(u64 ticks) { return ticks; }
+
+static int wdt_arm_seconds(unsigned seconds)
+{
+    assert(seconds > 0);
+    ++watchdog_calls;
+    return watchdog_fails ? -1 : 0;
+}
+
+/* The Neo must take the deferred path before generic USB initialization. */
+#define adt_path_offset(...) (abort(), 0)
+#define tps6598x_foreach_hpm(...) abort()
+#define usb_phy_bringup(...) abort()
+"""
+
+HARNESS = """
+int main(int argc, char **argv)
+{
+    assert(argc == 2);
+    const char *test = argv[1];
+
+    debug = !strcmp(test, "debug");
+    watchdog_fails = !strcmp(test, "watchdog-error");
+    carrier_owned = !strcmp(test, "owned");
+    if (!strcmp(test, "ready"))
+        cdc.state = USB_CDC_DWC_READY;
+
+    if (!strcmp(test, "zero-delay"))
+        assert(usb_cdc_schedule(0, 0, BIT(1) | BIT(2)) == -1);
+    else
+        usb_init();
+
+    u32 flags = cdc.state == USB_CDC_SCHEDULED ? cdc.flags : 0;
+    printf("%u %u %u %u %u %u\\n", (unsigned)cdc.state, flags,
+           watchdog_calls, (unsigned)watchdog_armed,
+           (unsigned)usb_cdc_state_due(&cdc, now_ms + 999),
+           (unsigned)usb_cdc_state_due(&cdc, now_ms + 1000));
+}
+"""
 
 
-def _usb_init_schedule_args():
-    usb = (ROOT / "src/usb.c").read_text()
-    body = usb[usb.index("void usb_init(void)"):]
-    body = body[:body.index("\n}\n")]
-    branch = body[body.index("if (chip_id == T8140) {"):]
-    m = re.search(r"usb_cdc_schedule\(\s*(\d+)\s*,\s*(\d+)\s*,\s*BIT\(1\)\s*\|\s*BIT\(2\)\s*\)", branch)
-    assert m, "usb_init() no longer schedules the CDC transition the way this test reads it"
-    return int(m.group(1)), int(m.group(2)), (1 << 1) | (1 << 2)
+@pytest.fixture(scope="module")
+def proxy_harness(tmp_path_factory):
+    build = tmp_path_factory.mktemp("neo-proxy")
+    source = build / "proxy.c"
+    executable = build / "proxy"
+    cdc = (SRC / "usb_cdc.c").read_text()
+    usb = (SRC / "usb.c").read_text()
+    functions = [
+        _body(cdc, "static bool usb2_target(void)"),
+        _body(cdc, "int usb_cdc_arm_watchdog(void)"),
+        _body(cdc, "int usb_cdc_schedule("),
+        _body(cdc, "bool usb_cdc_ready(void)"),
+        _body(cdc, "bool usb_cdc_owns_carrier(void)"),
+        _body(usb, "void usb_init(void)"),
+    ]
+    source.write_text("\n".join([STUBS, *functions, HARNESS]))
+    subprocess.run(
+        [*host_cc(), "-std=gnu11", "-Wall", "-Werror", "-DCDC_STATE_HOST_TEST",
+         "-iquote", str(SRC), str(source), str(SRC / "usb_cdc_state.c"),
+         "-o", str(executable)],
+        check=True,
+    )
+    return executable
 
 
-def test_usb_init_schedule_is_accepted(tmp_path):
-    lib = state_lib(tmp_path)
-    delay, reserved, flags = _usb_init_schedule_args()
-    state = State()
-    assert lib.usb_cdc_state_schedule(ctypes.byref(state), delay, reserved, flags, 10) == 0
-    # It runs once its deadline has passed, as the Stage 1 window's schedule does.
-    assert not lib.usb_cdc_state_due(ctypes.byref(state), 10 + delay - 1)
-    assert lib.usb_cdc_state_due(ctypes.byref(state), 10 + delay)
-
-
-def test_control_delay_zero_is_refused(tmp_path):
-    """The call as it was: no transition and, in usb_cdc_schedule(), no watchdog."""
-    lib = state_lib(tmp_path)
-    state = State()
-    assert lib.usb_cdc_state_schedule(ctypes.byref(state), 0, 0, 6, 10) == -1
-
-
-def test_watchdog_follows_an_accepted_schedule_only():
-    cdc = (ROOT / "src/usb_cdc.c").read_text()
-    sched = cdc[cdc.index("int usb_cdc_schedule("):]
-    sched = sched[:sched.index("\n}\n")]
-    assert re.search(r"if \(!ret && usb_cdc_arm_watchdog\(\)\)", sched)
+@pytest.mark.parametrize("case, expected, refused", [
+    # State, active flags, watchdog calls, armed, due at 999 ms, due at 1000 ms.
+    ("fallback",       (1, 6, 1, 1, 0, 1), False),
+    ("zero-delay",     (0, 0, 0, 0, 0, 0), False),
+    ("watchdog-error", (0, 0, 1, 0, 0, 0), True),
+    ("debug",          (0, 0, 0, 0, 0, 0), False),
+    ("owned",          (0, 0, 0, 0, 0, 0), False),
+    ("ready",          (2, 0, 0, 0, 0, 0), False),
+])
+def test_neo_proxy_schedule(proxy_harness, case, expected, refused):
+    result = subprocess.run([str(proxy_harness), case], check=True,
+                            capture_output=True, text=True)
+    *messages, state = result.stdout.splitlines()
+    assert tuple(map(int, state.split())) == expected
+    assert messages == (["usb: unable to schedule proxy transport"] if refused else [])
