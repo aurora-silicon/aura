@@ -50,9 +50,9 @@ class Node:
         return out
 
 
-def amp(name, addr, phandle, extra=None):
+def amp(name, addr, phandle, extra=None, compat="audio-control,sn012776"):
     props = {
-        "compatible": cstr("audio-control,sn012776"),
+        "compatible": cstr(compat),
         "reg": u32(addr) + u32(400000) + u32(0) + u32(0),
         "AAPL,phandle": u32(phandle),
     }
@@ -86,8 +86,8 @@ def adt(buses, extra=None):
                 [Node("arm-io", arm_io, [gpio_controller()] + (extra or []) + buses)])
 
 
-def dts(amps, stale=None, chosen=""):
-    """A device tree with one ti,sn012776 node per (bus, addr); stale: {(bus, addr): props}"""
+def dts(amps, stale=None, chosen="", compat='"ti,sn012776", "ti,tas2764"'):
+    """A device tree with one amp node per (bus, addr); stale: {(bus, addr): props}"""
     out = ["/dts-v1/;", "/ {", "\t#address-cells = <2>;", "\t#size-cells = <2>;",
            "\tchosen { %s};" % chosen]
     buses = sorted({b for b, _ in amps})
@@ -97,7 +97,7 @@ def dts(amps, stale=None, chosen=""):
         for bb, a in amps:
             if bb != b:
                 continue
-            out += ["\t\tcodec@%x {" % a, '\t\t\tcompatible = "ti,sn012776", "ti,tas2764";',
+            out += ["\t\tcodec@%x {" % a, "\t\t\tcompatible = %s;" % compat,
                     "\t\t\treg = <0x%x>;" % a]
             for k, v in (stale or {}).get((b, a), {}).items():
                 out.append("\t\t\t%s = [%s];" % (k, " ".join("%02x" % x for x in v)))
@@ -115,6 +115,7 @@ STALE = {"apple,amp-dcblocker-config": b"\xee\xee", "apple,bop-config": b"\xee",
 SIX = [(0, 0x38), (0, 0x39), (0, 0x3a), (1, 0x3b), (1, 0x3c), (1, 0x3d)]
 ROWS6 = bytes(b for i in range(6) for b in (0x60 + i, 0x70 + i, 0x80 + i, 0x90 + i))
 ZD6 = bytes(range(0x30, 0x30 + 48))
+TAS_ROWS = bytes([0x06, 0x03, 0x22, 0x24, 0x08, 0x04, 0x26, 0x28])
 
 
 def strap(pin, flags=0x100, phandle=GPIO_PHANDLE, fourcc=b"GPIO"):
@@ -243,11 +244,38 @@ def scenario(name):
         return adt(buses), dts(three, {(1, 0x41): STALE})
     if name == "no-amps":
         return adt([Node("i2c0", {}, [])]), dts(three, {(1, 0x41): STALE})
+    if name.startswith("tas-"):
+        g = {"speaker1": u32(0x32)}
+        if name in ("tas-group", "tas-wrong-member", "tas-wrong-member-stale"):
+            g["speaker-config"] = TAS_ROWS
+        elif name == "tas-short-speaker-config":
+            g["speaker-config"] = TAS_ROWS[:-1]
+        elif name == "tas-long-speaker-config":
+            g["speaker-config"] = TAS_ROWS + bytes(4)
+        amps = [(0, 0x51), (0, 0x54)]
+        member_compat = "audio-control,other" if name.startswith("tas-wrong-member") else "audio-control,tas5770"
+        buses = [Node("i2c0", {}, [
+            amp("audio-speaker", 0x51, 0x31, g, "audio-control,tas5770"),
+            amp("audio-speaker-a", 0x54, 0x32, compat=member_compat),
+        ])]
+        stale = {a: {"apple,speaker-config": b"\xee" * 4} for a in amps}
+        if name == "tas-wrong-member":
+            stale = {}
+        if name in ("tas-wrong-member-stale", "tas-no-adt-group-stale"):
+            # Two valid-looking gain rows could otherwise let Linux admit
+            # the route even though the loader could not source the rows.
+            stale = {addr: {"apple,speaker-config": bytes((0, i + 1, 0, 0))}
+                     for i, addr in enumerate(amps)}
+        if name == "tas-no-adt-group-stale":
+            buses = [Node("i2c0", {}, [])]
+        return adt(buses), dts(amps, stale, compat='"ti,tas5770l", "ti,tas2770"')
     raise SystemExit("unknown scenario %s" % name)
 
 
 SCENARIOS = ["group", "no-dcblocker", "six-amps", "short-speaker-config", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
-             "dangling-phandle", "no-amps"] + list(SPEAKER_ID_SCENARIOS) + list(HPD_SCENARIOS)
+             "dangling-phandle", "no-amps", "tas-group", "tas-wrong-member", "tas-wrong-member-stale", "tas-no-adt-group-stale",
+             "tas-no-speaker-config",
+             "tas-short-speaker-config", "tas-long-speaker-config"] + list(SPEAKER_ID_SCENARIOS) + list(HPD_SCENARIOS)
 
 
 def from_ioreg(path):
