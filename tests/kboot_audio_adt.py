@@ -246,14 +246,14 @@ def scenario(name):
         return adt([Node("i2c0", {}, [])]), dts(three, {(1, 0x41): STALE})
     if name.startswith("tas-"):
         g = {"speaker1": u32(0x32)}
-        if name in ("tas-group", "tas-wrong-member"):
+        if name in ("tas-group", "tas-wrong-member", "tas-wrong-member-stale"):
             g["speaker-config"] = TAS_ROWS
         elif name == "tas-short-speaker-config":
             g["speaker-config"] = TAS_ROWS[:-1]
         elif name == "tas-long-speaker-config":
             g["speaker-config"] = TAS_ROWS + bytes(4)
         amps = [(0, 0x51), (0, 0x54)]
-        member_compat = "audio-control,other" if name == "tas-wrong-member" else "audio-control,tas5770"
+        member_compat = "audio-control,other" if name.startswith("tas-wrong-member") else "audio-control,tas5770"
         buses = [Node("i2c0", {}, [
             amp("audio-speaker", 0x51, 0x31, g, "audio-control,tas5770"),
             amp("audio-speaker-a", 0x54, 0x32, compat=member_compat),
@@ -261,12 +261,20 @@ def scenario(name):
         stale = {a: {"apple,speaker-config": b"\xee" * 4} for a in amps}
         if name == "tas-wrong-member":
             stale = {}
+        if name in ("tas-wrong-member-stale", "tas-no-adt-group-stale"):
+            # Two valid-looking gain rows could otherwise let Linux admit
+            # the route even though the loader could not source the rows.
+            stale = {addr: {"apple,speaker-config": bytes((0, i + 1, 0, 0))}
+                     for i, addr in enumerate(amps)}
+        if name == "tas-no-adt-group-stale":
+            buses = [Node("i2c0", {}, [])]
         return adt(buses), dts(amps, stale, compat='"ti,tas5770l", "ti,tas2770"')
     raise SystemExit("unknown scenario %s" % name)
 
 
 SCENARIOS = ["group", "no-dcblocker", "six-amps", "short-speaker-config", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
-             "dangling-phandle", "no-amps", "tas-group", "tas-wrong-member", "tas-no-speaker-config",
+             "dangling-phandle", "no-amps", "tas-group", "tas-wrong-member", "tas-wrong-member-stale", "tas-no-adt-group-stale",
+             "tas-no-speaker-config",
              "tas-short-speaker-config", "tas-long-speaker-config"] + list(SPEAKER_ID_SCENARIOS) + list(HPD_SCENARIOS)
 
 

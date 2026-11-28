@@ -16,12 +16,11 @@
  *   speaker-config        -> apple,speaker-config        (4 bytes: operating level and slots)
  *   amp-tx-zd-config      -> apple,amp-tx-zd-config      (8 bytes: sense output idle slots)
  *
- * TAS5770L groups use the same four-byte speaker-config rows. A property the group does not have
- * (or one without a row for every amp) is removed from its amps, so the kernel never sees a value
- * that did not come from this Mac. Amps are matched to the corresponding DT compatible by I2C
- * address, which must name exactly one node. A group with an amp that cannot be matched is left as
- * it is: the kernel gets either the whole group's configuration or none of it. Nothing here stops
- * the boot.
+ * TAS5770L groups use the same four-byte speaker-config rows. Clear their rows in the input DT
+ * before applying the current ADT so a rejected or absent group cannot retain a previous gain.
+ * Missing properties and incomplete row arrays are omitted. Amps are matched by compatible and
+ * I2C address, which must identify exactly one node. The loader validates the group before writing
+ * its rows.
  */
 
 #include "kboot_audio.h"
@@ -34,6 +33,8 @@
 #include "libfdt/libfdt.h"
 
 #define MAX_GROUP_AMPS 16
+#define TAS5770_DT_COMPAT "ti,tas5770l"
+#define DT_SPEAKER_CONFIG "apple,speaker-config"
 
 struct amp_prop {
     const char *adt;
@@ -53,12 +54,12 @@ struct amp_family {
 static const struct amp_prop sn012776_props[] = {
     {"bop-config", "apple,bop-config", 0},
     {"amp-dcblocker-config", "apple,amp-dcblocker-config", 0},
-    {"speaker-config", "apple,speaker-config", 4},
+    {"speaker-config", DT_SPEAKER_CONFIG, 4},
     {"amp-tx-zd-config", "apple,amp-tx-zd-config", 8},
 };
 
 static const struct amp_prop tas5770_props[] = {
-    {"speaker-config", "apple,speaker-config", 4},
+    {"speaker-config", DT_SPEAKER_CONFIG, 4},
 };
 
 static const struct amp_family amp_families[] = {
@@ -70,7 +71,7 @@ static const struct amp_family amp_families[] = {
     },
     {
         .adt_compat = "audio-control,tas5770",
-        .dt_compat = "ti,tas5770l",
+        .dt_compat = TAS5770_DT_COMPAT,
         .props = tas5770_props,
         .nr_props = ARRAY_SIZE(tas5770_props),
         .exact_rows = true,
@@ -236,6 +237,17 @@ int kboot_audio_amp_config(void *dt, const void *adt)
 {
     int arm_io = adt_path_offset(adt, "/arm-io");
     int bus = arm_io;
+
+    /* Deleting a property leaves the containing node at the same offset. */
+    for (int node = fdt_node_offset_by_compatible(dt, -1, TAS5770_DT_COMPAT); node >= 0;
+         node = fdt_node_offset_by_compatible(dt, node, TAS5770_DT_COMPAT)) {
+        int ret = fdt_delprop(dt, node, DT_SPEAKER_CONFIG);
+
+        if (ret && ret != -FDT_ERR_NOTFOUND) {
+            printf("kboot: audio: could not clear incoming TAS speaker configuration: %d\n", ret);
+            return -1;
+        }
+    }
 
     if (arm_io < 0)
         return 0;
