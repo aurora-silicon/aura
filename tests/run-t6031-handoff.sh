@@ -81,6 +81,7 @@ while IFS= read -r f; do
     h="${f%.c}.h"
     [ -f "src/$h" ] && cp "src/$h" "$tmp/src/"
 done < "$root/tests/display-handoff-sources.txt"
+mkdir -p "$tmp/build" && : > "$tmp/build/build_cfg.h" # a host build: no Stage 1 or Stage 2 options
 for f in kboot_gpu.c kboot_gpu26.c kboot_gpu_t6031.c \
     kboot_gpu_t8122_power.c kboot_t6031.c firmware.c pmgr.c; do
     cp "src/$f" "$tmp/src/"

@@ -31,7 +31,8 @@ build() { # build <tree> <out> [extra cflags]; the test file is this tree's, or 
     tree=$1 out=$2
     shift 2
     tests=${TESTS:-$root}
-    mkdir -p "$out/src" || return 1
+    mkdir -p "$out/src" "$out/build" || return 1
+    : > "$out/build/build_cfg.h" || return 1 # a host build: no Stage 1 or Stage 2 options
     cp "$tree/src/kboot_gpu.c" "$tree/src/firmware.c" "$out/src/" || return 1
     cp "$tests"/tests/g15_host/*.h "$tests/tests/kboot_gpu_g15_host.c" "$out/src/" || return 1
     extra=
