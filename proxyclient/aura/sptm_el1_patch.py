@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Instruction rewrites that let SPTM and XNU run one level down, at EL1/GL1, under aura's
-classic hypervisor on SoCs without FEAT_NV2 (M1-M3).
+classic hypervisor on the M1 series, which has no FEAT_NV2.
 
 Natively SPTM runs at GL2 and XNU at EL2 with HCR_EL2.E2H set. aura holds EL2 and GL2, so both
 run one level lower. Their guarded world then lands in GL1, which the hardware supports as it

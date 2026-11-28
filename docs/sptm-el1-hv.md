@@ -1,7 +1,7 @@
-# macOS with SPTM under the classic hypervisor (M1 to M3)
+# macOS with SPTM under the classic hypervisor (M1 series)
 
-macOS 27 boots M1-class Macs through SPTM and TXM too. On M4 and later aura runs those as a FEAT_NV2
-guest at virtual EL2 (`docs/sptm-nv2-virt.md`). M1 to M3 have no NV2, but aura runs there at EL2
+macOS 27 boots M1-series Macs through SPTM and TXM too. On M4 and later aura runs those as a FEAT_NV2
+guest at virtual EL2 (`docs/sptm-nv2-virt.md`). The M1 series has no NV2, but aura runs there at EL2
 with unlocked Apple system registers, and its classic hypervisor can run SPTM, TXM and XNU one
 level down: XNU at EL1, SPTM's guarded world in GL1 and TXM in GL0, with aura keeping EL2 and
 GL2. That is how the hypervisor ran PPL. GENTER, GEXIT and SPTM's guarded ERETs then run in

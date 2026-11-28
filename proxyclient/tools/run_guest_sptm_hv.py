@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Boot macOS's own SPTM, TXM and XNU at EL1 under aura's classic hypervisor (M1-M3).
+"""Boot macOS's own SPTM, TXM and XNU at EL1 under aura's classic hypervisor (M1 series).
 
 Without FEAT_NV2 a guest cannot run at virtual EL2, so SPTM, TXM and XNU run at physical EL1
 with their guarded world in GL1, while aura holds EL2 and GL2, as with a classic macOS guest.
@@ -122,7 +122,7 @@ def main():
     bootstrap_port(iface, p)
     u = ProxyUtils(p, heap_size=128 * 1024 * 1024, aura_heap=128 * 1024 * 1024)
     if not u.cpu_features.apple_sysregs_unlocked:
-        raise SystemExit("this path needs unlocked Apple system registers (aura at EL2, M1-M3)")
+        raise SystemExit("this path needs unlocked Apple system registers (aura at EL2)")
     hv = HV(iface, p, u)
     hv.init()
 
