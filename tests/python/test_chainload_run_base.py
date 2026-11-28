@@ -10,6 +10,20 @@ below stage 1's base, are mapped inaccessible, so any access to them fails the
 test. After a successful call the chainload stub's copy and start.S's move to
 run_base (exercised on its own by test_start_run_base.py) are modelled, and
 the result is checked against what the stage 2 handoff relies on.
+
+The M3 cases (T8122, T6030, T6031) add the coprocessor log buffers iBoot leaves
+running: the __OS_LOG segments of /arm-io/<dev>/<nub> segment-ranges, the
+panel DCP's 0x120000 above stage 1's base. Failure modes they check:
+- the stub's copy to stage 1's base, or start.S's copy of the footprint to a
+  run base, writes over a live log (the log pages are mapped inaccessible);
+- the firmware block (SEPFW, preoslog, boot_args, ADT copy) is packed onto one;
+- the staged copy or a parked firmware block is itself allocated on one;
+- an image runs from its staged copy where RVBAR is locked (secondaries would
+  reset into the retired stage 1) or without a load header (an older stage 2);
+- a segment that is not a log, an empty one, one that only touches the copy,
+  a truncated record or one near the top of the address space moves anything;
+- the next stage's top_of_kernel_data leaves its staged copy or firmware block
+  unreserved, or start.S's M3 move would not land above them.
 """
 import re
 
@@ -17,7 +31,7 @@ from test_smp_timeouts import REPO, compile_and_run
 
 
 def function(source, name):
-    match = re.search(r"^(?:static )?(?:int|u64) " + name + r"\([^;{]*\)\s*\{", source, re.M)
+    match = re.search(r"^(?:static )?(?:int|u64|bool) " + name + r"\([^;{]*\)\s*\{", source, re.M)
     assert match, name
     end, depth = match.end(), 1
     while depth:
@@ -95,7 +109,11 @@ int main(void)
 
 def test_chainload_places_images_around_t8140_firmware_ro(tmp_path):
     source = (REPO / "src/chainload.c").read_text()
+    adt_h = (REPO / "src/adt.h").read_text()
+    adt_defs = _between(adt_h, "#define ADT_FOREACH_CHILD", "#define ADT_FOREACH_PROPERTY") + \
+        _between(adt_h, "struct adt_segment_ranges {", "#endif")
     bodies = function(source, "chainload_run_footprint") + "\n" + \
+        function(source, "chainload_meets_live_log") + "\n" + \
         function(source, "chainload_set_adt_range") + "\n" + function(source, "chainload_image")
     harness = r'''
 #define _GNU_SOURCE
@@ -127,6 +145,8 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define T6000 0x6000
 #define T6020 0x6020
 #define T6030 0x6030
+#define T6031 0x6031
+#define PACKED __attribute__((packed))
 #define sysop(op) ((void)0)
 #define ADT_GETPROP_ARRAY(adt, node, name, arr) adt_getprop_copy(adt, node, name, (arr), sizeof(arr))
 ''' + load_header() + r'''
@@ -159,7 +179,7 @@ static u64 force_alloc, alloc_fail, allocs, frees, last_alloc;
 static u8 adt_buf[128];
 #define TEST_SEPFW_OFF 64
 #define TEST_DEVTREE_OFF 80
-static char message[256];
+static char message[4096];
 static void *adt = adt_buf;
 static bool handed_on, inherited_dcp;
 static u64 retained_heap_base;
@@ -175,6 +195,37 @@ static struct {
 
 struct adt_property { char name[32]; u32 size; u8 value[]; };
 struct adt_node_hdr { u32 property_count, child_count; };
+''' + adt_defs + r'''/* RVBAR: locked on T8140, set by smp_start_cpu() on M1 to M3 */
+static struct midr_part_features { bool apple_sysregs_unlocked; } features;
+static const struct midr_part_features *cpu_features = &features;
+
+/* /arm-io and one nub under each of its devices, whose segment-ranges hold the logs */
+#define ARM_IO   100
+#define DEV0     200
+#define NUB0     300
+#define MAX_DEVS 4
+static int ndevs, arm_io = ARM_IO;
+static struct adt_segment_ranges nub_segs[MAX_DEVS][4];
+static u32 nub_len[MAX_DEVS];
+static void add_segment(int dev, u64 phys, u32 size, u32 flags)
+{
+    assert(dev < MAX_DEVS && nub_len[dev] < sizeof(nub_segs[dev]));
+    struct adt_segment_ranges r = {phys, 0, phys, size, flags};
+    memcpy((u8 *)nub_segs[dev] + nub_len[dev], &r, sizeof(r));
+    nub_len[dev] += sizeof(r);
+    ndevs = dev + 1 > ndevs ? dev + 1 : ndevs;
+}
+static int adt_get_child_count(const void *dt, int node)
+{
+    if (node == ARM_IO)
+        return ndevs;
+    return node >= DEV0 && node < DEV0 + ndevs;
+}
+static int adt_first_child_offset(const void *dt, int node)
+{
+    return node == ARM_IO ? DEV0 : NUB0 + node - DEV0;
+}
+static int adt_next_sibling_offset(const void *dt, int node) { return node + 1; }
 ''' + live_rtkit_record() + r'''
 /* The DCP this stage handed on running; described unless rtkit_get_live_state() failed */
 static bool described;
@@ -212,12 +263,21 @@ static int adt_path_offset(const void *dt, const char *path)
     assert(dt == adt);
     if (!strcmp(path, "/chosen"))
         return 0;
+    if (!strcmp(path, "/arm-io"))
+        return arm_io;
     assert(!strcmp(path, "/chosen/memory-map"));
     return adt_node;
 }
 /* This ADT has no preoslog and no BootArgs entry: their handling must leave the layout alone. */
 static const void *adt_getprop(const void *dt, int node, const char *name, u32 *len)
 {
+    if (node >= NUB0 && node < NUB0 + ndevs) {
+        assert(dt == adt && !strcmp(name, "segment-ranges"));
+        if (!nub_len[node - NUB0])
+            return NULL;
+        *len = nub_len[node - NUB0];
+        return nub_segs[node - NUB0];
+    }
     assert(dt == adt && node == adt_node);
     if (handed_on && (!strcmp(name, "SEPFW") || !strcmp(name, "DeviceTree"))) {
         if (len)
@@ -257,11 +317,15 @@ static void model_free(void *p)
     if (p)
         frees++;
 }
+/* Every line of one call, so a warning before the summary line is seen too */
 static int model_printf(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    int ret = vsnprintf(message, sizeof(message), fmt, ap);
+    size_t used = strlen(message);
+    if (used > sizeof(message) / 2)
+        used = 0;
+    int ret = vsnprintf(message + used, sizeof(message) - used, fmt, ap);
     va_end(ap);
     return ret;
 }
@@ -319,6 +383,10 @@ static void setup(int chip, u64 heap_used)
     setprop_ret = 0;
     handed_on = inherited_dcp = false;
     described = true;
+    features.apple_sysregs_unlocked = chip != T8140;
+    ndevs = 0;
+    arm_io = ARM_IO;
+    memset(nub_len, 0, sizeof(nub_len));
     memset(adt_buf, 0, sizeof(adt_buf));
     message[0] = 0;
     sepfw_src = ram + SEPFW_OFF;
@@ -825,6 +893,211 @@ static void inherited_dcp_needs_a_record_receiver(void)
     assert(chainload_image(image, sizeof(image), NULL, 0) == 0 && next_stage.entry);
 }
 
+/*
+ * M3 (T8122, T6030, T6031): the panel DCP's __OS_LOG 0x120000 above stage 1's base and the next
+ * coprocessor's right after it, both below top_of_kernel_data, as iBoot leaves them.
+ */
+#define LOG_OFF  0x120000UL
+#define LOG_SIZE 0x28000UL
+static void add_m3_logs(void)
+{
+    /* The DCP's text segment is no log: it may lie on the copy */
+    add_segment(0, home, 0x4000, 0x0);
+    add_segment(0, home + LOG_OFF, LOG_SIZE, 0xa);
+    add_segment(1, home + LOG_OFF + LOG_SIZE, LOG_SIZE, 0xa);
+}
+static void protect_m3_logs(int prot)
+{
+    if (sysconf(_SC_PAGESIZE) <= SZ_16K)
+        assert(!mprotect((void *)(home + LOG_OFF), 2 * LOG_SIZE, prot));
+}
+
+/* What start.S does with an image left where it was staged: an M3 ESP stage 2 moves itself */
+static void check_runs_staged(const u8 *image, size_t size)
+{
+    u64 isz = image_size_for(size), fw_size = ALIGN_UP(SEPFW_SIZE, SZ_16K) + SZ_16K;
+    u64 dest = next_stage.args[2];
+    assert(dest == next_stage.args[1] && dest >= live_heap);
+    assert(next_stage.args[3] == isz + fw_size);
+    assert(run_base_field(dest) == 0);
+    check_staging(image, size, dest + isz);
+    assert(strstr(message, "runs where it is staged") && !strstr(message, "WARNING"));
+    u64 run, payload;
+    run_next_stage(&run, &payload);
+    assert(run == dest && payload == dest + FOOTPRINT);
+    assert(!memcmp((void *)payload, image + FOOTPRINT, size - FOOTPRINT));
+    /* start.S moves the file part to ALIGN_UP(top_of_kernel_data, 64K): above all of it */
+    struct boot_args *ba = (struct boot_args *)next_stage.args[0];
+    assert(ALIGN_UP(ba->top_of_kernel_data, 0x10000UL) >= dest + isz + fw_size);
+    /* Stage 1's own image below the logs was left alone */
+    for (u64 a = home; a < home + LOG_OFF; a += 4096)
+        assert(*(u8 *)a == 0x5a);
+}
+
+static void m3_live_logs_are_never_written(int chip)
+{
+    const size_t size = 0x380000;
+    u8 *image;
+
+    /* A stage 2 whose code and data (footprint) alone reach the logs: it runs staged */
+    FOOTPRINT = 0x200000;
+    setup(chip, 0x1000000);
+    add_m3_logs();
+    protect_m3_logs(PROT_NONE);
+    assert(home + image_size_for(size) <= cur_boot_args.top_of_kernel_data);
+    image = make_image(size, CHAINLOAD_HDR_MAGIC, CHAINLOAD_HDR_VERSION,
+                       CHAINLOAD_HDR_F_RUN_BASE | CHAINLOAD_HDR_F_LIVE_DCP |
+                           CHAINLOAD_HDR_F_LIVE_RTKIT,
+                       FOOTPRINT);
+    assert(chainload_image(image, size, vars, NVARS) == 0);
+    assert(allocs == 1);
+    check_runs_staged(image, size);
+    protect_m3_logs(PROT_READ | PROT_WRITE);
+
+    /* The same without the logs in the ADT: the run base layout of before */
+    setup(chip, 0x1000000);
+    assert(chainload_image(image, size, vars, NVARS) == 0);
+    assert(run_base_field(next_stage.args[1]) == home && !strstr(message, "WARNING"));
+
+    /* Segments that do not meet the copy, or are no logs, change nothing */
+    setup(chip, 0x1000000);
+    add_segment(0, home - LOG_SIZE, LOG_SIZE, 0xa);   /* ends at our base */
+    add_segment(0, home + LOG_OFF, 0, 0xa);           /* empty */
+    add_segment(0, home + LOG_OFF, LOG_SIZE, 0xb);    /* other flags */
+    add_segment(1, ~0UL - 0x1000, 0x2000, 0xa);       /* wraps the address space */
+    add_segment(2, home + 0x20000000UL, 0x4000, 0xa); /* far above the copy */
+    add_segment(3, home + LOG_OFF, LOG_SIZE, 0xa);
+    nub_len[3] = sizeof(struct adt_segment_ranges) - 1; /* truncated record */
+    assert(chainload_image(image, size, vars, NVARS) == 0);
+    assert(run_base_field(next_stage.args[1]) == home && !strstr(message, "WARNING"));
+    /* ... nor does an ADT without /arm-io */
+    setup(chip, 0x1000000);
+    add_m3_logs();
+    arm_io = -1;
+    assert(chainload_image(image, size, vars, NVARS) == 0);
+    assert(run_base_field(next_stage.args[1]) == home);
+
+    /* A log that only the first byte past the footprint would reach is still met */
+    setup(chip, 0x1000000);
+    add_segment(0, home + FOOTPRINT - 1, 1, 0xa);
+    assert(chainload_image(image, size, vars, NVARS) == 0);
+    assert(run_base_field(next_stage.args[1]) == 0 && strstr(message, "runs where it is staged"));
+    /* ... as is one that starts below our base and ends one byte above it */
+    setup(chip, 0x1000000);
+    add_segment(0, home - 0x4000, 0x4001, 0xa);
+    assert(chainload_image(image, size, vars, NVARS) == 0);
+    assert(run_base_field(next_stage.args[1]) == 0 && strstr(message, "runs where it is staged"));
+
+    /* The staged copy may not be allocated on a log itself */
+    setup(chip, 0x1000000);
+    add_m3_logs();
+    protect_m3_logs(PROT_NONE);
+    force_alloc = home + LOG_OFF - SZ_16K;
+    refused(chip, image, size, "no room to stage");
+    protect_m3_logs(PROT_READ | PROT_WRITE);
+
+    /* Where RVBAR is locked the image keeps the layout of before, and says why */
+    setup(chip, 0x1000000);
+    add_m3_logs();
+    features.apple_sysregs_unlocked = false;
+    assert(chainload_image(image, size, vars, NVARS) == 0);
+    assert(run_base_field(next_stage.args[1]) == home && strstr(message, "WARNING"));
+    free(image);
+
+    /* An older stage 2 (no load header) is copied to our base as before, with a warning */
+    image = make_image(size, 0, 0, 0, 0);
+    setup(chip, 0x1000000);
+    add_m3_logs();
+    assert(chainload_image(image, size, vars, NVARS) == 0);
+    assert(next_stage.args[2] == home && strstr(message, "WARNING"));
+    free(image);
+
+    /*
+     * An image that ends below the logs whose firmware block would reach them: the image is
+     * copied to our base, its firmware block parked in the heap.
+     */
+    const size_t small = 0x100000 - 0x400;
+    FOOTPRINT = 0x80000;
+    image = make_image(small, CHAINLOAD_HDR_MAGIC, CHAINLOAD_HDR_VERSION,
+                       CHAINLOAD_HDR_F_RUN_BASE, FOOTPRINT);
+    setup(chip, 0x1000000);
+    add_m3_logs();
+    protect_m3_logs(PROT_NONE);
+    assert(home + image_size_for(small) <= home + LOG_OFF);
+    assert(chainload_image(image, small, vars, NVARS) == 0);
+    assert(allocs == 2 && next_stage.args[2] == home);
+    assert(next_stage.args[3] == image_size_for(small) && sepfw[0] >= live_heap);
+    assert(run_base_field(next_stage.args[1]) == 0);
+    check_staging(image, small, sepfw[0]);
+    u64 run, payload;
+    run_next_stage(&run, &payload);
+    assert(run == home && payload == home + FOOTPRINT);
+    /* ... and that block may not be parked on a log */
+    setup(chip, 0x1000000);
+    add_m3_logs();
+    force_alloc = home + LOG_OFF;
+    refused(chip, image, small, NULL);
+    assert(allocs == 1);
+    protect_m3_logs(PROT_READ | PROT_WRITE);
+    free(image);
+
+    /* The image would also reach the live heap and its footprint the logs: it runs staged */
+    const size_t big = 11426016;
+    FOOTPRINT = 0x410000UL;
+    image = make_image(big, CHAINLOAD_HDR_MAGIC, CHAINLOAD_HDR_VERSION,
+                       CHAINLOAD_HDR_F_RUN_BASE, FOOTPRINT);
+    setup(chip, 0x1000000);
+    add_m3_logs();
+    protect_m3_logs(PROT_NONE);
+    assert(home + image_size_for(big) > cur_boot_args.top_of_kernel_data);
+    assert(chainload_image(image, big, vars, NVARS) == 0);
+    check_runs_staged(image, big);
+    protect_m3_logs(PROT_READ | PROT_WRITE);
+    /* ... which a locked RVBAR cannot do: the run base layout of before, with a warning */
+    setup(chip, 0x1000000);
+    add_m3_logs();
+    features.apple_sysregs_unlocked = false;
+    assert(chainload_image(image, big, vars, NVARS) == 0);
+    assert(run_base_field(next_stage.args[1]) == home && strstr(message, "WARNING"));
+    free(image);
+    FOOTPRINT = 0x410000UL;
+}
+
+/* Optional built-image check: a real M3 ESP stage 2 (AURA_M3_STAGE2_FILE) against the logs */
+static void composed_m3_image_is_placed(void)
+{
+    const char *path = getenv("AURA_M3_STAGE2_FILE");
+    if (!path)
+        return;
+    FILE *f = fopen(path, "rb");
+    assert(f && !fseek(f, 0, SEEK_END));
+    long length = ftell(f);
+    assert(length > CHAINLOAD_HDR_OFFSET + CHAINLOAD_HDR_SIZE && (u64)length < RAM_SIZE / 2);
+    rewind(f);
+    size_t size = (size_t)length;
+    u8 *image = malloc(size);
+    assert(image && fread(image, 1, size, f) == size);
+    assert(!fclose(f));
+    struct chainload_header hdr;
+    memcpy(&hdr, image + CHAINLOAD_HDR_OFFSET, sizeof(hdr));
+    assert(hdr.magic == CHAINLOAD_HDR_MAGIC && hdr.footprint <= size);
+    FOOTPRINT = hdr.footprint;
+    setup(T6030, 0x1000000);
+    add_m3_logs();
+    protect_m3_logs(PROT_NONE);
+    assert(chainload_image(image, size, vars, NVARS) == 0);
+    bool staged = image_size_for(size) > LOG_OFF;
+    if (staged)
+        check_runs_staged(image, size);
+    else
+        assert(next_stage.args[2] == home && !run_base_field(next_stage.args[1]));
+    protect_m3_logs(PROT_READ | PROT_WRITE);
+    printf("composed M3 image: %zu bytes, footprint %#lx, %s\n", size, FOOTPRINT,
+           staged ? "runs staged above the heap" : "copied below the logs");
+    free(image);
+    FOOTPRINT = 0x410000UL;
+}
+
 int main(void)
 {
     /* The failing combined stage 2 (aura + 115 DTBs + U-Boot + variables) */
@@ -850,6 +1123,10 @@ int main(void)
     carries_live_display_in_chosen();
     inherited_dcp_needs_a_record_receiver();
     composed_image_is_placed();
+    m3_live_logs_are_never_written(T8122);
+    m3_live_logs_are_never_written(T6030);
+    m3_live_logs_are_never_written(T6031);
+    composed_m3_image_is_placed();
     puts("chainload run base matrix PASS");
     return 0;
 }
