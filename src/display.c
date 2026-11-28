@@ -137,24 +137,17 @@ static void display_afk_restart(const char *adt_path)
             display_afk_restarted[i] = true;
 }
 
+/*
+ * J473: HDMI (the DP to HDMI converter behind dptx-phy) on the primary DCP, as
+ * macOS does; dcpext serves the USB-C ports, where it offers DSC.
+ */
 static const display_config_t display_config_m2 = {
-#if USE_DCPEXT
-    .dcp = "/arm-io/dcpext",
-    .dcp_dart = "/arm-io/dart-dcpext",
-    .disp_dart = "/arm-io/dart-dispext0",
-    .pmgr_dev = "DISPEXT_CPU0",
-    .dcp_alias = "dcpext",
-    .dcp_index = 1,
-#else
     .dcp = "/arm-io/dcp",
     .dcp_dart = "/arm-io/dart-dcp",
     .disp_dart = "/arm-io/dart-disp0",
-    .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio",
-    .dptx_phy = "/arm-io/dptx-phy",
     .pmgr_dev = "DISP0_CPU0",
     .dcp_alias = "dcp",
     .dcp_index = 0,
-#endif
     .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio",
     .dptx_phy = "/arm-io/dptx-phy",
     .num_dptxports = 2,
