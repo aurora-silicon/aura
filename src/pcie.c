@@ -1131,6 +1131,25 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off, 
     return 0;
 }
 
+/* For a stage done with a post-M4 ANS, which runs on the APCIe PHY: the PHY and ANS powered off. */
+static const char *pcie_ans_path(void)
+{
+    return adt_path_offset(adt, "/arm-io/apcie") >= 0 ? "/arm-io/apcie" : "/arm-io/apcie0";
+}
+
+/*
+ * Controllers whose storage half is cycled through PMGR gates (pcie_ans_ps())
+ * and whose GP/radio bring-up and sleep tables live on dedicated paths
+ * (j813_n1_prepare(), dt_set_t8142_sleep_apcie()) do not use the generic
+ * whole-block pcie_init_controller() sequence.
+ */
+static bool pcie_block_skips_generic_init(const char *path)
+{
+    int node = adt_path_offset(adt, path);
+
+    return node >= 0 && adt_is_compatible(adt, node, "apcie,t8142");
+}
+
 int pcie_init(void)
 {
     bool success = false;
@@ -1168,6 +1187,14 @@ int pcie_init(void)
         int ret = pcie_t6050_init();
         pcie_initialized = !ret;
         return ret;
+    }
+
+    const char *primary = pcie_ans_path();
+    if (pcie_block_skips_generic_init(primary)) {
+        printf("pcie: %s (apcie,t8142) uses storage-gate and kernel handoff; skipping generic "
+               "init\n",
+               primary);
+        return 1;
     }
 
     success |= pcie_init_controller(APCIE, "/arm-io/apcie", false, false) == 0;
@@ -1241,12 +1268,6 @@ int pcie_reinit_after_sleep(void)
         return -1;
     pcie_initialized = true;
     return 0;
-}
-
-/* For a stage done with a post-M4 ANS, which runs on the APCIe PHY: the PHY and ANS powered off. */
-static const char *pcie_ans_path(void)
-{
-    return adt_path_offset(adt, "/arm-io/apcie") >= 0 ? "/arm-io/apcie" : "/arm-io/apcie0";
 }
 
 /*

@@ -93,6 +93,10 @@ static bool adt_is_compatible(const void *a, int node, const char *compat)
 }
 static const void *adt_getprop(const void *a, int node, const char *prop, u32 *len)
 {
+    if (node == 1 && !strcmp(prop, "compatible")) {
+        if (len) *len = strlen(controller_compat) + 1;
+        return controller_compat;
+    }
     if (node == 2 && !strcmp(prop, "reg")) {
         if (len) *len = bridge_reg_len;
         return bridge_reg_len ? bridge_reg : NULL;
@@ -397,6 +401,33 @@ int main(void)
     assert(powered == 0 && accesses == 0);
 
     /*
+     * Stage 2 kernel handoff on apcie,t8142: selected by the enumerated block
+     * compatible (not chip_id), skips generic whole-block init without logging
+     * "Unsupported compatible" or probing absent apcie0/ge0/ge1 nodes, and
+     * leaves pcie_initialized false and hardware untouched.
+     */
+    reset_model();
+    chip_id = T8142;
+    controller_compat = "apcie,t8142";
+    ans_present = 1;
+    ans_secure_bar = 1;
+    printf("t8142 case 0\n");
+    assert(pcie_init() == 1 && !pcie_initialized && powered == 0 && accesses == 0);
+    assert(!pcie_needs_sleep_reinit());
+    /* Same block compatible under another chip_id proves no chip_id gating. */
+    reset_model();
+    chip_id = 0x8132;
+    controller_compat = "apcie,t8142";
+    printf("t8142 case 1\n");
+    assert(pcie_init() == 1 && !pcie_initialized && powered == 0 && accesses == 0);
+    /* A genuinely unknown compatible still logs Unsupported compatible and fails. */
+    reset_model();
+    chip_id = 0x8132;
+    controller_compat = "apcie,unknown";
+    printf("t8142 case 2\n");
+    assert(pcie_init() == -1 && !pcie_initialized && powered == 0 && accesses == 0);
+
+    /*
      * The bridge check: apcie-port first, else reg's device number, else one "has neither"
      * line. Port 0 is set up the same way in each case; the lines are checked below.
      */
@@ -454,4 +485,28 @@ int main(void)
         "bridge case 5", neither,
         "bridge case 6", neither,
         "bridge case 7", neither,
+    ]
+    t8142_lines = []
+    in_t8142 = False
+    for line in out.splitlines():
+        if line == "t8142 case 0":
+            in_t8142 = True
+        elif line == "bridge case 0":
+            in_t8142 = False
+        if in_t8142:
+            t8142_lines.append(line)
+    skip_msg = (
+        "pcie: /arm-io/apcie (apcie,t8142) uses storage-gate and kernel handoff; "
+        "skipping generic init"
+    )
+    assert t8142_lines == [
+        "t8142 case 0",
+        skip_msg,
+        "t8142 case 1",
+        skip_msg,
+        "t8142 case 2",
+        'pcie: Unsupported compatible: "apcie,unknown"',
+        "pcie: Error getting node /arm-io/apcie0",
+        "pcie: Error getting node /arm-io/apcie-ge0",
+        "pcie: Error getting node /arm-io/apcie-ge1",
     ]
