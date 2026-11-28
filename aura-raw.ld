@@ -10,15 +10,23 @@ PHDRS
 {
   hdr PT_LOAD;
   text PT_LOAD;
-  rodata PT_LOAD;
   data PT_LOAD;
 }
+
+/*
+ * The step every region below starts and ends on: 16 KiB, the MMU page on Apple SoCs and a
+ * multiple of the 4 KiB page. memory.c maps [_base, _rodata_end) RX, the .data.smp_shared pages
+ * uncached and leaves a guard page at _stack_top, and chainload.c takes a load header footprint
+ * (_end - _base) only in 16 KiB units. tools/stage1_room.py reads this symbol; a link without it
+ * used 64 KiB steps.
+ */
+_layout_step = 0x4000;
 
 SECTIONS {
     _base = .;
 
     _text_start = .;
-    .init : ALIGN(0x10000) {
+    .init : ALIGN(_layout_step) {
         *(.init)
         *(.init.*)
         /*
@@ -36,38 +44,23 @@ SECTIONS {
         _init_content_end = .; /* tools/stage1_room.py */
     } :text
     /*
-     * No 64 KiB step between .init and .text: both are in the one read-execute segment, which
-     * still starts and ends on 64 KiB (_text_size). A step here left up to 64 KiB of .init
-     * unused, and code had to be moved between the two slots by hand to fit.
+     * .init, .text, .rodata and .rela.dyn follow each other with no step between them: memory.c
+     * maps [_base, _rodata_end) RX as one region and smp.c cleans it as one range, so a step only
+     * left part of a slot unused and made code move between slots by hand to fit.
      */
     .text : {
         _text_content_start = .;
-        *(EXCLUDE_FILE(*sptm_virt*.o *hv/hv_vm.o *hv/hv_virtio.o *hv/hv_vuart.o *hv/hv_wdt.o)
-          .text .text.*)
-        /* The largest guest-only object; the others are in .rodata, so both fill their steps. */
-        *sptm_virt_s2r.o(.text .text.*)
+        *(.text .text.*)
         . = ALIGN(8);
         *(.got.plt)
         _text_content_end = .;
-        . = ALIGN(0x10000);
     } :text
-    _text_size = . - _text_start;
-    .rodata : ALIGN(0x10000) {
-        /*
-         * Code that only runs when aura hosts a guest, in the executable read-only region
-         * ([_base, _rodata_end) is mapped RX, memory.c). .init and .text share one read-execute
-         * segment that sits just under its next 64 KiB step; .rodata has the room.
-         */
-        *sptm_virt*.o(.text .text.*)
-        *hv/hv_vm.o(.text .text.*)
-        *hv/hv_virtio.o(.text .text.*)
-        *hv/hv_vuart.o(.text .text.*)
-        *hv/hv_wdt.o(.text .text.*)
+    .rodata : {
         /* The compressed logos are .rodata (Makefile), but they go with the pixel data below. */
         *(EXCLUDE_FILE(*_48.o *_128.o *_256.o) .rodata)
         *(.rodata.*)
         . = ALIGN(8);
-    } :rodata
+    } :text
     .rela.dyn : {
         _rela_start = .;
         *(.rela)
@@ -87,14 +80,14 @@ SECTIONS {
          * padding and out of the range apply_rela() walks, which only accepts relative entries. */
         *(.rela.init)
         _rodata_content_end = .;
-        . = ALIGN(0x10000);
-    } :rodata
+        . = ALIGN(_layout_step);
+    } :text
     _rodata_end = .;
     _data_start = .;
-    .data : ALIGN(0x10000) {
+    .data : ALIGN(_layout_step) {
         _smp_shared_start = .;
         *(.data.smp_shared)
-        . = ALIGN(0x10000);
+        . = ALIGN(_layout_step);
         _smp_shared_end = .;
         *(EXCLUDE_FILE(*_48.o *_128.o *_256.o *font.o *font_retina.o) .data)
         *(.data.*)
@@ -113,10 +106,10 @@ SECTIONS {
         *_48.o(.data .rodata)
         *_128.o(.data .rodata)
         *_256.o(.data .rodata)
-        . = ALIGN(0x10000);
+        . = ALIGN(_layout_step);
         _file_end = .;
     } :data
-    .bss : ALIGN(0x10000) {
+    .bss : ALIGN(_layout_step) {
         _bss_start = .;
         *(.bss)
         *(.bss.*)
@@ -124,19 +117,19 @@ SECTIONS {
         *(COMMON)
         _bss_end = .;
     } : data
-    .stack_el3 : ALIGN(0x10000) {
+    .stack_el3 : ALIGN(_layout_step) {
         PROVIDE(_stack_top_el3 = .);
         . += _stack_size_el3 - 8;
         QUAD(0x5176694b43415453);
         PROVIDE(_stack_bot_el3 = .);
     }
-    .stack : ALIGN(0x10000) {
+    .stack : ALIGN(_layout_step) {
         PROVIDE(_stack_top = .);
         . += _stack_size - 8;
         QUAD(0x544f424b43415453);
         PROVIDE(_stack_bot = .);
     } :data
-    ASSERT(ALIGN(0x10000) == ., "Stack size is not aligned!")
+    ASSERT(ALIGN(_layout_step) == ., "Stack size is not aligned!")
     _data_size = . - _data_start;
     _end = .;
     _payload_start = .;

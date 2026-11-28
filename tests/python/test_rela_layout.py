@@ -8,7 +8,7 @@ moved .data, .bss and the stacks up by 64 KiB. The image here carries the same k
 one relative relocation and is linked with the Makefile's LDFLAGS, using each available AArch64
 linker. The checks: no orphan warning, only R_AARCH64_RELATIVE entries in [_rela_start, _rela_end)
 (apply_rela() accepts nothing else), and nothing past the padding, so _rodata_end is still the
-64 KiB boundary after _rela_end. With GNU ld, a control link without the script's .rela.init line
+step boundary after _rela_end (_layout_step in aura-raw.ld, 64 KiB in aura.ld). With GNU ld, a control link without the script's .rela.init line
 must show the old layout.
 """
 import platform
@@ -115,7 +115,8 @@ def test_rela_init_stays_inside_rela_dyn_padding(tmp_path, kind, script):
     sym, end, types, warnings = layout(tmp_path, linker, REPO / script, "fixed")
     assert "orphan" not in warnings, warnings
     assert types and all(t == R_AARCH64_RELATIVE for t in types), types
-    boundary = (sym["_rela_end"] + 0xFFFF) & ~0xFFFF
+    step = sym.get("_layout_step", 0x10000)
+    boundary = (sym["_rela_end"] + step - 1) & ~(step - 1)
     assert end == boundary == sym["_rodata_end"], (hex(sym["_rela_end"]), hex(end), hex(sym["_rodata_end"]))
 
     if kind != "gnu":
@@ -127,4 +128,4 @@ def test_rela_init_stays_inside_rela_dyn_padding(tmp_path, kind, script):
     unlisted.write_text(text.replace(FIX_LINE, ""))
     sym, end, types, warnings = layout(tmp_path, linker, unlisted, "control")
     assert "orphan section `.rela.init'" in warnings, warnings
-    assert sym["_rodata_end"] == end > ((sym["_rela_end"] + 0xFFFF) & ~0xFFFF)
+    assert sym["_rodata_end"] == end > ((sym["_rela_end"] + step - 1) & ~(step - 1))
