@@ -158,7 +158,12 @@ static void *decompress_xz(void *p, size_t size)
 
 static void *load_fdt(void *p, size_t size)
 {
+#ifdef ESP_STAGE2
+    enum fw_version os_fw = firmware_os_components();
+    int rank = payload_profile_rank_fw(p, os_fw == V26_6_2, os_fw >= V27_0);
+#else
     int rank = payload_profile_rank(p, firmware_os_components() == V26_6_2);
+#endif
     if (rank && rank >= fdt_rank && fdt_node_check_compatible(p, 0, expect_compatible) == 0) {
         printf("Found a devicetree for %s at %p\n", expect_compatible, p);
         fdt = p;
