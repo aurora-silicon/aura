@@ -215,6 +215,51 @@ def test_contradictory_adt_routes_nothing_on_that_port(tmp_path):
     assert "port 3: 2 PD controllers in the ADT, not one" in out and "ROUTES0 2" in out
 
 
+FIXED = r'''
+    /* A fixed HDMI output on dcpext0: its DP PHY and its crossbar output */
+    int hphy = add("/soc", "hdmi-phy"), hxbar = add("/soc", "hdmi-xbar");
+    fdt_setprop_u32(dt, hphy, "#phy-cells", 1);
+    fdt_setprop_u32(dt, hphy, "phandle", 0x777);
+    fdt_setprop_u32(dt, hxbar, "#mux-control-cells", 1);
+    fdt_setprop_u32(dt, hxbar, "phandle", 0x778);
+    fdt32_t fphy[2] = {cpu_to_fdt32(0x777), cpu_to_fdt32(6)};
+    fdt32_t fmux[2] = {cpu_to_fdt32(0x778), cpu_to_fdt32(0)};
+    fdt_setprop(dt, node("%(e0)s"), "phys", fphy, sizeof(fphy));
+    fdt_setprop(dt, node("%(e0)s"), "mux-controls", fmux, sizeof(fmux));
+    fdt_setprop_string(dt, node("%(e0)s"), "phy-names", PHY_NAME);
+    fdt_setprop_string(dt, node("%(e0)s"), "mux-control-names", "dp-xbar");
+''' % {"e0": E0}
+
+
+def test_a_fixed_output_stays_first_in_a_hybrid_pipeline(tmp_path):
+    out = run(tmp_path, adt_nodes(), "#define PHY_NAME \"dp-phy\"\n" + FIXED + ENGINES + r'''
+    int len;
+    const char *names = fdt_getprop(dt, node("%(e0)s"), "phy-names", &len);
+    assert(len == 28 && !memcmp(names, "dp-phy\0typec0\0typec1\0typec2\0", 28));
+    names = fdt_getprop(dt, node("%(e0)s"), "mux-control-names", &len);
+    assert(len == 29 && !memcmp(names, "dp-xbar\0typec0\0typec1\0typec2\0", 29));
+    assert(cell("%(e0)s", "phys", 0, 8) == 0x777 && cell("%(e0)s", "phys", 1, 8) == 6);
+    assert(fdt_node_offset_by_phandle(dt, cell("%(e0)s", "phys", 2, 8)) ==
+           node("/soc/phy@2ab000000"));
+    assert(cell("%(e0)s", "mux-controls", 0, 8) == 0x778 &&
+           cell("%(e0)s", "mux-controls", 1, 8) == 0);
+    assert(fdt_node_offset_by_phandle(dt, cell("%(e0)s", "mux-controls", 6, 8)) ==
+           node("/soc/mux@38b24c000"));
+    /* The route indices still count the Type-C routes only */
+    assert(cell("%(e0)s", "apple,typec-dptx-phys", 0, 3) == 1);
+    names = fdt_getprop(dt, node("%(e1)s"), "phy-names", &len);
+    assert(len == 21 && !memcmp(names, "typec0\0typec1\0typec2\0", 21));
+''' % {"e0": E0, "e1": E1}, dt_setup())
+    assert "ROUTES0 3" in out and "ROUTES1 3" in out and "AGAIN 0" in out
+
+
+def test_other_phys_than_a_fixed_output_are_the_tree_s_own(tmp_path):
+    out = run(tmp_path, adt_nodes(), "#define PHY_NAME \"typec0\"\n" + FIXED + ENGINES,
+              dt_setup())
+    assert "names PHYs or crossbars already: no routes" in out and "ROUTES0 0" in out
+    assert "ROUTES1 3" in out
+
+
 def test_another_port_type_with_the_same_number_is_not_the_controller(tmp_path):
     out = run(tmp_path, adt_nodes(typed_port=3), ENGINES, dt_setup())
     assert "PD controllers in the ADT" not in out and "ROUTES0 3" in out

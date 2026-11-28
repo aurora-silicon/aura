@@ -20,7 +20,9 @@
  * Every output on the processor's die whose PHY, crossbar and PD controller the tree describes
  * becomes a route, matched by register address: the tree decides which ports Linux may have
  * (a port whose PHY it does not describe, or describes reserved, gets none). Nothing here
- * depends on the chip or the board. A tree that carries its own routes keeps them.
+ * depends on the chip or the board. A tree that carries its own routes keeps them. A processor
+ * that also drives a fixed output (an HDMI port's DP PHY, named dp-phy, and its crossbar output,
+ * dp-xbar) keeps that first: the routes are written after it, a hybrid pipeline.
  */
 
 #include "kboot_display_routes.h"
@@ -500,6 +502,28 @@ static ROUTES_TEXT int dt_route_graph(void *dt, const char *engine, int k,
 }
 
 /*
+ * The fixed output `node` names before its routes are written: none, or exactly one entry
+ * named `name` in `prop` (`names` holding the names). Copies it to `out` (`*len` bytes, at most
+ * two cells) and returns 0, or returns -1 if the property holds anything else.
+ */
+static ROUTES_TEXT int dt_fixed_output(void *dt, int node, const char *prop, const char *names,
+                                       const char *name, fdt32_t *out, int *len)
+{
+    int plen, nlen;
+    const fdt32_t *v = fdt_getprop(dt, node, prop, &plen);
+    const char *n = fdt_getprop(dt, node, names, &nlen);
+
+    *len = 0;
+    if (!v)
+        return n ? -1 : 0;
+    if (!n || nlen != (int)strlen(name) + 1 || strcmp(n, name) || plen < 4 || plen > 8 || plen % 4)
+        return -1;
+    memcpy(out, v, plen);
+    *len = plen;
+    return 0;
+}
+
+/*
  * Writes the routes of the processor at `engine` (a DT path) from `f`, if its node asks for
  * them (an empty typec-routes). Returns the number written, 0 if none was asked for or
  * possible, -1 if a write failed (the caller discards the transaction).
@@ -515,7 +539,13 @@ ROUTES_TEXT int dcp_typec_routes_write(void *dt, const char *engine,
 
     if (routes < 0 || fdt_first_subnode(dt, routes) >= 0)
         return 0;
-    if (fdt_getprop(dt, node, "phys", NULL) || fdt_getprop(dt, node, "mux-controls", NULL)) {
+    /* A fixed output's PHY and crossbar output stay first */
+    fdt32_t fixed_phy[2], fixed_mux[2];
+    int fixed_phy_len, fixed_mux_len;
+    if (dt_fixed_output(dt, node, "phys", "phy-names", "dp-phy", fixed_phy, &fixed_phy_len) ||
+        dt_fixed_output(dt, node, "mux-controls", "mux-control-names", "dp-xbar", fixed_mux,
+                        &fixed_mux_len) ||
+        (fixed_mux_len && !fixed_phy_len)) {
         rlog("asks for its Type-C routes but names PHYs or crossbars already: no routes\n");
         return 0;
     }
@@ -533,10 +563,16 @@ ROUTES_TEXT int dcp_typec_routes_write(void *dt, const char *engine,
         return 0;
     }
 
-    fdt32_t phys[2 * DCP_TYPEC_MAX_ROUTES], mux[2 * DCP_TYPEC_MAX_ROUTES];
+    fdt32_t phys[2 * DCP_TYPEC_MAX_ROUTES + 2], mux[2 * DCP_TYPEC_MAX_ROUTES + 2];
     fdt32_t states[DCP_TYPEC_MAX_ROUTES], targets[DCP_TYPEC_MAX_ROUTES];
-    char names[DCP_TYPEC_MAX_ROUTES * 8];
-    int nphys = 0, nnames = 0;
+    char phy_names[DCP_TYPEC_MAX_ROUTES * 8 + 8], mux_names[DCP_TYPEC_MAX_ROUTES * 8 + 8];
+    int nphys = fixed_phy_len / 4, nmux = fixed_mux_len / 4;
+    int nphy_names = nphys ? (int)sizeof("dp-phy") : 0;
+    int nmux_names = nmux ? (int)sizeof("dp-xbar") : 0;
+    memcpy(phys, fixed_phy, fixed_phy_len);
+    memcpy(mux, fixed_mux, fixed_mux_len);
+    memcpy(phy_names, "dp-phy", nphy_names);
+    memcpy(mux_names, "dp-xbar", nmux_names);
     for (int k = 0; k < n; k++) {
         u32 ph_phy, ph_xbar;
         if (dt_phandle(dt, t[k].phy, &ph_phy) || dt_phandle(dt, t[k].xbar, &ph_xbar))
@@ -544,19 +580,22 @@ ROUTES_TEXT int dcp_typec_routes_write(void *dt, const char *engine,
         phys[nphys++] = cpu_to_fdt32(ph_phy);
         if (t[k].phy_cells)
             phys[nphys++] = cpu_to_fdt32(PHY_TYPE_DP);
-        mux[2 * k] = cpu_to_fdt32(ph_xbar);
-        mux[2 * k + 1] = cpu_to_fdt32(t[k].cell);
+        mux[nmux++] = cpu_to_fdt32(ph_xbar);
+        mux[nmux++] = cpu_to_fdt32(t[k].cell);
         states[k] = cpu_to_fdt32(f->source);
         targets[k] = cpu_to_fdt32(t[k].endpoint);
-        nnames += snprintf(names + nnames, sizeof(names) - nnames, "typec%d", k) + 1;
+        nphy_names +=
+            snprintf(phy_names + nphy_names, sizeof(phy_names) - nphy_names, "typec%d", k) + 1;
+        nmux_names +=
+            snprintf(mux_names + nmux_names, sizeof(mux_names) - nmux_names, "typec%d", k) + 1;
     }
 
     node = kboot_fdt_path_exact(dt, engine);
     /* Properties added to a node move the nodes after it, not the node itself */
     if (node < 0 || fdt_setprop(dt, node, "phys", phys, nphys * 4) ||
-        fdt_setprop(dt, node, "phy-names", names, nnames) ||
-        fdt_setprop(dt, node, "mux-controls", mux, n * 8) ||
-        fdt_setprop(dt, node, "mux-control-names", names, nnames) ||
+        fdt_setprop(dt, node, "phy-names", phy_names, nphy_names) ||
+        fdt_setprop(dt, node, "mux-controls", mux, nmux * 4) ||
+        fdt_setprop(dt, node, "mux-control-names", mux_names, nmux_names) ||
         fdt_setprop(dt, node, "apple,typec-mux-indices", states, n * 4) ||
         fdt_setprop(dt, node, "apple,typec-dptx-phys", targets, n * 4) ||
         fdt_setprop_u32(dt, node, "apple,dptx-die", f->domain))
