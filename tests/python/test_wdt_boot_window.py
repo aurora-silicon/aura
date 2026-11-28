@@ -4,7 +4,9 @@
 Ways it can fail, and the check for each:
 1. A plain Stage 1 boot leaves every watchdog off (the 11-08/11-09 M2 hangs): main.c must arm it
    after disarming iBoot's, in Stage 1 builds only.
-2. Stage 2 (ESP_STAGE2) arms it too: U-Boot and GRUB menus may wait for a person indefinitely.
+2. Stage 2 (ESP_STAGE2) leaves it armed into U-Boot/GRUB, whose menus may wait for a person
+   indefinitely: it re-arms it at its start (plain, non-debug, non-BRINGUP boots only) and must
+   disarm it before it vectors to the next stage.
 3. A host that attaches gets reset under it: the first synced window or proxy request disarms it.
 4. A host attach disarms something else: a trial watchdog or one a host armed (P_WDT_ARM) stays.
 5. Arming on a layout it cannot drive: wdt_arm()'s ADT checks refuse, nothing is written.
@@ -195,14 +197,38 @@ def function_body(source, signature):
     raise AssertionError(signature)
 
 
-def test_stage1_arms_it_after_disarming_iboot_and_stage2_does_not():
+def test_stage1_arms_it_after_disarming_iboot():
     body = function_body((ROOT / 'src/main.c').read_text(), 'void aura_main(void)')
     disable = body.index('wdt_disable();')
     arm = body.index('wdt_arm_boot()')
     assert disable < arm < body.index('run_actions();')
     guard = body.rindex('#if', 0, arm)
     assert re.match(r'#if defined\(CHAINLOADING\) && !defined\(ESP_STAGE2\)', body[guard:])
-    assert body.index('#endif', guard) > arm
+    assert body.index('#elif', guard) > arm
+
+
+def test_esp_stage2_runs_it_until_the_hand_off_only():
+    body = function_body((ROOT / 'src/main.c').read_text(), 'void aura_main(void)')
+    first = body.index('wdt_arm_boot()')
+    arm = body.index('wdt_arm_boot()', first + 1)
+    assert body.count('wdt_arm_boot()') == 2
+    # the second arm: ESP Stage 2, not BRINGUP, not a trial or a debug boot, before any device work
+    guard = body.rindex('#elif', 0, arm)
+    assert body[guard:body.index('\n', guard)] == '#elif defined(CHAINLOADING) && !defined(BRINGUP)'
+    assert body.index('#if defined(CHAINLOADING) && !defined(ESP_STAGE2)') < guard
+    line = body[body.rindex('\n', 0, arm):arm]
+    assert '!aura_trial_enabled() && !aura_debug_enabled()' in line
+    assert arm < body.index('pmgr_init()') < body.index('run_actions();')
+    # the hand-off disarms only the boot watchdog, in ESP Stage 2 builds, before vectoring
+    disarm = body.index('wdt_disarm_boot();')
+    assert body.count('wdt_disarm_boot();') == 1
+    assert body.rindex('#if defined(CHAINLOADING) && defined(ESP_STAGE2)', 0, disarm) > \
+        body.index('mmu_shutdown();')
+    assert disarm < body.index('next_stage.entry(')
+    wdt = (ROOT / 'src/wdt.c').read_text()
+    fn = function_body(wdt, 'void wdt_disarm_boot(void)')
+    assert fn.index('if (!wdt_boot_armed)') < fn.index('wdt_boot_armed = false;') < \
+        fn.index('wdt_disable();')
 
 
 def test_a_host_disarms_it_as_soon_as_it_is_seen():

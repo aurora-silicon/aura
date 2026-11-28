@@ -22,9 +22,10 @@ void wdt_s2r_guard_exit(const struct wdt_guard *guard);
 /* The longest the 24 MHz counter allows, for each stage of a trial boot */
 #define WDT_TRIAL_SECONDS 178
 int wdt_arm_trial(void);
-/* Stage 1 on a plain boot: the same longest period, until a host attaches or Stage 2 disarms it */
+/* A plain boot: the same longest period, until a host attaches or Stage 2 hands off */
 #define WDT_BOOT_SECONDS 178
 int wdt_arm_boot(void);
+void wdt_disarm_boot(void);
 void wdt_host_attached(void);
 bool wdt_boot_watchdog_armed(void);
 bool wdt_host_was_attached(void);

@@ -327,9 +327,10 @@ int wdt_arm_trial(void)
  * Linux, so a Stage 1 or early Stage 2 that stops (an NVMe command that never completes, a failed
  * read that drops it into the proxy with no host) stays on screen until someone holds the power
  * button. Stage 1 arms the watchdog for its longest period instead. The first host it sees (a
- * synced window or proxy request) disarms it, so a debugging session is never reset under it;
- * Stage 2's own wdt_disable() at its start disarms it on the normal path. Its reads take well
- * under a second, and its bounded host windows are 10-100 s.
+ * synced window or proxy request) disarms it, so a debugging session is never reset under it.
+ * An ESP Stage 2 re-arms it with a fresh period at its start (not on a debug boot) and disarms it
+ * at its hand-off. Stage 1's reads take well under a second, and its bounded host windows are
+ * 10-100 s.
  */
 int wdt_arm_boot(void)
 {
@@ -342,6 +343,15 @@ int wdt_arm_boot(void)
 bool wdt_boot_watchdog_armed(void)
 {
     return wdt_boot_armed;
+}
+
+/* Stage 2's hand-off on a plain boot: only the boot watchdog, never one another stage armed. */
+void wdt_disarm_boot(void)
+{
+    if (!wdt_boot_armed)
+        return;
+    wdt_boot_armed = false;
+    wdt_disable();
 }
 
 /* A host has synced with this stage: a later stop in the proxy must not arm the boot watchdog. */
