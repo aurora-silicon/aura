@@ -26,6 +26,10 @@ def test_dart_tunables_map_by_physical_address(tmp_path):
         source.index("struct acio_tunable {"):
         source.index("static_assert(sizeof(struct acio_tunable)")
     ]
+    dart_index = source[
+        source.index("struct dt_dart_entry {"):
+        source.index("/* A physical register window")
+    ]
     functions = "\n".join(
         extract(source, signature)
         for signature in (
@@ -33,6 +37,9 @@ def test_dart_tunables_map_by_physical_address(tmp_path):
             "static bool dt_node_is_apple_dart(",
             "static int dt_find_dart_by_address(",
             "static u64 dt_dart_window(",
+            "static void dt_dart_index_init(",
+            "static int dt_dart_index_find(",
+            "static void dt_dart_index_adjust(",
             "static int dt_copy_dart_tunable(",
             "static void dt_copy_dart_tunables(",
         )
@@ -54,7 +61,7 @@ typedef unsigned long u64;
         for (node = adt_first_child_offset(tree, node); _count--; \
              node = adt_next_sibling_offset(tree, node))
 static void *dt, *adt;
-''' + structs + acio + r'''
+''' + structs + acio + dart_index + r'''
 
 /* Public node names and instance counts model the four lab ADT shapes. The
  * union is exactly 37 tunable-bearing DART nodes. Addresses and rows are wholly

@@ -3380,6 +3380,13 @@ static int dt_append_acio_tunable(int adt_node, int fdt_node,
     }
 
     u32 n_tunables = tunables_len / sizeof(*tunable_adt);
+    if (!n_tunables)
+        return 0;
+
+    fdt32_t *cells = malloc(n_tunables * 3 * sizeof(*cells));
+    if (!cells)
+        return -1;
+
     for (size_t j = 0; j < n_tunables; j++) {
         const struct acio_tunable *tunable = &tunable_adt[j];
 
@@ -3392,11 +3399,13 @@ static int dt_append_acio_tunable(int adt_node, int fdt_node,
 
         if (tunable->size != 4) {
             printf("kboot: ACIO tunable has invalid size %d\n", tunable->size);
+            free(cells);
             return -1;
         }
 
         if (tunable->offset % tunable->size) {
             printf("kboot: ACIO tunable has unaligned offset %x\n", tunable->offset);
+            free(cells);
             return -1;
         }
 
@@ -3404,23 +3413,27 @@ static int dt_append_acio_tunable(int adt_node, int fdt_node,
             tunable->offset > tunable_info->reg_size - tunable->size ||
             tunable_info->reg_offset > UINT32_MAX - tunable->offset) {
             printf("kboot: ACIO tunable has invalid offset %x\n", tunable->offset);
+            free(cells);
             return -1;
         }
 
         if (tunable->mask > UINT32_MAX || tunable->value > UINT32_MAX) {
             printf("kboot: ACIO tunable does not fit a 32-bit register\n");
+            free(cells);
             return -1;
         }
-        if (fdt_appendprop_u32(dt, fdt_node, tunable_info->fdt_name,
-                               tunable->offset + tunable_info->reg_offset) < 0)
-            return -1;
-        if (fdt_appendprop_u32(dt, fdt_node, tunable_info->fdt_name, tunable->mask) < 0)
-            return -1;
-        if (fdt_appendprop_u32(dt, fdt_node, tunable_info->fdt_name, tunable->value) < 0)
-            return -1;
+
+        cells[3 * j] = cpu_to_fdt32(tunable->offset + tunable_info->reg_offset);
+        cells[3 * j + 1] = cpu_to_fdt32(tunable->mask);
+        cells[3 * j + 2] = cpu_to_fdt32(tunable->value);
     }
 
-    return 0;
+    int ret = 0;
+    if (n_tunables)
+        ret = fdt_appendprop(dt, fdt_node, tunable_info->fdt_name, cells,
+                             n_tunables * 3 * sizeof(*cells));
+    free(cells);
+    return ret < 0 ? -1 : 0;
 }
 
 static int dt_append_dart_tunable(int adt_node, int fdt_node,
@@ -3456,6 +3469,19 @@ static bool dt_node_is_apple_dart(int node)
 
     return false;
 }
+
+struct dt_dart_entry {
+    u64 address;
+    int node;
+    bool duplicate;
+};
+
+struct dt_dart_index {
+    struct dt_dart_entry *entries;
+    size_t count;
+    size_t cap;
+    bool valid;
+};
 
 /* A physical register window is the only stable join key between the two trees. */
 static int dt_find_dart_by_address(u64 address)
@@ -3497,7 +3523,76 @@ static u64 dt_dart_window(int dart)
     return ((u64)fdt32_ld(&reg[ac]) << 32) | fdt32_ld(&reg[ac + 1]);
 }
 
-static int dt_copy_dart_tunable(int adt_node, const char *adt_name, u64 address)
+static void dt_dart_index_init(struct dt_dart_index *idx)
+{
+    memset(idx, 0, sizeof(*idx));
+    idx->valid = true;
+
+    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
+        const char *status;
+
+        if (!dt_node_is_apple_dart(node))
+            continue;
+        status = fdt_getprop(dt, node, "status", NULL);
+        if (status && !strcmp(status, "disabled"))
+            continue;
+
+        u64 address = dt_get_address(dt, node);
+        bool matched = false;
+        for (size_t i = 0; i < idx->count; i++) {
+            if (idx->entries[i].address == address) {
+                idx->entries[i].duplicate = true;
+                matched = true;
+                break;
+            }
+        }
+        if (matched)
+            continue;
+
+        if (idx->count == idx->cap) {
+            size_t new_cap = idx->cap ? idx->cap * 2 : 64;
+            struct dt_dart_entry *grown = realloc(idx->entries, new_cap * sizeof(*grown));
+            if (!grown) {
+                free(idx->entries);
+                memset(idx, 0, sizeof(*idx));
+                return;
+            }
+            idx->entries = grown;
+            idx->cap = new_cap;
+        }
+        idx->entries[idx->count++] = (struct dt_dart_entry){
+            .address = address,
+            .node = node,
+            .duplicate = false,
+        };
+    }
+}
+
+static int dt_dart_index_find(const struct dt_dart_index *idx, u64 address)
+{
+    if (!idx || !idx->valid)
+        return dt_find_dart_by_address(address);
+
+    for (size_t i = 0; i < idx->count; i++) {
+        if (idx->entries[i].address == address)
+            return idx->entries[i].duplicate ? -FDT_ERR_EXISTS : idx->entries[i].node;
+    }
+    return -FDT_ERR_NOTFOUND;
+}
+
+static void dt_dart_index_adjust(struct dt_dart_index *idx, int edited_node, int delta)
+{
+    if (!idx || !idx->valid || !delta)
+        return;
+
+    for (size_t i = 0; i < idx->count; i++) {
+        if (idx->entries[i].node > edited_node)
+            idx->entries[i].node += delta;
+    }
+}
+
+static int dt_copy_dart_tunable(struct dt_dart_index *idx, int adt_node, const char *adt_name,
+                                u64 address)
 {
     struct adt_tunable_info tunable = {
         .adt_name = adt_name,
@@ -3505,7 +3600,7 @@ static int dt_copy_dart_tunable(int adt_node, const char *adt_name, u64 address)
         .reg_size = 0x4000,
         .required = true,
     };
-    int dart = dt_find_dart_by_address(address);
+    int dart = dt_dart_index_find(idx, address);
 
     if (dart < 0) {
         printf("FDT: no unique enabled DART at 0x%lx for ADT %s\n", address, adt_name);
@@ -3520,12 +3615,17 @@ static int dt_copy_dart_tunable(int adt_node, const char *adt_name, u64 address)
     u64 window = dt_dart_window(dart);
     if (window)
         tunable.reg_size = window;
-    if (dt_append_dart_tunable(adt_node, dart, &tunable)) {
+
+    u32 before = fdt_size_dt_struct(dt);
+    int ret = dt_append_dart_tunable(adt_node, dart, &tunable);
+    if (ret) {
         /* The converter can have appended valid rows before rejecting one. */
         fdt_delprop(dt, dart, tunable.fdt_name);
+        dt_dart_index_adjust(idx, dart, (int)fdt_size_dt_struct(dt) - (int)before);
         printf("FDT: rejected ADT DART table %s at 0x%lx\n", adt_name, address);
         return -1;
     }
+    dt_dart_index_adjust(idx, dart, (int)fdt_size_dt_struct(dt) - (int)before);
 
     printf("FDT: copied ADT DART table %s to 0x%lx\n", adt_name, address);
     return 0;
@@ -3558,6 +3658,9 @@ static void dt_copy_dart_tunables(const char *const *only)
     }
     path[depth + 1] = 0;
 
+    struct dt_dart_index dart_idx;
+    dt_dart_index_init(&dart_idx);
+
     int node = arm_io;
     ADT_FOREACH_CHILD(adt, node)
     {
@@ -3589,23 +3692,28 @@ static void dt_copy_dart_tunables(const char *const *only)
                  * writes. The old PCIe-C-only path emitted this marker too.
                  */
                 if (!instance && !strncmp(name, "dart-apciec", 11)) {
-                    int dart = dt_find_dart_by_address(address);
+                    int dart = dt_dart_index_find(&dart_idx, address);
 
                     if (dart >= 0 && !fdt_getprop(dt, dart, "apple,tunable", NULL)) {
+                        u32 before = fdt_size_dt_struct(dt);
                         if (fdt_setprop_empty(dt, dart, "apple,tunable") < 0)
                             printf("FDT: could not mark empty PCIe-C DART table at 0x%lx\n",
                                    address);
                         else
                             printf("FDT: ADT PCIe-C DART at 0x%lx requests no tunables\n", address);
+                        dt_dart_index_adjust(&dart_idx, dart,
+                                             (int)fdt_size_dt_struct(dt) - (int)before);
                     }
                 }
                 continue;
             }
 
             /* Fail soft and continue with every other DART instance. */
-            dt_copy_dart_tunable(node, prop, address);
+            dt_copy_dart_tunable(&dart_idx, node, prop, address);
         }
     }
+
+    free(dart_idx.entries);
 }
 
 static u8 crc8(u8 *b, size_t len)

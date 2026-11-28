@@ -377,16 +377,25 @@ static int pcie_apcie_table_fdt(void *dt, int host, int adt_node, int *path, siz
 static int pcie_apcie_host(void *dt, int *path)
 {
     u64 rc;
+    int parents[32];
+    int depth = -1;
 
     if (adt_get_reg(adt, path, "reg", 1, &rc, NULL) < 0)
         return -1;
-    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
-        int idx = fdt_stringlist_search(dt, node, "reg-names", "rc"), len;
-        const fdt32_t *reg = fdt_getprop(dt, node, "reg", &len);
-        int parent = fdt_parent_offset(dt, node);
+    for (int node = fdt_next_node(dt, -1, &depth); node >= 0 && depth >= 0;
+         node = fdt_next_node(dt, node, &depth)) {
+        if (depth < (int)ARRAY_SIZE(parents))
+            parents[depth] = node;
 
-        if (idx < 0 || !reg || fdt_address_cells(dt, parent) != 2 ||
-            fdt_size_cells(dt, parent) != 2 || len < (idx + 1) * 16)
+        int idx = fdt_stringlist_search(dt, node, "reg-names", "rc"), len;
+        if (idx < 0)
+            continue;
+        const fdt32_t *reg = fdt_getprop(dt, node, "reg", &len);
+        if (!reg || len < (idx + 1) * 16)
+            continue;
+        int parent = (depth > 0 && depth <= (int)ARRAY_SIZE(parents)) ? parents[depth - 1]
+                                                                      : fdt_parent_offset(dt, node);
+        if (parent < 0 || fdt_address_cells(dt, parent) != 2 || fdt_size_cells(dt, parent) != 2)
             continue;
         if (((u64)fdt32_to_cpu(reg[4 * idx]) << 32 | fdt32_to_cpu(reg[4 * idx + 1])) == rc)
             return node;
