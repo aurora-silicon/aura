@@ -5,9 +5,9 @@ firmware IOVAs.
 Runs kboot.c's dt_set_ane_firmware(), dt_set_ane_node(), dt_ane_fill_region() and
 dt_get_or_add_reserved_mem() as they are, on real FDTs built with aura's libfdt, against a
 fake ADT. Segment values are the J615 27.2 /arm-io/ane, J616s 26.6.2 /arm-io/ane0, the Neo (J700)
-26.6.2 /arm-io/ane, the J713 26.6.2 /arm-io/ane and the J714s 27.0 /arm-io/ane0 segment-ranges.
-The J714s DT also has a soc@200000000 ahead of the /soc that holds the ANE, which libfdt resolves
-"/soc" to.
+26.6.2 /arm-io/ane, the J713 26.6.2 /arm-io/ane and the J714s and J716c 27.0 /arm-io/ane0
+segment-ranges. The T6050 DTs also have a soc@200000000 ahead of the /soc that holds the ANE,
+which libfdt resolves "/soc" to.
 """
 
 from pathlib import Path
@@ -34,6 +34,10 @@ BOARDS = {
     "j714s": dict(compat="apple,t6050-ane", node="neural-processor@508000000",
                   adt="/arm-io/ane0", text=0x10000DC0000, data=0x10002114000, text_sz=0xC0000,
                   data_sz=0x2AC000, data_iova=0x100000C0000, phys_base=0x10003B40000,
+                  sibling=1, nub_preload=0),
+    "j716c": dict(compat="apple,t6050-ane", node="neural-processor@508000000",
+                  adt="/arm-io/ane0", text=0x10000DC0000, data=0x10002268000, text_sz=0xC0000,
+                  data_sz=0x2AC000, data_iova=0x100000C0000, phys_base=0x10003DC8000,
                   sibling=1, nub_preload=0),
 }
 
