@@ -17,6 +17,14 @@ REPO = Path(__file__).resolve().parents[2]
 TOOLS = ("run_guest_sptm.py", "console_tail.py")
 
 
+def load_runner():
+    spec = importlib.util.spec_from_file_location(
+        "run_guest_sptm", REPO / "proxyclient/tools/run_guest_sptm.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def aura_imports(path):
     """Every `from aura... import name` in a tool, including those inside functions."""
     for node in ast.walk(ast.parse(path.read_text())):
@@ -103,6 +111,33 @@ def test_same_release_selects_exact_kernel(offset, instruction, selected, hidden
     release, quirks = tool.xnu_quirks(b"xnu-13432.41.4~")
     assert (release == "xnu-13432.41.4") == selected
     assert ("/arm-io/centauri" in quirks["hide"]) == hidden_radio
+
+
+@pytest.mark.parametrize(("port", "is_kis", "expected"), (
+    ("/dev/ttyAMA10", False, True),
+    ("/dev/ttyACM0", False, False),
+    ("/dev/cu.usbmodemP_01", False, False),
+    ("/dev/tty.kis-1", True, False),
+))
+def test_post_entry_drain_needed(port, is_kis, expected):
+    runner = load_runner()
+    iface = type("Iface", (), {
+        "devpath": port,
+        "dev": type("Serial", (), {"port": port})(),
+        "is_kis": is_kis,
+    })()
+    assert runner.post_entry_drain_needed(iface) is expected
+
+
+def test_post_entry_drain_resolves_aura_symlink(monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(runner.os.path, "realpath", lambda path: "/dev/ttyACM0")
+    iface = type("Iface", (), {
+        "devpath": "/dev/aura",
+        "dev": type("Serial", (), {"port": "/dev/aura"})(),
+        "is_kis": False,
+    })()
+    assert runner.post_entry_drain_needed(iface) is False
 
 
 def test_debug_port_preserves_hpm_bus_manager(monkeypatch):
@@ -229,3 +264,29 @@ def test_tail_console_does_not_overread_before_disconnect(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "TTY> SPTM-virt[gpu]: the deadline the host asked for: rebooting via watchdog" in out
     assert "--- tail: device gone ---" in out
+
+
+@pytest.mark.parametrize(("stash_off", "expect_write"), [
+    (0x120, True),
+    (0, True),
+    (None, False),
+])
+def test_patch_sptm_handles_optional_ctrr_stash_off(stash_off, expect_write):
+    runner = load_runner()
+    proxy = MagicMock()
+    proxy.read32.return_value = 0xB4FFFFC1
+    sym = {
+        "sptm_virt_flush": 0x1000,
+        "sptm_virt_ctrr_stash_off": 0x2000,
+    }
+    sp = {
+        "patches": [("APSTS poll", 0x10, 0xFFFFFFFF, 0xB4FFFFC1, 0xD503201F)],
+        "mte": None,
+        "ctrr_stash_off": stash_off,
+    }
+    runner.patch_sptm(proxy, sym, 0x80000000, sp)
+    stash_writes = [c.args for c in proxy.write32.call_args_list if c.args[0] == 0x2000]
+    if expect_write:
+        assert stash_writes == [(0x2000, stash_off)]
+    else:
+        assert stash_writes == []

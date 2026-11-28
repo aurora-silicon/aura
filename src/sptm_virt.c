@@ -266,7 +266,7 @@ __attribute__((used, retain)) int sptm_virt_place(struct sptm_virt_placement *ou
 {
     struct sptm_virt_layout l;
 
-    if (!out)
+    if (!out || !sptm_virt_requested())
         return -1;
     memset(out, 0, sizeof(*out));
     if (sptm_virt_layout(&l) < 0 || sptm_virt_gl_alloc() < 0)
@@ -349,6 +349,9 @@ __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
 {
     struct sptm_virt_layout l;
 
+    /* Direct proxy callers must pass the same exact SoC/ADT contract as the host profile. */
+    if (!sptm_virt_requested() || !sptm_virt_s2_admit())
+        return -1;
     if (sptm_virt_layout(&l) < 0) {
         printf("SPTM-virt: load refused, no valid carve-out layout\n");
         return -1;
