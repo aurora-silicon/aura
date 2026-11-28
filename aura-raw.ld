@@ -145,6 +145,11 @@ SECTIONS {
      * part that reaches that buffer is loaded onto it, and the DCP can overwrite it before
      * start.S has copied it, so everything before the pixel data must end below it. Past
      * _file_end the image is only zeros (.bss), as before.
+     *
+     * A stage 1 with chainload.c's live log check never copies a stage 2 onto that buffer: on
+     * M1 to M3 it leaves an image whose copy would reach a live __OS_LOG where it staged it,
+     * above its heap. The limit stays for stage 1 itself, which iBoot loads, and for every
+     * stage 2 while stage 1s without that check are installed.
      */
     _file_limit = 0x120000;
     ASSERT(_file_vital_end - _base <= _file_limit,

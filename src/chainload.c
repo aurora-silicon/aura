@@ -53,6 +53,37 @@ static u64 chainload_run_footprint(const void *image, size_t size, u32 *flags)
     return hdr.footprint;
 }
 
+/*
+ * Whether [start, end) meets a coprocessor log buffer iBoot left running: the __OS_LOG segment
+ * (flags 0xa) of any /arm-io/<dev>/<nub> segment-ranges. The coprocessor keeps writing it, so
+ * nothing may be copied there. On T8122, T6030 and T6031 (M3) the panel DCP's starts 0x120000
+ * above our base (aura-raw.ld _file_limit).
+ */
+static bool chainload_meets_live_log(u64 start, u64 end)
+{
+    int dev = adt_path_offset(adt, "/arm-io");
+    if (dev < 0)
+        return false;
+    ADT_FOREACH_CHILD(adt, dev)
+    {
+        int nub = dev;
+        ADT_FOREACH_CHILD(adt, nub)
+        {
+            u32 len = 0;
+            const u8 *v = adt_getprop(adt, nub, "segment-ranges", &len);
+            for (u32 i = 0; v && i + sizeof(struct adt_segment_ranges) <= len;
+                 i += sizeof(struct adt_segment_ranges)) {
+                struct adt_segment_ranges r;
+                memcpy(&r, v + i, sizeof(r));
+                if (r.unk == 0xa && r.size && r.phys < end &&
+                    (r.phys >= start || start - r.phys < r.size))
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* DISPLAY_LIVE_ADT_PROP and DISPLAY_LIVE_RTKIT_ADT_PROP, in this order */
 #define LIVE_DCP_ADT_ENTRY_SIZE                                                                    \
     (2 * sizeof(struct adt_property) + sizeof(u64) + DISPLAY_LIVE_RTKIT_RECORD_SIZE)
@@ -178,7 +209,7 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     u64 image_end = new_base + image_size;
     u64 packed_end = image_end + fw_size;
     u64 run_base = 0, footprint = 0;
-    bool must_stage = false;
+    bool must_stage = false, keep_staged = false;
     if (ro_status == 1 && image_end > ro_start && new_base < ro_end) {
         /*
          * T8140: the firmware RO range lies about 10 MiB above our base on a J700, and the
@@ -215,17 +246,39 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
         must_stage = true;
     }
 
-    bool park_fw = !run_base && !must_stage &&
+    /*
+     * A copy to our base must not reach a live coprocessor log buffer either: on M3 the panel
+     * DCP's starts 0x120000 above it, below most of a Stage 2 file. Where iBoot leaves RVBAR
+     * unlocked (M1 to M3: smp_start_cpu() points it at the running image), an aura image (one
+     * with a load header) can run from its staged copy instead, which nothing copies anywhere
+     * and which already lies above our heap. A firmware block that alone would reach a log is
+     * parked below. An image without the header, or one where RVBAR is locked, is placed as
+     * before.
+     */
+    u64 in_place_end = must_stage ? new_base + footprint : image_end;
+    if (!run_base && chainload_meets_live_log(new_base, in_place_end)) {
+        if (target_footprint && cpu_features->apple_sysregs_unlocked) {
+            keep_staged = true;
+            must_stage = false;
+            footprint = 0;
+        } else {
+            printf("chainload: WARNING: image copy reaches a live coprocessor log\n");
+        }
+    }
+
+    bool park_fw = !run_base && !must_stage && !keep_staged &&
                    ((ro_status == 1 && packed_end > ro_start && image_end < ro_end) ||
                     (live_heap > protected_heap_start && packed_end > protected_heap_start &&
-                     image_end < live_heap));
+                     image_end < live_heap) ||
+                    chainload_meets_live_log(image_end, packed_end));
     u8 *parked = NULL;
     u64 fw_base = image_end;
     if (park_fw) {
         printf(
             "chainload: packed span would overlap protected/live memory; parking firmware block\n");
         parked = memalign(SZ_16K, fw_size);
-        if (!parked || (u64)parked > ram_end || fw_size > ram_end - (u64)parked) {
+        if (!parked || (u64)parked > ram_end || fw_size > ram_end - (u64)parked ||
+            chainload_meets_live_log((u64)parked, (u64)parked + fw_size)) {
             free(parked);
             return -1;
         }
@@ -252,8 +305,9 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     bool fits_staged =
         staged >= new_base + footprint && staged <= ram_end &&
         copy_size + stub_size <= ram_end - staged &&
-        !(ro_status == 1 && staged < ro_end && staged + copy_size + stub_size > ro_start);
-    if (!run_base && !park_fw && fits_staged) {
+        !(ro_status == 1 && staged < ro_end && staged + copy_size + stub_size > ro_start) &&
+        !chainload_meets_live_log(staged, staged + copy_size + stub_size);
+    if (!run_base && !park_fw && !keep_staged && fits_staged) {
         u64 run_footprint = target_footprint;
         if (run_footprint && !(new_base & (SZ_16K - 1)) && staged >= new_base + run_footprint &&
             (ro_status != 1 || new_base + run_footprint <= ro_start || new_base >= ro_end)) {
@@ -266,14 +320,15 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
         free(new_image);
         return -1;
     }
-    if (run_base) {
+    if (run_base || keep_staged) {
         /*
          * The staged copy is the destination: the stub has nothing to copy. The stub runs from
-         * just after it, so the whole allocation must stay in RAM and clear of firmware RO.
+         * just after it, so the whole allocation must stay in RAM and clear of firmware RO and
+         * of the live logs.
          */
         new_base = staged;
         if (new_base < run_base + footprint || !fits_staged) {
-            printf("chainload: no room to stage the image above firmware RO\n");
+            printf("chainload: no room to stage the image above firmware RO or a live log\n");
             free(new_image);
             return -1;
         }
@@ -367,6 +422,8 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     if (run_base)
         printf("chainload: image staged at 0x%lx runs its first 0x%lx bytes at 0x%lx\n", new_base,
                footprint, run_base);
+    else if (keep_staged)
+        printf("chainload: image runs where it is staged, at 0x%lx\n", new_base);
     next_stage.entry = stub;
     next_stage.args[0] = fw_base + fw_bootargs_off;
     next_stage.args[1] = (u64)new_image;
