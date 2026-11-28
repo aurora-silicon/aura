@@ -833,8 +833,9 @@ def refused(r, why, bw=BW):
     return True
 
 
-def test_handoff_publishes_and_enables_adt_route(host):
-    result = headless(host, typec=1)
+@pytest.mark.parametrize("fw272", [0, 1], ids=["27.0", "27.2"])
+def test_handoff_publishes_and_enables_adt_route(host, fw272):
+    result = headless(host, typec=1, fw272=fw272)
     assert handed_off(result)
     assert result.route == {
         "graph": "connected",
@@ -845,8 +846,9 @@ def test_handoff_publishes_and_enables_adt_route(host):
     }
 
 
-def test_handoff_leaves_routes_empty_for_an_unmatched_image(host):
-    result = headless(host, typec=1, mismatch=1)
+@pytest.mark.parametrize("fw272", [0, 1], ids=["27.0-image", "27.2-image"])
+def test_handoff_leaves_routes_empty_for_an_unmatched_image(host, fw272):
+    result = headless(host, typec=1, fw272=fw272, mismatch=1)
     assert refused(result, "is not a known pair for external engines")
     assert result.route == {
         "graph": "empty",
