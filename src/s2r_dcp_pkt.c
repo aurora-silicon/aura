@@ -41,6 +41,8 @@ static struct s2r_dcp {
     u64 mbox, dart, dart_size;
     u64 vm_base;
     bool have_vm_base;
+    u8 nsid; /* the DART's ADT sid-count (T6050's DCP DARTs have 32; the DCP's stream is 23) */
+    int sid; /* the ADT's sid property, walked first, or -1 */
     u64 dva, lo;
     u64 pa[S2R_DCP_PAGES];
     int resolved; /* 0 not yet, 1 found, -1 not found */
@@ -101,7 +103,12 @@ static int s2r_dcp_resolve(struct s2r_dcp *d)
                    d->dva, d->vm_base, S2R_DCP_T8110_IOVA_BITS, S2R_DCP_T8110_IOVA_BITS);
     }
     u32 walked = 0;
-    for (u8 sid = 0; sid < 16; sid++) {
+    for (int n = -1; n < d->nsid; n++) {
+        if (n >= 0 && n == d->sid)
+            continue;
+        if (n < 0 && d->sid < 0)
+            continue;
+        u8 sid = n < 0 ? d->sid : n;
         struct s2r_dcp_walk w = {d, iova, 0};
         int ret = dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual,
                                          s2r_dcp_visit, &w);
@@ -264,8 +271,13 @@ void s2r_dcp_add(const char *name, u64 mbox)
     int node = adt_path_offset_trace(adt, path, p);
     if (node < 0 || adt_get_reg(adt, p, "reg", 0, &base, &size) < 0)
         return;
-    s2r_dcp[s2r_n_dcp] = (struct s2r_dcp){.mbox = mbox, .dart = base, .dart_size = size};
-    u32 len = 0;
+    s2r_dcp[s2r_n_dcp] =
+        (struct s2r_dcp){.mbox = mbox, .dart = base, .dart_size = size, .nsid = 16, .sid = -1};
+    u32 len = 0, v32;
+    if (ADT_GETPROP(adt, node, "sid-count", &v32) >= 0 && v32 && v32 <= 32)
+        s2r_dcp[s2r_n_dcp].nsid = v32;
+    if (ADT_GETPROP(adt, node, "sid", &v32) >= 0 && v32 < s2r_dcp[s2r_n_dcp].nsid)
+        s2r_dcp[s2r_n_dcp].sid = v32;
     const void *vb = adt_getprop(adt, node, "vm-base", &len);
     if (vb && (len == 4 || len == 8)) {
         u64 v = 0;
@@ -273,8 +285,9 @@ void s2r_dcp_add(const char *name, u64 mbox)
         s2r_dcp[s2r_n_dcp].vm_base = v;
         s2r_dcp[s2r_n_dcp].have_vm_base = true;
     }
-    printf("SPTM-virt[s2r]: dcp-pkt %d %s mbox 0x%lx dart 0x%lx vm-base %s0x%lx\n", s2r_n_dcp, name,
-           mbox, base, s2r_dcp[s2r_n_dcp].have_vm_base ? "" : "(none) ",
-           s2r_dcp[s2r_n_dcp].vm_base);
+    printf(
+        "SPTM-virt[s2r]: dcp-pkt %d %s mbox 0x%lx dart 0x%lx vm-base %s0x%lx sids %u (first %d)\n",
+        s2r_n_dcp, name, mbox, base, s2r_dcp[s2r_n_dcp].have_vm_base ? "" : "(none) ",
+        s2r_dcp[s2r_n_dcp].vm_base, s2r_dcp[s2r_n_dcp].nsid, s2r_dcp[s2r_n_dcp].sid);
     s2r_n_dcp++;
 }
