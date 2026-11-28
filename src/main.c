@@ -437,6 +437,18 @@ void aura_main(void)
         printf("WDT: could not arm the boot watchdog\n");
     else if (!aura_trial_enabled())
         printf("WDT: boot watchdog armed (%u s)\n", WDT_BOOT_SECONDS);
+#elif defined(CHAINLOADING) && !defined(BRINGUP)
+    /*
+     * Stage 2 on a plain boot takes Stage 1's boot watchdog over with a fresh period: a stop
+     * anywhere before the hand-off (storage that never answers, a display or payload step that
+     * never returns) would otherwise wait for the power button. The hand-off disarms it again
+     * (U-Boot and GRUB menus may wait for a person; U-Boot runs its own watchdog), and so does
+     * the first host request. A debug boot has someone at the Mac.
+     */
+    else if (!aura_trial_enabled() && !aura_debug_enabled() && wdt_arm_boot())
+        printf("WDT: could not arm the boot watchdog\n");
+    else if (!aura_trial_enabled() && !aura_debug_enabled())
+        printf("WDT: boot watchdog armed until the hand-off (%u s)\n", WDT_BOOT_SECONDS);
 #endif
 #ifndef BRINGUP
     if (pmgr_init() && chip_id == T8140)
@@ -533,6 +545,11 @@ next_stage:
     /* Give the next stage of a trial boot the whole watchdog period. */
     if (aura_trial_enabled() && wdt_arm_trial())
         printf("WDT: could not arm the trial watchdog\n");
+#if defined(CHAINLOADING) && defined(ESP_STAGE2)
+    /* A plain boot's next stage brings its own watchdog: leave the hardware as Stage 2 found it. */
+    else if (!aura_trial_enabled())
+        wdt_disarm_boot();
+#endif
     printf("Vectoring to next stage...\n");
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
     stage1_log_flush();

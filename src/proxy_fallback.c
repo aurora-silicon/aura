@@ -13,23 +13,32 @@
  * needs nothing from Stage 1 beyond the trial itself.
  *
  * A plain boot that stops in the proxy is in the same place. Stage 1 runs its boot watchdog for
- * that (wdt_arm_boot()), but a Stage 2 disarms it at its start, so a Stage 2 that could not start
- * its payload stayed in the proxy until someone held the power button or reset it over USB-C (on
- * the M4 MacBook Air: an ANS that a warm boot's start from off could not bring up, about one
- * warm boot in eight; a later boot brings it up). Such a stop arms the boot watchdog again, unless
- * a host has attached already, this is a debug boot or a BRINGUP build (which never hands off and
- * stays in the proxy by design), and then stops in the proxy as before. The first proxy request
- * from a host turns it off (wdt_host_attached()); a host that only holds the port open and sends
- * nothing for that long is reset like an absent one. Without a host the Mac restarts and the
- * next boot tries again.
+ * that (wdt_arm_boot()). A Stage 2 used to disarm it at its start, so one that could not start its
+ * payload stayed in the proxy until someone held the power button or reset it over USB-C (on the
+ * M4 MacBook Air: an ANS that a warm boot's start from off could not bring up, about one warm boot
+ * in eight; a later boot brings it up). An ESP Stage 2 now runs it from its start (main.c), and a
+ * stop that finds it off arms it again, unless a host has attached already, this is a debug boot
+ * or a BRINGUP build (which never hands off and stays in the proxy by design). It then stops in
+ * the proxy as before. The first proxy request from a host turns it off (wdt_host_attached()); a
+ * host that only holds the port open and sends nothing for that long is reset like an absent one.
+ * Without a host the Mac restarts and the next boot tries again.
  */
 bool proxy_fallback(const char *why)
 {
     if (!aura_trial_enabled()) {
 #ifndef BRINGUP
-        if (wdt_boot_watchdog_armed() || wdt_host_was_attached() || aura_debug_enabled())
+#ifdef ESP_STAGE2
+        /* It runs from Stage 2's start (main.c); arm it here only if something turned it off. */
+        bool keep = wdt_host_was_attached() || aura_debug_enabled();
+        bool arm = !wdt_boot_watchdog_armed();
+#else
+        /* Stage 1's own boot watchdog runs, and its own stop explains it. */
+        bool keep = wdt_boot_watchdog_armed() || wdt_host_was_attached() || aura_debug_enabled();
+        bool arm = true;
+#endif
+        if (keep)
             return false;
-        if (wdt_arm_boot()) {
+        if (arm && wdt_arm_boot()) {
             printf("%s; no boot watchdog, staying in the proxy\n", why);
             return false;
         }

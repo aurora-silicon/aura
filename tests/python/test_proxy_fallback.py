@@ -256,7 +256,7 @@ int main(int argc, char **argv)
 
 
 def _fallback(tmp_path, trial, host, boot_wdt=False, arm_fails=False, host_seen=False,
-              debug=False):
+              debug=False, esp_stage2=False, want_panel=False):
     header = (ROOT / "src/proxy_fallback.h").read_text()
     header = header[header.index("#define PROXY_FALLBACK_HOST_MS"):]
     header = header[:header.index("\n")]
@@ -266,11 +266,15 @@ def _fallback(tmp_path, trial, host, boot_wdt=False, arm_fails=False, host_seen=
     src.write_text(FALLBACK.replace("@HEADER@", header).replace("@FALLBACK@", fn))
     exe = tmp_path / "f"
     subprocess.run([*host_cc(), "-std=gnu11", "-Wall", "-Werror", "-Wno-unused-function",
-                    "-Wno-unused-parameter", str(src), "-o", str(exe)], check=True)
+                    "-Wno-unused-parameter", *(["-DESP_STAGE2"] if esp_stage2 else []), str(src),
+                    "-o", str(exe)], check=True)
     out = subprocess.run([str(exe), str(int(trial)), str(int(host)), str(int(boot_wdt)),
                           str(int(arm_fails)), str(int(host_seen)), str(int(debug))], check=True,
                          capture_output=True, text=True).stdout
-    return dict(item.split("=") for item in out.strip().splitlines()[-1].split())
+    result = dict(item.split("=") for item in out.strip().splitlines()[-1].split())
+    if want_panel:
+        result["panel"] = str(int("restarts by itself" in out))
+    return result
 
 
 def test_plain_boot_arms_the_boot_watchdog_and_keeps_the_proxy(tmp_path):
@@ -285,6 +289,32 @@ def test_plain_boot_leaves_a_running_boot_watchdog(tmp_path):
     """Stage 1's own boot watchdog still runs: nothing to arm (and no fresh period)."""
     assert _fallback(tmp_path, False, False, boot_wdt=True) == {
         "ret": "0", "waited": "0", "reboots": "0", "arms": "0", "boot": "0"}
+
+
+def test_esp_stage2_keeps_its_running_boot_watchdog_and_tells_the_owner(tmp_path):
+    """An ESP Stage 2 runs the boot watchdog from its start: a stop neither re-arms it (the
+    period keeps running) nor stays silent: the panel says the Mac restarts."""
+    assert _fallback(tmp_path, False, False, boot_wdt=True, esp_stage2=True, want_panel=True) == {
+        "ret": "0", "waited": "0", "reboots": "0", "arms": "0", "boot": "0", "panel": "1"}
+
+
+def test_esp_stage2_arms_a_boot_watchdog_it_finds_off(tmp_path):
+    """A transition watchdog took over and went away (T8140 CDC): arm it again and say so."""
+    assert _fallback(tmp_path, False, False, esp_stage2=True, want_panel=True) == {
+        "ret": "0", "waited": "0", "reboots": "0", "arms": "0", "boot": "1", "panel": "1"}
+
+
+def test_esp_stage2_never_arms_under_a_host_or_on_a_debug_boot(tmp_path):
+    for kw in ({"host_seen": True}, {"debug": True}):
+        assert _fallback(tmp_path, False, False, boot_wdt=True, esp_stage2=True, want_panel=True,
+                         **kw) == {"ret": "0", "waited": "0", "reboots": "0", "arms": "0",
+                                   "boot": "0", "panel": "0"}, kw
+
+
+def test_stage1_stays_silent_under_its_own_boot_watchdog(tmp_path):
+    """Stage 1 (no ESP_STAGE2) keeps its old behaviour: its own stop explains the restart."""
+    assert _fallback(tmp_path, False, False, boot_wdt=True, want_panel=True) == {
+        "ret": "0", "waited": "0", "reboots": "0", "arms": "0", "boot": "0", "panel": "0"}
 
 
 def test_plain_boot_never_arms_under_a_host_or_on_a_debug_boot(tmp_path):
@@ -352,7 +382,7 @@ def test_bringup_builds_keep_the_proxy():
     fn = _body((ROOT / "src/proxy_fallback.c").read_text(), "bool proxy_fallback(const char *why)")
     plain = fn[:fn.index("\n    }\n")]
     guard = plain.index("#ifndef BRINGUP")
-    assert guard < plain.index("wdt_arm_boot()") < plain.index("#endif")
+    assert guard < plain.index("wdt_arm_boot()") < plain.rindex("#endif")
 
 
 WDT_HANDOVER = r'''
