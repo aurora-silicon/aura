@@ -74,7 +74,7 @@ static struct node {
     } props[8];
     int nprops, nreg;
     u64 reg[5][2];
-} nodes[16];
+} nodes[24];
 static int nnodes;
 
 static struct node *node(const char *path)
@@ -186,32 +186,44 @@ int adt_get_property_count(const void *a, int n)
     return n < 1 || n > nnodes ? -1 : nodes[n - 1].nprops;
 }
 
+static bool adt_is_child(int parent, int child)
+{
+    const char *path = nodes[child - 1].path;
+    const char *slash = strrchr(path, '/');
+    size_t len = strlen(nodes[parent - 1].path);
+
+    return slash && (size_t)(slash - path) == len && !strncmp(path, nodes[parent - 1].path, len);
+}
+
 int adt_get_child_count(const void *a, int n)
 {
-    UNUSED(a);
-    UNUSED(n);
-    return 0;
+    int count = 0;
+    for (int i = 1; i <= nnodes; i++)
+        count += adt_is_child(n, i);
+    return count;
 }
 
 int adt_first_child_offset(const void *a, int n)
 {
-    UNUSED(a);
-    UNUSED(n);
+    for (int i = 1; i <= nnodes; i++)
+        if (adt_is_child(n, i))
+            return i;
     return -1;
 }
 
 int adt_next_sibling_offset(const void *a, int n)
 {
-    UNUSED(a);
-    UNUSED(n);
+    for (int parent = 1; parent <= nnodes; parent++)
+        if (adt_is_child(parent, n))
+            for (int i = n + 1; i <= nnodes; i++)
+                if (adt_is_child(parent, i))
+                    return i;
     return -1;
 }
 
 const char *adt_get_name(const void *a, int n)
 {
-    UNUSED(a);
-    UNUSED(n);
-    return "";
+    return strrchr(nodes[n - 1].path, '/') + 1;
 }
 
 int host_adt_nprops(int n)
@@ -338,18 +350,16 @@ static u64 arg(int argc, char **argv, const char *name, u64 otherwise)
     return otherwise;
 }
 
-/* The first image row whose engines are handed off (or not): this boot's OS firmware and uuid */
-static const char *image(bool ext)
+/* Fixed fixture identities. The implementation table is the code under test. */
+static const char *image(bool prefer_27_0)
 {
-    for (size_t i = 0; i < ARRAY_SIZE(t6050_images); i++)
-        if (t6050_images[i].ext == ext) {
-            os_firmware.version = t6050_images[i].os_fw;
-            os_firmware.string = "the OS firmware";
-            os_firmware.num[0] = 27;
-            os_firmware.num_length = 3;
-            return t6050_images[i].uuid;
-        }
-    DIE("no image row\n");
+    os_firmware.version = prefer_27_0 ? V27_0 : V27_2;
+    os_firmware.string = "the OS firmware";
+    os_firmware.num[0] = 27;
+    os_firmware.num[1] = os_firmware.version == V27_2 ? 2 : 0;
+    os_firmware.num_length = 3;
+    return prefer_27_0 ? "64863924-B56B-3E32-87FE-038677F52709"
+                       : "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E";
 }
 
 /*
@@ -413,6 +423,81 @@ static const char *status(void *dt, const char *path)
 #define PMC      0x510f00000UL
 enum { PH_DART_DCP = 1, PH_DART_DISP, PH_MBOX, PH_PMC };
 
+#define ROUTE_ENGINE "/soc/dcpext@389c00000"
+#define ROUTE_PHY "/soc/phy@1000"
+#define ROUTE_MUX "/soc/mux@2000"
+#define ROUTE_HPM "/soc/spmi@3000/usb-pd@a"
+#define ROUTE_DCP_EP ROUTE_ENGINE "/typec-routes/route@0/port/endpoint"
+#define ROUTE_USB_EP ROUTE_HPM "/connector/ports/port@2/endpoint@0"
+
+static void add_typec_port(void *dt, int soc)
+{
+    const char *output = "/arm-io/dp-output";
+    const char *engine = "/arm-io/dcpext0";
+    node("/arm-io");
+    prop_u32(engine, "dp-switch-parent", 1);
+    prop_u32(engine, "dp-switch-ufp-endpoint", 0);
+    prop_u32(engine, "dp-switch-ufp-port", 0);
+    prop_u32(output, "dp-switch-parent", 1);
+    prop_u32(output, "transport-tunneled", 0);
+    prop_u32(output, "dp-switch-dfp-endpoint", 2);
+    prop_u32(output, "dp-switch-dfp-port", 0);
+    prop_u32(output, "port-number", 1);
+    prop_u32(output, "atc-phy", 2);
+    prop_u32(output, "dpxbar-parent", 3);
+    prop_u32("/arm-io/phy", "AAPL,phandle", 2);
+    prop_u32("/arm-io/mux", "AAPL,phandle", 3);
+    reg("/arm-io/phy", 0, 0x1000, 0x4000);
+    reg("/arm-io/mux", 0, 0x2000, 0x4000);
+    reg("/arm-io/spmi", 0, 0x3000, 0x4000);
+    prop_u32("/arm-io/spmi/hpm", "port-number", 1);
+    prop_u32("/arm-io/spmi/hpm", "reg", 0xa);
+
+    int phy = fdt_dev(dt, soc, "phy@1000", 0x1000, 0);
+    OK(fdt_setprop_u32(dt, phy, "#phy-cells", 1));
+    OK(fdt_setprop_empty(dt, phy, "mode-switch"));
+    int mux = fdt_dev(dt, soc, "mux@2000", 0x2000, 0);
+    OK(fdt_setprop_u32(dt, mux, "#mux-control-cells", 1));
+    OK(fdt_setprop_string(dt, mux, "compatible", "apple,t8142-display-crossbar"));
+    int bus = fdt_dev(dt, soc, "spmi@3000", 0x3000, 0);
+    OK(fdt_setprop_u32(dt, bus, "#address-cells", 1));
+    OK(fdt_setprop_u32(dt, bus, "#size-cells", 0));
+    int hpm = fdt_add_subnode(dt, bus, "usb-pd@a");
+    OK(hpm);
+    OK(fdt_setprop_u32(dt, hpm, "reg", 0xa));
+    OK(fdt_setprop_string(dt, hpm, "status", "disabled"));
+    int connector = fdt_add_subnode(dt, hpm, "connector");
+    OK(connector);
+    OK(fdt_setprop_string(dt, connector, "compatible", "usb-c-connector"));
+
+    int routes = fdt_add_subnode(dt, fdt_path_offset(dt, ROUTE_ENGINE), "typec-routes");
+    OK(routes);
+    OK(fdt_setprop_u32(dt, routes, "#address-cells", 1));
+    OK(fdt_setprop_u32(dt, routes, "#size-cells", 0));
+}
+
+static bool points_at(void *dt, int from, int to)
+{
+    int len = 0;
+    const fdt32_t *remote = fdt_getprop(dt, from, "remote-endpoint", &len);
+    return to >= 0 && remote && len == sizeof(*remote) && fdt32_ld(remote) &&
+           fdt32_ld(remote) == fdt_get_phandle(dt, to);
+}
+
+static void show_typec_port(void *dt)
+{
+    int dcp_ep = fdt_path_offset(dt, ROUTE_DCP_EP);
+    int usb_ep = fdt_path_offset(dt, ROUTE_USB_EP);
+    int routes = fdt_path_offset(dt, ROUTE_ENGINE "/typec-routes");
+    int first = fdt_first_subnode(dt, routes);
+    const char *graph = first == -FDT_ERR_NOTFOUND && usb_ep == -FDT_ERR_NOTFOUND ? "empty" :
+                        points_at(dt, dcp_ep, usb_ep) && points_at(dt, usb_ep, dcp_ep) ?
+                            "connected" : "broken";
+
+    printf("route graph=%s phy=%s mux=%s bus=%s hpm=%s\n", graph, status(dt, ROUTE_PHY),
+           status(dt, ROUTE_MUX), status(dt, "/soc/spmi@3000"), status(dt, ROUTE_HPM));
+}
+
 /*
  * A board without a panel whose display subsystem scans out through dcpext0: every check of the
  * engine and the subsystem holds but the ones the arguments decide (vram= vsize= fb= stride=
@@ -426,7 +511,11 @@ static int headless(int argc, char **argv)
     u64 meta_size = arg(argc, argv, "meta", 0), bw = arg(argc, argv, "bw", 0);
     const char *nub = "/arm-io/dcpext0/iop-dcpext0-nub";
 
-    prop(nub, "uuid", image(true), 37);
+    bool fw272 = arg(argc, argv, "fw272", 0);
+    const char *uuid = image(!fw272);
+    if (arg(argc, argv, "mismatch", 0))
+        image(fw272); /* Report the other OS firmware with this image. */
+    prop(nub, "uuid", uuid, 37);
     prop_u32(nub, "running", 1);
     segments(nub, 0, 0);
     reg("/arm-io/dcpext0", 0, COPROC, 0x4000);
@@ -488,10 +577,17 @@ static int headless(int argc, char **argv)
     OK(fdt_setprop_string(dt, disp, "status", "disabled"));
     fdt_u32s(dt, disp, "iommus", 2, PH_DART_DISP, 0, 0, 0);
 
+    bool typec = arg(argc, argv, "typec", 0);
+    if (typec)
+        add_typec_port(dt, soc);
+
     if (dt_set_display_handoff(dt))
         DIE("dt_set_display_handoff() failed\n");
     if (fdt_check_header(dt))
         DIE("the device tree is not valid\n");
+
+    if (typec)
+        show_typec_port(dt);
 
     int chosen = fdt_path_offset(dt, "/chosen");
     const char *said = fdt_getprop(dt, chosen, T6050_STATUS, NULL);
@@ -661,8 +757,12 @@ class Result:
         self.log, self.reserved, self.scratch = [], [], None
         for line in text.splitlines():
             kind, _, rest = line.partition(" ")
-            if kind == "DCP:":
+            if line.startswith("DCP routes: "):
+                self.log.append(line)
+            elif kind == "DCP:":
                 self.log.append(rest.partition(": ")[2])
+            elif kind == "route":
+                self.route = dict(item.split("=") for item in rest.split())
             elif kind == "result":
                 self.state = dict(item.split("=") for item in rest.split())
             elif kind == "scratch":
@@ -731,6 +831,32 @@ def refused(r, why, bw=BW):
     assert not r.said("handed off")
     assert r.scratch == [4, 0, 5, bw]
     return True
+
+
+@pytest.mark.parametrize("fw272", [0, 1], ids=["27.0", "27.2"])
+def test_handoff_publishes_and_enables_adt_route(host, fw272):
+    result = headless(host, typec=1, fw272=fw272)
+    assert handed_off(result)
+    assert result.route == {
+        "graph": "connected",
+        "phy": "okay",
+        "mux": "okay",
+        "bus": "okay",
+        "hpm": "okay",
+    }
+
+
+@pytest.mark.parametrize("fw272", [0, 1], ids=["27.0-image", "27.2-image"])
+def test_handoff_leaves_routes_empty_for_an_unmatched_image(host, fw272):
+    result = headless(host, typec=1, fw272=fw272, mismatch=1)
+    assert refused(result, "is not a known pair for external engines")
+    assert result.route == {
+        "graph": "empty",
+        "phy": "disabled",
+        "mux": "disabled",
+        "bus": "disabled",
+        "hpm": "disabled",
+    }
 
 
 # ---- the boot framebuffer and /vram ------------------------------------------------------------
