@@ -537,6 +537,7 @@ struct dcp6_sid {
     bool ok;
     int nruns;
     struct dcp6_run runs[DCP6_MAX_RUNS];
+    u32 fb_pages; /* no panel: display pages in iBoot's dummy framebuffer, not handed over */
 };
 
 enum { VM_DCP, VM_DISP }; /* dart-dcp, dart-disp0 */
@@ -552,7 +553,9 @@ static struct {
     bool vm_ok;
     int nnubs;
     const char *nubs[DCP6_NUBS_MAX];
-    int nsegs, seg_text, seg_oslog, seg_vram;
+    int nsegs, seg_text, seg_oslog, seg_vram; /* seg_vram -1: no panel, no framebuffer segment */
+    bool no_panel;       /* headless T6041 sleep host: internal DCP runs with no panel */
+    u64 vram, vram_size; /* ADT /vram, iBoot's boot framebuffer */
     struct dcp6_seg_def derived[DCP6_SEGS_MAX];
     char derived_names[DCP6_SEGS_MAX][2][DCP6_DEF_LEN]; /* heap segments' names */
     bool mmio_ok;     /* display domain on and the register reads below did not fault */
@@ -1756,6 +1759,10 @@ static int dcp6_derive_segs(const struct adt_segment_ranges *seg, int n, const c
 
     if (dcp6_adt_reg("/vram", 0, &vram))
         bail("no /vram\n");
+    int vram_path[8];
+    if (adt_path_offset_trace(adt, "/vram", vram_path) < 0 ||
+        adt_get_reg(adt, vram_path, "reg", 0, &dcp6.vram, &dcp6.vram_size))
+        bail("no /vram size\n");
 
     for (int i = 0; i < n; i++) {
         struct adt_segment_ranges r;
@@ -1813,8 +1820,16 @@ static int dcp6_derive_segs(const struct adt_segment_ranges *seg, int n, const c
             d->name = name;
         }
     }
-    if (text < 0 || data < 0 || oslog < 0 || vram_seg < 0)
-        bail("dcp segments lack text, __DATA, __OS_LOG or /vram\n");
+    if (text < 0 || data < 0 || oslog < 0)
+        bail("dcp segments lack text, __DATA or __OS_LOG\n");
+    /*
+     * With no panel, iBoot runs the internal DCP without scanning anything out: its boot
+     * framebuffer at /vram is a dummy outside the firmware's segments.
+     */
+    if (vram_seg < 0 && !dcp6.no_panel)
+        bail("no dcp segment is /vram\n");
+    if (vram_seg < 0)
+        dlog("no panel: no dcp segment is /vram; the boot framebuffer stays the display's\n");
 
     dcp6.nsegs = n;
     dcp6.seg_text = text;
@@ -1932,6 +1947,8 @@ static int dcp6_get_segs(void)
 
     /* The framebuffer segment is /vram, where iBoot's boot framebuffer lives */
     u64 vram;
+    if (dcp6.seg_vram < 0)
+        return 0;
     const struct dcp6_seg *fb = &dcp6.segs[dcp6.seg_vram];
     if (dcp6_adt_reg("/vram", 0, &vram) || vram != fb->phys || kboot_fb_base() < fb->phys ||
         kboot_fb_base() >= fb->phys + fb->size)
@@ -1954,6 +1971,12 @@ static int dcp6_seg_of(u64 phys)
 static int dcp6_run_add(struct dcp6_sid *s, u64 dva, u64 pa)
 {
     int seg = dcp6_seg_of(pa);
+    /* No panel: the display stream may map iBoot's dummy boot framebuffer; it is not handed over */
+    if (seg < 0 && dcp6.seg_vram < 0 && s == &dcp6.sid[1] && pa >= dcp6.vram &&
+        pa - dcp6.vram < dcp6.vram_size) {
+        s->fb_pages++;
+        return 0;
+    }
     if (seg < 0)
         bail("%s SID %d maps DVA 0x%lx to 0x%lx, outside the firmware segments\n", s->what, s->sid,
              dva, pa);
@@ -2018,6 +2041,7 @@ static int dcp6_walk(struct dcp6_sid *s, const char *adt_dart, int vm, u64 base)
     u64 pt_lo, pt_hi, vm_base, vm_size;
 
     s->nruns = 0;
+    s->fb_pages = 0;
     int node = adt_path_offset(adt, adt_dart);
     snprintf(prop, sizeof(prop), "pt-region-%d", s->sid);
     if (node < 0 || dcp6_adt_u64_pair(node, prop, &pt_lo, &pt_hi))
@@ -2079,7 +2103,7 @@ static int dcp6_check_sid(struct dcp6_sid *s)
         for (int i = 0; i < dcp6.nsegs; i++)
             if (i != dcp6.seg_oslog && !seen[i])
                 bail("dcp SID %d does not map dcp segment %d\n", s->sid, i);
-    } else if (s == &dcp6.sid[1] && !seen[dcp6.seg_vram]) {
+    } else if (s == &dcp6.sid[1] && dcp6.seg_vram >= 0 && !seen[dcp6.seg_vram]) {
         bail("display SID %d does not map the framebuffer\n", s->sid);
     }
     return 0;
@@ -2108,6 +2132,9 @@ static void dcp6_dry_run(void)
         s->what = sids[i].what;
         s->sid = sids[i].sid;
         s->ok = !dcp6_walk(s, sids[i].dart, sids[i].vm, sids[i].base) && !dcp6_check_sid(s);
+        if (s->fb_pages)
+            dlog("%s SID %d maps %u page(s) of the dummy boot framebuffer; not handed over\n",
+                 s->what, s->sid, s->fb_pages);
         if (!s->ok)
             continue;
 #ifdef DEBUG
@@ -3135,6 +3162,18 @@ static bool t6041_headless(void *dt)
     return dcp6.soc == &dcp_soc_t6041_max && !fdt_node_check_compatible(dt, 0, "apple,j575c");
 }
 
+/*
+ * A headless T6041 DT asks for the internal DCP handoff by marking the dcp node as a sleep host
+ * (apple,sleep-host-stop). Older DTs without that property keep the external-only path.
+ */
+static bool t6041_headless_sleep_host(void *dt)
+{
+    if (!t6041_headless(dt))
+        return false;
+    int dcp = fdt_path_offset(dt, "dcp");
+    return dcp >= 0 && fdt_getprop(dt, dcp, "apple,sleep-host-stop", NULL);
+}
+
 static struct dcp6_seg t6041_headless_text;
 
 static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
@@ -3239,14 +3278,14 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
                  dcp6_overlaps(s->remap, s->size, segs[j].remap, segs[j].size)))
                 return -1;
     }
-    /* The two external processors and the panel share immutable TEXT. */
+    /* The external processors and the internal DCP share immutable TEXT. */
     const struct dcp6_seg *shared_text = NULL;
-    if (t6041_headless(dt)) {
+    if (dcp6.seg_text >= 0 && dcp6.seg_text < dcp6.nsegs) {
+        shared_text = &dcp6.segs[dcp6.seg_text];
+    } else if (t6041_headless(dt)) {
         if (!t6041_headless_text.phys)
             t6041_headless_text = segs[SEG_TEXT];
         shared_text = &t6041_headless_text;
-    } else if (dcp6.seg_text >= 0 && dcp6.seg_text < dcp6.nsegs) {
-        shared_text = &dcp6.segs[dcp6.seg_text];
     }
     if (!shared_text || segs[SEG_TEXT].phys != shared_text->phys ||
         segs[SEG_TEXT].size != shared_text->size)
@@ -3320,8 +3359,10 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
  * Headless: with no internal handoff, nothing else enables the display subsystem the external
  * chains join, nor its own DART (disp0's, which iBoot leaves locked). Enable both once an external
  * processor has its firmware memory; the kernel's gate then enables that processor's chain.
+ * After an internal handoff (`enable` false) the kernel's gate enables them with the DCP, and only
+ * the framebuffer region is added here.
  */
-static int t6041_headless_display(void *dt)
+static int t6041_headless_display_fb(void *dt, bool enable)
 {
     int display = fdt_path_offset(dt, "disp0");
     int len;
@@ -3332,8 +3373,10 @@ static int t6041_headless_display(void *dt)
     int dart = fdt_node_offset_by_phandle(dt, fdt32_ld(iommu));
     if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart") ||
         dcp6_status_disabled(dt, dart, "display subsystem DART") ||
-        fdt_setprop_string(dt, dart, "status", "okay"))
+        (enable && fdt_setprop_string(dt, dart, "status", "okay")))
         return -1;
+    if (!enable && fdt_stringlist_search(dt, display, "memory-region-names", "framebuffer") >= 0)
+        return 0;
 
     /*
      * The DRM aperture: iBoot's dummy boot framebuffer, as the other handoffs give /vram. There
@@ -3347,11 +3390,18 @@ static int t6041_headless_display(void *dt)
         return -1;
     fdt32_t region = cpu_to_fdt32(dcp6_add_resv(dt, name, fb, fb_size, "framebuffer"));
     display = fdt_path_offset(dt, "disp0");
-    if (!region || display < 0 || fdt_setprop(dt, display, "memory-region", &region, 4) ||
-        fdt_setprop(dt, display, "memory-region-names", "framebuffer", sizeof("framebuffer")))
+    if (!region || display < 0 || fdt_appendprop(dt, display, "memory-region", &region, 4) ||
+        fdt_appendprop_string(dt, display, "memory-region-names", "framebuffer"))
         return -1;
+    if (!enable)
+        return 0;
     display = fdt_path_offset(dt, "disp0");
     return display < 0 ? -1 : fdt_setprop_string(dt, display, "status", "okay");
+}
+
+static int t6041_headless_display(void *dt)
+{
+    return t6041_headless_display_fb(dt, true);
 }
 
 static void t6041_ext_handoffs(void *dt)
@@ -3359,6 +3409,7 @@ static void t6041_ext_handoffs(void *dt)
     int panel = fdt_path_offset(dt, "dcp");
     bool panel_handoff = panel >= 0 && fdt_getprop(dt, panel, dcp6.soc->marker, NULL);
     bool published = false;
+    t6041_headless_text = (struct dcp6_seg){0};
     if (!panel_handoff) {
         if (!t6041_headless(dt))
             return;
@@ -3381,16 +3432,20 @@ static void t6041_ext_handoffs(void *dt)
             published = true;
         }
     }
-    if (!published || !t6041_headless(dt) || panel_handoff)
+    if (!t6041_headless(dt) || (!published && !panel_handoff))
         return;
     void *scratch = dcp6_scratch(dt);
     if (!scratch)
         return;
-    if (t6041_headless_display(scratch)) {
-        dlog("display subsystem not enabled; the external processors stay disabled\n");
+    if (t6041_headless_display_fb(scratch, !panel_handoff)) {
+        dlog("display subsystem %s\n", panel_handoff ? "framebuffer not added"
+                                                     : "not enabled; the external processors "
+                                                       "stay disabled");
         free(scratch);
     } else if (!dcp6_commit(dt, scratch)) {
-        dlog("display subsystem and its DART enabled for the external processors\n");
+        dlog("%s\n", panel_handoff ? "no panel: display subsystem framebuffer added"
+                                   : "display subsystem and its DART enabled for the external "
+                                     "processors");
     }
 }
 
@@ -4276,9 +4331,10 @@ int dt_set_display_handoff(void *dt)
     dcp6_find_nubs();
     dcp6_reserve_oslogs(dt);
     dcp6_check_hw();
+    dcp6.no_panel = t6041_headless_sleep_host(dt);
     dcp6_dry_run();
 
-    if (armed && t6041_headless(dt))
+    if (armed && t6041_headless(dt) && !dcp6.no_panel)
         dlog("no panel: the internal DCP is not handed over\n");
     else if (armed)
         dcp6_handoff(dt);
