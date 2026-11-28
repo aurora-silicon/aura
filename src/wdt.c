@@ -293,9 +293,19 @@ static int wdt_arm(unsigned seconds)
  * simple-reconfig when wdt-version >= 3 with simple-reconfig-wdog-support and reg[3], otherwise
  * WD1 RESET_EN on wdt-version 2) and reads back what it wrote; other layouts refuse.
  */
+static bool wdt_boot_armed;
+
 int wdt_arm_seconds(unsigned seconds)
 {
-    return wdt_arm(seconds);
+    int ret = wdt_arm(seconds);
+
+    /*
+     * The hardware now runs this period, not the boot watchdog's: a host that attaches later
+     * must not turn off a watchdog it did not arm (usb_cdc's CDC transition watchdog on T8140).
+     */
+    if (!ret)
+        wdt_boot_armed = false;
+    return ret;
 }
 
 /*
@@ -304,7 +314,6 @@ int wdt_arm_seconds(unsigned seconds)
  * Linux's driver finds it running and keeps it fed. The next boot takes the normal path, as the
  * trial marker is already spent.
  */
-static bool wdt_boot_armed;
 
 int wdt_arm_trial(void)
 {
@@ -335,9 +344,18 @@ bool wdt_boot_watchdog_armed(void)
     return wdt_boot_armed;
 }
 
+/* A host has synced with this stage: a later stop in the proxy must not arm the boot watchdog. */
+static bool wdt_host_seen;
+
+bool wdt_host_was_attached(void)
+{
+    return wdt_host_seen;
+}
+
 /* Only the boot watchdog: a trial's or a host-armed one is not ours to disarm. */
 void wdt_host_attached(void)
 {
+    wdt_host_seen = true;
     if (!wdt_boot_armed)
         return;
     wdt_boot_armed = false;
