@@ -44,31 +44,9 @@ int pmgr_adt_collect_psregs(const char *path, u64 *out, u8 *flags, int max)
     abort();
 }
 
-int adt_get_child_count(const void *tree, int offset)
-{
-    UNUSED(tree);
-    UNUSED(offset);
-    abort();
-}
-
-int adt_first_child_offset(const void *tree, int offset)
-{
-    UNUSED(tree);
-    UNUSED(offset);
-    abort();
-}
-
-int adt_next_sibling_offset(const void *tree, int offset)
-{
-    UNUSED(tree);
-    UNUSED(offset);
-    abort();
-}
-
-const char *adt_get_name(const void *tree, int nodeoffset)
-{
-    UNUSED(tree);
-    UNUSED(nodeoffset);
-    abort();
-}
+/*
+ * adt_get_child_count(), adt_first_child_offset(), adt_next_sibling_offset() and adt_get_name()
+ * come from adt_tree.h, which every host that includes this header also includes: the T8132
+ * handoff walks the fake ADT's node tree.
+ */
 #endif

@@ -186,32 +186,59 @@ int adt_get_property_count(const void *a, int n)
     return n < 1 || n > nnodes ? -1 : nodes[n - 1].nprops;
 }
 
+/* The tree walk: a node's children are the nodes whose path is its path plus one component. */
+static bool child_of(int parent, int n)
+{
+    const char *p = parent ? nodes[parent - 1].path : "";
+    size_t len = strlen(p);
+    const char *c = nodes[n - 1].path;
+    return !strncmp(c, p, len) && c[len] == '/' && c[len + 1] && !strchr(c + len + 1, '/');
+}
+
+static int parent_of(int n)
+{
+    const char *c = nodes[n - 1].path;
+    const char *slash = strrchr(c, '/');
+    for (int i = 1; i <= nnodes; i++)
+        if (strlen(nodes[i - 1].path) == (size_t)(slash - c) &&
+            !strncmp(nodes[i - 1].path, c, slash - c))
+            return i;
+    return 0;
+}
+
+static int child_after(int parent, int after)
+{
+    for (int i = after + 1; i <= nnodes; i++)
+        if (child_of(parent, i))
+            return i;
+    return -1;
+}
+
 int adt_get_child_count(const void *a, int n)
 {
     UNUSED(a);
-    UNUSED(n);
-    return 0;
+    int count = 0;
+    for (int i = 1; i <= nnodes; i++)
+        count += child_of(n, i);
+    return count;
 }
 
 int adt_first_child_offset(const void *a, int n)
 {
     UNUSED(a);
-    UNUSED(n);
-    return -1;
+    return child_after(n, 0);
 }
 
 int adt_next_sibling_offset(const void *a, int n)
 {
     UNUSED(a);
-    UNUSED(n);
-    return -1;
+    return n < 1 || n > nnodes ? -1 : child_after(parent_of(n), n);
 }
 
 const char *adt_get_name(const void *a, int n)
 {
     UNUSED(a);
-    UNUSED(n);
-    return "";
+    return n < 1 || n > nnodes ? NULL : strrchr(nodes[n - 1].path, '/') + 1;
 }
 
 int host_adt_nprops(int n)
@@ -580,7 +607,7 @@ static int t6041_headless_fb(void)
 
     memset(&dcp6, 0, sizeof(dcp6));
     dcp6.soc = &dcp_soc_t6041_max;
-    int rc = t6041_headless_display(dt);
+    int rc = dcp6_headless_display(dt, dcp6.soc->disp_compat);
     printf("result rc=%d\n", rc);
     int len = 0, n, count = 0;
     fdt_for_each_subnode(n, dt, fdt_path_offset(dt, "/reserved-memory"))

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 """tools/stage1_room.py: the room a Stage 1 link has left, with and without a 64 KiB step
-between .init and .text."""
+between .init and .text, and the symbols a link must or must not have."""
 
 import importlib.util
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -66,3 +67,50 @@ def test_built_stage1():
         pytest.skip("not an aura-raw.ld link")
     # .text starts within one page of the end of .init, not on the next 64 KiB step.
     assert s["_text_content_start"] - s["_init_content_end"] < 0x4000
+
+
+def test_symbol_problems():
+    names = {"_file_vital_end", "dt_set_dcpext_handoff"}
+    assert stage1_room.symbol_problems(names) == []
+    assert stage1_room.symbol_problems(names, forbid=["dt_set_dcpext_handoff"]) == \
+        ["links dt_set_dcpext_handoff, which it must not"]
+    assert stage1_room.symbol_problems(names, require=["dt_set_dcpext_handoff"]) == []
+    assert stage1_room.symbol_problems(set(), require=["dt_set_dcpext_handoff"]) == \
+        ["does not link dt_set_dcpext_handoff"]
+
+
+def fake_nm(tmp_path, lines, status=0):
+    nm = tmp_path / "nm"
+    out = tmp_path / "nm.out"
+    out.write_text("".join(f"{line}\n" for line in lines))
+    nm.write_text(f"#!/bin/sh\ncat '{out}'\nexit {status}\n")
+    nm.chmod(0o755)
+    return nm
+
+
+LAYOUT = ["000000000001e000 T _text_content_start", "000000000001dc68 T _init_content_end",
+          "00000000000ad178 T _text_content_end", "00000000000e9000 T _rodata_content_end",
+          "0000000000100000 T _data_start", "000000000011b538 T _file_vital_end"]
+
+
+def room_cli(tmp_path, nm, *args):
+    return subprocess.run([sys.executable, str(ROOT / "tools/stage1_room.py"), "unused.elf",
+                           "--nm", str(nm), *args], capture_output=True, text=True)
+
+
+def test_cli_symbol_checks(tmp_path):
+    nm = fake_nm(tmp_path, LAYOUT + ["0000000000041458 T dt_set_dcpext_handoff"])
+    assert room_cli(tmp_path, nm, "--require", "dt_set_dcpext_handoff").returncode == 0
+    r = room_cli(tmp_path, nm, "--forbid", "dt_set_dcpext_handoff")
+    assert r.returncode == 1 and "links dt_set_dcpext_handoff" in r.stderr
+    nm = fake_nm(tmp_path, LAYOUT)
+    assert room_cli(tmp_path, nm, "--forbid", "dt_set_dcpext_handoff").returncode == 0
+    r = room_cli(tmp_path, nm, "--require", "dt_set_dcpext_handoff")
+    assert r.returncode == 1 and "does not link dt_set_dcpext_handoff" in r.stderr
+
+
+def test_cli_nm_failure_fails(tmp_path):
+    # A broken nm must not let a --forbid check pass silently.
+    nm = fake_nm(tmp_path, [], status=1)
+    r = room_cli(tmp_path, nm, "--forbid", "dt_set_dcpext_handoff")
+    assert r.returncode != 0

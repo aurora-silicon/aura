@@ -26,7 +26,7 @@ def host(tmp_path_factory):
     return build_host(tmp_path_factory.mktemp("t6041"))
 
 
-def build_host(tmp, unknown_profile=False, host_source="t6041_display_host.c"):
+def build_host(tmp, unknown_profile=False, host_source="t6041_display_host.c", defines=()):
     cc = host_cc()
     if not shutil.which(cc[0]):
         pytest.skip("no host C compiler")
@@ -62,7 +62,7 @@ def build_host(tmp, unknown_profile=False, host_source="t6041_display_host.c"):
         [*cc, "-std=gnu11", "-D_GNU_SOURCE", "-O1", "-g", "-Wall", "-Wno-unused-function",
          "-Wno-format", "-Wno-format-truncation", "-fsanitize=address,undefined",
          "-fno-omit-frame-pointer", "-fno-sanitize-recover=undefined",
-         "-I", str(src), "-I", str(ROOT / "src"),
+         *(f"-D{d}" for d in defines), "-I", str(src), "-I", str(ROOT / "src"),
          str(src / host_source), *(str(src / name) for name in handoff_srcs),
          *(str(ROOT / "src/libfdt" / f) for f in LIBFDT), "-o", str(binary)],
         check=True,

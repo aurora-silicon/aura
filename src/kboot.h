@@ -3,6 +3,8 @@
 #ifndef KBOOT_H
 #define KBOOT_H
 
+#include "../build/build_cfg.h"
+
 #include "types.h"
 
 // declarations for kboot_t6020_compat.c
@@ -71,6 +73,43 @@ void kboot_loaded_file_part(u64 *base, u64 *size);
 
 /* The node at an absolute path or alias, matching each node name exactly (see kboot.c) */
 int kboot_fdt_path_exact(const void *fdt, const char *path);
+
+/*
+ * What kboot.c's M4 internal DCP handoff did, for the external display processors' handoff
+ * (kboot_display_handoff.c), which acts only beside a complete one or on a board with no panel.
+ */
+enum dcp_internal {
+    DCP_INTERNAL_NONE,     /* refused, or published without its display maps or firmware clocks */
+    DCP_INTERNAL_COMPLETE, /* published whole: the inherited display maps and, on firmware 27, the
+                              firmware clocks */
+    DCP_INTERNAL_NO_PANEL, /* not attempted: ADT /arm-io/disp0 is external (no panel) */
+};
+/*
+ * The handoff is built into the ESP Stage 2 only (kboot_display_handoff.c). A Stage 1 that boots
+ * an OS itself declines it (0): kboot.c then keeps the firmware-ready path for the external
+ * processors of older firmware, and on firmware given its clocks boots only if none may still run
+ * (dt_keep_dcpext()). The ESP Stage 2's returns 1 on such firmware, -1 if the memory of a
+ * processor it did not hand over could not all be kept.
+ */
+#ifdef ESP_STAGE2
+int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks);
+#else
+static inline int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
+{
+    (void)dt;
+    (void)internal;
+    (void)fw_clocks;
+    return 0;
+}
+#endif
+/*
+ * Both stages, on firmware given its clocks: withdraw what the device tree promised of every
+ * external display processor not handed over. The ESP Stage 2 keeps the memory of each one the
+ * ADT describes that may still run as iBoot left it; a Stage 1, which has no room for that, fails
+ * if any may still run (kboot_display_handoff.c). -1 if that memory could not all be kept: the OS
+ * must then not start.
+ */
+int dt_keep_dcpext(void *dt);
 
 // from rust/usb4.rs
 u64 rust_usb4_router_uuid(void);
