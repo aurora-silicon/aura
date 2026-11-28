@@ -293,7 +293,8 @@ def harness_source():
         # the table geometry and descriptor tests
         between(memory, "#define VADDR_L3_INDEX_BITS", "/*\n * aura supports 4K and 16K paging"),
         # mmu_pt_get_l1() to mmu_rm_mapping(): the table builder, the CTRR ranges and mmu_map()
-        between(memory, "static u64 *mmu_pt_get_l1(u64 from)", "static void mmu_map_mmio(void)"),
+        between(memory, "static u64 *mmu_pt_get_l1(u64 from, bool alloc)",
+                "static void mmu_map_mmio(void)"),
         HARNESS_TAIL,
     ))
 
