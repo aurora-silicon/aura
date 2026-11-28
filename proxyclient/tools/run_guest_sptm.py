@@ -27,6 +27,10 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_MEM             T6050: also hook the MCC, AMCC, DCS and coprocessor DARTs
   AURA_S2R_CP_NO_ANS       T6050 COPROC: leave ANS's own pages unhooked
   AURA_S2R_DCP_PKT         T6050 COPROC: copy the DCPs' IOMFB packets into the ring
+  AURA_S2R_DCP_PKT_MAX     input bytes copied per packet (default 128)
+  AURA_S2R_DCP_PKT_FULL    up to 4 tags (e.g. A407,A408) copied whole, input and output
+  AURA_S2R_DCP_PKT_FULLMAX bytes copied each way for those (default 4096)
+  AURA_S2R_DCP_PKT_EVERY   copy one in N of each such tag whole (default 1)
   AURA_S2R_CP_ANSX=<mask>  T6050 COPROC: also hook 1 the ANS SART, 2 the NVMe BAR page, 4 AUS5
   AURA_S2R_DROP_USB        tear down aura's USB gadget at the sleep commit
   AURA_S2R_WAKE_S=<s>      GO, timer-only sleep: arm the PMU RTC alarm s seconds after the commit
@@ -149,6 +153,10 @@ KNOWN_ENV = {
     "AURA_S2R_CP_NO_ANS",
     "AURA_S2R_CP_ANSX",
     "AURA_S2R_DCP_PKT",
+    "AURA_S2R_DCP_PKT_MAX",
+    "AURA_S2R_DCP_PKT_FULL",
+    "AURA_S2R_DCP_PKT_FULLMAX",
+    "AURA_S2R_DCP_PKT_EVERY",
     "AURA_S2R_USB_RETAKE",
     "AURA_S2R_USB_RETAKE_MS",
     "AURA_TAIL_SECS",
@@ -805,6 +813,22 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
     if env_on("AURA_S2R_DCP_PKT"):
         p.write32(sym["sptm_virt_s2r_dcp_pkt"], 1)
         print("coprocessor trace: DCP IOMFB packets copied into the ring")
+    if os.environ.get("AURA_S2R_DCP_PKT_MAX"):
+        p.write32(sym["sptm_virt_s2r_dcp_pkt_max"], env_int("AURA_S2R_DCP_PKT_MAX"))
+        print("DCP packets: %s input bytes each" % os.environ["AURA_S2R_DCP_PKT_MAX"])
+    if os.environ.get("AURA_S2R_DCP_PKT_FULL"):
+        tags = [t.strip() for t in os.environ["AURA_S2R_DCP_PKT_FULL"].split(",") if t.strip()][:4]
+        for i, t in enumerate(tags):
+            if len(t) != 4:
+                raise SystemExit("AURA_S2R_DCP_PKT_FULL: a tag is 4 characters (e.g. A407): %r" % t)
+            # the packet header stores the tag reversed ("A407" as '7' '0' '4' 'A')
+            p.write32(sym["sptm_virt_s2r_dcp_pkt_full"] + 4 * i, int.from_bytes(t[::-1].encode(), "little"))
+        if os.environ.get("AURA_S2R_DCP_PKT_FULLMAX"):
+            p.write32(sym["sptm_virt_s2r_dcp_pkt_fullmax"], env_int("AURA_S2R_DCP_PKT_FULLMAX"))
+        if os.environ.get("AURA_S2R_DCP_PKT_EVERY"):
+            p.write32(sym["sptm_virt_s2r_dcp_pkt_every"], env_int("AURA_S2R_DCP_PKT_EVERY"))
+        print("DCP packets copied whole: %s (up to %s bytes, one in %s)" % (",".join(tags),
+              os.environ.get("AURA_S2R_DCP_PKT_FULLMAX", "4096"), os.environ.get("AURA_S2R_DCP_PKT_EVERY", "1")))
     if env_on("AURA_S2R_CP_NO_ANS"):
         p.write32(sym["sptm_virt_s2r_cp_skip_ans"], 1)
         print("coprocessor trace: ANS's pages left unhooked")
