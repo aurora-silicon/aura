@@ -70,10 +70,10 @@ RAZ_WI = {
     enc(3, 5, 4, 0, 0): "SPSR_EL12", enc(3, 5, 4, 0, 1): "ELR_EL12",
     enc(3, 5, 12, 0, 0): "VBAR_EL12", enc(3, 5, 5, 2, 0): "ESR_EL12",
     enc(3, 5, 6, 0, 0): "FAR_EL12", enc(3, 5, 13, 0, 1): "CONTEXTIDR_EL12",
-    # A pair SPTM's normal-world bootstrap writes with one value (a PMU counter configuration,
-    # like PMCR1's); both are UNDEFINED at EL1.
+    # PMCR1_GL1 and its neighbour s3_6_c15_c8_5, which SPTM's normal-world bootstrap writes
+    # with one PMU counter configuration; both are UNDEFINED at EL1.
     enc(3, 6, 15, 8, 5): "s3_6_c15_c8_5",
-    enc(3, 1, 15, 8, 2): "s3_1_c15_c8_2",
+    enc(3, 1, 15, 8, 2): "PMCR1_GL1",
 }
 
 # Apple's _EL12/_EL02 aliases (an EL1 register reached from EL2, as SPTM configures the level
@@ -187,8 +187,11 @@ HVC = 0xd4000002
 
 def _adrp_add(words, i, base_va):
     """The address an ADRP at word i and the ADD after it build, if they form a pair."""
+    if i + 1 >= len(words):
+        return None
     a, b = words[i], words[i + 1]
-    if a & 0x9f000000 != 0x90000000 or b & 0xff800000 != 0x91000000:
+    # ADRP; ADD (immediate, 64-bit, shift 0: bit 22 clear)
+    if a & 0x9f000000 != 0x90000000 or b & 0xffc00000 != 0x91000000:
         return None
     rd = a & 31
     if (b & 31) != rd or ((b >> 5) & 31) != rd:
@@ -211,7 +214,7 @@ def early_vbar(img):
         imm = words[i] & 0x3ffffff
         i += imm - (1 << 26) if imm & (1 << 25) else imm
     msr_vbar = encode(False, enc(3, 0, 12, 0, 0), 0)
-    for j in range(i, i + 64):
+    for j in range(max(i, 0), min(i + 64, len(words) - 2)):
         r = _adrp_add(words, j, seg.vmaddr)
         if r and words[j + 2] == msr_vbar | r[1]:
             return r[0]

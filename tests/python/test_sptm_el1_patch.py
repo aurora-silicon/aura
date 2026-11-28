@@ -103,6 +103,24 @@ def test_early_vector_trap():
         assert words(img, vbar + 0x80 * k, 2) == [pe.HVC | (0x5E00 + k) << 5, NOP]
 
 
+def test_early_vector_ignores_a_shifted_add():
+    vbar = EXEC + 0x1000
+    body = EXEC + 0x40
+    code = [NOP] * 0x1000
+    code[0] = 0x14000000 | ((body - EXEC) // 4)
+    i = (body - EXEC) // 4
+    code[i:i + 3] = [adrp(0, body, vbar), 0x91400000 | (vbar & 0xFFF) << 10,  # add ..., lsl #12
+                     msr(pe.enc(3, 0, 12, 0, 0), 0)]
+    with pytest.raises(ValueError):
+        pe.early_vbar(macho([], code, EXEC))
+
+
+def test_early_vector_branch_out_of_the_segment():
+    code = [0x14000000 | 0x10000] + [NOP] * 127  # b far past __TEXT_EXEC's end
+    with pytest.raises(ValueError):
+        pe.early_vbar(macho([], code, EXEC))
+
+
 def test_early_vector_needs_a_vbar_write():
     img = macho([], [NOP] * 128, EXEC)
     with pytest.raises(ValueError):
