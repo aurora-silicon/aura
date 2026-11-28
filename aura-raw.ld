@@ -22,15 +22,9 @@ SECTIONS {
         *(.init)
         *(.init.*)
         /*
-         * Code that only runs when aura hosts a guest, or once per boot. .text follows .init
-         * directly, so where an object goes no longer changes the room left; these stay here to
-         * keep the order of the code.
+         * Run-once OS preparation. .text follows .init directly, so where an object goes no
+         * longer changes the room left; it stays here to keep the order of the code.
          */
-        *hv/hv_vm.o(.text .text.*)
-        *hv/hv_virtio.o(.text .text.*)
-        *hv/hv_vuart.o(.text .text.*)
-        *hv/hv_wdt.o(.text .text.*)
-        /* Run-once OS preparation. */
         *kboot.o(.text .text.*)
         /*
          * The Ed25519 verifier's curve and field code (run once per boot). Its SHA-512 and
@@ -48,7 +42,8 @@ SECTIONS {
      */
     .text : {
         _text_content_start = .;
-        *(EXCLUDE_FILE(*sptm_virt*.o) .text .text.*)
+        *(EXCLUDE_FILE(*sptm_virt*.o *hv/hv_vm.o *hv/hv_virtio.o *hv/hv_vuart.o *hv/hv_wdt.o)
+          .text .text.*)
         /* The largest guest-only object; the others are in .rodata, so both fill their steps. */
         *sptm_virt_s2r.o(.text .text.*)
         . = ALIGN(8);
@@ -58,8 +53,16 @@ SECTIONS {
     } :text
     _text_size = . - _text_start;
     .rodata : ALIGN(0x10000) {
-        /* Guest-only code uses the existing executable read-only region. */
+        /*
+         * Code that only runs when aura hosts a guest, in the executable read-only region
+         * ([_base, _rodata_end) is mapped RX, memory.c). .init and .text share one read-execute
+         * segment that sits just under its next 64 KiB step; .rodata has the room.
+         */
         *sptm_virt*.o(.text .text.*)
+        *hv/hv_vm.o(.text .text.*)
+        *hv/hv_virtio.o(.text .text.*)
+        *hv/hv_vuart.o(.text .text.*)
+        *hv/hv_wdt.o(.text .text.*)
         /* The compressed logos are .rodata (Makefile), but they go with the pixel data below. */
         *(EXCLUDE_FILE(*_48.o *_128.o *_256.o) .rodata)
         *(.rodata.*)
