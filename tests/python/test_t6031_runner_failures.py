@@ -71,6 +71,10 @@ def runner(tmp_path):
         (REPO / "tests/display-handoff-sources.txt").read_bytes())
     (tree / "rust/src/adt.rs").write_text("// from_raw_parts(self.name.as_ptr() as *const u8, 32)\n")
     (tree / "src/kboot.c").write_text("""
+static int dt_fill_pmp_from_node(void) { return 0;
+}
+static int dt_fill_pmp_from(void) { return 0;
+}
 static int dt_fill_pmp(void) { return 0;
 }
 static void dt_pass_pmp(void) {

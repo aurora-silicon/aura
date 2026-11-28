@@ -10,12 +10,43 @@
  * Nobody may be at the Mac when an aura-try trial would stop in the proxy, and only a host can
  * drive it or reboot it there; the trial watchdog is the only other way out. The trial spent its
  * marker on the ESP before its image was read, so a reboot lands on the configured image. This
- * needs nothing from Stage 1 beyond the trial itself. Any other stage stops in the proxy as before.
+ * needs nothing from Stage 1 beyond the trial itself.
+ *
+ * A plain boot that stops in the proxy is in the same place. Stage 1 runs its boot watchdog for
+ * that (wdt_arm_boot()), but a Stage 2 disarms it at its start, so a Stage 2 that could not start
+ * its payload stayed in the proxy until someone held the power button or reset it over USB-C (on
+ * the M4 MacBook Air: an ANS that a warm boot's start from off could not bring up, about one
+ * warm boot in eight; a later boot brings it up). Such a stop arms the boot watchdog again, unless
+ * a host has attached already, this is a debug boot or a BRINGUP build (which never hands off and
+ * stays in the proxy by design), and then stops in the proxy as before. The first proxy request
+ * from a host turns it off (wdt_host_attached()); a host that only holds the port open and sends
+ * nothing for that long is reset like an absent one. Without a host the Mac restarts and the
+ * next boot tries again.
  */
 bool proxy_fallback(const char *why)
 {
-    if (!aura_trial_enabled())
+    if (!aura_trial_enabled()) {
+#ifndef BRINGUP
+        if (wdt_boot_watchdog_armed() || wdt_host_was_attached() || aura_debug_enabled())
+            return false;
+        if (wdt_arm_boot()) {
+            printf("%s; no boot watchdog, staying in the proxy\n", why);
+            return false;
+        }
+        /*
+         * Shown on the panel. Like Stage 1's own stop, this repeats on every boot that fails the
+         * same way: no count survives the reset for this stage to read (the failed storage holds
+         * none and Stage 1 clears iBoot's failed-boot count), so the owner ends it with a host
+         * or the power button.
+         */
+        printf("\n%s. Without a host, this Mac restarts by itself within %u s to try again.\n"
+               "  A host that sends a proxy request in that time stops the restarts.\n"
+               "  Hold the power button to shut down, then hold it again to choose another "
+               "system.\n",
+               why, WDT_BOOT_SECONDS);
+#endif
         return false;
+    }
 
     /*
      * A Stage 1 that took the trial marker still runs its boot watchdog, and the first host turns
