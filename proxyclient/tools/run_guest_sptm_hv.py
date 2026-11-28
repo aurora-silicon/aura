@@ -8,17 +8,18 @@ SPTM's bootstrap already checks CurrentEL; the EL2 and GL2 registers it still us
 in its text before upload (aura/sptm_el1_patch.py), and one in XNU's. TXM uses none.
 See docs/sptm-el1-hv.md.
 
-    run_guest_sptm_hv.py --wait --sptm sptm.bin --txm txm.bin \\
-        --xnu kernelcache.macho --trustcache static.trustcache --vuart-log guest.log
+    run_guest_sptm_hv.py --device /dev/serial/by-id/usb-...-if00 --wait --sptm sptm.bin \\
+        --txm txm.bin --xnu kernelcache.macho --trustcache static.trustcache --vuart-log guest.log
 
-The guest's serial console is the hypervisor's virtual UART, the proxy's second USB serial port
-(--vuart-log copies it to a file). Shell helpers (in the hypervisor shell, after ^C):
+The guest's serial console is the hypervisor's virtual UART, the proxy's second USB serial port:
+the CDC ACM interface two after the proxy's own, on the same USB device (--vuart-log copies it
+to a file; --vuart-port names it instead). Shell helpers (in the hypervisor shell, after ^C):
   diag()            SPTM's diagnostic record (exception its early vector took: ESR/ELR/FAR)
   panic()           the text SPTM's panic path leaves in that record
   resume_fault()    return the guest to the instruction its last EL1 exception came from
 """
 import argparse
-import glob
+import os
 import pathlib
 import signal
 import struct
@@ -48,15 +49,27 @@ MOVZ = 0xd2800000
 DEFAULT_CMDLINE = "serial=3 -v debug=0x14e wdt=-1 msgbuf=1048576 -noprogress"
 
 
-def wait_for_proxy(timeout):
-    """The USB serial ports of a proxy window (aura-proxy on the ESP), within timeout s."""
+def wait_for(path, timeout):
+    """Wait for a device node (the proxy window opening, aura-proxy on the ESP)."""
     end = time.time() + timeout
-    while time.time() < end:
-        if glob.glob("/dev/ttyACM*"):
-            time.sleep(0.5)  # let the second port appear too
-            return sorted(glob.glob("/dev/ttyACM*"))
+    while not os.path.exists(path):
+        if time.time() > end:
+            raise SystemExit(f"{path} did not appear")
         time.sleep(0.2)
-    raise SystemExit("no proxy appeared")
+
+
+def vuart_port(proxy):
+    """The hypervisor's virtual UART: the tty of the CDC ACM interface two after the proxy's own
+    (its data interface sits between them), on the proxy's USB device, from sysfs."""
+    tty = os.path.basename(os.path.realpath(proxy))
+    intf = os.path.realpath(f"/sys/class/tty/{tty}/device")  # .../<usbdev>:<cfg>.<n>
+    usbdev, _, num = os.path.basename(intf).rpartition(".")
+    want = os.path.join(os.path.dirname(intf), f"{usbdev}.{int(num) + 2}", "tty")
+    for _ in range(25):  # it enumerates with the proxy's port; allow a moment
+        if os.path.isdir(want) and os.listdir(want):
+            return "/dev/" + os.listdir(want)[0]
+        time.sleep(0.2)
+    raise SystemExit(f"no virtual UART next to {proxy} (looked for {want}); give --vuart-port")
 
 
 def log_vuart(port, path):
@@ -81,10 +94,14 @@ def main():
     ap.add_argument("--shell", "-S", action="store_true", help="shell before the jump")
     ap.add_argument("--logfile", "-l", type=pathlib.Path)
     ap.add_argument("--cmdline", default=DEFAULT_CMDLINE)
+    ap.add_argument("--device", default=os.environ.get("AURADEVICE"),
+                    help="the proxy's serial port (default: $AURADEVICE)")
     ap.add_argument("--wait", action="store_true",
-                    help="wait up to 3 minutes for the proxy's window and use its port")
+                    help="wait up to 3 minutes for --device to appear (the proxy's window)")
     ap.add_argument("--vuart-log", type=pathlib.Path,
-                    help="copy the guest's console (the second USB serial port) here")
+                    help="copy the guest's console (the proxy's virtual UART port) here")
+    ap.add_argument("--vuart-port",
+                    help="the virtual UART's serial port (default: found next to --device)")
     ap.add_argument("--dry-run", action="store_true", help="plan, print and stop")
     ap.add_argument("--auto-fix", action="store_true",
                     help="bring-up aid: at an UNDEFINED MRS/MSR that reaches SPTM's early vector, "
@@ -102,7 +119,12 @@ def main():
             print(f"patch {name}: {line}")
     # SPTM's checks of the hardware against its own placement (sptm_patch); which exist depends
     # on the SPTM (T8103's has only the APSTS poll).
-    for what, off, _m, old, new in sptm_patch.plan(bytes(sptm), 0)["patches"]:
+    checks = sptm_patch.plan(bytes(sptm), 0)
+    if checks["ctrr_stash_off"] or checks["mte"]:
+        # CTXR checks and MTE tag storage need aura's sptm_virt support (docs/sptm-nv2-virt.md),
+        # which the classic hypervisor does not have.
+        raise SystemExit("this SPTM checks CTXR or places MTE tag storage: not an M1-series SPTM")
+    for what, off, _m, old, new in checks["patches"]:
         if struct.unpack_from("<I", sptm, off)[0] != old:
             raise SystemExit(f"sptm {what} at {off:#x}: unexpected word")
         struct.pack_into("<I", sptm, off, new)
@@ -110,14 +132,15 @@ def main():
     vbar = pe.early_vector_trap(sptm, EARLY_VEC_HVC)
     print(f"patch sptm: early vector {vbar:#x} -> hvc #{EARLY_VEC_HVC:#x}+n")
 
+    if not args.device:
+        raise SystemExit("give --device (or set AURADEVICE) to the proxy's serial port")
     if args.wait:
-        ports = wait_for_proxy(180)
-        iface = UartInterface(device=ports[0])
-    else:
-        ports = sorted(glob.glob("/dev/ttyACM*"))
-        iface = UartInterface()
-    if args.vuart_log and len(ports) > 1:
-        threading.Thread(target=log_vuart, args=(ports[1], args.vuart_log), daemon=True).start()
+        wait_for(args.device, 180)
+    iface = UartInterface(device=args.device)
+    if args.vuart_log:
+        port = args.vuart_port or vuart_port(args.device)
+        print(f"guest console: {port} -> {args.vuart_log}")
+        threading.Thread(target=log_vuart, args=(port, args.vuart_log), daemon=True).start()
     p = AuraProxy(iface, debug=False)
     bootstrap_port(iface, p)
     u = ProxyUtils(p, heap_size=128 * 1024 * 1024, aura_heap=128 * 1024 * 1024)
@@ -221,7 +244,12 @@ def main():
         if not EARLY_VEC_HVC <= idx < EARLY_VEC_HVC + 16:
             return orig_hvc(ctx)
         esr, elr, far, spsr = (u.mrs(r) for r in (ESR_EL12, ELR_EL12, FAR_EL12, SPSR_EL12))
-        pa = p.hv_translate(elr, False, False) & ~0xfff | (elr & 0xfff)
+        pa = p.hv_translate(elr, False, False)
+        if not pa:
+            hv.log(f"SPTM early vector #{idx - EARLY_VEC_HVC}: ESR={esr:#x} ELR={elr:#x} "
+                   f"(not mapped) FAR={far:#x} SPSR={spsr:#x}")
+            return False
+        pa = pa & ~0xfff | (elr & 0xfff)
         word = p.read32(pa)
         hv.log(f"SPTM early vector #{idx - EARLY_VEC_HVC}: ESR={esr:#x} (EC "
                f"{(esr >> 26) & 0x3f:#x}) ELR={elr:#x} (PA {pa:#x}, {word:#010x}) "

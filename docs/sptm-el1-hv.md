@@ -48,15 +48,18 @@ configure-boot`), as for the NV2 path. Put an `aura-proxy` file at the ESP root 
 waits 15 s for a host. Then:
 
 ```
-PYTHONPATH=proxyclient python3 proxyclient/tools/run_guest_sptm_hv.py --wait \
+PYTHONPATH=proxyclient python3 proxyclient/tools/run_guest_sptm_hv.py \
+    --device /dev/serial/by-id/usb-...-if00 --wait \
     --sptm sptm.bin --txm txm.bin --xnu kernelcache.macho --trustcache static.trustcache \
     --vuart-log guest.log
 ```
 
 The images come from the Mac's own Preboot volume, decompressed: `sptm.<soc>.release.im4p`,
 `txm.macosx.release.im4p`, the kernelcache and the static trust cache. The script patches the
-images before it waits, so it is ready when the window opens. The guest's serial console is the
-hypervisor's virtual UART, which is the proxy's second USB serial port (`--vuart-log`). Interrupt
+images before it waits, so it is ready when the window opens. `--device` names the proxy's own port, so another Mac's proxy on the same host
+is never opened (opening it would also stop its Stage 1 boot watchdog). The guest's serial console
+is the hypervisor's virtual UART, the CDC ACM interface two after the proxy's on the same USB
+device, which the script finds in sysfs (`--vuart-log`; `--vuart-port` names it instead). Interrupt
 the guest with SIGINT to the script. `diag()` and `panic()` print SPTM's diagnostic record and
 panic text, and tracers load with `-m` as for any classic guest.
 
