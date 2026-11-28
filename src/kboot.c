@@ -10534,6 +10534,11 @@ static int dt_clear_pmp_props(int pmp_node)
  */
 static int dt_fill_pmp_unit(int pmp_node, int nub_anode)
 {
+    /* LAB ONLY (m5-slc-aura x1): leave the aliasless PMP node as the board DT has it, as before #506. */
+    if (chip_id == T6050) {
+        printf("FDT: PMP: LAB x1: aliasless PMP node left as the DT has it\n");
+        return 0;
+    }
     return dt_clear_pmp_props(pmp_node) || dt_fill_pmp_from_node(pmp_node, nub_anode) ||
            dt_set_pmp_bootargs(pmp_node, nub_anode, true) || dt_set_pmp_pmgr(pmp_node);
 }
