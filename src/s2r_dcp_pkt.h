@@ -6,6 +6,8 @@
 #include "types.h"
 
 extern u32 sptm_virt_s2r_dcp_pkt;
+extern u32 sptm_virt_s2r_dcp_pkt_max, sptm_virt_s2r_dcp_pkt_fullmax, sptm_virt_s2r_dcp_pkt_every;
+extern u32 sptm_virt_s2r_dcp_pkt_full[4];
 
 void s2r_dcp_add(const char *name, u64 mbox);
 void s2r_dcp_watch(u64 addr, const u64 *val, int width);

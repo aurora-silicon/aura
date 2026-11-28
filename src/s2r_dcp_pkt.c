@@ -28,6 +28,8 @@
 #define S2R_PKT_TAG   0x544b5043UL /* "CPKT" */
 #define S2R_PKT_MAX   128
 #define S2R_DCP_OPEN  4
+#define S2R_PKT_NFULL 4
+#define S2R_PKT_FULL  BIT(63) /* in open[]: the packet was copied whole, so is its output */
 /*
  * dart_walk_locked_t8110() visits 2048 L1 entries of 32 MiB: 36-bit IOVAs. A DVA is the DART's
  * vm-base (its ADT node's property, as dart.c reads it) plus such an IOVA: J613's RPC memory is
@@ -50,6 +52,17 @@ static struct s2r_dcp {
 } s2r_dcp[S2R_DCP_N];
 static int s2r_n_dcp;
 u32 sptm_virt_s2r_dcp_pkt; /* host: copy the DCPs' IOMFB packets into the ring */
+/*
+ * Host, debug only (AURA_S2R_DCP_PKT_*): the input bytes copied per packet (head), and up to
+ * S2R_PKT_NFULL packet tags (the header's first word, e.g. "A407" stored as '7' '0' '4' 'A')
+ * whose input and output are copied up to pkt_fullmax bytes each, one in every pkt_every of each
+ * tag (the rest as any other packet). A swap at 120 Hz copied whole would fill the ring in seconds.
+ */
+u32 sptm_virt_s2r_dcp_pkt_max = S2R_PKT_MAX;
+u32 sptm_virt_s2r_dcp_pkt_full[S2R_PKT_NFULL];
+u32 sptm_virt_s2r_dcp_pkt_fullmax = 0x1000;
+u32 sptm_virt_s2r_dcp_pkt_every = 1;
+static u32 s2r_pkt_seen[S2R_PKT_NFULL];
 
 struct s2r_dcp_walk {
     struct s2r_dcp *d;
@@ -122,23 +135,43 @@ static void s2r_pkt_rec(int idx, int kind, int word, u64 pa, u64 v, bool a2i)
         pa, v, S2R_PKT_TAG | ((u64)idx << 32) | ((u64)kind << 36) | ((u64)word << 40), a2i);
 }
 
-/* kind 0: an AP call, 1: a DCP callback, 2: an AP call's output, 3: a callback's output */
-static void s2r_dcp_copy(int idx, struct s2r_dcp *d, u64 off, int kind, bool a2i)
+/* A packet whose tag the host named, on its turn (one in pkt_every): copied whole. */
+static bool s2r_dcp_full(u32 tag)
+{
+    for (int i = 0; i < S2R_PKT_NFULL; i++)
+        if (sptm_virt_s2r_dcp_pkt_full[i] && sptm_virt_s2r_dcp_pkt_full[i] == tag) {
+            u32 every = sptm_virt_s2r_dcp_pkt_every ? sptm_virt_s2r_dcp_pkt_every : 1;
+            return s2r_pkt_seen[i]++ % every == 0;
+        }
+    return false;
+}
+
+/*
+ * kind 0: an AP call, 1: a DCP callback, 2: an AP call's output, 3: a callback's output.
+ * Returns whether the packet was copied whole (a call's output then is too).
+ */
+static bool s2r_dcp_copy(int idx, struct s2r_dcp *d, u64 off, int kind, bool a2i, bool full)
 {
     u64 h0, h1, pa0 = s2r_dcp_pa(d, off), pa1 = s2r_dcp_pa(d, off + 8);
     if (!pa0 || !pa1 || !sptm_virt_peek64(pa0, &h0) || !sptm_virt_peek64(pa1, &h1))
-        return;
+        return false;
+    if (kind < 2)
+        full = s2r_dcp_full(h0);
     s2r_pkt_rec(idx, kind, 0, pa0, h0, a2i);
     s2r_pkt_rec(idx, kind, 1, pa1, h1, a2i);
     u64 in = h0 >> 32, out = h1 & 0xffffffff;
+    u64 imax = full ? sptm_virt_s2r_dcp_pkt_fullmax : sptm_virt_s2r_dcp_pkt_max;
+    u64 omax = full ? sptm_virt_s2r_dcp_pkt_fullmax : 56;
     u64 from = kind < 2 ? off + 16 : ALIGN_DOWN(off + 12 + min(in, (u64)S2R_DCP_RPC), 8);
-    u64 to = kind < 2 ? off + 12 + min(in, (u64)S2R_PKT_MAX) : from + min(out + 8, 64UL);
-    for (u64 o = from, w = 2; o < to && o + 8 <= S2R_DCP_RPC; o += 8, w++) {
+    u64 to = kind < 2 ? off + 12 + min(in, imax) : from + min(out + 8, omax + 8);
+    /* the record's word number has 24 bits (pc 63:40) */
+    for (u64 o = from, w = 2; o < to && o + 8 <= S2R_DCP_RPC && w < BIT(24); o += 8, w++) {
         u64 v, pa = s2r_dcp_pa(d, o);
         if (!pa || !sptm_virt_peek64(pa, &v))
-            return;
+            return full;
         s2r_pkt_rec(idx, kind, w, pa, v, a2i);
     }
+    return full;
 }
 
 static void s2r_dcp_msg(int idx, u64 m0, u64 m1, int dir)
@@ -163,17 +196,19 @@ static void s2r_dcp_msg(int idx, u64 m0, u64 m1, int dir)
     if (ctl & 0x40) {
         /* A reply closes the newest outstanding packet of the other side. */
         int o = !dir;
-        if (d->nopen[o] > 0 && d->nopen[o] <= S2R_DCP_OPEN)
-            s2r_dcp_copy(idx, d, d->open[o][--d->nopen[o]], 2 + o, dir == 0);
+        if (d->nopen[o] > 0 && d->nopen[o] <= S2R_DCP_OPEN) {
+            u64 e = d->open[o][--d->nopen[o]];
+            s2r_dcp_copy(idx, d, e & ~S2R_PKT_FULL, 2 + o, dir == 0, e & S2R_PKT_FULL);
+        }
         return;
     }
     u64 off = (dir == 0 ? ((ctl & 0x100) ? 0x20000 : 0) : ((ctl & 0x100) ? 0x40000 : 0x60000)) +
               ((ctl >> 10) & 3) * 0x8000UL + (u16)(m0 >> 16);
     if (off >= S2R_DCP_RPC)
         return;
-    s2r_dcp_copy(idx, d, off, dir, dir == 0);
+    bool full = s2r_dcp_copy(idx, d, off, dir, dir == 0, false);
     if (d->nopen[dir] >= 0 && d->nopen[dir] < S2R_DCP_OPEN)
-        d->open[dir][d->nopen[dir]++] = off;
+        d->open[dir][d->nopen[dir]++] = off | (full ? S2R_PKT_FULL : 0);
 }
 
 static void s2r_dcp_watch_one(int i, u64 off, const u64 *val, int width);
