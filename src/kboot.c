@@ -26,6 +26,7 @@
 #include "kboot_atc.h"
 #include "kboot_audio.h"
 #include "kboot_display_facts.h"
+#include "kboot_display_t8142.h"
 #include "kboot_gpu_t8122.h"
 #include "kboot_mte.h"
 #include "kboot_pmp.h"
@@ -8393,41 +8394,6 @@ static struct disp_mapping *const dcpext_reserved_regions_t8142[ARRAY_SIZE(dcpex
 
 static const char *t8142_dcpext_result;
 
-/*
- * Reserve the page tables of a locked stream. A two-level 16K T8110 stream has
- * one root and at most 2048 L2 tables. With !required, a stream that is not
- * locked or has no translating root is idle and has nothing to keep (0). Once
- * a translating root is seen, every failure returns -1: the DART may still be
- * walking a table that would otherwise be left to the kernel.
- */
-static int dt_reserve_t8142_stream_tables(u32 provider, u32 sid, bool required)
-{
-    int chosen = adt_path_offset(adt, "/chosen");
-    u64 dram, size;
-    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
-        ADT_GETPROP(adt, chosen, "dram-size", &size) != sizeof(size))
-        return -1;
-    /* Read before a DART view is made, so a view that fails is not taken as idle. */
-    int translating = dart_fdt_t8110_translating(dt, provider, sid);
-    if (translating <= 0)
-        return translating < 0 || required ? -1 : 0;
-    dart_dev_t *dart = dart_init_fdt_locked(dt, provider, sid);
-    if (!dart)
-        return -1;
-    const size_t capacity = 1 + SZ_16K / sizeof(u64);
-    u64 *pages = malloc(capacity * sizeof(*pages));
-    size_t count = 0;
-    int ret = pages ? dart_collect_locked_tables(dart, dram, size, pages, capacity, &count) : -1;
-    dart_shutdown(dart);
-    /* Tables remain CPU-mapped: the kernel may extend an inherited root. */
-    for (size_t i = 0; !ret && i < count; i++)
-        if (fdt_add_mem_rsv(dt, pages[i], SZ_16K))
-            ret = -1;
-    if (pages)
-        free(pages);
-    return ret;
-}
-
 struct t8142_stream_pages {
     u64 mapped, outside;
     u64 first_iova, first_paddr;
@@ -8550,8 +8516,11 @@ static int dt_set_t8142_dcpext(unsigned int n)
 
     /* The PIODMA stream of the external display's frontend DART. */
     u32 pio_dart = 0, pio_sid = 0;
-    int piodma = fdt_subnode_offset(dt, node, "piodma");
-    prop = piodma < 0 ? NULL : fdt_getprop(dt, piodma, "iommus", &len);
+    char pio_path[160];
+    int piodma = node < 0 ? node : kboot_t8142_dcpext_piodma(dt, alias);
+    if (piodma < 0 || fdt_get_path(dt, piodma, pio_path, sizeof(pio_path)))
+        return -1;
+    prop = fdt_getprop(dt, piodma, "iommus", &len);
     if (prop && len == 8) {
         pio_dart = fdt32_ld(&prop[0]);
         pio_sid = fdt32_ld(&prop[1]);
@@ -8575,12 +8544,15 @@ static int dt_set_t8142_dcpext(unsigned int n)
         return -1;
 
     t8142_dcpext_result = "firmware DART not locked or not translating";
-    if (dt_reserve_t8142_stream_tables(fw_dart, fw_sid, true))
+    if (dart_fdt_t8110_translating(dt, fw_dart, fw_sid) != 1)
         return -1;
-    /* Idle scanout and PIODMA roots have no mappings yet; keep what exists. */
-    t8142_dcpext_result = "scanout or PIODMA tables not reserved";
-    if (dt_reserve_t8142_stream_tables(pio_dart, pio_sid, false) ||
-        dt_reserve_t8142_stream_tables(pio_dart, 0, false))
+
+    /*
+     * Every page the three streams map and their page tables, so a port iBoot lit keeps its
+     * scanout buffer. Idle scanout and PIODMA streams have nothing to keep yet.
+     */
+    t8142_dcpext_result = "live display mappings not preserved";
+    if (kboot_t8142_dcpext_preserve(dt, alias, pio_path))
         return -1;
 
     t8142_dcpext_result = "carveout reservation failed";
@@ -9885,6 +9857,138 @@ static void dt_reserve_rtbuddyseg_logs(void)
            count[0], count[1], count[2]);
 }
 
+/* Withdraw native consumers and their mapper/mailbox suppliers together. */
+static int dt_refuse_t8142_display(void)
+{
+    static const char *const compats[] = {
+        "apple,t8142-dcp",
+        "apple,t8142-dcpext",
+        "apple,display-subsystem",
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(compats); i++) {
+        int node = -1;
+        while ((node = fdt_node_offset_by_compatible(dt, node, compats[i])) >= 0) {
+            char path[256];
+            if (fdt_get_path(dt, node, path, sizeof(path)) ||
+                dt_t8140_disable_refs(node, "iommus", "#iommu-cells"))
+                return -1;
+            node = fdt_path_offset(dt, path);
+            if (node < 0 || dt_t8140_disable_refs(node, "mboxes", "#mbox-cells"))
+                return -1;
+            node = fdt_path_offset(dt, path);
+            if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled") ||
+                dt_t8140_disable_typec_routes(path))
+                return -1;
+            node = fdt_path_offset(dt, path);
+        }
+    }
+    /* The internal scanout/PIODMA mapper can otherwise reset a live stream. */
+    static const char *const aliases[] = {"disp0", "disp0-piodma", "disp0_piodma"};
+    for (size_t i = 0; i < ARRAY_SIZE(aliases); i++) {
+        int node = fdt_path_offset(dt, aliases[i]);
+        if (node < 0)
+            continue;
+        if (dt_t8140_disable_refs(node, "iommus", "#iommu-cells"))
+            return -1;
+        node = fdt_path_offset(dt, aliases[i]);
+        if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
+            return -1;
+    }
+    return 0;
+}
+
+static const char *t8142_dcp_result;
+
+/* T8142: the internal DCP iBoot left running, with its carveouts, framebuffer and segments. */
+static int dt_set_t8142_dcp(unsigned int unused)
+{
+    UNUSED(unused);
+
+    const char *piodma = kboot_t8142_disp0_piodma_alias(dt);
+    t8142_dcp_result = "carveout reservation failed";
+    if (dt_carveout_reserved_regions("dcp", "disp0", piodma, disp_reserved_regions_t8142,
+                                     ARRAY_SIZE(disp_reserved_regions_t8142)))
+        return -1;
+    t8142_dcp_result = "framebuffer reservation failed";
+    if (dt_vram_reserved_region("dcp", "disp0"))
+        return -1;
+    t8142_dcp_result = "firmware segment reservation failed";
+    if (dt_reserve_m5_display_segments("dcp", "/arm-io/dcp/iop-dcp-nub", false))
+        return -1;
+    t8142_dcp_result = "device tree update failed";
+    if (kboot_t8142_display_enable(dt))
+        return -1;
+    t8142_dcp_result = "okay";
+    return 0;
+}
+
+/* Keep a result visible after a boot without a serial console; never fatal. */
+static void dt_t8142_handoff_result(const char *alias, const char *result)
+{
+    char property[40];
+    printf("FDT: %s handoff: %s\n", alias, result);
+    snprintf(property, sizeof(property), "aurora,%s-handoff", alias);
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0 || fdt_setprop_string(dt, chosen, property, result))
+        printf("FDT: could not record the %s handoff result in /chosen\n", alias);
+}
+
+/* For the hardware row: the handoff's /memreserve/ entries and the FDT room left after it. */
+static void dt_t8142_log_fdt_space(void)
+{
+    int used = fdt_off_dt_strings(dt) + fdt_size_dt_strings(dt);
+    printf("FDT: T8142 display handoff: %d /memreserve/ entries, %d bytes of FDT space left\n",
+           fdt_num_mem_rsv(dt), (int)fdt_totalsize(dt) - used);
+}
+
+/*
+ * Every part of the T8142 display handoff is optional: a refused internal DCP
+ * leaves the boot framebuffer to the OS, a refused external DCP stays disabled.
+ * An external DCP scans out through disp0, so it is handed over only together
+ * with the internal one. Only a tree whose display consumers cannot be
+ * withdrawn again fails the boot.
+ */
+static int dt_set_display_t8142(void)
+{
+    if (!fdt_get_alias(dt, "dcp"))
+        return 0;
+#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
+    /*
+     * A Stage 1 chains the Stage 2 that hands the display over, and has no room
+     * for the handoff below the DCP log buffer. A kernel it boots itself keeps
+     * the boot framebuffer, as after a refused handoff.
+     */
+    dt_t8142_handoff_result("dcp", "not in Stage 1");
+    if (dt_refuse_t8142_display())
+        bail("FDT: cannot withdraw the T8142 display nodes\n");
+    return 0;
+#endif
+    /* A refused session may still DMA; its proven RAM/table reservations stay. */
+    const char *result = "translation reservation failed";
+    if (kboot_t8142_display_reserve(dt) == 0) {
+        result = "refused";
+        if (!dt_display_transaction(dt_set_t8142_dcp, 0))
+            result = "okay";
+        else if (t8142_dcp_result && strcmp(t8142_dcp_result, "okay"))
+            result = t8142_dcp_result;
+    }
+    if (strcmp(result, "okay")) {
+        dt_t8142_handoff_result("dcp", result);
+        printf("FDT: T8142 display handoff refused; keeping the boot framebuffer\n");
+        if (dt_refuse_t8142_display())
+            bail("FDT: cannot withdraw the T8142 display nodes\n");
+        dt_t8142_log_fdt_space();
+        return 0;
+    }
+    dt_t8142_handoff_result("dcp", result);
+
+    dt_set_t8142_dcpexts();
+    if (kboot_t8142_display_prune(dt))
+        printf("FDT: disp0: could not drop the external DARTs that stay disabled\n");
+    dt_t8142_log_fdt_space();
+    return 0;
+}
+
 static int dt_set_display(void)
 {
     if (chip_id == T8140)
@@ -10016,11 +10120,8 @@ static int dt_set_display(void)
         /* Fail-soft (kboot_display_handoff.c): __OS_LOG reservations and the internal panel. */
         return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
-        ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
-                                           disp_reserved_regions_t8142,
-                                           ARRAY_SIZE(disp_reserved_regions_t8142));
-        if (ret)
-            return ret;
+        /* Fail-soft: internal DCP, then each external DCP in its own transaction. */
+        return dt_set_display_t8142();
     } else {
         printf("FDT: unknown compatible, skip display reserved-memory setup\n");
         return 0;
@@ -10043,17 +10144,7 @@ static int dt_set_display(void)
 
     const display_config_t *disp_cfg = display_get_config();
 
-    ret = dt_vram_reserved_region(disp_cfg ? disp_cfg->dcp_alias : "dcp", "disp0");
-    if (ret)
-        return ret;
-    if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
-        ret = dt_reserve_m5_display_segments("dcp", "/arm-io/dcp/iop-dcp-nub", false);
-        if (ret)
-            return ret;
-        /* Never fatal: a refused external DCP only stays disabled. */
-        dt_set_t8142_dcpexts();
-    }
-    return 0;
+    return dt_vram_reserved_region(disp_cfg ? disp_cfg->dcp_alias : "dcp", "disp0");
 }
 
 /* PMP DEVICE DVFS START */
