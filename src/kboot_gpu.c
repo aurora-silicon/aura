@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
+#include "../build/build_cfg.h"
+
 #include "kboot.h"
 #include "adt.h"
 #include "assert.h"
@@ -3095,6 +3097,17 @@ static int dt_set_gpu_t8122(void *dt)
  */
 #define G17_MAX_PERF_STATES 16
 
+/*
+ * A Stage 1 only chains the Stage 2 that boots the OS, and has no room below the DCP log
+ * buffer for the SRAM fill: there a node's apple,sram-microvolt stays 0, which the kernel
+ * refuses, so the GPU stays off rather than running on an unfilled table.
+ */
+#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
+#define G17_FILL_SRAM 0
+#else
+#define G17_FILL_SRAM 1
+#endif
+
 /* G17 SoCs whose firmware iBoot loads and whose UAT it sets up for a raw boot object */
 struct g17_soc {
     const char *compat;           /* Linux compatible */
@@ -3338,6 +3351,18 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
             goto disable;
 
     int ph_len;
+    /*
+     * A DT that states each OPP's SRAM voltage (T8142) gets the machine's own, from
+     * perf-states-sram, as its core voltages come from perf-states: the SRAM table
+     * tracks the chip's bin, so a board-wide one would not hold on every Mac. Only
+     * such a node's SRAM table is checked; the others do not use it.
+     */
+    bool sram_uv = G17_FILL_SRAM && fdt_getprop(dt, gpu, "apple,sram-microvolt", &ph_len);
+    if (sram_uv && ph_len != (int)(count * sizeof(fdt32_t)))
+        goto disable;
+    for (u32 i = 0; sram_uv && i < count; i++)
+        if (sram[i].volt > UINT32_MAX / 1000)
+            goto disable;
     const fdt32_t *opp_ph = fdt_getprop(dt, gpu, "operating-points-v2", &ph_len);
     if (!opp_ph || ph_len != sizeof(*opp_ph))
         goto disable;
@@ -3389,6 +3414,13 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
             fdt_setprop_inplace_u32(dt, opp, "opp-microvolt", states[opp_count].volt * 1000))
             goto disable;
         opp_count++;
+    }
+    if (sram_uv) {
+        fdt32_t cells[G17_MAX_PERF_STATES];
+        for (u32 i = 0; i < count; i++)
+            cells[i] = cpu_to_fdt32(sram[i].volt * 1000);
+        if (fdt_setprop_inplace(dt, gpu, "apple,sram-microvolt", cells, count * sizeof(*cells)))
+            goto disable;
     }
     for (size_t i = 0; i < nregions; i++)
         if (dt_set_resvmem(dt, regions[i].path, base[i], size[i]))
