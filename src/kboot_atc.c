@@ -1443,30 +1443,39 @@ static const struct t6050_atc_tunable t6050_atc_tunables[] = {
     {"tunable_PIPE_HANDLER_DEFAULT", "apple,tunable-pipe-default", "pipehandler", 3, 0},
 };
 
-static T6050_ATC int t6050_export_atc(void *dt, int node, u32 port)
+/*
+ * A fixed DisplayPort PHY (apple,t6050-dp-phy: an ATC without a USB side, such as the HDMI
+ * port's) takes the first nine: no CIO, USB2 or PIPE tables.
+ */
+#define T6050_ATC_DP_TUNABLES 9
+
+/* In .rodata.xtext (types.h): Stage 1's .text has no room left */
+static T6050_ATC AURA_XTEXT int t6050_export_atc(void *dt, int node, u32 port, bool dp)
 {
     char path[24];
     int trace[2][8], src[2], len, parent = fdt_parent_offset(dt, node);
     u32 plen = 0, dlen = 0;
+    size_t count = dp ? T6050_ATC_DP_TUNABLES : ARRAY_SIZE(t6050_atc_tunables);
 
     if (parent < 0 || fdt_address_cells(dt, parent) != 2 || fdt_size_cells(dt, parent) != 2)
         return -1;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < (dp ? 1 : 2); i++) {
         snprintf(path, sizeof(path), i ? "/arm-io/usb-drd%u" : "/arm-io/atc-phy%u", port);
         src[i] = adt_path_offset_trace(adt, path, trace[i]);
         if (src[i] < 0)
             return -1;
     }
+    if (!adt_is_compatible_at(adt, src[0], "atc-phy,t6050", 0))
+        return -1;
     /* usb-drdN must be the controller of atc-phyN */
     const u32 *phandle = adt_getprop(adt, src[0], "AAPL,phandle", &plen);
-    const u32 *phy = adt_getprop(adt, src[1], "atc-phy-parent", &dlen);
-    if (!adt_is_compatible_at(adt, src[0], "atc-phy,t6050", 0) || !phandle || !phy || plen != 4 ||
-        dlen != 4 || *phandle != *phy)
+    const u32 *phy = dp ? NULL : adt_getprop(adt, src[1], "atc-phy-parent", &dlen);
+    if (!dp && (!phandle || !phy || plen != 4 || dlen != 4 || *phandle != *phy))
         return -1;
 
-    for (size_t i = 0; i < ARRAY_SIZE(t6050_atc_tunables); i++) {
+    for (size_t i = 0; i < count; i++) {
         const struct t6050_atc_tunable *t = &t6050_atc_tunables[i];
-        bool drd = i == ARRAY_SIZE(t6050_atc_tunables) - 1;
+        bool drd = !dp && i == ARRAY_SIZE(t6050_atc_tunables) - 1;
         int index = fdt_stringlist_search(dt, node, "reg-names", t->res);
         const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
         u64 base, size;
@@ -1492,24 +1501,33 @@ static T6050_ATC_INIT void t6050_clear_atc(void *dt, int node)
         fdt_delprop(dt, node, t6050_atc_tunables[i].fdt_name);
 }
 
-/* All or nothing per port; on failure the PHY is left without tunables, as before. */
-static T6050_ATC_INIT void t6050_setup_atc(void *dt)
+/*
+ * All or nothing per port; on failure the PHY is left without tunables, as before. In
+ * .rodata.xtext (types.h), as t6050_export_atc: Stage 1's .init ends just under the 2 KiB step
+ * that would move .text up.
+ */
+static T6050_ATC AURA_XTEXT void t6050_setup_atc(void *dt)
 {
-    int node = -1;
+    static const char *const compat[] = {"apple,t6050-combo-phy", "apple,t6050-dp-phy"};
 
-    while ((node = fdt_node_offset_by_compatible(dt, node, "apple,t6050-combo-phy")) >= 0) {
-        int len;
-        const fdt32_t *index = fdt_getprop(dt, node, "apple,port-index", &len);
-        u32 port = index && len == 4 ? fdt32_ld(index) : 0;
+    for (int c = 0; c < 2; c++) {
+        int node = -1;
 
-        /* Port 0 carries aura's debug link: never describe it */
-        if (!port || port > 5)
-            continue;
-        t6050_clear_atc(dt, node);
-        bool ok = !t6050_export_atc(dt, node, port);
-        if (!ok)
+        while ((node = fdt_node_offset_by_compatible(dt, node, compat[c])) >= 0) {
+            int len;
+            const fdt32_t *index = fdt_getprop(dt, node, "apple,port-index", &len);
+            u32 port = index && len == 4 ? fdt32_ld(index) : 0;
+
+            /* Port 0 carries aura's debug link: never describe it */
+            if (!port || port > 5)
+                continue;
             t6050_clear_atc(dt, node);
-        printf("FDT: T6050 ATC%u tunables %s\n", port, ok ? "copied" : "unavailable");
+            bool ok = !t6050_export_atc(dt, node, port, c);
+            if (!ok)
+                t6050_clear_atc(dt, node);
+            printf("FDT: T6050 ATC%u %stunables %s\n", port, c ? "DP PHY " : "",
+                   ok ? "copied" : "unavailable");
+        }
     }
 }
 
