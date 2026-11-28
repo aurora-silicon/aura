@@ -4,12 +4,15 @@
 
 #include "libfdt/libfdt.h"
 
-/* Legacy is a framebuffer fallback on 26.x. An exact experimental DT wins
- * regardless of archive order; other firmware never selects that profile.
- * The J615 25G83 tree (experimental) ranks like the J613's: selecting it
- * hands nothing over by itself, the display and GPU handoffs also need
- * chosen.asahi,j615-25g83-experimental=1 (t8122_25g83.h), which aura.conf
- * supplies only after the device trees have been ranked.
+/* Legacy trees are the default fallback (rank 1). Firmware-specific trees win
+ * regardless of archive order when their OS firmware matches (rank 2) and are
+ * never selected on other firmware (rank 0):
+ * - J613/J615 25G83 (os_26_6_2): apple,j613-25g83-profile + 26.6.2 compat.
+ *   Selecting J615 hands nothing over by itself; the display and GPU handoffs
+ *   also need chosen.asahi,j615-25g83-experimental=1 (t8122_25g83.h), which
+ *   aura.conf supplies only after the device trees have been ranked.
+ * - T8112 macOS 27+ (os_27): apple,t8112-mtp with apple,rtkit-keep-running
+ *   (e.g. t8112-j413-fw27.dtb vs t8112-j413.dtb).
  */
 static inline int payload_profile_rank(const void *dt, bool os_26_6_2)
 {
@@ -27,5 +30,14 @@ static inline int payload_profile_rank(const void *dt, bool os_26_6_2)
                    fdt32_ld(compat + 2) == 2
                ? 2
                : 0;
+}
+
+static inline int payload_profile_rank_fw(const void *dt, bool os_26_6_2, bool os_27)
+{
+    int mtp = fdt_node_offset_by_compatible(dt, -1, "apple,t8112-mtp");
+    if (mtp >= 0 && fdt_getprop(dt, mtp, "apple,rtkit-keep-running", NULL))
+        return os_27 ? 2 : 0;
+
+    return payload_profile_rank(dt, os_26_6_2);
 }
 #endif

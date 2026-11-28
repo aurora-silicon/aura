@@ -67,8 +67,9 @@ typedef s64 ssize_t;
 #define sys_reg(op0, op1, CRn, CRm, op2) , _S, op0, op1, CRn, CRm, op2
 
 /*
- * Code with no room left in .text or .init (each sits just under its next 64 KiB step). aura maps
- * [_base, _rodata_end) executable (memory.c), so .rodata can hold it on freestanding ELF builds.
+ * Code kept with the read-only data. aura maps [_base, _rodata_end) executable (memory.c), so
+ * .rodata can hold it on freestanding ELF builds; aura-raw.ld links .text and .rodata as one
+ * region, so this only groups the code there.
  */
 #if defined(__ELF__) && !__STDC_HOSTED__
 #define AURA_XTEXT __attribute__((section(".rodata.xtext"), noinline))

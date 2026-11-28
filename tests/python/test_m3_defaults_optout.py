@@ -95,9 +95,9 @@ typedef uint64_t u64;
 #define ARRAY_SIZE(s) (sizeof(s) / sizeof((s)[0]))
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 ''' + between(header, "struct kernel_header {", "void kboot_set_initrd(") + r'''
-enum { V26_6_2 = 1 };
+enum fw_version { V26_6_2 = 1, V27_0 = 2 };
 /* The release whose coprocessor firmware the OS iBoot loads (firmware.c) */
-static int firmware_os_components(void) { return V26_6_2; }
+static enum fw_version firmware_os_components(void) { return V26_6_2; }
 #include "payload_profile.h"
 static int XzDecode(void *in, uint32_t *in_len, void *out, uint32_t *out_len) { return 0; }
 

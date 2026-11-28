@@ -2,18 +2,21 @@
 # SPDX-License-Identifier: MIT
 """How much a Stage 1 image can still grow before it reaches the DCP log buffer.
 
-aura-raw.ld puts the code (.init and .text), .rodata + .rela.dyn and .data on 64 KiB steps, and
-everything up to _file_vital_end must end below _file_limit (0x120000, see aura-raw.ld). The link
-fails once it does not. This reports how close a build is, so a change or a toolchain that eats
-the last few KiB fails in CI before a distribution's toolchain trips over it:
+aura-raw.ld puts the code and read-only data (.init, .text, .rodata and .rela.dyn: one
+read-execute region) and .data on steps of _layout_step (16 KiB), and everything up to
+_file_vital_end must end below _file_limit (0x120000, see aura-raw.ld). The link fails once it
+does not. This reports how close a build is, so a change or a toolchain that eats the last few KiB
+fails in CI before a distribution's toolchain trips over it:
 
   data   bytes .data can grow before _file_vital_end reaches the limit
-  text/rodata
-         bytes each can grow before it crosses its next 64 KiB step, which moves .data up 64 KiB
-  init   the same for .init, only in a link that starts .text on its own 64 KiB step (older
-         trees, without _text_content_start)
+  code   bytes the read-execute region can grow before it crosses its next step, which moves
+         .data up one step
 
-The headroom is the data room while that is 64 KiB or more, else the smallest of all four.
+The headroom is the data room while that is a step or more, else the smaller of the two.
+
+Older links, without _layout_step, used 64 KiB steps with one between .text and .rodata (and,
+without _text_content_start, one between .init and .text). For those it reports text, rodata
+(and init) instead of code, as it did.
 
   tools/stage1_room.py build/aura-raw.elf [--min BYTES] [--nm NM]
 """
@@ -25,11 +28,13 @@ import subprocess
 import sys
 
 FILE_LIMIT = 0x120000
-STEP = 0x10000
+# The step of a link without _layout_step.
+OLD_STEP = 0x10000
 SYMBOLS = ("_init_content_end", "_text_content_end", "_rodata_content_end", "_data_start",
            "_file_vital_end")
-# Start of .text, in a link where .text follows .init directly and the two share their room.
-OPTIONAL = ("_text_content_start",)
+# _text_content_start: start of .text, in a link where .text follows .init directly and the two
+# share their room. _layout_step: the step of a link with one read-execute region (aura-raw.ld).
+OPTIONAL = ("_text_content_start", "_layout_step")
 
 
 def find_nm(arg):
@@ -52,21 +57,25 @@ def read_symbols(elf, nm):
     return syms
 
 
-def to_step(addr):
-    return (addr + STEP - 1) & ~(STEP - 1)
+def to_step(addr, step):
+    return (addr + step - 1) & ~(step - 1)
 
 
 def room(syms):
+    step = syms.get("_layout_step")
     r = {}
-    if "_text_content_start" not in syms:
-        # .text starts on its own 64 KiB step (older aura-raw.ld).
-        r["init"] = to_step(syms["_init_content_end"]) - syms["_init_content_end"]
-    r |= {
-        "text": to_step(syms["_text_content_end"]) - syms["_text_content_end"],
-        "rodata": to_step(syms["_rodata_content_end"]) - syms["_rodata_content_end"],
-        "data": FILE_LIMIT - syms["_file_vital_end"],
-    }
-    headroom = r["data"] if r["data"] >= STEP else min(r.values())
+    if step:
+        # .init, .text, .rodata and .rela.dyn are one region ending on a step (_rodata_end).
+        r["code"] = to_step(syms["_rodata_content_end"], step) - syms["_rodata_content_end"]
+    else:
+        step = OLD_STEP
+        if "_text_content_start" not in syms:
+            # .text starts on its own 64 KiB step (older aura-raw.ld).
+            r["init"] = to_step(syms["_init_content_end"], step) - syms["_init_content_end"]
+        r["text"] = to_step(syms["_text_content_end"], step) - syms["_text_content_end"]
+        r["rodata"] = to_step(syms["_rodata_content_end"], step) - syms["_rodata_content_end"]
+    r["data"] = FILE_LIMIT - syms["_file_vital_end"]
+    headroom = r["data"] if r["data"] >= step else min(r.values())
     return r, headroom
 
 
